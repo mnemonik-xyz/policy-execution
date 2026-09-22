@@ -1,0 +1,15 @@
+[package]
+name = "warrant-policy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+bincode.workspace = true
+k256.workspace = true
+warrant-verified-policy = { path = "../verified" }
+
+[dev-dependencies]
+serde_json = "1.0"
