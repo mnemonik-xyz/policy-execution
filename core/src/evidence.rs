@@ -139,6 +139,45 @@ impl InvoiceAuthorization {
     }
 }
 
+/// What the escrow's signer signs: `InvoiceEscrow.signerDigest(journal)`. The tag,
+/// chain and escrow address bind the signature to one contract even though the
+/// journal already carries them.
+pub fn signer_digest(chain_id: u64, escrow: &Address, journal: &[u8]) -> Hash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"warrant/invoice-signer/v1");
+    hasher.update([0u8; 24]);
+    hasher.update(chain_id.to_be_bytes());
+    hasher.update(escrow);
+    hasher.update(Sha256::digest(journal));
+    hasher.finalize().into()
+}
+
+/// Signs `journal` for `InvoiceEscrow.settleSigned`: 65 bytes `r || s || v`, low-s,
+/// `v` in {27, 28}, as OpenZeppelin's `ECDSA.recover` expects.
+pub fn sign_journal(
+    key: &k256::ecdsa::SigningKey,
+    chain_id: u64,
+    escrow: &Address,
+    journal: &[u8],
+) -> Vec<u8> {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    let digest = signer_digest(chain_id, escrow, journal);
+    let (signature, recovery): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) = key
+        .sign_prehash(&digest)
+        .expect("signing cannot fail for a valid key");
+    // Canonical low-s; flipping s flips the recovered point's parity.
+    let (signature, recovery) = match signature.normalize_s() {
+        Some(low) => (
+            low,
+            k256::ecdsa::RecoveryId::from_byte(recovery.to_byte() ^ 1).unwrap(),
+        ),
+        None => (signature, recovery),
+    };
+    let mut out = signature.to_bytes().to_vec();
+    out.push(27 + recovery.to_byte());
+    out
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskReason {
     NotUsd,

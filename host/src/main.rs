@@ -8,7 +8,7 @@ use warrant_methods::{
     WARRANT_GUEST_ELF, WARRANT_GUEST_ID, WARRANT_INVOICE_GUEST_ELF, WARRANT_INVOICE_GUEST_ID,
 };
 use warrant_policy::evidence::{
-    authorize_invoice, InvoiceAuthorization, InvoiceInput, InvoiceOutcome,
+    authorize_invoice, sign_journal, InvoiceAuthorization, InvoiceInput, InvoiceOutcome,
 };
 use warrant_policy::{authorize, Input};
 
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     ensure!(
         args.len() >= 2 && (args[1].ends_with("image-id") || args.len() >= 3),
-        "Usage: warrant-host [invoice-]image-id | [invoice-]evaluate|execute|prove input.json [receipt.bin] | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
+        "Usage: warrant-host [invoice-]image-id | [invoice-]evaluate|execute|prove input.json [receipt.bin] | invoice-sign signer-key.hex input.json output.json | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
     );
     match args[1].as_str() {
         "image-id" => println!(
@@ -94,6 +94,39 @@ fn main() -> Result<()> {
             "0x{}",
             hex::encode(Digest::from(WARRANT_INVOICE_GUEST_ID).as_bytes())
         ),
+        "invoice-sign" => {
+            // Signer mode: the buyer-run service evaluates natively and signs the
+            // journal for InvoiceEscrow.settleSigned. The key never leaves this host.
+            let input_path = args.get(3).context("Missing input path")?;
+            let output = args.get(4).context("Missing output path")?;
+            ensure!(!Path::new(output).exists(), "Output already exists");
+            let text = fs::read_to_string(&args[2]).context("Cannot read signer key file")?;
+            let raw = hex::decode(text.trim().strip_prefix("0x").unwrap_or(text.trim()))
+                .context("Signer key must be hex")?;
+            let key = k256::ecdsa::SigningKey::from_slice(&raw).context("Invalid signer key")?;
+            let input = read_invoice(input_path)?;
+            let auth = allowed_invoice(&input)?;
+            let journal = auth.journal();
+            let scope = &auth.authorization.request.scope;
+            let signature = sign_journal(&key, scope.chain_id, &scope.vault, &journal);
+            let public = key.verifying_key().to_encoded_point(false);
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?
+                .write_all(&serde_json::to_vec_pretty(&serde_json::json!({
+                    "journal": format!("0x{}", hex::encode(&journal)),
+                    "signature": format!("0x{}", hex::encode(&signature)),
+                    "signerPublicKey": format!("0x{}", hex::encode(&public.as_bytes()[1..])),
+                    "chainId": scope.chain_id,
+                    "escrow": format!("0x{}", hex::encode(scope.vault)),
+                    "amount": auth.authorization.request.amount,
+                }))?)?;
+            println!(
+                "Signed authorization written to {output}; amount {}",
+                auth.authorization.request.amount
+            );
+        }
         "invoice-evaluate" => {
             let auth = allowed_invoice(&read_invoice(&args[2])?)?;
             println!("{}", serde_json::to_string_pretty(&auth)?);

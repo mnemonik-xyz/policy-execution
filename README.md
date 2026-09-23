@@ -12,8 +12,9 @@ facts only when they can be re-derived or checked deterministically.
 Invoice evidence checker (2026-09-23): `evidence::authorize_invoice` parses a
 UBL 2.1 invoice, admits agent line claims only with checkable evidence, and
 returns Allow, Ask or a denial through a verified three-valued evaluator. Its
-14-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) through a
-separate invoice guest. See [the design](evidence-checker.md) and
+14-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) either by a
+proof from a separate invoice guest or, below a threshold, by the buyer-run
+signer (`warrant-host invoice-sign`). See [the design](evidence-checker.md) and
 [recorded results](verified/verification-results.md).
 
 The implementation includes reusable [policy templates](templates/README.md),

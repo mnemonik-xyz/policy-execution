@@ -15,8 +15,9 @@ uses them; the existing `authorize()` path rejects the new atoms.
   purchase-order bypasses, an ignored unknown conjunct, an ignored unknown line
   label, and Ask returned as Allow. Postcondition or loop-invariant failures both
   count; compiler errors do not.
-- **38 native tests passed**: 17 existing, 18 invoice fixtures (E1–E13 plus
-  authority, signature and path-separation checks) and 3 XML reader tests.
+- **40 native tests passed**: 17 existing, 20 invoice fixtures (E1–E13 plus
+  authority, signature, path-separation and two Solidity-fixture checks) and 3
+  XML reader tests. Solidity: 54 tests, 22 of them for `InvoiceEscrow`.
 - Existing policy commitments are unchanged: `policy_hash` of both fixture
   policies is byte-identical to `main` (new `Rule` variants are appended).
 - Shared evaluator source SHA-256:

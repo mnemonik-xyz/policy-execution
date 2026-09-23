@@ -23,23 +23,27 @@ fn hex(b: &[u8]) -> String {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    assert_eq!(
-        args.len(),
-        7,
-        "invoice_fixture out_dir chain_id escrow token vendor base_timestamp"
+    assert!(
+        args.len() == 7 || args.len() == 8,
+        "invoice_fixture out_dir chain_id escrow token vendor base_timestamp [invoice_number]"
     );
     let scope = Scope {
         chain_id: args[2].parse().unwrap(),
         vault: bytes(&args[3]),
         token: bytes(&args[4]),
     };
-    let mut input = fixture_at(doc().xml(), scope, args[6].parse().unwrap());
+    let mut document = doc();
+    if let Some(number) = args.get(7) {
+        document.number = number.clone().leak();
+    }
+    let mut input = fixture_at(document.xml(), scope, args[6].parse().unwrap());
     input.vendor.recipient = bytes(&args[5]);
     resign(&mut input);
     let InvoiceOutcome::Allow(auth) = authorize_invoice(&input).unwrap() else {
         panic!("fixture must be allowed");
     };
     let out = Path::new(&args[1]);
+    fs::create_dir_all(out).unwrap();
     fs::write(
         out.join("input.json"),
         serde_json::to_vec_pretty(&input).unwrap(),

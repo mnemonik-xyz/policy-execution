@@ -4,6 +4,7 @@ import {InvoiceEscrow} from "../src/InvoiceEscrow.sol";
 import {PolicyExecutionVault} from "../src/PolicyExecutionVault.sol";
 import {JournalVerifier, TestToken} from "./PolicyExecutionVault.t.sol";
 import {CallbackToken} from "./EscrowToken.t.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 interface InvoiceVm {
     function prank(address) external;
@@ -16,6 +17,8 @@ interface InvoiceVm {
     function parseJsonUint(string calldata, string calldata) external pure returns (uint256);
     function parseJsonAddress(string calldata, string calldata) external pure returns (address);
     function assume(bool) external pure;
+    function sign(uint256, bytes32) external pure returns (uint8, bytes32, bytes32);
+    function addr(uint256) external pure returns (address);
 }
 
 contract InvoiceEscrowTest {
@@ -24,6 +27,8 @@ contract InvoiceEscrowTest {
     address constant RELAYER = address(0x5678);
     bytes32 constant POLICY = keccak256("buyer-policy");
     bytes32 constant PO = keccak256("PO-77");
+    uint256 constant SIGNER_KEY = 0xA11CE;
+    uint64 constant THRESHOLD = 1000;
     TestToken token;
     JournalVerifier verifier;
     InvoiceEscrow escrow;
@@ -33,10 +38,11 @@ contract InvoiceEscrowTest {
         vm.warp(1000);
         token = new TestToken();
         verifier = new JournalVerifier();
-        escrow = new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)));
+        escrow =
+            new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), vm.addr(SIGNER_KEY), THRESHOLD);
         token.mint(address(this), 10_000);
         token.approve(address(escrow), 10_000);
-        id = escrow.offer(POLICY, 1, PO, VENDOR, 3000, 1200, 5000);
+        id = escrow.offer(POLICY, 1, PO, VENDOR, 3000, 1500, 1200, 5000);
     }
 
     function accept() internal {
@@ -74,7 +80,22 @@ contract InvoiceEscrowTest {
     }
 
     function spent() internal view returns (uint64 s) {
-        (,,,,, s,,,) = escrow.orders(id);
+        (,,,,, s,,,,,,) = escrow.orders(id);
+    }
+
+    function signerSpent() internal view returns (uint64 s) {
+        (,,,,,,,,,, s,) = escrow.orders(id);
+    }
+
+    /// A journal signed by the escrow's signer; the mock verifier never sees it.
+    function signed(bytes32 taskId, uint64 amount) internal view returns (bytes memory j, bytes memory sig) {
+        j = abi.encode(base(taskId, amount), PO, uint64(3000));
+        sig = signWith(SIGNER_KEY, j);
+    }
+
+    function signWith(uint256 key, bytes memory j) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, escrow.signerDigest(j));
+        return abi.encodePacked(r, s, v);
     }
 
     function testReservesFullOrderAndRequiresVendorAcceptance() public {
@@ -110,7 +131,7 @@ contract InvoiceEscrowTest {
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
         escrow.settle(hex"abcd", again);
         // A second order under another policy still cannot pay the same obligation.
-        bytes32 other = escrow.offer(keccak256("other-policy"), 1, PO, VENDOR, 500, 1200, 5000);
+        bytes32 other = escrow.offer(keccak256("other-policy"), 1, PO, VENDOR, 500, 0, 1200, 5000);
         vm.prank(VENDOR);
         escrow.accept(other);
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-1"), 100);
@@ -121,10 +142,10 @@ contract InvoiceEscrowTest {
     }
 
     function testSameOrderNumberUnderDifferentPoliciesDoesNotCollide() public {
-        bytes32 other = escrow.offer(keccak256("other-buyer"), 1, PO, VENDOR, 500, 1200, 5000);
+        bytes32 other = escrow.offer(keccak256("other-buyer"), 1, PO, VENDOR, 500, 0, 1200, 5000);
         require(other != id && escrow.totalReserved() == 3500);
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
-        escrow.offer(POLICY, 1, PO, RELAYER, 1, 1200, 5000);
+        escrow.offer(POLICY, 1, PO, RELAYER, 1, 0, 1200, 5000);
     }
 
     function testProvenOrderCeilingMustMatchFundedOrder() public {
@@ -203,7 +224,7 @@ contract InvoiceEscrowTest {
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
         escrow.accept(id);
         // After the acceptance deadline anyone may return an unaccepted order.
-        bytes32 second = escrow.offer(POLICY, 1, keccak256("PO-78"), VENDOR, 100, 1200, 5000);
+        bytes32 second = escrow.offer(POLICY, 1, keccak256("PO-78"), VENDOR, 100, 0, 1200, 5000);
         vm.warp(1201);
         vm.prank(VENDOR);
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
@@ -216,27 +237,28 @@ contract InvoiceEscrowTest {
     function testInvalidOfferTerms() public {
         bytes32 p = keccak256("new");
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, address(0), 1, 1200, 5000);
+        escrow.offer(p, 1, PO, address(0), 1, 0, 1200, 5000);
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, bytes32(0), VENDOR, 1, 1200, 5000);
+        escrow.offer(p, 1, bytes32(0), VENDOR, 1, 0, 1200, 5000);
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 0, PO, VENDOR, 1, 1200, 5000);
+        escrow.offer(p, 0, PO, VENDOR, 1, 0, 1200, 5000);
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 0, 1200, 5000);
+        escrow.offer(p, 1, PO, VENDOR, 0, 0, 1200, 5000);
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 1, 1200, 1200);
+        escrow.offer(p, 1, PO, VENDOR, 1, 0, 1200, 1200);
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 1, 999, 5000);
+        escrow.offer(p, 1, PO, VENDOR, 1, 0, 999, 5000);
     }
 
     function testFeeOnTransferFundingIsRejected() public {
         CallbackToken feeToken = new CallbackToken();
-        InvoiceEscrow feeEscrow = new InvoiceEscrow(address(feeToken), address(verifier), bytes32(uint256(1)));
+        InvoiceEscrow feeEscrow =
+            new InvoiceEscrow(address(feeToken), address(verifier), bytes32(uint256(1)), address(0), 0);
         feeToken.mint(address(this), 100);
         feeToken.approve(address(feeEscrow), 100);
         feeToken.configure(address(0), "", true);
         vm.expectRevert(InvoiceEscrow.InvalidFunding.selector);
-        feeEscrow.offer(POLICY, 1, PO, VENDOR, 100, 1200, 5000);
+        feeEscrow.offer(POLICY, 1, PO, VENDOR, 100, 0, 1200, 5000);
     }
 
     /// Cumulative payments never exceed the ceiling, whatever the invoice amounts.
@@ -257,6 +279,156 @@ contract InvoiceEscrowTest {
         }
         require(spent() == paid && token.balanceOf(VENDOR) == paid);
         require(escrow.totalReserved() == 3000 - paid && token.balanceOf(address(escrow)) == 3000 - paid);
+    }
+
+    function testSignedSettlementBelowThreshold() public {
+        accept();
+        (bytes memory j, bytes memory sig) = signed(keccak256("INV-S1"), 999);
+        vm.prank(RELAYER);
+        escrow.settleSigned(j, sig);
+        require(token.balanceOf(VENDOR) == 999 && spent() == 999 && signerSpent() == 999);
+        require(escrow.remaining(id) == 2001 && escrow.totalReserved() == 2001);
+        // The same obligation cannot be paid again by proof either.
+        bytes memory proven = invoice(keccak256("INV-S1"), 999);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settle(hex"abcd", proven);
+    }
+
+    function testAmountAtOrAboveThresholdRequiresProof() public {
+        accept();
+        (bytes memory j, bytes memory sig) = signed(keccak256("INV-S2"), THRESHOLD);
+        vm.expectRevert(InvoiceEscrow.ProofRequired.selector);
+        escrow.settleSigned(j, sig);
+        // The proof path takes the same journal.
+        verifier.approve(j);
+        escrow.settle(hex"abcd", j);
+        require(token.balanceOf(VENDOR) == THRESHOLD && signerSpent() == 0);
+    }
+
+    function testSignerAllowanceCapsSplitPayments() public {
+        accept();
+        (bytes memory j1, bytes memory s1) = signed(keccak256("INV-S3"), 900);
+        escrow.settleSigned(j1, s1);
+        (bytes memory j2, bytes memory s2) = signed(keccak256("INV-S4"), 601);
+        vm.expectRevert(InvoiceEscrow.SignerAllowanceExceeded.selector);
+        escrow.settleSigned(j2, s2);
+        (bytes memory j3, bytes memory s3) = signed(keccak256("INV-S5"), 600);
+        escrow.settleSigned(j3, s3);
+        require(signerSpent() == 1500 && spent() == 1500);
+        // Proofs are not limited by the signer allowance, only by the ceiling.
+        escrow.settle(hex"abcd", invoice(keccak256("INV-S6"), 1500));
+        require(spent() == 3000 && escrow.remaining(id) == 0);
+    }
+
+    function testWrongSignerAndMalformedSignaturesAreRejected() public {
+        accept();
+        bytes memory j = abi.encode(base(keccak256("INV-S7"), 100), PO, uint64(3000));
+        bytes memory other = signWith(0xB0B, j);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(j, other);
+        bytes memory sig = signWith(SIGNER_KEY, j);
+        // A signature over a different journal does not transfer.
+        bytes memory altered = abi.encode(base(keccak256("INV-S8"), 100), PO, uint64(3000));
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(altered, sig);
+        // High-s form of a valid signature is rejected by ECDSA.recover.
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_KEY, escrow.signerDigest(j));
+        bytes32 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+        bytes memory highS = abi.encodePacked(r, bytes32(uint256(n) - uint256(s)), v == 27 ? uint8(28) : uint8(27));
+        vm.expectRevert();
+        escrow.settleSigned(j, highS);
+        vm.expectRevert();
+        escrow.settleSigned(j, hex"1234");
+        escrow.settleSigned(j, sig);
+        require(token.balanceOf(VENDOR) == 100);
+    }
+
+    function testSignedPathHonoursSharedChecks() public {
+        accept();
+        PolicyExecutionVault.Authorization memory a = base(keccak256("INV-S9"), 100);
+        a.recipient = RELAYER;
+        bytes memory redirected = abi.encode(a, PO, uint64(3000));
+        bytes memory sig = signWith(SIGNER_KEY, redirected);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleSigned(redirected, sig);
+        vm.warp(5001);
+        (bytes memory late, bytes memory lateSig) = signed(keccak256("INV-S10"), 100);
+        vm.expectRevert(InvoiceEscrow.InvalidState.selector);
+        escrow.settleSigned(late, lateSig);
+    }
+
+    function testCustomerCanRevokeSignerButNotProofs() public {
+        accept();
+        vm.prank(RELAYER);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.revokeSigner(id);
+        escrow.revokeSigner(id);
+        (bytes memory j, bytes memory sig) = signed(keccak256("INV-S11"), 100);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(j, sig);
+        verifier.approve(j);
+        escrow.settle(hex"abcd", j);
+        require(token.balanceOf(VENDOR) == 100);
+    }
+
+    function testProofsOnlyDeploymentAndTerms() public {
+        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
+        new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), address(0), 1);
+        InvoiceEscrow proofsOnly =
+            new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), address(0), 0);
+        token.approve(address(proofsOnly), 100);
+        bytes32 o = proofsOnly.offer(POLICY, 1, PO, VENDOR, 100, 0, 1200, 5000);
+        vm.prank(VENDOR);
+        proofsOnly.accept(o);
+        PolicyExecutionVault.Authorization memory a = base(keccak256("INV-S12"), 50);
+        a.vault = address(proofsOnly);
+        bytes memory j = abi.encode(a, PO, uint64(100));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_KEY, proofsOnly.signerDigest(j));
+        vm.expectRevert(InvoiceEscrow.ProofRequired.selector);
+        proofsOnly.settleSigned(j, abi.encodePacked(r, s, v));
+        // An allowance above the ceiling is not a valid order.
+        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
+        escrow.offer(keccak256("p2"), 1, PO, VENDOR, 100, 101, 1200, 5000);
+    }
+
+    /// Signature-authorized payments never exceed the allowance; proofs still respect the ceiling.
+    function testFuzzSignerAllowanceHolds(uint64 a, uint64 b) public {
+        vm.assume(a > 0 && b > 0 && a < THRESHOLD && b < THRESHOLD);
+        accept();
+        uint256 paid;
+        uint64[2] memory amounts = [a, b];
+        for (uint256 i; i < 2; i++) {
+            (bytes memory j, bytes memory sig) = signed(keccak256(abi.encode("SFUZZ", i)), amounts[i]);
+            if (uint256(amounts[i]) + paid <= 1500) {
+                escrow.settleSigned(j, sig);
+                paid += amounts[i];
+            } else {
+                vm.expectRevert(InvoiceEscrow.SignerAllowanceExceeded.selector);
+                escrow.settleSigned(j, sig);
+            }
+        }
+        require(signerSpent() == paid && spent() == paid && token.balanceOf(VENDOR) == paid);
+    }
+
+    /// The Rust signer helper produces signatures this contract recovers to the expected address.
+    function testRustSignatureRecoversToSigner() public view {
+        string memory json = vm.readFile("test/fixtures/invoice-signature.json");
+        bytes memory journal = vm.parseJsonBytes(json, ".journal");
+        bytes memory signature = vm.parseJsonBytes(json, ".signature");
+        bytes memory publicKey = vm.parseJsonBytes(json, ".signerPublicKey");
+        require(publicKey.length == 64 && signature.length == 65);
+        address expected = address(uint160(uint256(keccak256(publicKey))));
+        // The fixture was signed for chain 5042002 and escrow 0x0303…03; recompute that digest.
+        bytes32 digest = sha256(
+            abi.encodePacked(
+                bytes("warrant/invoice-signer/v1"),
+                uint256(5042002),
+                address(0x0303030303030303030303030303030303030303),
+                sha256(journal)
+            )
+        );
+        require(ECDSA.recover(digest, signature) == expected);
+        require(signature[64] == 0x1b || signature[64] == 0x1c);
     }
 
     /// The Rust evidence checker's journal decodes to the same fields in Solidity.

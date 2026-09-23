@@ -422,3 +422,33 @@ fn solidity_journal_fixture_matches_rust_encoding() {
     }
     assert_eq!(std::fs::read_to_string(path).unwrap(), rendered);
 }
+
+/// Keeps `contracts/test/fixtures/invoice-signature.json` equal to what `sign_journal`
+/// emits for the E1 authorization under a public test key; `InvoiceEscrowTest`
+/// recovers the signer from it. Regenerate with `WARRANT_UPDATE_FIXTURES=1`.
+#[test]
+fn solidity_signature_fixture_matches_rust_signing() {
+    let auth = allowed(&fixture(doc().xml()));
+    let journal = auth.journal();
+    let signer = key(4);
+    let signature = sign_journal(&signer, 5042002, &[3; 20], &journal);
+    assert_eq!(signature.len(), 65);
+    assert!(signature[64] == 27 || signature[64] == 28);
+    let public = signer.verifying_key().to_encoded_point(false);
+    let json = serde_json::json!({
+        "comment": "Synthetic E1 authorization signed with public test key 0x04..04; never a real signer.",
+        "journal": hex(&journal),
+        "signature": hex(&signature),
+        "signerPublicKey": hex(&public.as_bytes()[1..]),
+        "digest": hex(&signer_digest(5042002, &[3; 20], &journal)),
+    });
+    let rendered = serde_json::to_string_pretty(&json).unwrap() + "\n";
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../contracts/test/fixtures/invoice-signature.json"
+    );
+    if std::env::var_os("WARRANT_UPDATE_FIXTURES").is_some() {
+        std::fs::write(path, &rendered).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), rendered);
+}

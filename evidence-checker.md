@@ -275,6 +275,9 @@ run on Arc. Gas cost is not yet measured.
 
 Plan: owner-run signer for the live payment path in the hackathon window; RISC
 Zero on Arc as the trustless mode once one Groth16 receipt verifies on testnet.
+Implemented in [`InvoiceEscrow`](invoice-escrow.md): `settleSigned` below an
+immutable `proofThreshold` and within a per-order `signerAllowance`, `settle`
+with a receipt for any amount, and a buyer-only `revokeSigner` that only tightens.
 
 **Key roles.**
 
