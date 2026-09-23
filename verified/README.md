@@ -75,7 +75,21 @@ previous image receipts remain intact. Set `WARRANT_RECEIPT_DIR` to that directo
 when running the receipt tests; it must contain `request.json`, `alternative.json`
 and their corresponding `.receipt` files. See the parent [demo commands](../README.md#build-and-test).
 
+## Three-valued evaluation
+
+`evaluate3(rule, facts3)` returns exactly `kleene(rule, facts3)`, a strong Kleene
+reading of the same rules over facts whose optional parts may be unknown.
+`decide` maps `Some(true)`, `Some(false)` and `None` to Allow, Deny and Ask.
+`decision_sound` proves that Allow implies `satisfies` for **every** completion
+of the unknown facts, and Deny implies it fails for every completion. The
+converse does not hold: Ask can occur even when every completion happens to
+agree, which is the conservative direction. Only Allow authorizes a payment.
+
 ## Verification outcome
+
+On 2026-09-23, after adding the invoice atoms and three-valued evaluation, Verus
+reported **16 verified, 0 errors** and all 14 executable mutations were rejected.
+See [the 2026-09-23 record](verification-results.md).
 
 On 2026-09-22, Verus reported **7 verified, 0 errors** with `--no-cheating`.
 All eight executable mutations were rejected: reversed and exclusive amount

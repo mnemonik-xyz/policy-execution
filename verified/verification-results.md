@@ -1,4 +1,33 @@
-# Verification results: 2026-09-22
+# Verification results
+
+## 2026-09-23: invoice atoms and three-valued evaluation
+
+Added `LineLabelsWithin`, `NoDeniedTerm` and `WithinPo` to the shared evaluator,
+and `evaluate3`/`decide`, which return Allow, Deny or Ask over facts that may be
+unknown (strong Kleene semantics). The evidence checker in `core/src/evidence.rs`
+uses them; the existing `authorize()` path rejects the new atoms.
+
+- Verus `0.2026.09.20.aef82ed`, with `--no-cheating`: **16 verified, 0 errors**.
+  New obligations: `evaluate3 == kleene`, `decide` maps exactly onto `kleene`, and
+  `decision_sound` (Allow holds, and Deny fails, for every completion of the
+  unknown facts).
+- **14 mutations rejected**: the original 8 plus line-label, denied-term and
+  purchase-order bypasses, an ignored unknown conjunct, an ignored unknown line
+  label, and Ask returned as Allow. Postcondition or loop-invariant failures both
+  count; compiler errors do not.
+- **38 native tests passed**: 17 existing, 18 invoice fixtures (E1–E13 plus
+  authority, signature and path-separation checks) and 3 XML reader tests.
+- Existing policy commitments are unchanged: `policy_hash` of both fixture
+  policies is byte-identical to `main` (new `Rule` variants are appended).
+- Shared evaluator source SHA-256:
+  `f48d2294ace11540c1352b1da9a0a24a42f8c920b7d644e62b515e42cf966bd4`
+
+**Not re-run:** the RISC Zero guest was not rebuilt (no `rzup` toolchain in this
+environment). The guest's evaluator code changed, so its image ID changes on the
+next build; the image ID and receipts recorded below belong to the 2026-09-22
+snapshot and will not verify against a rebuilt guest.
+
+## 2026-09-22
 
 The first exercise verified the shared policy evaluator and integrated it into
 both native authorization and the RISC Zero guest. It did not formally verify

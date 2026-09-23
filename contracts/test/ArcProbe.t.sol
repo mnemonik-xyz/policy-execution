@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 import {TaskEscrow} from "../src/TaskEscrow.sol";
+import {InvoiceEscrow} from "../src/InvoiceEscrow.sol";
 import {RiscZeroGroth16Verifier} from "../vendor/risc0/contracts/src/groth16/RiscZeroGroth16Verifier.sol";
 import {ControlID} from "../vendor/risc0/contracts/src/groth16/ControlID.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -19,6 +20,8 @@ contract ArcProbe {
         TaskEscrow escrow = new TaskEscrow(token, address(verifier), imageId);
         require(address(escrow.token()) == token && escrow.imageId() == imageId && escrow.totalReserved() == 0);
         require(IERC20Metadata(token).balanceOf(address(escrow)) == 0);
+        InvoiceEscrow invoices = new InvoiceEscrow(token, address(verifier), imageId);
+        require(address(invoices.token()) == token && invoices.imageId() == imageId && invoices.totalReserved() == 0);
         // A recognizable result for the read-only constructor simulation.
         assembly {
             mstore(0, 1)

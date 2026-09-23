@@ -52,6 +52,14 @@ def main():
         "category bypass": ("category_contains(categories, facts.category)", "true"),
         "recipient bypass": ("bytes_equal(&facts.recipient, recipient)", "true"),
         "deliverable bypass": ("bytes_equal(&facts.deliverable, hash)", "true"),
+        "line label bypass": ("Rule::LineLabelsWithin(labels) => labels_within(labels, &facts.line_labels)",
+                              "Rule::LineLabelsWithin(labels) => true"),
+        "denied term bypass": ("Rule::NoDeniedTerm => facts.no_denied_term,", "Rule::NoDeniedTerm => true,"),
+        "purchase order bypass": ("Rule::WithinPo => facts.amount <= facts.po_remaining,", "Rule::WithinPo => true,"),
+        "unknown conjunct ignored": ("None => unknown = true,\n                    Some(true) => {},",
+                                     "None => {},\n                    Some(true) => {},"),
+        "unknown line label ignored": ("None => {\n                unknown = true;\n            },", "None => {},"),
+        "ask becomes allow": ("None => Decision::Ask,", "None => Decision::Allow,"),
     }
     with tempfile.TemporaryDirectory(prefix="warrant-verus-mutations-") as directory:
         for name, (before, after) in mutations.items():
@@ -62,7 +70,9 @@ def main():
             result = verify(verus, path)
             output = result.stdout + result.stderr
             # A compiler/setup failure is not evidence that a proof caught the bug.
-            if result.returncode == 0 or "postcondition not satisfied" not in output:
+            proof_failure = ("postcondition not satisfied" in output
+                             or "invariant not satisfied" in output)
+            if result.returncode == 0 or not proof_failure:
                 print(output)
                 raise SystemExit(f"Mutation did not produce the expected proof failure: {name}")
             print(f"Rejected mutation: {name}", flush=True)

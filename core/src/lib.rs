@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 pub use warrant_verified_policy::Rule;
 use warrant_verified_policy::{evaluate, Facts};
 
+pub mod evidence;
+mod xml;
+
 pub type Hash = [u8; 32];
 pub type Address = [u8; 20];
 
@@ -102,6 +105,9 @@ pub enum Denial {
     RequestMismatch,
     EmptyValidityWindow,
     PolicyDenied,
+    InvalidDocument,
+    VendorMismatch,
+    PoMismatch,
 }
 
 impl std::fmt::Display for Denial {
@@ -139,11 +145,13 @@ pub fn acceptance_message(acceptance: &Acceptance) -> Vec<u8> {
     tagged_bytes(b"warrant/acceptance/v1", acceptance)
 }
 
-fn valid_scope(scope: &Scope) -> bool {
+pub(crate) fn valid_scope(scope: &Scope) -> bool {
     scope.chain_id != 0 && scope.vault != [0; 20] && scope.token != [0; 20]
 }
 
-fn valid_rule(rule: &Rule, depth: usize, remaining: &mut usize) -> bool {
+/// Invoice-only atoms are rejected outside the invoice path, where their facts
+/// do not exist.
+pub(crate) fn valid_rule(rule: &Rule, invoice: bool, depth: usize, remaining: &mut usize) -> bool {
     if depth > 8 || *remaining == 0 {
         return false;
     }
@@ -152,7 +160,9 @@ fn valid_rule(rule: &Rule, depth: usize, remaining: &mut usize) -> bool {
         Rule::All(children) | Rule::Any(children) => {
             !children.is_empty()
                 && children.len() <= 16
-                && children.iter().all(|r| valid_rule(r, depth + 1, remaining))
+                && children
+                    .iter()
+                    .all(|r| valid_rule(r, invoice, depth + 1, remaining))
         }
         Rule::AmountAtMost(cap) => *cap > 0,
         Rule::VendorCategoryIn(categories) => {
@@ -161,10 +171,14 @@ fn valid_rule(rule: &Rule, depth: usize, remaining: &mut usize) -> bool {
         Rule::Accepted => true,
         Rule::DeliverableEquals(hash) => *hash != [0; 32],
         Rule::RecipientEquals(address) => *address != [0; 20],
+        Rule::LineLabelsWithin(labels) => {
+            invoice && !labels.is_empty() && labels.len() <= 64 && !labels.contains(&0)
+        }
+        Rule::NoDeniedTerm | Rule::WithinPo => invoice,
     }
 }
 
-fn valid_key(bytes: &[u8]) -> bool {
+pub(crate) fn valid_key(bytes: &[u8]) -> bool {
     bytes.len() == 33 && VerifyingKey::from_sec1_bytes(bytes).is_ok()
 }
 
@@ -174,14 +188,14 @@ pub fn validate_policy(policy: &Policy) -> Result<(), Denial> {
         || policy.valid_after > policy.valid_until
         || !valid_key(&policy.registry_key)
         || !valid_key(&policy.acceptance_key)
-        || !valid_rule(&policy.rule, 0, &mut 128)
+        || !valid_rule(&policy.rule, false, 0, &mut 128)
     {
         return Err(Denial::InvalidPolicy);
     }
     Ok(())
 }
 
-fn verify(key: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Denial> {
+pub(crate) fn verify(key: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Denial> {
     let key = VerifyingKey::from_sec1_bytes(key).map_err(|_| Denial::InvalidSignature)?;
     let sig = Signature::from_slice(signature).map_err(|_| Denial::InvalidSignature)?;
     // Use canonical low-S signatures to avoid alternate encodings of evidence.
@@ -203,6 +217,10 @@ fn matches(rule: &Rule, request: &Request, evidence: &Evidence) -> bool {
             accepted: evidence.acceptance.accepted,
             deliverable: request.deliverable_hash,
             recipient: request.recipient,
+            // Invoice-only facts; validate_policy rejects rules that read them.
+            line_labels: Vec::new(),
+            no_denied_term: false,
+            po_remaining: 0,
         },
     )
 }

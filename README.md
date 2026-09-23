@@ -6,6 +6,15 @@ policy, and emits an authorization. A RISC Zero guest proves that execution.
 
 See [the detailed data-flow diagram](data-flow.md) for actor responsibilities,
 privacy boundaries and contract enforcement.
+The [evidence checker](evidence-checker.md) admits agent-extracted invoice
+facts only when they can be re-derived or checked deterministically.
+
+Invoice evidence checker (2026-09-23): `evidence::authorize_invoice` parses a
+UBL 2.1 invoice, admits agent line claims only with checkable evidence, and
+returns Allow, Ask or a denial through a verified three-valued evaluator. Its
+14-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) through a
+separate invoice guest. See [the design](evidence-checker.md) and
+[recorded results](verified/verification-results.md).
 
 The implementation includes reusable [policy templates](templates/README.md),
 issuer signing tools, a fixed Rust interpreter with a Verus-proved evaluator,
@@ -14,9 +23,11 @@ The escrow locks the approved policy commitment, recipient, amount and deadlines
 the agent explicitly accepts those terms before work. Proof generation and
 submission need no administrative role.
 
-Validation: 28 Rust tests, 32 Solidity tests (including a real verifier),
-7 Verus obligations and 8 mutation checks pass. See the
-[validation record](validation-results.md) for scope and reproduction.
+Validation before the evidence checker: 28 Rust tests, 32 Solidity tests
+(including a real verifier), 7 Verus obligations and 8 mutation checks pass. See
+the [validation record](validation-results.md) for scope and reproduction. The
+evidence checker raises the Verus result to 16 obligations and 14 rejected
+mutations and adds 21 native tests; see [its record](verified/verification-results.md).
 
 See [contract deployment instructions](contracts/README.md) and the local demo
 below. Public-network deployment is separate from local verification; no Arc
@@ -50,7 +61,8 @@ The amount is in token base units; the application must establish that the chose
 token has six decimals before displaying it as USDC. Categories are the registry's
 defined IDs, not a model's guesses. Available rules are `all`, `any`,
 `amount_at_most`, `vendor_category_in`, `accepted`, `deliverable_equals`, and
-`recipient_equals`. Empty combinations, unknown operations, zero categories,
+`recipient_equals`; the invoice path adds `line_labels_within`, `no_denied_term`
+and `within_po`, which `authorize()` rejects. Empty combinations, unknown operations, zero categories,
 excessive nesting and oversized rules fail closed. The maximum is 128 nodes,
 8 nested levels, 16 children per combination and 64 category entries.
 

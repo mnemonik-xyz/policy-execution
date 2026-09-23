@@ -14,6 +14,12 @@ pub enum Rule {
     Accepted,
     DeliverableEquals([u8; 32]),
     RecipientEquals([u8; 20]),
+    /// Every invoice line has an admitted label in the set; no lines never satisfies.
+    LineLabelsWithin(Vec<u16>),
+    /// The deterministic scan found no owner-denied term on any invoice line.
+    NoDeniedTerm,
+    /// The payment fits in what remains of its purchase order.
+    WithinPo,
 }
 
 /// The caller supplies these facts only after authenticating and binding evidence.
@@ -23,6 +29,9 @@ pub struct Facts {
     pub accepted: bool,
     pub deliverable: [u8; 32],
     pub recipient: [u8; 20],
+    pub line_labels: Vec<u16>,
+    pub no_denied_term: bool,
+    pub po_remaining: u64,
 }
 
 /// Declarative policy meaning: conjunction, disjunction, membership and equality.
@@ -40,6 +49,11 @@ pub open spec fn satisfies(rule: &Rule, facts: &Facts) -> bool
         Rule::Accepted => facts.accepted,
         Rule::DeliverableEquals(hash) => facts.deliverable@ == hash@,
         Rule::RecipientEquals(recipient) => facts.recipient@ == recipient@,
+        Rule::LineLabelsWithin(labels) => facts.line_labels.len() > 0
+            && forall|i: int| 0 <= i < facts.line_labels.len()
+                ==> labels@.contains(#[trigger] facts.line_labels[i]),
+        Rule::NoDeniedTerm => facts.no_denied_term,
+        Rule::WithinPo => facts.amount <= facts.po_remaining,
     }
 }
 
@@ -59,6 +73,29 @@ fn bytes_equal<const N: usize>(a: &[u8; N], b: &[u8; N]) -> (result: bool)
         i += 1;
     }
     assert(a@ =~= b@);
+    true
+}
+
+fn labels_within(labels: &Vec<u16>, lines: &Vec<u16>) -> (result: bool)
+    ensures
+        result == (lines.len() > 0 && forall|i: int| 0 <= i < lines.len()
+            ==> labels@.contains(#[trigger] lines[i])),
+{
+    if lines.len() == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < lines.len()
+        invariant
+            i <= lines.len(),
+            forall|j: int| 0 <= j < i ==> labels@.contains(#[trigger] lines[j]),
+        decreases lines.len() - i,
+    {
+        if !category_contains(labels, lines[i]) {
+            return false;
+        }
+        i += 1;
+    }
     true
 }
 
@@ -122,6 +159,9 @@ pub fn evaluate(rule: &Rule, facts: &Facts) -> (result: bool)
         Rule::Accepted => facts.accepted,
         Rule::DeliverableEquals(hash) => bytes_equal(&facts.deliverable, hash),
         Rule::RecipientEquals(recipient) => bytes_equal(&facts.recipient, recipient),
+        Rule::LineLabelsWithin(labels) => labels_within(labels, &facts.line_labels),
+        Rule::NoDeniedTerm => facts.no_denied_term,
+        Rule::WithinPo => facts.amount <= facts.po_remaining,
     }
 }
 
@@ -151,6 +191,307 @@ pub proof fn contractor_policy_guarantees(
             assert(satisfies(&children[2], facts));
         },
         _ => {},
+    }
+}
+
+
+/// Facts whose Tier 1 and optional parts may be unknown. Signed and derived fields
+/// that select or quantify the payment are always known before evaluation.
+pub struct Facts3 {
+    pub amount: u64,
+    pub category: u16,
+    pub accepted: Option<bool>,
+    pub deliverable: [u8; 32],
+    pub recipient: [u8; 20],
+    pub line_labels: Vec<Option<u16>>,
+    pub no_denied_term: Option<bool>,
+    pub po_remaining: Option<u64>,
+}
+
+#[cfg_attr(feature = "serde", derive(Clone, Copy, Debug, PartialEq, Eq))]
+pub enum Decision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+pub open spec fn agrees<T>(known: Option<T>, value: T) -> bool {
+    match known {
+        Some(v) => v == value,
+        None => true,
+    }
+}
+
+/// `facts` is one way of filling in every unknown in `f3`.
+pub open spec fn completes(f3: &Facts3, facts: &Facts) -> bool {
+    &&& facts.amount == f3.amount
+    &&& facts.category == f3.category
+    &&& agrees(f3.accepted, facts.accepted)
+    &&& facts.deliverable@ == f3.deliverable@
+    &&& facts.recipient@ == f3.recipient@
+    &&& facts.line_labels.len() == f3.line_labels.len()
+    &&& forall|i: int| 0 <= i < f3.line_labels.len()
+        ==> agrees(#[trigger] f3.line_labels[i], facts.line_labels[i])
+    &&& agrees(f3.no_denied_term, facts.no_denied_term)
+    &&& agrees(f3.po_remaining, facts.po_remaining)
+}
+
+/// Strong Kleene semantics: `Some(b)` only when every completion evaluates to `b`.
+pub open spec fn kleene(rule: &Rule, f3: &Facts3) -> Option<bool>
+    decreases rule,
+{
+    match rule {
+        Rule::All(children) => {
+            if exists|i: int| 0 <= i < children.len()
+                && kleene(#[trigger] &children[i], f3) == Some(false) {
+                Some(false)
+            } else if forall|i: int| 0 <= i < children.len()
+                ==> kleene(#[trigger] &children[i], f3) == Some(true) {
+                Some(true)
+            } else {
+                None
+            }
+        },
+        Rule::Any(children) => {
+            if exists|i: int| 0 <= i < children.len()
+                && kleene(#[trigger] &children[i], f3) == Some(true) {
+                Some(true)
+            } else if forall|i: int| 0 <= i < children.len()
+                ==> kleene(#[trigger] &children[i], f3) == Some(false) {
+                Some(false)
+            } else {
+                None
+            }
+        },
+        Rule::AmountAtMost(cap) => Some(f3.amount <= *cap),
+        Rule::VendorCategoryIn(categories) => Some(categories@.contains(f3.category)),
+        Rule::Accepted => f3.accepted,
+        Rule::DeliverableEquals(hash) => Some(f3.deliverable@ == hash@),
+        Rule::RecipientEquals(recipient) => Some(f3.recipient@ == recipient@),
+        Rule::LineLabelsWithin(labels) => {
+            if f3.line_labels.len() == 0 {
+                Some(false)
+            } else if exists|i: int| 0 <= i < f3.line_labels.len()
+                && label_outside(labels, #[trigger] f3.line_labels[i]) {
+                Some(false)
+            } else if forall|i: int| 0 <= i < f3.line_labels.len()
+                ==> (#[trigger] f3.line_labels[i]) is Some {
+                Some(true)
+            } else {
+                None
+            }
+        },
+        Rule::NoDeniedTerm => f3.no_denied_term,
+        Rule::WithinPo => match f3.po_remaining {
+            Some(remaining) => Some(f3.amount <= remaining),
+            None => None,
+        },
+    }
+}
+
+pub open spec fn label_outside(labels: &Vec<u16>, line: Option<u16>) -> bool {
+    match line {
+        Some(label) => !labels@.contains(label),
+        None => false,
+    }
+}
+
+/// Soundness: a known three-valued result holds for every completion of the facts.
+pub proof fn kleene_sound(rule: &Rule, f3: &Facts3, facts: &Facts)
+    requires completes(f3, facts),
+    ensures
+        kleene(rule, f3) == Some(true) ==> satisfies(rule, facts),
+        kleene(rule, f3) == Some(false) ==> !satisfies(rule, facts),
+    decreases rule,
+{
+    match rule {
+        Rule::All(children) => {
+            assert forall|i: int| 0 <= i < children.len() implies
+                (kleene(#[trigger] &children[i], f3) == Some(true) ==> satisfies(&children[i], facts))
+                && (kleene(&children[i], f3) == Some(false) ==> !satisfies(&children[i], facts)) by {
+                kleene_sound(&children[i], f3, facts);
+            }
+        },
+        Rule::Any(children) => {
+            assert forall|i: int| 0 <= i < children.len() implies
+                (kleene(#[trigger] &children[i], f3) == Some(true) ==> satisfies(&children[i], facts))
+                && (kleene(&children[i], f3) == Some(false) ==> !satisfies(&children[i], facts)) by {
+                kleene_sound(&children[i], f3, facts);
+            }
+        },
+        Rule::LineLabelsWithin(labels) => {
+            if kleene(rule, f3) == Some(false) && f3.line_labels.len() > 0 {
+                let i = choose|i: int| 0 <= i < f3.line_labels.len()
+                    && label_outside(labels, #[trigger] f3.line_labels[i]);
+                assert(agrees(f3.line_labels[i], facts.line_labels[i]));
+            }
+            if kleene(rule, f3) == Some(true) {
+                assert forall|i: int| 0 <= i < facts.line_labels.len() implies
+                    labels@.contains(#[trigger] facts.line_labels[i]) by {
+                    assert(f3.line_labels[i] is Some);
+                    assert(!label_outside(labels, f3.line_labels[i]));
+                    assert(agrees(f3.line_labels[i], facts.line_labels[i]));
+                }
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Allow and Deny are each correct for every way of filling in the unknowns.
+pub proof fn decision_sound(rule: &Rule, f3: &Facts3)
+    ensures
+        kleene(rule, f3) == Some(true) ==> forall|facts: Facts|
+            completes(f3, &facts) ==> #[trigger] satisfies(rule, &facts),
+        kleene(rule, f3) == Some(false) ==> forall|facts: Facts|
+            completes(f3, &facts) ==> !#[trigger] satisfies(rule, &facts),
+{
+    assert forall|facts: Facts| completes(f3, &facts) implies
+        (kleene(rule, f3) == Some(true) ==> #[trigger] satisfies(rule, &facts))
+        && (kleene(rule, f3) == Some(false) ==> !satisfies(rule, &facts)) by {
+        kleene_sound(rule, f3, &facts);
+    }
+}
+
+fn labels_within3(labels: &Vec<u16>, lines: &Vec<Option<u16>>) -> (result: Option<bool>)
+    ensures
+        result == (if lines.len() == 0 {
+            Some(false)
+        } else if exists|i: int| 0 <= i < lines.len() && label_outside(labels, #[trigger] lines[i]) {
+            Some(false)
+        } else if forall|i: int| 0 <= i < lines.len() ==> (#[trigger] lines[i]) is Some {
+            Some(true)
+        } else {
+            None
+        }),
+{
+    if lines.len() == 0 {
+        return Some(false);
+    }
+    let mut unknown = false;
+    let mut i: usize = 0;
+    while i < lines.len()
+        invariant
+            i <= lines.len(),
+            forall|j: int| 0 <= j < i ==> !label_outside(labels, #[trigger] lines[j]),
+            unknown == exists|j: int| 0 <= j < i && (#[trigger] lines[j]) is None,
+        decreases lines.len() - i,
+    {
+        match lines[i] {
+            Some(label) => {
+                if !category_contains(labels, label) {
+                    assert(label_outside(labels, lines[i as int]));
+                    return Some(false);
+                }
+            },
+            None => {
+                unknown = true;
+            },
+        }
+        i += 1;
+    }
+    if unknown {
+        None
+    } else {
+        assert forall|j: int| 0 <= j < lines.len() implies (#[trigger] lines[j]) is Some by {
+            if lines[j] is None {
+                assert(exists|k: int| 0 <= k < i && (#[trigger] lines[k]) is None);
+            }
+        }
+        Some(true)
+    }
+}
+
+/// Executable strong Kleene evaluation; equal to `kleene` for every rule and facts.
+#[verifier::loop_isolation(false)]
+pub fn evaluate3(rule: &Rule, f3: &Facts3) -> (result: Option<bool>)
+    ensures result == kleene(rule, f3),
+    decreases rule,
+{
+    match rule {
+        Rule::All(children) => {
+            let mut unknown = false;
+            let mut i: usize = 0;
+            while i < children.len()
+                invariant
+                    i <= children.len(),
+                    forall|j: int| 0 <= j < i ==> kleene(#[trigger] &children[j], f3) != Some(false),
+                    unknown == exists|j: int| 0 <= j < i && kleene(#[trigger] &children[j], f3) is None,
+                decreases children.len() - i,
+            {
+                match evaluate3(&children[i], f3) {
+                    Some(false) => return Some(false),
+                    None => unknown = true,
+                    Some(true) => {},
+                }
+                i += 1;
+            }
+            if unknown {
+                None
+            } else {
+                assert forall|j: int| 0 <= j < children.len() implies
+                    kleene(#[trigger] &children[j], f3) == Some(true) by {
+                    if kleene(&children[j], f3) is None {
+                        assert(exists|k: int| 0 <= k < i && kleene(#[trigger] &children[k], f3) is None);
+                    }
+                }
+                Some(true)
+            }
+        },
+        Rule::Any(children) => {
+            let mut unknown = false;
+            let mut i: usize = 0;
+            while i < children.len()
+                invariant
+                    i <= children.len(),
+                    forall|j: int| 0 <= j < i ==> kleene(#[trigger] &children[j], f3) != Some(true),
+                    unknown == exists|j: int| 0 <= j < i && kleene(#[trigger] &children[j], f3) is None,
+                decreases children.len() - i,
+            {
+                match evaluate3(&children[i], f3) {
+                    Some(true) => return Some(true),
+                    None => unknown = true,
+                    Some(false) => {},
+                }
+                i += 1;
+            }
+            if unknown {
+                None
+            } else {
+                assert forall|j: int| 0 <= j < children.len() implies
+                    kleene(#[trigger] &children[j], f3) == Some(false) by {
+                    if kleene(&children[j], f3) is None {
+                        assert(exists|k: int| 0 <= k < i && kleene(#[trigger] &children[k], f3) is None);
+                    }
+                }
+                Some(false)
+            }
+        },
+        Rule::AmountAtMost(cap) => Some(f3.amount <= *cap),
+        Rule::VendorCategoryIn(categories) => Some(category_contains(categories, f3.category)),
+        Rule::Accepted => f3.accepted,
+        Rule::DeliverableEquals(hash) => Some(bytes_equal(&f3.deliverable, hash)),
+        Rule::RecipientEquals(recipient) => Some(bytes_equal(&f3.recipient, recipient)),
+        Rule::LineLabelsWithin(labels) => labels_within3(labels, &f3.line_labels),
+        Rule::NoDeniedTerm => f3.no_denied_term,
+        Rule::WithinPo => match f3.po_remaining {
+            Some(remaining) => Some(f3.amount <= remaining),
+            None => None,
+        },
+    }
+}
+
+/// Allow only when the policy holds for every completion; Deny only when it fails
+/// for every completion; otherwise Ask. Only Allow may authorize a payment.
+pub fn decide(rule: &Rule, f3: &Facts3) -> (result: Decision)
+    ensures
+        result == Decision::Allow <==> kleene(rule, f3) == Some(true),
+        result == Decision::Deny <==> kleene(rule, f3) == Some(false),
+{
+    match evaluate3(rule, f3) {
+        Some(true) => Decision::Allow,
+        Some(false) => Decision::Deny,
+        None => Decision::Ask,
     }
 }
 

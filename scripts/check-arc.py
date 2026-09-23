@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Arc Testnet eth_call: real verifier, tamper rejection and escrow constructor.
+"""Read-only Arc Testnet eth_call: real verifier, tamper rejection and escrow constructors.
 Does not broadcast, fund an account or claim a persistent contract deployment.
 """
 import argparse, json, pathlib, subprocess
@@ -19,4 +19,4 @@ encoded=run('cast','abi-encode','constructor(address,bytes,bytes32,bytes32)',
 request=json.dumps({'data':bytecode+encoded[2:],'gas':hex(15000000)})
 result=json.loads(run('cast','rpc','--rpc-url',args.rpc,'eth_call',request,'latest'))
 assert result=='0x'+'00'*31+'01',result
-print('Arc Testnet read-only simulation passed: real proof, tamper rejection, USDC interface and escrow construction.')
+print('Arc Testnet read-only simulation passed: real proof, tamper rejection, USDC interface, task and invoice escrow construction.')
