@@ -1,133 +1,92 @@
-# Policy execution: actors, evidence and proof
+# Policy execution: actors, evidence and settlement
 
-## Example request
-
-> Pay a registered contractor up to 100 USDC after our designated reviewer accepts
-> the deliverable.
-
-The owner approves the rules and registry/reviewer keys in advance. The contractor
-can be selected later. The registry authenticates that contractor, and the reviewer
-signs acceptance bound to the same task, deliverable, recipient and amount.
-
-## Data-flow diagram
+The customer selects a reviewed template, fills its parameters and approves the
+resulting concrete policy commitment. The agent receives the policy data and
+checks it against the on-chain agreement before accepting work.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Owner as Business owner
-    participant Agent as Untrusted agent
-    participant Registry as Approved vendor registry
-    participant Reviewer as Approved acceptance reviewer
-    participant Prover as Owner-controlled prover
-    participant Guest as Fixed policy interpreter in zkVM
-    participant Check as Local receipt verifier
-    participant Vault as Payment vault - planned
-    participant Token as Token contract - planned
+    actor Customer
+    participant Agent
+    participant Issuers as Registry and reviewer
+    participant Prover as Customer or agent-selected prover
+    participant Guest as Fixed Rust interpreter in zkVM
+    participant Escrow as TaskEscrow
+    participant Verifier as Pinned RISC Zero verifier
+    participant Token as ERC-20 token
 
-    Note over Owner,Prover: POLICY APPROVAL
-    Owner->>Prover: Reviewed policy, issuer keys, scope and validity interval
-    Prover->>Prover: Compute policy commitment
-    Owner-->>Vault: Planned: pin approved policy hash and version; fund budget
-    Note over Prover,Guest: One interpreter handles supported rule combinations.<br/>Changing policy data does not require a new program.
-
-    Note over Agent,Reviewer: TASK AND EVIDENCE
-    Agent->>Agent: Select contractor and propose task payment
-    Agent->>Registry: Request vendor credential
-    Registry-->>Agent: Signed recipient, category, scope and validity
-    Agent->>Reviewer: Present task and deliverable for acceptance
-    Reviewer-->>Agent: Signed task ID, deliverable hash, recipient, amount, result and validity
-    Note right of Reviewer: Reviewer evaluates acceptance.<br/>The proof authenticates this statement.<br/>It does not establish objective work quality.
-
-    Note over Prover,Check: POLICY EXECUTION AND PROOF
-    Agent->>Prover: Payment proposal plus signed evidence
-    Prover->>Guest: Private policy, request and evidence
-    Guest->>Guest: Validate bounded policy structure
-    Guest->>Guest: Verify signatures using policy-approved keys
-    Guest->>Guest: Match evidence to payment, task, deliverable and domain
-    Guest->>Guest: Intersect policy and evidence validity intervals
-    Guest->>Guest: Evaluate all / any and supported predicates
-    Note right of Guest: Shared evaluator has a Verus correctness proof.<br/>Evidence checks and surrounding authorization code are outside that proof.
-    alt Invalid evidence or policy denies
-        Guest-->>Prover: Abort without an authorization journal
-        Prover-->>Agent: Reject payment proposal
-    else Policy allows
-        Guest-->>Prover: Public authorization journal
-        Prover->>Prover: Generate cryptographic execution proof
-        Prover->>Check: Receipt plus expected interpreter image ID
-        Check->>Check: Verify proof and its binding to the public journal
-        Check-->>Prover: Valid receipt or verification failure
-    end
-
-    rect rgb(242, 242, 242)
-        Note over Agent,Token: PLANNED PAYMENT INTEGRATION
-        Prover-->>Agent: EVM-compatible proof plus public authorization
-        Agent-->>Vault: Submit proof and authorization
-        Vault->>Vault: Verify proof against approved interpreter image
-        Vault->>Vault: Check active policy, domain, current time and remaining budget
-        Vault->>Vault: Reject cancelled or already-paid task ID
-        alt Every check passes
-            Vault->>Vault: Consume task ID and update spend atomically
-            Vault->>Token: Transfer exact amount to proof-bound recipient
-            Note over Vault,Token: Transfer failure must revert consumption and spend too
-        else Any check fails
-            Vault-->>Agent: Revert without payment
-        end
-    end
+    Customer->>Customer: Instantiate template and compute policy hash
+    Customer->>Token: Approve escrow allowance
+    Customer->>Escrow: offer(policy hash/version, recipient, amount, deadlines)
+    Escrow->>Token: Reserve full payment via transferFrom
+    Customer-->>Agent: Policy JSON and task ID
+    Agent->>Agent: Check policy commitment, authorities and task terms
+    Agent->>Escrow: accept(task ID)
+    Note over Customer,Escrow: Accepted terms and reservation cannot be changed by the customer
+    Agent->>Issuers: Present credentials and completed deliverable
+    Issuers-->>Agent: Signed vendor credential and task acceptance
+    Agent->>Prover: Policy, request and signed evidence
+    Prover->>Guest: Private witness
+    Guest->>Guest: Authenticate evidence, bind request, evaluate policy
+    Guest-->>Prover: Public authorization journal
+    Prover->>Prover: Generate execution proof and Groth16 seal
+    Prover->>Escrow: settle(seal, journal), relayed by anyone
+    Escrow->>Escrow: Check accepted task, exact terms and current time
+    Escrow->>Verifier: verify(seal, pinned image ID, journal hash)
+    Verifier-->>Escrow: Valid or revert
+    Escrow->>Escrow: Mark task paid and consume reservation
+    Escrow->>Token: Transfer exact amount to recorded recipient
+    Note over Escrow,Token: Failed transfer reverts the full settlement
 ```
 
-## Implementation status
+## Enforcement and ownership
 
-The current executable is a local CLI. As of 2026-09-22, all 24 tests pass:
-17 native interpreter tests, 4 guest execution tests and 3 receipt verification
-tests. Two real succinct receipts for different policies and recipients verify
-against the same interpreter image. Receipt tests reject modified authorization
-fields and a wrong interpreter image. The earlier Circom prototype's tests are
-separate. Verus verifies the shared evaluator against declarative semantics
-(7 verified, 0 errors); eight executable mutations fail verification. This does
-not cover the surrounding authorization pipeline. See the
-[verification results](verified/verification-results.md).
+The contract records the policy commitment, version, fixed recipient/amount and
+acceptance/settlement deadlines. It independently enforces those terms. Rule
+semantics and evidence validation execute in the fixed interpreter; the proof
+binds the result to the exact committed policy and payment journal.
 
-Registry/reviewer credentials are signed test fixtures. Agent and issuer services,
-owner approval UI and a separate prover service are not implemented. The shaded
-payment section is a future integration: this CLI does not produce EVM-ready
-proofs or submit payments. The arrows show responsibilities and the intended data
-flow, not a claim that all participants are deployed services.
+The escrow has no administrator, upgrade or emergency withdrawal. Refund before
+acceptance is customer-controlled; after acceptance it requires the agreed
+settlement timeout. This secures conditional payment, not unconditional payment
+for work that never obtains the required evidence. See the
+[complete state diagram and timeout boundaries](task-escrow.md).
 
-## What the proof establishes
+The separate spending vault intentionally supports revocation, budget changes,
+pause and customer withdrawals. It is suitable for revocable delegation rather
+than an agent's committed task agreement.
 
-The interpreter authenticates evidence and evaluates the policy before emitting a
-payment authorization. A verified receipt binds this computation to the
-fixed interpreter image and its public output. The owner-approved policy hash
-must match that output before payment. Adding unsupported operations requires a
-reviewed interpreter upgrade; changing supported rules only changes policy data.
+## What is proved
 
-The owner must approve an exact policy, including who can attest acceptance.
-Proving that a reviewer signed a statement does not establish that it is true.
-Likewise, the proof does not establish that the rules capture the user's entire
-natural-language intent. The shared rule evaluator has a
-[Verus proof against declarative semantics](verified/README.md); the surrounding
-authorization pipeline is not formally verified.
+Verus proves that the shared evaluator follows its mathematical rule semantics.
+RISC Zero proves execution of the pinned guest, including signature and request
+binding checks. Neither establishes that a reviewer is honest or that the policy
+captures natural-language intent. The Solidity contracts and surrounding Rust
+pipeline are tested, not formally verified.
 
-## Who can see what?
+## Privacy and availability
 
-| Data | Agent | Owner-controlled prover | Public verifier |
-|---|---|---|---|
-| Full policy and issuer keys | Optional | Yes | Policy hash; values may be inferred |
-| Recipient, amount and task ID | Yes | Yes | Yes |
-| Signed vendor credential and acceptance statement | Yes in this flow | Yes | Evidence commitment |
-| Deliverable bytes | According to task permissions | Not needed by this interpreter | Not published |
-| Deliverable hash | Yes | Yes | Yes |
-| Scope, policy version and authorization time bounds | Available with authorization | Yes | Yes |
+The prover sees the full policy and signed evidence. In the escrow workflow the
+agent also receives the policy so it can review its agreement. Public observers
+see the recipient, amount, domain, task/deliverable hashes, policy hash/version,
+evidence hash and validity bounds. This is not payment anonymity; unsalted policy
+commitments can reveal low-entropy policies through guessing.
 
-ZK privacy is relative to the verifier. The prover sees its private inputs. Repeated
-requests and their outcomes can reveal aspects of a hidden policy; the design does
-not promise resistance to such inference or payment anonymity.
+A customer-operated prover is optional, not a security authority. An agent with
+the policy and evidence can prove independently. A prover or reviewer can withhold
+service; proof validity does not provide liveness or prevent acceptance censorship.
 
 ## Implementation references
 
+- [Reusable templates and issuer signing](templates/README.md)
 - [Policy types, evidence checks and interpreter](core/src/lib.rs)
-- [Fixed zkVM guest](methods/guest/src/main.rs)
-- [Host execution, proving and verification CLI](host/src/main.rs)
-- [Interpreter tests](core/tests/policy.rs)
-- [Receipt tests requiring completed real proofs](host/tests/receipts.rs)
-- [Build instructions and remaining limitations](README.md)
+- [Verus specification and evaluator](verified/src/lib.rs)
+- [zkVM guest](methods/guest/src/main.rs)
+- [Host proving, wrapping and export](host/src/main.rs)
+- [Task escrow](contracts/src/TaskEscrow.sol)
+- [Deployment and Arc status](contracts/README.md)
+- [Validation results and boundaries](validation-results.md)
+
+This is a CLI/contract implementation. A hosted marketplace, browser approval UI
+and managed proving or reviewer services are not implemented.

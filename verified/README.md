@@ -1,8 +1,9 @@
 # Policy evaluator verification exercise
 
 This crate contains the **actual evaluator used by the native application and
-RISC Zero guest**, together with its Verus specification and proofs. Ownership
-and approval governance decisions remain deferred until after this exercise.
+RISC Zero guest**, together with its Verus specification and proofs. The
+subsequent [task escrow design](../task-escrow.md) defines agreement ownership and
+settlement; those contracts are outside this evaluator proof.
 
 ## What is proved
 

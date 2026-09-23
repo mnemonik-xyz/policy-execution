@@ -1,0 +1,7 @@
+{
+  "name": "warrant-policy-vault",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "test": "forge test", "build": "forge build" },
+  "dependencies": { "@openzeppelin/contracts": "5.6.1" }
+}

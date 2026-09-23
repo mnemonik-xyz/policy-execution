@@ -1,4 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
+use risc0_zkvm::sha::{Digest, Digestible};
 use risc0_zkvm::{
     default_executor, default_prover, ExecutorEnv, InnerReceipt, ProverOpts, Receipt,
 };
@@ -39,10 +40,14 @@ fn main() -> Result<()> {
     );
     let args: Vec<String> = std::env::args().collect();
     ensure!(
-        args.len() >= 3,
-        "Usage: warrant-host evaluate|execute|prove input.json [receipt.bin] | verify receipt.bin"
+        args.len() >= 2 && (args[1] == "image-id" || args.len() >= 3),
+        "Usage: warrant-host image-id | evaluate|execute|prove input.json [receipt.bin] | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
     );
     match args[1].as_str() {
+        "image-id" => println!(
+            "0x{}",
+            hex::encode(Digest::from(WARRANT_GUEST_ID).as_bytes())
+        ),
         "evaluate" => {
             let auth = authorize(&read_input(&args[2])?)?;
             println!("{}", serde_json::to_string_pretty(&auth)?);
@@ -97,6 +102,53 @@ fn main() -> Result<()> {
             println!("Image ID: {:?}", WARRANT_GUEST_ID);
             println!("Policy hash: {}", hex::encode(expected.policy_hash));
             println!("Receipt: {output}");
+        }
+        "wrap" | "export-evm" => {
+            let output = args.get(3).context("Missing output path")?;
+            ensure!(!Path::new(output).exists(), "Output already exists");
+            let receipt: Receipt = bincode::deserialize(&fs::read(&args[2])?)?;
+            ensure!(
+                !matches!(receipt.inner, InnerReceipt::Fake(_)),
+                "Refusing fake proof"
+            );
+            receipt.verify(WARRANT_GUEST_ID)?;
+            ensure!(
+                receipt.journal.bytes.len() == 384,
+                "Unexpected journal schema"
+            );
+            let bytes = if args[1] == "wrap" {
+                eprintln!("Compressing verified receipt to Groth16; local Docker prover required");
+                let wrapped = default_prover().compress(&ProverOpts::groth16(), &receipt)?;
+                ensure!(
+                    matches!(wrapped.inner, InnerReceipt::Groth16(_)),
+                    "Expected Groth16 receipt"
+                );
+                wrapped.verify(WARRANT_GUEST_ID)?;
+                ensure!(
+                    wrapped.journal.bytes == receipt.journal.bytes,
+                    "Journal mismatch"
+                );
+                bincode::serialize(&wrapped)?
+            } else {
+                let InnerReceipt::Groth16(ref groth16) = receipt.inner else {
+                    bail!("EVM export requires a real Groth16 receipt; run wrap first");
+                };
+                // RISC Zero's EVM wire format: four-byte verifier-parameter selector + seal.
+                let mut seal = groth16.verifier_parameters.as_bytes()[..4].to_vec();
+                seal.extend_from_slice(&groth16.seal);
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "imageId": format!("0x{}", hex::encode(Digest::from(WARRANT_GUEST_ID).as_bytes())),
+                    "journal": format!("0x{}", hex::encode(&receipt.journal.bytes)),
+                    "journalDigest": format!("0x{}", hex::encode(receipt.journal.digest().as_bytes())),
+                    "seal": format!("0x{}", hex::encode(seal)),
+                }))?
+            };
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?
+                .write_all(&bytes)?;
+            println!("Verified output written to {output}");
         }
         "verify" => {
             let receipt: Receipt = bincode::deserialize(&fs::read(&args[2])?)?;

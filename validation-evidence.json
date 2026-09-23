@@ -1,0 +1,25 @@
+{
+  "result": {
+    "chainId": 31337,
+    "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "verifier": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+    "escrow": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+    "imageId": "0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e",
+    "taskId": "0x7b09ca803f04f528c49163e16f774e9e3c7ebe25470b0166528c87f90533a461",
+    "policyHash": "0x62723046a2e98466c8251742c5739afec6318a4752411601b006c96beba83ddd",
+    "recipient": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+    "amount": 100000000,
+    "transaction": "0x2fc6c97c3cf464e03bed3a1d194a0819a445ea961614dd974c1c408d6c9fa3dc",
+    "gasUsed": "0x4b174",
+    "realProof": true,
+    "replayRejected": true
+  },
+  "artifacts": {
+    "policy.json": "1d7e572586fd384cb9a3192ffa0ac0dce9a9f66b13d4b52b4397131f5f6177f5",
+    "request.json": "b4f97c853b921c6cccc4ee0c04fd318732ed88945b16e5d2dea6f0e822dca251",
+    "request.receipt": "e23539fa604bac74161197f12d5b98e75450fbcc1389a896f4e40783a2cbb7f8",
+    "request-groth16.receipt": "33513e86edafccb727747fa293b11630cefc6a36ade00e115d299f42248a54b6",
+    "evm.json": "f70ccec45e84f0cf6a1bef53f8d515a32c58581cccd0ce5cb8a5fcd4e7ab0e02",
+    "deployment.json": "1f117d9e371fb15e8186e3cb46bbedf5ca76423f91dc236712b0e4521b60549c"
+  }
+}

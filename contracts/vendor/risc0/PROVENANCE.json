@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/risc0/risc0-ethereum",
+  "commit": "32aa0b6f23ddd02dd93fc71717667606e5c7db86",
+  "tag": "v3.0.0",
+  "sha256": {
+    "LICENSE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+    "contracts/src/IRiscZeroSelectable.sol": "54a8a39dd427e8ec21db31815d80a3df6df992d3244a2370ba21517dde7dd11b",
+    "contracts/src/IRiscZeroVerifier.sol": "cfd7c80872313134d028c0250ddc86036448fb4df290ce4dba113ea80646e180",
+    "contracts/src/StructHash.sol": "9fd507fc30726dcecf35a7a1d16b2ffe34561721fa37895bb75b9c3cf07f0131",
+    "contracts/src/Util.sol": "4711aa3c42754c996278f62091ffd1422132512e0900a9cdea3fe54235fa5896",
+    "contracts/src/groth16/ControlID.sol": "753535e844a84a28b275fe21bd4c30022266b27bcdaa9b189220dece220accfa",
+    "contracts/src/groth16/Groth16Verifier.sol": "14bdf78c8b6168b12a5235395d42b8daabb48ee29d49913bb06d20071f156fd6",
+    "contracts/src/groth16/RiscZeroGroth16Verifier.sol": "f24784fb625b8a82232c79f21db28f759593e29a287a4f9865cc6e78d36eb283"
+  }
+}

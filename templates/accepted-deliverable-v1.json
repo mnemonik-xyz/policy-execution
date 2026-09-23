@@ -1,0 +1,13 @@
+{
+  "id": "accepted-deliverable-v1",
+  "description": "Pay one designated contractor for a specific accepted deliverable, within a payment cap.",
+  "rule": {
+    "all": [
+      "accepted",
+      {"amount_at_most": {"$param": "max_amount"}},
+      {"vendor_category_in": {"$param": "categories"}},
+      {"recipient_equals": {"$param": "recipient"}},
+      {"deliverable_equals": {"$param": "deliverable_hash"}}
+    ]
+  }
+}

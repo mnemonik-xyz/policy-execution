@@ -5,17 +5,24 @@ payment. A fixed Rust interpreter authenticates the evidence, evaluates the
 policy, and emits an authorization. A RISC Zero guest proves that execution.
 
 See [the detailed data-flow diagram](data-flow.md) for actor responsibilities,
-privacy boundaries and the distinction between implemented and planned steps.
+privacy boundaries and contract enforcement.
 
-Validated on 2026-09-22: all 24 tests pass (17 native, 4 guest execution and
-3 receipt verification). Verus reports 7 verified, 0 errors for the shared
-evaluator; eight deliberate executable mutations fail verification. Two real
-succinct receipts for different policies and recipients verify against the same
-new interpreter image, taking 224 and 236 seconds locally. See the
-[recorded results and proof boundary](verified/verification-results.md).
-Payment integration remains pending.
+The implementation includes reusable [policy templates](templates/README.md),
+issuer signing tools, a fixed Rust interpreter with a Verus-proved evaluator,
+RISC Zero proofs, a revocable payment vault, and a [committed task escrow](task-escrow.md).
+The escrow locks the approved policy commitment, recipient, amount and deadlines;
+the agent explicitly accepts those terms before work. Proof generation and
+submission need no administrative role.
 
-Unlike the Circom prototype on `feat/warrant-proof-execution`, this version can
+Validation: 28 Rust tests, 32 Solidity tests (including a real verifier),
+7 Verus obligations and 8 mutation checks pass. See the
+[validation record](validation-results.md) for scope and reproduction.
+
+See [contract deployment instructions](contracts/README.md) and the local demo
+below. Public-network deployment is separate from local verification; no Arc
+contract address is claimed here.
+
+Unlike the [separate Circom prototype](../proof-execution/), this version can
 change rule combinations and accept dynamically chosen recipients without changing
 the interpreter program. This is a typed policy DSL, not natural-language execution
 or a Lean-proved specification. The rule evaluator now has a
@@ -100,7 +107,7 @@ sequenceDiagram
     actor Owner
     participant Agent
     participant Sources as Registry and reviewer
-    participant Prover as Owner-controlled prover
+    participant Prover as Selected prover
     participant Guest as Fixed policy interpreter in zkVM
     participant Verify as Receipt verifier
 
@@ -122,7 +129,7 @@ sequenceDiagram
 
 The CLI currently runs the prover and verifier locally. Separate agent/prover
 services and an owner approval UI are not implemented. The prover sees the private
-policy and evidence; a blockchain verifier would not need those inputs. Public
+policy and evidence; the blockchain verifier does not need those inputs. Public
 outputs include recipient, amount, task and deliverable identifiers, payment
 domain, policy version/hash, validity bounds and evidence commitment. This is not
 payment anonymity. Policy commitments are unsalted, so small policy spaces may be
@@ -190,11 +197,25 @@ or the interpreter image. The original unoptimized run caused heavy swapping on
 this machine; do not assume that proof generation has the same resource footprint
 as ordinary guest execution.
 
-## Payment integration boundary
+## Templates, signing and payment integration
 
-This iteration implements the interpreter and native zkVM receipt flow. It does
-**not yet submit payments, produce EVM-ready Groth16 seals, or deploy a new vault**.
-The independent payment prototype is preserved on `feat/warrant-proof-execution`.
+Use `warrant-policy instantiate` to turn a reviewed template and explicit
+parameters into a concrete policy; `warrant-policy hash` lets both parties verify
+the commitment. See [template and issuer signing commands](templates/README.md).
+`warrant-evidence` signs registry and reviewer statements on the issuer's machine.
+It does not decide whether work is satisfactory.
+
+For a spending vault, the customer approves the policy with `setPolicy()` and
+retains cancellation, pause and withdrawal powers. For committed work, use
+`TaskEscrow.offer()`: funding reserves the full payment, the designated recipient
+accepts, and the customer cannot then change terms or withdraw that reservation.
+Only valid proof settlement or the agreed timeout releases it. See the
+[escrow lifecycle, journeys and refund rules](task-escrow.md).
+
+A prover converts a succinct receipt into Groth16 with `warrant-host wrap`, then
+exports the seal and journal with `export-evm`. The contract checks the exact
+policy/payment/domain against stored authorization and calls the pinned verifier.
+The prover has no discretionary spending authority.
 
 `Authorization::journal()` emits twelve Solidity-ABI words in this exact order:
 
@@ -203,9 +224,9 @@ policyHash, chainId, vault, token, recipient, amount, taskId, deliverableHash,
 policyVersion, validAfter, validUntil, evidenceHash
 ```
 
-The eventual vault must check the receipt against the pinned interpreter image,
-bind these words to its active policy/domain, check current block time and budget,
-consume the task ID across policy versions, and transfer atomically. A verified
+The vault checks the pinned interpreter image, active policy/domain, current
+block time and budget, consumes the task ID across policy versions, and transfers
+atomically. The escrow binds the same journal to its accepted task and reservation. A verified
 receipt by itself is not permission to spend: the interpreter cannot know current
 chain authorization, spent budget or whether the task has already been paid.
 
@@ -220,3 +241,54 @@ The policy and evidence commitment encoding is length-delimited, domain-separate
 bincode 1.3 serialization of typed structures followed by SHA-256. JSON formatting
 does not change the commitment. Changes to that schema or serialization version
 are interpreter changes and must not silently reuse an old approval.
+
+## Reproduce deployment and real settlement locally
+
+Prerequisites: the Rust/RISC Zero toolchains above, Foundry (`forge`, `cast`,
+`anvil`), Python 3, Node/npm, and running Docker for Groth16 wrapping. Local wrapping
+uses RISC Zero's `risczero/risc0-groth16-prover:v2025-04-03.1` x86 image; on Apple
+Silicon the demo selects `linux/amd64`. Allow several minutes and sufficient RAM
+and disk for proving. All demo keys and funds are synthetic.
+
+```sh
+# From policy-execution/
+npm ci --prefix contracts --ignore-scripts
+python3 scripts/local-demo.py
+```
+
+The script starts its own loopback-only Anvil, deploys a test token, runs the
+same `contracts/script/Deploy.s.sol` used for deployment, instantiates a template,
+funds and accepts a task, generates and wraps a real proof, settles through an
+independent relayer, checks balances and rejects replay. It shuts down Anvil on
+exit and leaves inputs, receipts, EVM export, deployment records and `result.json`
+in a fresh `artifacts/escrow-*/` directory. `--deploy-only` checks deployment,
+funding and acceptance without claiming proof settlement.
+
+For external networks, follow [the deployment procedure](contracts/README.md).
+Construct policies only after knowing the deployed escrow address. Share policy
+JSON with the agent, verify its commitment, and leave time for evidence issuance,
+proving and transaction inclusion before `settleBy`.
+
+## Complete validation
+
+Generate the two distinct policy receipts using the earlier commands, and keep
+the EVM export from the local demo. Supply absolute paths below:
+
+```sh
+RISC0_BUILD_LOCKED=1 WARRANT_RECEIPT_DIR=/absolute/path/to/receipts \
+  cargo test -p warrant-policy -p warrant-host --release --locked -- \
+  --include-ignored --test-threads=1
+cd contracts
+WARRANT_EVM_FIXTURE=/absolute/path/to/artifacts/escrow-run/evm.json forge test
+forge fmt --check src test script
+cd ..
+python3 verified/verify.py --verus /absolute/path/to/verus --mutations
+git diff --check
+```
+
+The receipt directory must contain `request.json`, `alternative.json` and their
+matching `.receipt` files. `WARRANT_EVM_FIXTURE` must be inside `artifacts/` under
+the configured Foundry read permission. Without that variable, the real verifier
+test uses the checked-in synthetic proof fixture. A fresh demo proves the current
+build and validates actual escrow settlement. See
+[recorded validation evidence](validation-results.md) for results and limitations.

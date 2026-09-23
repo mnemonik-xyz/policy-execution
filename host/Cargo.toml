@@ -1,5 +1,6 @@
 [package]
 name = "warrant-host"
+default-run = "warrant-host"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,5 +13,4 @@ bincode.workspace = true
 hex = "0.4"
 anyhow = "1.0"
 
-[dev-dependencies]
 k256.workspace = true

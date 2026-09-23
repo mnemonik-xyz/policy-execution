@@ -1,0 +1,11 @@
+{
+  "id": "accepted-contractor-v1",
+  "description": "Pay an eligible contractor after the designated reviewer accepts the deliverable, within a payment cap.",
+  "rule": {
+    "all": [
+      "accepted",
+      {"amount_at_most": {"$param": "max_amount"}},
+      {"vendor_category_in": {"$param": "categories"}}
+    ]
+  }
+}
