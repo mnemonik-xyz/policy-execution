@@ -38,11 +38,31 @@ contract InvoiceEscrowTest {
         vm.warp(1000);
         token = new TestToken();
         verifier = new JournalVerifier();
-        escrow =
-            new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), vm.addr(SIGNER_KEY), THRESHOLD);
+        escrow = new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)));
         token.mint(address(this), 10_000);
         token.approve(address(escrow), 10_000);
-        id = escrow.offer(POLICY, 1, PO, VENDOR, 3000, 1500, 1200, 5000);
+        id = escrow.offer(terms(POLICY, PO, VENDOR, 3000, vm.addr(SIGNER_KEY), 1500, THRESHOLD));
+    }
+
+    /// Proofs-only terms: no signer, no allowance, no threshold.
+    function terms(bytes32 policy, bytes32 po, address recipient, uint64 maxTotal)
+        internal
+        pure
+        returns (InvoiceEscrow.Terms memory)
+    {
+        return terms(policy, po, recipient, maxTotal, address(0), 0, 0);
+    }
+
+    function terms(
+        bytes32 policy,
+        bytes32 po,
+        address recipient,
+        uint64 maxTotal,
+        address signer,
+        uint64 allowance,
+        uint64 threshold
+    ) internal pure returns (InvoiceEscrow.Terms memory) {
+        return InvoiceEscrow.Terms(policy, 1, po, recipient, maxTotal, signer, allowance, threshold, 1200, 5000);
     }
 
     function accept() internal {
@@ -79,12 +99,12 @@ contract InvoiceEscrowTest {
         return encode(base(taskId, amount), PO, 3000);
     }
 
-    function spent() internal view returns (uint64 s) {
-        (,,,,, s,,,,,,) = escrow.orders(id);
+    function spent() internal view returns (uint64) {
+        return escrow.order(id).spent;
     }
 
-    function signerSpent() internal view returns (uint64 s) {
-        (,,,,,,,,,, s,) = escrow.orders(id);
+    function signerSpent() internal view returns (uint64) {
+        return escrow.order(id).signerSpent;
     }
 
     /// A journal signed by the escrow's signer; the mock verifier never sees it.
@@ -131,7 +151,7 @@ contract InvoiceEscrowTest {
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
         escrow.settle(hex"abcd", again);
         // A second order under another policy still cannot pay the same obligation.
-        bytes32 other = escrow.offer(keccak256("other-policy"), 1, PO, VENDOR, 500, 0, 1200, 5000);
+        bytes32 other = escrow.offer(terms(keccak256("other-policy"), PO, VENDOR, 500));
         vm.prank(VENDOR);
         escrow.accept(other);
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-1"), 100);
@@ -142,10 +162,10 @@ contract InvoiceEscrowTest {
     }
 
     function testSameOrderNumberUnderDifferentPoliciesDoesNotCollide() public {
-        bytes32 other = escrow.offer(keccak256("other-buyer"), 1, PO, VENDOR, 500, 0, 1200, 5000);
+        bytes32 other = escrow.offer(terms(keccak256("other-buyer"), PO, VENDOR, 500));
         require(other != id && escrow.totalReserved() == 3500);
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
-        escrow.offer(POLICY, 1, PO, RELAYER, 1, 0, 1200, 5000);
+        escrow.offer(terms(POLICY, PO, RELAYER, 1));
     }
 
     function testProvenOrderCeilingMustMatchFundedOrder() public {
@@ -224,7 +244,7 @@ contract InvoiceEscrowTest {
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
         escrow.accept(id);
         // After the acceptance deadline anyone may return an unaccepted order.
-        bytes32 second = escrow.offer(POLICY, 1, keccak256("PO-78"), VENDOR, 100, 0, 1200, 5000);
+        bytes32 second = escrow.offer(terms(POLICY, keccak256("PO-78"), VENDOR, 100));
         vm.warp(1201);
         vm.prank(VENDOR);
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
@@ -236,29 +256,50 @@ contract InvoiceEscrowTest {
 
     function testInvalidOfferTerms() public {
         bytes32 p = keccak256("new");
+        InvoiceEscrow.Terms memory t = terms(p, PO, VENDOR, 1);
+        InvoiceEscrow.Terms memory bad;
+        for (uint256 field; field < 6; field++) {
+            bad = t;
+            if (field == 0) bad.recipient = address(0);
+            if (field == 1) bad.poId = bytes32(0);
+            if (field == 2) bad.policyVersion = 0;
+            if (field == 3) bad.maxTotal = 0;
+            if (field == 4) bad.settleBy = 1200;
+            if (field == 5) bad.acceptBy = 999;
+            vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
+            escrow.offer(bad);
+        }
+    }
+
+    function testSignerTermsMustBeConsistent() public {
+        bytes32 p = keccak256("signer-terms");
+        address signer = vm.addr(SIGNER_KEY);
+        // A signer needs both room to act; room needs a signer; the vendor cannot sign its own invoices.
+        InvoiceEscrow.Terms[5] memory bad = [
+            terms(p, PO, VENDOR, 100, signer, 0, 10),
+            terms(p, PO, VENDOR, 100, signer, 10, 0),
+            terms(p, PO, VENDOR, 100, address(0), 10, 10),
+            terms(p, PO, VENDOR, 100, address(0), 0, 10),
+            terms(p, PO, VENDOR, 100, VENDOR, 10, 10)
+        ];
+        for (uint256 i; i < bad.length; i++) {
+            vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
+            escrow.offer(bad[i]);
+        }
+        // An allowance above the ceiling is not a valid order.
         vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, address(0), 1, 0, 1200, 5000);
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, bytes32(0), VENDOR, 1, 0, 1200, 5000);
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 0, PO, VENDOR, 1, 0, 1200, 5000);
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 0, 0, 1200, 5000);
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 1, 0, 1200, 1200);
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(p, 1, PO, VENDOR, 1, 0, 999, 5000);
+        escrow.offer(terms(p, PO, VENDOR, 100, signer, 101, 10));
+        escrow.offer(terms(p, PO, VENDOR, 100, signer, 100, 10));
     }
 
     function testFeeOnTransferFundingIsRejected() public {
         CallbackToken feeToken = new CallbackToken();
-        InvoiceEscrow feeEscrow =
-            new InvoiceEscrow(address(feeToken), address(verifier), bytes32(uint256(1)), address(0), 0);
+        InvoiceEscrow feeEscrow = new InvoiceEscrow(address(feeToken), address(verifier), bytes32(uint256(1)));
         feeToken.mint(address(this), 100);
         feeToken.approve(address(feeEscrow), 100);
         feeToken.configure(address(0), "", true);
         vm.expectRevert(InvoiceEscrow.InvalidFunding.selector);
-        feeEscrow.offer(POLICY, 1, PO, VENDOR, 100, 0, 1200, 5000);
+        feeEscrow.offer(terms(POLICY, PO, VENDOR, 100));
     }
 
     /// Cumulative payments never exceed the ceiling, whatever the invoice amounts.
@@ -371,24 +412,96 @@ contract InvoiceEscrowTest {
         require(token.balanceOf(VENDOR) == 100);
     }
 
-    function testProofsOnlyDeploymentAndTerms() public {
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), address(0), 1);
-        InvoiceEscrow proofsOnly =
-            new InvoiceEscrow(address(token), address(verifier), bytes32(uint256(1)), address(0), 0);
-        token.approve(address(proofsOnly), 100);
-        bytes32 o = proofsOnly.offer(POLICY, 1, PO, VENDOR, 100, 0, 1200, 5000);
+    function testProofsOnlyOrderRejectsEverySignature() public {
+        bytes32 p = keccak256("proofs-only");
+        bytes32 o = escrow.offer(terms(p, PO, VENDOR, 100));
         vm.prank(VENDOR);
-        proofsOnly.accept(o);
+        escrow.accept(o);
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-S12"), 50);
-        a.vault = address(proofsOnly);
+        a.policyHash = p;
         bytes memory j = abi.encode(a, PO, uint64(100));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_KEY, proofsOnly.signerDigest(j));
+        bytes memory sig = signWith(SIGNER_KEY, j);
         vm.expectRevert(InvoiceEscrow.ProofRequired.selector);
-        proofsOnly.settleSigned(j, abi.encodePacked(r, s, v));
-        // An allowance above the ceiling is not a valid order.
-        vm.expectRevert(InvoiceEscrow.InvalidTerms.selector);
-        escrow.offer(keccak256("p2"), 1, PO, VENDOR, 100, 101, 1200, 5000);
+        escrow.settleSigned(j, sig);
+        verifier.approve(j);
+        escrow.settle(hex"abcd", j);
+        require(token.balanceOf(VENDOR) == 50);
+    }
+
+    /// Each order names its own signer; a key valid for one order signs nothing for another.
+    function testSignerIsPerOrder() public {
+        bytes32 p = keccak256("other-signer");
+        uint256 otherKey = 0xB0B;
+        bytes32 o = escrow.offer(terms(p, PO, VENDOR, 1000, vm.addr(otherKey), 1000, THRESHOLD));
+        vm.prank(VENDOR);
+        escrow.accept(o);
+        accept();
+        PolicyExecutionVault.Authorization memory a = base(keccak256("INV-P1"), 100);
+        a.policyHash = p;
+        bytes memory j = abi.encode(a, PO, uint64(1000));
+        // The first order's signer cannot settle the second order.
+        bytes memory wrong = signWith(SIGNER_KEY, j);
+        bytes memory right = signWith(otherKey, j);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(j, wrong);
+        escrow.settleSigned(j, right);
+        // And the second order's signer cannot settle the first.
+        (bytes memory j1, bytes memory s1) = signed(keccak256("INV-P2"), 100);
+        bytes memory wrong1 = signWith(otherKey, j1);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(j1, wrong1);
+        escrow.settleSigned(j1, s1);
+        require(token.balanceOf(VENDOR) == 200);
+        // Revoking one order leaves the other untouched.
+        escrow.revokeSigner(o);
+        (bytes memory j2, bytes memory s2) = signed(keccak256("INV-P3"), 100);
+        escrow.settleSigned(j2, s2);
+        require(token.balanceOf(VENDOR) == 300);
+    }
+
+    /// The buyer settles an undecided invoice on their own authority, within the same bounds.
+    function testBuyerApprovalWithinBounds() public {
+        bytes32 obligation = keccak256("INV-ASK-1");
+        bytes32 document = keccak256("ask document");
+        vm.expectRevert(InvoiceEscrow.InvalidState.selector);
+        escrow.settleApproved(id, obligation, 700, document);
+        accept();
+        vm.prank(RELAYER);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleApproved(id, obligation, 700, document);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleApproved(id, obligation, 700, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, obligation, 0, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, bytes32(0), 700, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, obligation, 700, bytes32(0));
+        vm.expectRevert(InvoiceEscrow.OrderExceeded.selector);
+        escrow.settleApproved(id, obligation, 3001, document);
+        escrow.settleApproved(id, obligation, 700, document);
+        require(token.balanceOf(VENDOR) == 700 && spent() == 700 && signerSpent() == 0);
+        require(escrow.remaining(id) == 2300 && escrow.totalReserved() == 2300);
+        // Once approved, neither a proof nor a signature nor a second approval pays it again.
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleApproved(id, obligation, 1, document);
+        bytes memory proven = invoice(obligation, 700);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settle(hex"abcd", proven);
+        (bytes memory j, bytes memory sig) = signed(obligation, 700);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleSigned(j, sig);
+        // And an invoice paid by proof cannot be approved again.
+        escrow.settle(hex"abcd", invoice(keccak256("INV-2"), 100));
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleApproved(id, keccak256("INV-2"), 100, document);
+        // Approval ignores the signer allowance and threshold but not the deadline.
+        escrow.settleApproved(id, keccak256("INV-ASK-2"), 2000, document);
+        require(spent() == 2800 && signerSpent() == 0);
+        vm.warp(5001);
+        vm.expectRevert(InvoiceEscrow.InvalidState.selector);
+        escrow.settleApproved(id, keccak256("INV-ASK-3"), 1, document);
     }
 
     /// Signature-authorized payments never exceed the allowance; proofs still respect the ceiling.

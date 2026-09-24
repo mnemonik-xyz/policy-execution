@@ -20,7 +20,7 @@ contract ArcProbe {
         TaskEscrow escrow = new TaskEscrow(token, address(verifier), imageId);
         require(address(escrow.token()) == token && escrow.imageId() == imageId && escrow.totalReserved() == 0);
         require(IERC20Metadata(token).balanceOf(address(escrow)) == 0);
-        InvoiceEscrow invoices = new InvoiceEscrow(token, address(verifier), imageId, address(0), 0);
+        InvoiceEscrow invoices = new InvoiceEscrow(token, address(verifier), imageId);
         require(address(invoices.token()) == token && invoices.imageId() == imageId && invoices.totalReserved() == 0);
         // A recognizable result for the read-only constructor simulation.
         assembly {

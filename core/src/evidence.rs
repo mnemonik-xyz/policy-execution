@@ -121,6 +121,57 @@ pub struct InvoiceInput {
     pub po_spent: u64,
 }
 
+/// What an untrusted agent may hand to the buyer-run signing service: the received
+/// bytes, its claims and the signed credentials. The policy and the order's spend
+/// are not accepted from the agent; the service holds the policy and reads the
+/// spend from the escrow. Unknown fields are rejected, so a request that smuggles
+/// either in fails to parse.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignRequest {
+    pub document: Vec<u8>,
+    pub claims: Vec<LineClaim>,
+    pub vendor: InvoiceVendorCredential,
+    pub vendor_signature: Vec<u8>,
+    pub po: PurchaseOrder,
+    pub po_signature: Vec<u8>,
+    pub acceptance: Option<Acceptance>,
+    pub acceptance_signature: Option<Vec<u8>>,
+}
+
+impl SignRequest {
+    /// Completes the request with what the service knows on its own authority.
+    pub fn into_input(self, policy: InvoicePolicy, po_spent: u64) -> InvoiceInput {
+        InvoiceInput {
+            policy,
+            document: self.document,
+            claims: self.claims,
+            vendor: self.vendor,
+            vendor_signature: self.vendor_signature,
+            po: self.po,
+            po_signature: self.po_signature,
+            acceptance: self.acceptance,
+            acceptance_signature: self.acceptance_signature,
+            po_spent,
+        }
+    }
+}
+
+impl From<InvoiceInput> for SignRequest {
+    fn from(input: InvoiceInput) -> Self {
+        SignRequest {
+            document: input.document,
+            claims: input.claims,
+            vendor: input.vendor,
+            vendor_signature: input.vendor_signature,
+            po: input.po,
+            po_signature: input.po_signature,
+            acceptance: input.acceptance,
+            acceptance_signature: input.acceptance_signature,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvoiceAuthorization {
     pub authorization: Authorization,

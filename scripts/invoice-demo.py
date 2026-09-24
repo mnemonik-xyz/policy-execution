@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Fresh local chain: fund a purchase order, vendor accepts, then settle invoices two
-ways: a sub-threshold invoice by signature from the buyer-run signer (sub-second),
-and the same flow by real proof (prove, wrap for EVM, settle). Rejects replay.
+"""Fresh local chain: fund a purchase order naming a signer, vendor accepts, then
+settle invoices three ways: a sub-threshold invoice by signature from the buyer-run
+signing service (which reads the order from the chain and signs in well under a
+second), an undecided invoice by the buyer's own approval, and a third by real
+proof (prove, wrap for EVM, settle). Rejects replay and smuggled inputs.
 Uses only Anvil's public test accounts and keys. Never connects to a public network.
 """
 import argparse, json, os, pathlib, socket, subprocess, time, urllib.request
@@ -12,10 +14,10 @@ options = parser.parse_args()
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
 ENV = dict(os.environ, RISC0_BUILD_LOCKED='1', RAYON_NUM_THREADS='4', DOCKER_DEFAULT_PLATFORM='linux/amd64')
-def run(*args, cwd=ROOT):
+def run(*args, cwd=ROOT, expect=0):
     p = subprocess.run(args, cwd=cwd, env=ENV, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode:
-        raise RuntimeError(f'{args[0]} failed: {p.stderr}\n{p.stdout}')
+    if p.returncode != expect:
+        raise RuntimeError(f'{args[0]} exited {p.returncode}, expected {expect}: {p.stderr}\n{p.stdout}')
     return p.stdout.strip()
 def rpc(method, params=[]):
     req = urllib.request.Request(URL, json.dumps(dict(jsonrpc='2.0', id=1, method=method, params=params)).encode(), {'Content-Type':'application/json'})
@@ -60,7 +62,7 @@ try:
     run('forge','build',cwd=ROOT/'contracts')
     image=run('target/release/warrant-host','invoice-image-id')
     token=deploy('test/PolicyExecutionVault.t.sol:TestToken')
-    ENV.update(WARRANT_TOKEN=token, WARRANT_IMAGE_ID=image, WARRANT_SIGNER=SIGNER, WARRANT_PROOF_THRESHOLD=str(2000*10**6))
+    ENV.update(WARRANT_TOKEN=token, WARRANT_IMAGE_ID=image)
     run('forge','script','script/DeployInvoice.s.sol:DeployInvoice','--broadcast','--slow','--unlocked','--sender',CUSTOMER,'--rpc-url',URL,cwd=ROOT/'contracts')
     deployment=json.loads((ROOT/'contracts/broadcast/DeployInvoice.s.sol/31337/run-latest.json').read_text())
     addresses={t['contractName']:t['contractAddress'] for t in deployment['transactions'] if t['transactionType']=='CREATE'}
@@ -77,18 +79,25 @@ try:
     send(CUSTOMER,token,'mint(address,uint256)',CUSTOMER,ceiling)
     send(CUSTOMER,token,'approve(address,uint256)',escrow,ceiling)
     order=call(escrow,'orderIdFor(bytes32,bytes32)(bytes32)',terms['policyHash'],terms['poId'])
-    # Up to half the ceiling may settle on the signer's word; the rest needs proofs.
-    send(CUSTOMER,escrow,'offer(bytes32,uint64,bytes32,address,uint64,uint64,uint64,uint64)',
-         terms['policyHash'],terms['policyVersion'],terms['poId'],VENDOR,ceiling,ceiling//2,now+600,base+3700)
+    # The buyer names the signer for this order: up to half the ceiling may settle on
+    # its word, and only invoices under 2000 USDC; the rest needs proofs or approval.
+    threshold=2000*10**6
+    offer_terms=(f"({terms['policyHash']},{terms['policyVersion']},{terms['poId']},{VENDOR},{ceiling},"
+                 f"{SIGNER},{ceiling//2},{threshold},{now+600},{base+3700})")
+    send(CUSTOMER,escrow,'offer((bytes32,uint64,bytes32,address,uint64,address,uint64,uint64,uint64,uint64))',offer_terms)
     send(VENDOR,escrow,'accept(bytes32)',order)
     assert number(call(escrow,'totalReserved()(uint256)'))==ceiling
     if options.deploy_only:
         print('Deployment script, order funding and vendor acceptance passed:', out, flush=True)
         raise SystemExit(0)
-    # Signer mode: the buyer-run service evaluates natively and signs; settles in one transaction.
+    # Signer mode: the buyer-run service holds the policy and key, reads the order from
+    # the chain, evaluates natively and signs; the relayer settles in one transaction.
+    sign=lambda request,output,expect=0: run('target/release/warrant-host','invoice-sign',str(signer_key_file),
+        str(out/'policy.json'),URL,str(request),str(output),expect=expect)
     started=time.time()
-    run('target/release/warrant-host','invoice-sign',str(signer_key_file),str(out/'input.json'),str(out/'signed.json'))
+    sign(out/'request.json',out/'signed.json')
     signed=json.loads((out/'signed.json').read_text())
+    assert signed['orderId']==order and signed['amount']==amount
     assert int(call(escrow,'signerDigest(bytes)(bytes32)',signed['journal']),16)  # digest computable on chain
     settled_signed=send(RELAYER,escrow,'settleSigned(bytes,bytes)',signed['journal'],signed['signature'])
     signed_seconds=time.time()-started
@@ -97,11 +106,36 @@ try:
     try: call(escrow,'settleSigned(bytes,bytes)',signed['journal'],signed['signature'])
     except RuntimeError: pass
     else: raise AssertionError('Signed replay unexpectedly accepted')
-    print(f'Signed settlement done in {signed_seconds:.2f}s (evaluate, sign, submit). Artifacts:',out,flush=True)
+    print(f'Signed settlement done in {signed_seconds:.2f}s (read order, evaluate, sign, submit). Artifacts:',out,flush=True)
+    # The service refuses what the agent may not supply: a policy or a spend figure.
+    smuggled=json.loads((out/'request.json').read_text()); smuggled['po_spent']=0
+    (out/'smuggled.json').write_text(json.dumps(smuggled))
+    sign(out/'smuggled.json',out/'smuggled-out.json',expect=1)
+    assert not (out/'smuggled-out.json').exists()
+    # A key the order does not name signs nothing, even with the right policy.
+    other_key_file=out/'other.key'
+    other_key_file.write_text('0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba\n')
+    run('target/release/warrant-host','invoice-sign',str(other_key_file),str(out/'policy.json'),URL,
+        str(out/'request.json'),str(out/'other-out.json'),expect=1)
+    assert not (out/'other-out.json').exists()
+    # An undecided invoice: a line nobody can label. The service signs nothing and
+    # records why; the buyer settles it on their own authority, within the same bounds.
+    run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
+        str(out/'ask'),'31337',escrow,token,VENDOR,str(base),'INV-1003','ask')
+    sign(out/'ask/request.json',out/'ask.json',expect=3)
+    ask=json.loads((out/'ask.json').read_text())
+    assert ask['ask']==['UnlabeledLines([1])'] and 'signature' not in ask
+    approved=send(CUSTOMER,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',ask['orderId'],ask['obligationId'],ask['payable'],ask['documentHash'])
+    assert number(call(token,'balanceOf(address)(uint256)',VENDOR))==amount+ask['payable']
+    try: send(CUSTOMER,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',ask['orderId'],ask['obligationId'],ask['payable'],ask['documentHash'])
+    except (RuntimeError,AssertionError): pass
+    else: raise AssertionError('Approval replay unexpectedly accepted')
+    print('Undecided invoice settled by buyer approval; replay rejected; smuggled inputs and unnamed signers refused.',flush=True)
     if options.signed_only:
         (out/'result.json').write_text(json.dumps(dict(chainId=31337,token=token,escrow=escrow,signer=SIGNER,orderId=order,
             amount=amount,signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],
-            signedSeconds=round(signed_seconds,2),realProof=False),indent=2)+'\n')
+            signedSeconds=round(signed_seconds,2),approvedTransaction=approved['transactionHash'],
+            approvedAmount=ask['payable'],realProof=False),indent=2)+'\n')
         raise SystemExit(0)
     # Proof mode for a second invoice against the same order; the first is already consumed.
     run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
@@ -115,18 +149,20 @@ try:
     assert proof['imageId']==image
     call(verifier,'verify(bytes,bytes32,bytes32)',proof['seal'],proof['imageId'],proof['journalDigest'])
     settled=send(RELAYER,escrow,'settle(bytes,bytes)',proof['seal'],proof['journal'])
-    assert number(call(token,'balanceOf(address)(uint256)',VENDOR))==2*amount
-    assert number(call(escrow,'remaining(bytes32)(uint64)',order))==ceiling-2*amount
-    assert number(call(escrow,'totalReserved()(uint256)'))==ceiling-2*amount
+    paid=2*amount+ask['payable']
+    assert number(call(token,'balanceOf(address)(uint256)',VENDOR))==paid
+    assert number(call(escrow,'remaining(bytes32)(uint64)',order))==ceiling-paid
+    assert number(call(escrow,'totalReserved()(uint256)'))==ceiling-paid
     try: call(escrow,'settle(bytes,bytes)',proof['seal'],proof['journal'])
     except RuntimeError: pass
     else: raise AssertionError('Replay unexpectedly accepted')
     summary=dict(chainId=31337,token=token,verifier=verifier,escrow=escrow,imageId=image,signer=SIGNER,orderId=order,
         policyHash=terms['policyHash'],poId=terms['poId'],recipient=VENDOR,amount=amount,ceiling=ceiling,
         signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],signedSeconds=round(signed_seconds,2),
+        approvedTransaction=approved['transactionHash'],approvedAmount=ask['payable'],
         provenTransaction=settled['transactionHash'],provenGasUsed=settled['gasUsed'],realProof=True,replayRejected=True)
     (out/'result.json').write_text(json.dumps(summary,indent=2)+'\n')
-    print('Signed and proven invoices settled; vendor paid twice; replays rejected. Result:',out/'result.json',flush=True)
+    print('Signed, approved and proven invoices settled; vendor paid three times; replays rejected. Result:',out/'result.json',flush=True)
 finally:
     node.terminate()
     try: node.wait(timeout=10)

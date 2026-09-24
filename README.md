@@ -14,7 +14,7 @@ UBL 2.1 invoice, admits agent line claims only with checkable evidence, and
 returns Allow, Ask or a denial through a verified three-valued evaluator. Its
 14-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) either by a
 proof from a separate invoice guest or, below a threshold, by the buyer-run
-signer (`warrant-host invoice-sign`). See [the design](evidence-checker.md) and
+signer the buyer names per order (`warrant-host invoice-sign`), or by the buyer's own approval when the checker cannot decide. See [the design](evidence-checker.md) and
 [recorded results](verified/verification-results.md).
 
 The implementation includes reusable [policy templates](templates/README.md),
@@ -169,6 +169,25 @@ cargo build -p warrant-host --release --locked
 Both workspace and guest `Cargo.lock` files are included. The guest declares its
 Rust 1.88 minimum and uses dependency resolution compatible with that toolchain.
 Use `RISC0_BUILD_LOCKED=1` for builds that must reject guest-lock changes.
+
+### Reproducible guest builds
+
+A local guest build embeds toolchain and machine specifics, so its image ID is
+not the same everywhere. For an image ID that anyone can rebuild and check, set
+`RISC0_USE_DOCKER=1`: `methods/build.rs` then compiles both guests inside
+RISC Zero's pinned Docker image, with the workspace root mounted so path
+dependencies resolve. This needs a running Docker daemon on an x86 machine, the
+same requirement as the Groth16 wrap.
+
+```sh
+RISC0_USE_DOCKER=1 RISC0_BUILD_LOCKED=1 cargo build -p warrant-host --release --locked
+target/release/warrant-host invoice-image-id
+```
+
+Deploy with the ID printed by that build, and prove on a machine that built the
+same way. `scripts/prover-vm.sh` sets up such a machine from a fresh Ubuntu
+image. Not run in this repository's recorded validation: the environment used
+for it had no Docker daemon.
 
 The guest pins RISC Zero's `k256`, `sha2` and `crypto-bigint` accelerator patches
 to exact commits, following its [ECDSA example](https://github.com/risc0/risc0/tree/v3.0.5/examples/ecdsa/k256).

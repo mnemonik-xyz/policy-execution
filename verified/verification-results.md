@@ -17,7 +17,7 @@ uses them; the existing `authorize()` path rejects the new atoms.
   count; compiler errors do not.
 - **40 native tests passed**: 17 existing, 20 invoice fixtures (E1–E13 plus
   authority, signature, path-separation and two Solidity-fixture checks) and 3
-  XML reader tests. Solidity: 54 tests, 22 of them for `InvoiceEscrow`.
+  XML reader tests. Solidity: 57 tests, 25 of them for `InvoiceEscrow`.
 - Existing policy commitments are unchanged: `policy_hash` of both fixture
   policies is byte-identical to `main` (new `Rule` variants are appended).
 - Shared evaluator source SHA-256:

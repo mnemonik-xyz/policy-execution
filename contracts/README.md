@@ -2,11 +2,11 @@
 
 - `src/PolicyExecutionVault.sol`: customer-controlled, revocable spending delegation.
 - `src/TaskEscrow.sol`: funded fixed-price agreements, locked when the recipient accepts.
-- `src/InvoiceEscrow.sol`: funded purchase orders settled by proven or signed
-  invoices up to a ceiling; see [the invoice escrow](../invoice-escrow.md). Deploy
-  with `script/DeployInvoice.s.sol` and the `warrant-host invoice-image-id` output;
-  set `WARRANT_SIGNER` and `WARRANT_PROOF_THRESHOLD` to enable the signer path
-  (both unset means proofs only).
+- `src/InvoiceEscrow.sol`: funded purchase orders settled by proven, signed or
+  buyer-approved invoices up to a ceiling; see [the invoice escrow](../invoice-escrow.md).
+  Deploy with `script/DeployInvoice.s.sol` and the `warrant-host invoice-image-id`
+  output. The signer, its allowance and the proof threshold are per order, chosen
+  by the buyer in `offer(Terms)`; nothing about them is fixed at deployment.
 
 See [the escrow design and lifecycle](../task-escrow.md) for permissions, journeys,
 policy binding, refund rules and security boundaries.
