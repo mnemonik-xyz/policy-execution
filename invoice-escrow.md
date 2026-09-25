@@ -83,7 +83,7 @@ sequenceDiagram
     else Allow, but a proof is needed
         Service-->>Agent: refused: amount at or above threshold or over allowance
     else Ask
-        Service-->>Agent: no signature; ask record (reasons, obligationId, documentHash, payable)
+        Service-->>Agent: no signature, ask record (reasons, obligationId, documentHash, payable)
     else Deny or invalid
         Service-->>Agent: error, nothing written
     end
@@ -107,7 +107,7 @@ sequenceDiagram
     Agent->>Service: SignRequest with a line nobody can label
     Service-->>Agent: ask record: UnlabeledLines([1]), obligationId, documentHash, payable
     Agent->>Buyer: escalate with the invoice and the ask record
-    Buyer->>Buyer: reads the invoice; decides
+    Buyer->>Buyer: reads the invoice, decides
     Buyer->>Chain: settleApproved(orderId, obligationId, payable, documentHash)
     Chain->>Chain: accepted order, before settleBy, msg.sender is the buyer, within ceiling, obligation unused
     Chain-->>Vendor: USDC
