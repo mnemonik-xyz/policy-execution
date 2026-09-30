@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LicenseRef-Mnemonik-SRL-1.0
 pragma solidity ^0.8.24;
 import {TaskEscrow} from "../src/TaskEscrow.sol";
 import {PolicyExecutionVault} from "../src/PolicyExecutionVault.sol";
