@@ -25,6 +25,7 @@ const STATE_ACCEPTED: u64 = 2;
 /// The `InvoiceEscrow.Order` struct as `order(bytes32)` returns it: 14 static words.
 #[derive(Debug)]
 pub struct OrderView {
+    pub customer: Address,
     pub recipient: Address,
     pub policy_hash: Hash,
     pub policy_version: u64,
@@ -64,6 +65,7 @@ impl OrderView {
             words.len()
         );
         Ok(OrderView {
+            customer: word_address(words, 0)?,
             recipient: word_address(words, 1)?,
             policy_hash: words[64..96].try_into().unwrap(),
             policy_version: word_u64(words, 3)?,
@@ -79,13 +81,21 @@ impl OrderView {
     }
 }
 
-/// `InvoiceEscrow.orderIdFor`: keccak256(abi.encode(chainId, escrow, policyHash, poId)).
-pub fn order_id(chain_id: u64, escrow: &Address, policy_hash: &Hash, po_id: &Hash) -> Hash {
+/// `InvoiceEscrow.orderIdFor`: keccak256(abi.encode(chainId, escrow, customer, policyHash, poId)).
+pub fn order_id(
+    chain_id: u64,
+    escrow: &Address,
+    customer: &Address,
+    policy_hash: &Hash,
+    po_id: &Hash,
+) -> Hash {
     let mut h = Keccak256::new();
     h.update([0u8; 24]);
     h.update(chain_id.to_be_bytes());
     h.update([0u8; 12]);
     h.update(escrow);
+    h.update([0u8; 12]);
+    h.update(customer);
     h.update(policy_hash);
     h.update(po_id);
     h.finalize().into()
@@ -183,12 +193,17 @@ pub fn sign(
     let id = order_id(
         scope.chain_id,
         &scope.vault,
+        &policy.customer,
         &policy_hash,
         &request.po.po_id,
     );
     let order = chain.order(&scope.vault, &id)?;
 
-    // The order must exist for this policy and name this service as its signer.
+    // The order must belong to the policy customer and name this service as its signer.
+    ensure!(
+        order.customer == policy.customer,
+        "Order customer differs from the policy"
+    );
     ensure!(
         order.state == STATE_ACCEPTED,
         "Order {} is not accepted",
@@ -314,13 +329,15 @@ mod tests {
 
     #[test]
     fn order_id_matches_the_contract_layout() {
-        // keccak256(abi.encode(uint256 31337, address 0x11.., bytes32 0x22.., bytes32 0x33..))
-        let id = order_id(31337, &[0x11; 20], &[0x22; 32], &[0x33; 32]);
+        // ABI words: chain 31337, escrow 0x11.., customer 0x44.., policy 0x22.., PO 0x33..
+        let id = order_id(31337, &[0x11; 20], &[0x44; 20], &[0x22; 32], &[0x33; 32]);
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&[0; 24]);
         encoded.extend_from_slice(&31337u64.to_be_bytes());
         encoded.extend_from_slice(&[0; 12]);
         encoded.extend_from_slice(&[0x11; 20]);
+        encoded.extend_from_slice(&[0; 12]);
+        encoded.extend_from_slice(&[0x44; 20]);
         encoded.extend_from_slice(&[0x22; 32]);
         encoded.extend_from_slice(&[0x33; 32]);
         assert_eq!(id, <[u8; 32]>::from(Keccak256::digest(&encoded)));

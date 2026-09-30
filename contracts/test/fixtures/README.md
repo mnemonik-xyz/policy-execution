@@ -11,3 +11,18 @@ image is `0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e`.
 rejects tampering. It is a verifier regression fixture, not proof that an arbitrary
 later guest build is correct. Run `scripts/local-demo.py` to generate a fresh
 proof and settle an accepted task against the current build.
+
+## Authenticated invoice proof
+
+`invoice-proof.json` is a real Groth16 export from the full invoice demo on
+2026-09-30, using synthetic invoices and public test issuer keys. It records the
+invoice guest image, input hash and relevant source hashes. Its journal has
+15 words, including the funding customer.
+
+`RealInvoiceSettlementTest` verifies this proof, rejects changes to each journal
+word, reconstructs its local domain with Foundry cheatcodes, then funds, accepts
+and settles through the actual escrow and verifier. A second settlement rejects.
+The demo separately performed those operations on freshly deployed Anvil contracts.
+Regenerate using `python3 scripts/invoice-demo.py` after guest changes; an old
+receipt does not validate changed guest code. See [validation results](../../../validation-results.md)
+for the distinction between cryptographic checks and evaluator proofs.

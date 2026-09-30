@@ -26,7 +26,8 @@ contract RealVerifierTest {
         bytes32 digest = sha256(journal);
         vm.expectRevert();
         verifier.verify(seal, bytes32(uint256(imageId) ^ 1), digest);
-        for (uint256 word; word < 12; word++) {
+        require(journal.length > 0 && journal.length % 32 == 0);
+        for (uint256 word; word < journal.length / 32; word++) {
             journal[word * 32 + 31] ^= bytes1(uint8(1));
             digest = sha256(journal);
             vm.expectRevert();

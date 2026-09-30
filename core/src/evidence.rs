@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use warrant_verified_policy::{decide, Decision, Facts3, Rule};
 
 /// Changes whenever parsing or checking semantics change; bound into evidence.
-pub const CHECKER_VERSION: u32 = 1;
+pub const CHECKER_VERSION: u32 = 2;
 const USDC_DECIMALS: u32 = 6;
 const MAX_LINES: usize = 256;
 const MAX_TERMS: usize = 256;
@@ -32,17 +32,21 @@ pub struct LexiconEntry {
     pub terms: Vec<String>,
 }
 
-/// Owner-approved policy for invoice payments. Immutable once a vault is deployed.
+/// Owner-approved policy for invoice payments. Its commitment is fixed per funded order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvoicePolicy {
     pub version: u64,
+    /// Funding customer whose orders this policy can authorize.
+    pub customer: Address,
     pub scope: Scope,
     pub valid_after: u64,
     pub valid_until: u64,
     pub registry_key: Vec<u8>,
     /// The buyer's key. It signs purchase orders and nothing else.
     pub po_key: Vec<u8>,
+    /// Buyer-approved invoice source or trusted intake authority, separate from settlement signing.
+    pub invoice_key: Vec<u8>,
     pub acceptance_key: Option<Vec<u8>>,
     /// Bounds on what a purchase order may authorise.
     pub max_po_total: u64,
@@ -86,6 +90,19 @@ pub struct PurchaseOrder {
     pub valid_until: u64,
 }
 
+/// An invoice source attests to exact document bytes for one buyer, PO and payment domain.
+/// This authenticates the supplied record, not delivery or uniqueness of the underlying debt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvoiceAttestation {
+    pub scope: Scope,
+    pub customer: Address,
+    pub po_id: Hash,
+    pub document_hash: Hash,
+    pub valid_after: u64,
+    pub valid_until: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimEvidence {
@@ -114,6 +131,9 @@ pub struct InvoiceInput {
     pub vendor_signature: Vec<u8>,
     pub po: PurchaseOrder,
     pub po_signature: Vec<u8>,
+    /// Both absent means Ask; a partial or invalid attestation is rejected.
+    pub invoice_attestation: Option<InvoiceAttestation>,
+    pub invoice_signature: Option<Vec<u8>>,
     pub acceptance: Option<Acceptance>,
     pub acceptance_signature: Option<Vec<u8>>,
     /// Spend already recorded against this order, read from the vault. The vault
@@ -135,6 +155,9 @@ pub struct SignRequest {
     pub vendor_signature: Vec<u8>,
     pub po: PurchaseOrder,
     pub po_signature: Vec<u8>,
+    /// Both absent means Ask; a partial or invalid attestation is rejected.
+    pub invoice_attestation: Option<InvoiceAttestation>,
+    pub invoice_signature: Option<Vec<u8>>,
     pub acceptance: Option<Acceptance>,
     pub acceptance_signature: Option<Vec<u8>>,
 }
@@ -150,6 +173,8 @@ impl SignRequest {
             vendor_signature: self.vendor_signature,
             po: self.po,
             po_signature: self.po_signature,
+            invoice_attestation: self.invoice_attestation,
+            invoice_signature: self.invoice_signature,
             acceptance: self.acceptance,
             acceptance_signature: self.acceptance_signature,
             po_spent,
@@ -166,6 +191,8 @@ impl From<InvoiceInput> for SignRequest {
             vendor_signature: input.vendor_signature,
             po: input.po,
             po_signature: input.po_signature,
+            invoice_attestation: input.invoice_attestation,
+            invoice_signature: input.invoice_signature,
             acceptance: input.acceptance,
             acceptance_signature: input.acceptance_signature,
         }
@@ -177,15 +204,18 @@ pub struct InvoiceAuthorization {
     pub authorization: Authorization,
     pub po_id: Hash,
     pub po_max_total: u64,
+    pub customer: Address,
 }
 
 impl InvoiceAuthorization {
-    /// The 12 base journal words followed by `poId` and `poMaxTotal`.
+    /// The 12 base journal words followed by `poId`, `poMaxTotal` and `customer`.
     pub fn journal(&self) -> Vec<u8> {
         let mut out = self.authorization.journal();
         out.extend_from_slice(&self.po_id);
         out.extend_from_slice(&[0; 24]);
         out.extend_from_slice(&self.po_max_total.to_be_bytes());
+        out.extend_from_slice(&[0; 12]);
+        out.extend_from_slice(&self.customer);
         out
     }
 }
@@ -231,6 +261,7 @@ pub fn sign_journal(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskReason {
+    InvoiceAttestationMissing,
     NotUsd,
     TotalsInconsistent,
     PayableUnknown,
@@ -271,11 +302,20 @@ pub struct InvoiceFacts {
 }
 
 pub fn invoice_policy_hash(policy: &InvoicePolicy) -> Hash {
-    hash_tagged(b"warrant/invoice-policy/v1", policy)
+    hash_tagged(b"warrant/invoice-policy/v2", policy)
 }
 
 pub fn invoice_vendor_message(credential: &InvoiceVendorCredential) -> Vec<u8> {
     tagged_bytes(b"warrant/invoice-vendor/v1", credential)
+}
+
+pub fn invoice_attestation_message(attestation: &InvoiceAttestation) -> Vec<u8> {
+    tagged_bytes(b"warrant/invoice-attestation/v1", attestation)
+}
+
+/// SHA-256 of the exact invoice bytes, without XML canonicalization or reformatting.
+pub fn invoice_document_hash(document: &[u8]) -> Hash {
+    Sha256::digest(document).into()
 }
 
 pub fn po_message(po: &PurchaseOrder) -> Vec<u8> {
@@ -318,10 +358,12 @@ fn valid_term(term: &str) -> bool {
 pub fn validate_invoice_policy(policy: &InvoicePolicy) -> Result<(), Denial> {
     let terms: usize = policy.lexicon.iter().map(|e| e.terms.len()).sum();
     let ok = policy.version != 0
+        && policy.customer != [0; 20]
         && valid_scope(&policy.scope)
         && policy.valid_after <= policy.valid_until
         && valid_key(&policy.registry_key)
         && valid_key(&policy.po_key)
+        && valid_key(&policy.invoice_key)
         && policy.acceptance_key.as_deref().is_none_or(valid_key)
         && policy.max_po_total > 0
         && !policy.po_categories.is_empty()
@@ -390,7 +432,7 @@ fn cac<'a>(parent: &'a Element, local: &str) -> Result<Option<&'a Element>, Deni
 /// Parses the received bytes into Tier 0 facts. Structural problems deny; values
 /// the checker cannot establish become unknown and resolve to Ask later.
 pub fn parse_invoice(document: &[u8]) -> Result<InvoiceFacts, Denial> {
-    let doc_hash: Hash = Sha256::digest(document).into();
+    let doc_hash = invoice_document_hash(document);
     let root = xml::parse(document).map_err(|_| Denial::InvalidDocument)?;
     if root.ns != UBL_INVOICE || root.local != "Invoice" {
         return Err(Denial::InvalidDocument);
@@ -652,6 +694,38 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
         return Err(Denial::PoMismatch);
     }
 
+    // This is mandatory authorization evidence, not a rule atom: an Any branch
+    // cannot bypass invoice authentication. Missing evidence can be escalated to
+    // the buyer, but never produces an automatic authorization.
+    let attestation = match (&input.invoice_attestation, &input.invoice_signature) {
+        (None, None) => {
+            return Ok(InvoiceOutcome::Ask(vec![
+                AskReason::InvoiceAttestationMissing,
+            ]))
+        }
+        (Some(attestation), Some(signature)) => {
+            if attestation.scope != policy.scope {
+                return Err(Denial::ScopeMismatch);
+            }
+            if attestation.valid_after > attestation.valid_until {
+                return Err(Denial::InvalidEvidence);
+            }
+            if attestation.customer != policy.customer
+                || attestation.po_id != po.po_id
+                || attestation.document_hash != facts.doc_hash
+            {
+                return Err(Denial::RequestMismatch);
+            }
+            verify(
+                &policy.invoice_key,
+                &invoice_attestation_message(attestation),
+                signature,
+            )?;
+            attestation
+        }
+        _ => return Err(Denial::InvalidEvidence),
+    };
+
     let mut ask = Vec::new();
     if !facts.usd {
         ask.push(AskReason::NotUsd);
@@ -678,11 +752,13 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
     let mut valid_after = policy
         .valid_after
         .max(vendor.valid_after)
-        .max(po.valid_after);
+        .max(po.valid_after)
+        .max(attestation.valid_after);
     let mut valid_until = policy
         .valid_until
         .min(vendor.valid_until)
-        .min(po.valid_until);
+        .min(po.valid_until)
+        .min(attestation.valid_until);
     let accepted = match (
         &policy.acceptance_key,
         &input.acceptance,
@@ -756,6 +832,8 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
                         &input.vendor_signature,
                         po,
                         &input.po_signature,
+                        attestation,
+                        &input.invoice_signature,
                         &input.acceptance,
                         &input.acceptance_signature,
                     ),
@@ -763,6 +841,7 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
             },
             po_id: po.po_id,
             po_max_total: po.max_total,
+            customer: policy.customer,
         }))),
     }
 }

@@ -12,7 +12,7 @@ facts only when they can be re-derived or checked deterministically.
 Invoice evidence checker (2026-09-23): `evidence::authorize_invoice` parses a
 UBL 2.1 invoice, admits agent line claims only with checkable evidence, and
 returns Allow, Ask or a denial through a verified three-valued evaluator. Its
-14-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) either by a
+15-word journal is settled by [`InvoiceEscrow`](invoice-escrow.md) either by a
 proof from a separate invoice guest or, below a threshold, by the buyer-run
 signer the buyer names per order (`warrant-host invoice-sign`), or by the buyer's own approval when the checker cannot decide. See [the design](evidence-checker.md) and
 [recorded results](verified/verification-results.md).
@@ -40,6 +40,24 @@ the interpreter program. This is a typed policy DSL, not natural-language execut
 or a Lean-proved specification. The rule evaluator now has a
 [Verus correctness proof](verified/README.md); the surrounding authorization
 pipeline remains outside that proof.
+
+## Invoice authentication and compatibility (2026-09-30)
+
+Invoice orders and replay state are now isolated by funding customer. The invoice
+policy requires a `customer` address and an `invoice_key` public key, and uses commitment domain
+`warrant/invoice-policy/v2`; its journal appends that customer as word 15. The
+signing service, fixtures and demo use this layout. A new invoice guest image
+and escrow deployment are required. Existing 14-word receipts cannot settle
+through the new contract. The separate task/vault journal stays at 12 words.
+
+Automatic authorization now requires an `InvoiceAttestation` signed by the
+policy's buyer-approved invoice authority. It binds exact document bytes, customer,
+PO, chain, escrow, token and validity period. Missing evidence returns Ask;
+changed bytes or invalid signatures are rejected before policy evaluation.
+An attestation proves the named authority endorsed those bytes, not delivery or
+uniqueness of the underlying debt. Buyer approval remains an explicit override.
+See [issuer commands and trust boundary](invoice-escrow.md#invoice-source-authentication)
+and [validation](validation-results.md).
 
 ## First supported request
 
