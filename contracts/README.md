@@ -30,8 +30,9 @@ absolute path to a newly exported real receipt inside `../artifacts/` to overrid
 real-proof escrow settlement. Never deploy the test verifier as a payment verifier.
 
 Upstream verifier sources are vendored unchanged under `vendor/risc0`, with commit,
-file hashes and license recorded in `PROVENANCE.json` and `LICENSE`. The deployment
-script pins its control IDs and deploys the immutable base verifier directly.
+file hashes and license recorded in `PROVENANCE.json` and `LICENSE`. The Groth16
+verifier files are GPL-3.0; see `vendor/risc0/NOTICE.md` before importing them. The
+deployment script pins its control IDs and deploys the immutable base verifier directly.
 
 ## Deploy the verifier and escrow
 
