@@ -21,5 +21,131 @@
     "request-groth16.receipt": "33513e86edafccb727747fa293b11630cefc6a36ade00e115d299f42248a54b6",
     "evm.json": "f70ccec45e84f0cf6a1bef53f8d515a32c58581cccd0ce5cb8a5fcd4e7ab0e02",
     "deployment.json": "1f117d9e371fb15e8186e3cb46bbedf5ca76423f91dc236712b0e4521b60549c"
+  },
+  "customerIsolation20260930": {
+    "baselineCommit": "c589871",
+    "status": "historical intermediate customer-isolation-only working revision; superseded below; not deployed publicly",
+    "rust": {
+      "passed": 55,
+      "receiptTestsSkipped": 3
+    },
+    "solidity": {
+      "passed": 61,
+      "invoiceTests": 29,
+      "fuzzRunsPerTest": 256
+    },
+    "invoiceJournalWords": 15,
+    "invoicePolicyDomain": "warrant/invoice-policy/v2",
+    "localInvoiceImageId": "0x357262792dbc6ade4d173b8b32d0f6814e9124f7a6810892f9a925da40d378c6",
+    "reproducibleDockerBuild": false,
+    "freshInvoiceProof": false,
+    "signerAndApprovalDemo": {
+      "chainId": 31337,
+      "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "escrow": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+      "signer": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "orderId": "0xad8bc0679e6fe96161f770a67b5561911e225effcdb5b71372a7dd887cf84470",
+      "amount": 1320000000,
+      "signedTransaction": "0x499f2abae546f91e04bbfd7293505ea4d3f0bbc26ffa368e1f63ed30701c8bec",
+      "signedGasUsed": "0x1e5a7",
+      "signedSeconds": 0.03,
+      "approvedTransaction": "0xff77f041798d0c714b4c1267de2518b994201e1f5a4cb0ee5b4d49459ad64971",
+      "approvedAmount": 330000000,
+      "realProof": false
+    },
+    "localArtifactDirectory": "artifacts/invoice-1790777088922324000",
+    "artifactSha256": {
+      "input.json": "a4100aa65d41128bf21759b3b1ea857eb750174f32ad568d45eeb0359254a41e",
+      "policy.json": "f4c0aa3c6974a03b7a8815417814250f824312fe7793e4f8939ea66e3e386da2",
+      "request.json": "70a1ac6336c1ba05f6f513f7f4a570c306d0f54bf79d27c117340881ca04279b",
+      "signed.json": "a9f239ced281a25f3f93207fbf0f286017a7afc68ee76c544e2db3bdddbcfa8d",
+      "ask.json": "fe8775c0d4fcd724b6c1c8f87896401bd24ffc7b33500ef1519234ef9142d18f",
+      "deployment.json": "f3d93b79c271b6a90919049fc1bca090951fe96d60d027515a700e012451efe5",
+      "result.json": "efd7e01b57482b485f23b2bfc7cad5497a5a76cd546f7130779b32219e143e1b"
+    },
+    "sourceSha256": {
+      "core/src/evidence.rs": "5127b32b674c7faff2dc5cf007775b05e56330bac4281b01bedd2d1125aca2d6",
+      "verified/src/lib.rs": "f48d2294ace11540c1352b1da9a0a24a42f8c920b7d644e62b515e42cf966bd4",
+      "contracts/src/InvoiceEscrow.sol": "8ec18e1a40b6c5c9b460c0aa7cdcb2d9c6cdf7d4c5e374b1cff9acc4f7864016",
+      "host/src/signer.rs": "a640b0b14b7c14eae77dc8250635e94789c8c465900385798176473709ee2b03"
+    }
+  },
+  "invoiceAuthentication20260930": {
+    "baselineCommit": "c589871",
+    "status": "working revision; local validation only",
+    "rust": {
+      "passed": 62,
+      "receiptTestsSkipped": 3
+    },
+    "solidity": {
+      "passed": 62,
+      "invoiceEscrowTests": 29,
+      "realInvoiceSettlementTests": 1,
+      "fuzzRunsPerTest": 256
+    },
+    "invoiceJournalWords": 15,
+    "invoicePolicyDomain": "warrant/invoice-policy/v2",
+    "checkerVersion": 2,
+    "reproducibleDockerGuestBuild": false,
+    "freshInvoiceProof": true,
+    "guestCycles": 2097152,
+    "segments": 8,
+    "result": {
+      "chainId": 31337,
+      "token": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "verifier": "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
+      "escrow": "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0",
+      "imageId": "0x399a3c1c37287cbcc30f9e619c55ba55841dcd7055425860e1c22a6215dd3716",
+      "signer": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "orderId": "0xa6c921ef4ed435f726d21e817a2796fc48fc7a1b23d4c5c85ab8167b90e7b366",
+      "policyHash": "0xad0ad59d2e3928603c7dbea926002f2ee509b986aa18807101ac57790fc092ff",
+      "poId": "0x647b78c11a5e9b06e7088f5da15e149b7130a938d26b8c62d7256da8625788da",
+      "recipient": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "amount": 1320000000,
+      "ceiling": 3000000000,
+      "signedTransaction": "0x671eec404f67bd6c1d004fbd2c4f6daae1b9de9f210a3b0b0147a9d03aadf065",
+      "signedGasUsed": "0x1e59b",
+      "signedSeconds": 0.04,
+      "approvedTransaction": "0x970ad1fd9c9ca68a481d9757e9a2246f149bac1f01532f4ae0270ea760ac5519",
+      "approvedAmount": 330000000,
+      "provenTransaction": "0x813628ba85b07689061b8e9c55b628e4dc712afe4a354d69c65355902ea9cf20",
+      "provenGasUsed": "0x4fb05",
+      "realProof": true,
+      "replayRejected": true,
+      "invoiceTamperingRejected": true,
+      "missingAttestationAsked": true,
+      "proveSeconds": 445.65,
+      "wrapSeconds": 79.73,
+      "succinctReceiptBytes": 224186,
+      "groth16ReceiptBytes": 1457,
+      "hostPlatform": "macOS-15.5-arm64-arm-64bit-Mach-O",
+      "hostCpuCount": 14,
+      "rayonThreads": "4",
+      "segmentPo2": "18",
+      "rustVersion": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+    },
+    "localArtifactDirectory": "artifacts/invoice-1790777730640790000",
+    "artifactSha256": {
+      "proof/input.json": "eb5909ebde113a8b58edc17bfa1aaaff0057035802633ee8f8527d7d2442c532",
+      "proof/policy.json": "2559d7da66aa7d3273c5e83d741501e0c5dedc5499e61d17d5bf43e99ef8832d",
+      "invoice.receipt": "f1deefc01606a7719109af1ae15e43ae62479f298e029c04306276b638dbfdc4",
+      "invoice-groth16.receipt": "04988c37e67e8787db5c8f53fea6a895a9eefe9e94be4d2c19f8c7d5ff48d964",
+      "evm.json": "be818164a552fb197f5b6dda07f2e68952551509a92ba08ffda1d483e7777691",
+      "deployment.json": "8252b082510a8d60108c5e0d76bcc930d13729dda05e161f5bbaff08456c622d",
+      "result.json": "9da3f24517a1027cb6aaec5d8ba4c76b061c8be7672676426dd3ca27fb334895",
+      "prove.log": "3df2a51b76c909575f7a8c4ac78ac8647a6a0f12c9274c8602f8e4c92efe9b94",
+      "wrap.log": "9fbd36177e82fd103e74e8ec1fb1977521b7a222aca4bda3381ddd78ec737e21"
+    },
+    "sourceSha256": {
+      "core/src/evidence.rs": "764fe821572b21f2afa6714ba5cb207645bc9025109588e3f002a8963cc1d317",
+      "core/src/xml.rs": "36ea72b0c07015a8eb1b222b117849701e35362674b132bc531a9182f1efe8dd",
+      "verified/src/lib.rs": "f48d2294ace11540c1352b1da9a0a24a42f8c920b7d644e62b515e42cf966bd4",
+      "contracts/src/InvoiceEscrow.sol": "8ec18e1a40b6c5c9b460c0aa7cdcb2d9c6cdf7d4c5e374b1cff9acc4f7864016",
+      "host/src/signer.rs": "a640b0b14b7c14eae77dc8250635e94789c8c465900385798176473709ee2b03",
+      "host/src/bin/warrant-evidence.rs": "d4e9d247ae1b761aacdc961cfcf21ea298355273d5a7f57ba954e7ab52c4a07f",
+      "Cargo.lock": "dab3bba7a33e07928e498a06c9036d389691abd5051983426a9de33ca4078ea4"
+    },
+    "retainedProofFixture": "contracts/test/fixtures/invoice-proof.json",
+    "retainedProofSha256": "fd2f5d4c005945913e3e6474dc2427492a0bb9f924e4927ddfaab09a05c64301"
   }
 }

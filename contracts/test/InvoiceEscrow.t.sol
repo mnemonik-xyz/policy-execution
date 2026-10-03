@@ -91,7 +91,7 @@ contract InvoiceEscrowTest {
         internal
         returns (bytes memory j)
     {
-        j = abi.encode(a, poId, poMax);
+        j = abi.encode(a, poId, poMax, address(this));
         verifier.approve(j);
     }
 
@@ -109,7 +109,7 @@ contract InvoiceEscrowTest {
 
     /// A journal signed by the escrow's signer; the mock verifier never sees it.
     function signed(bytes32 taskId, uint64 amount) internal view returns (bytes memory j, bytes memory sig) {
-        j = abi.encode(base(taskId, amount), PO, uint64(3000));
+        j = abi.encode(base(taskId, amount), PO, uint64(3000), address(this));
         sig = signWith(SIGNER_KEY, j);
     }
 
@@ -202,7 +202,7 @@ contract InvoiceEscrowTest {
 
     function testUnprovedOrMalformedJournalsAreRejected() public {
         accept();
-        bytes memory unproved = abi.encode(base(keccak256("INV-1"), 100), PO, uint64(3000));
+        bytes memory unproved = abi.encode(base(keccak256("INV-1"), 100), PO, uint64(3000), address(this));
         vm.expectRevert();
         escrow.settle(hex"abcd", unproved);
         bytes memory taskFormat = abi.encode(base(keccak256("INV-1"), 100));
@@ -363,13 +363,13 @@ contract InvoiceEscrowTest {
 
     function testWrongSignerAndMalformedSignaturesAreRejected() public {
         accept();
-        bytes memory j = abi.encode(base(keccak256("INV-S7"), 100), PO, uint64(3000));
+        bytes memory j = abi.encode(base(keccak256("INV-S7"), 100), PO, uint64(3000), address(this));
         bytes memory other = signWith(0xB0B, j);
         vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
         escrow.settleSigned(j, other);
         bytes memory sig = signWith(SIGNER_KEY, j);
         // A signature over a different journal does not transfer.
-        bytes memory altered = abi.encode(base(keccak256("INV-S8"), 100), PO, uint64(3000));
+        bytes memory altered = abi.encode(base(keccak256("INV-S8"), 100), PO, uint64(3000), address(this));
         vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
         escrow.settleSigned(altered, sig);
         // High-s form of a valid signature is rejected by ECDSA.recover.
@@ -388,7 +388,7 @@ contract InvoiceEscrowTest {
         accept();
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-S9"), 100);
         a.recipient = RELAYER;
-        bytes memory redirected = abi.encode(a, PO, uint64(3000));
+        bytes memory redirected = abi.encode(a, PO, uint64(3000), address(this));
         bytes memory sig = signWith(SIGNER_KEY, redirected);
         vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
         escrow.settleSigned(redirected, sig);
@@ -419,7 +419,7 @@ contract InvoiceEscrowTest {
         escrow.accept(o);
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-S12"), 50);
         a.policyHash = p;
-        bytes memory j = abi.encode(a, PO, uint64(100));
+        bytes memory j = abi.encode(a, PO, uint64(100), address(this));
         bytes memory sig = signWith(SIGNER_KEY, j);
         vm.expectRevert(InvoiceEscrow.ProofRequired.selector);
         escrow.settleSigned(j, sig);
@@ -438,7 +438,7 @@ contract InvoiceEscrowTest {
         accept();
         PolicyExecutionVault.Authorization memory a = base(keccak256("INV-P1"), 100);
         a.policyHash = p;
-        bytes memory j = abi.encode(a, PO, uint64(1000));
+        bytes memory j = abi.encode(a, PO, uint64(1000), address(this));
         // The first order's signer cannot settle the second order.
         bytes memory wrong = signWith(SIGNER_KEY, j);
         bytes memory right = signWith(otherKey, j);
@@ -548,9 +548,10 @@ contract InvoiceEscrowTest {
     function testRustJournalDecodesFieldForField() public view {
         string memory json = vm.readFile("test/fixtures/invoice-journal.json");
         bytes memory journal = vm.parseJsonBytes(json, ".journal");
-        require(journal.length == 14 * 32);
-        (PolicyExecutionVault.Authorization memory a, bytes32 poId, uint64 poMax) =
-            abi.decode(journal, (PolicyExecutionVault.Authorization, bytes32, uint64));
+        require(journal.length == 15 * 32);
+        (PolicyExecutionVault.Authorization memory a, bytes32 poId, uint64 poMax, address customer) =
+            abi.decode(journal, (PolicyExecutionVault.Authorization, bytes32, uint64, address));
+        require(customer == vm.parseJsonAddress(json, ".customer"));
         require(a.policyHash == vm.parseJsonBytes32(json, ".policyHash"));
         require(a.chainId == vm.parseJsonUint(json, ".chainId"));
         require(a.vault == vm.parseJsonAddress(json, ".vault"));
@@ -565,5 +566,79 @@ contract InvoiceEscrowTest {
         require(a.evidenceHash == vm.parseJsonBytes32(json, ".evidenceHash"));
         require(poId == vm.parseJsonBytes32(json, ".poId"));
         require(poMax == vm.parseJsonUint(json, ".poMaxTotal"));
+    }
+
+    function testCustomerCannotBeChangedBehindProofOrSignature() public {
+        accept();
+        address otherBuyer = address(0xB0B);
+        token.mint(otherBuyer, 3000);
+        vm.prank(otherBuyer);
+        token.approve(address(escrow), 3000);
+        vm.prank(otherBuyer);
+        bytes32 otherOrder = escrow.offer(terms(POLICY, PO, VENDOR, 3000, vm.addr(SIGNER_KEY), 1500, THRESHOLD));
+        vm.prank(VENDOR);
+        escrow.accept(otherOrder);
+
+        bytes32 obligation = keccak256("customer-bound-invoice");
+        (bytes memory journal, bytes memory sig) = signed(obligation, 100);
+        verifier.approve(journal);
+        bytes memory redirected = abi.encode(base(obligation, 100), PO, uint64(3000), otherBuyer);
+        vm.expectRevert();
+        escrow.settle(hex"abcd", redirected);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleSigned(redirected, sig);
+
+        escrow.settleSigned(journal, sig);
+        require(escrow.consumed(address(this), obligation));
+        require(!escrow.consumed(otherBuyer, obligation));
+        require(escrow.order(otherOrder).spent == 0);
+        // An independently authenticated journal can pay the other customer's order.
+        escrow.settleSigned(redirected, signWith(SIGNER_KEY, redirected));
+        require(escrow.consumed(otherBuyer, obligation));
+        require(escrow.order(otherOrder).spent == 100);
+    }
+
+    function testLegacyInvoiceJournalCannotSettle() public {
+        accept();
+        bytes memory legacy = abi.encode(base(keccak256("legacy"), 100), PO, uint64(3000));
+        verifier.approve(legacy);
+        bytes memory signature = signWith(SIGNER_KEY, legacy);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settle(hex"abcd", legacy);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleSigned(legacy, signature);
+    }
+
+    function testOtherBuyerCannotConsumeVictimObligation() public {
+        accept();
+        bytes32 obligation = keccak256("victim invoice");
+        bytes memory victimJournal = invoice(obligation, 1320);
+        address attacker = address(0xBAD);
+        token.mint(attacker, 1);
+        vm.prank(attacker);
+        token.approve(address(escrow), 1);
+        vm.prank(attacker);
+        bytes32 attackOrder = escrow.offer(terms(keccak256("attacker policy"), keccak256("attacker PO"), attacker, 1));
+        vm.prank(attacker);
+        escrow.accept(attackOrder);
+        vm.prank(attacker);
+        escrow.settleApproved(attackOrder, obligation, 1, keccak256("anything"));
+        require(token.balanceOf(attacker) == 1, "attacker gets own funding back");
+        escrow.settle(hex"abcd", victimJournal);
+    }
+
+    function testSquatterCannotReserveAnotherCustomersOrder() public {
+        address attacker = address(0xBAD);
+        bytes32 victimPolicy = keccak256("upcoming victim policy");
+        bytes32 victimPo = keccak256("upcoming victim PO");
+        token.mint(attacker, 1);
+        vm.prank(attacker);
+        token.approve(address(escrow), 1);
+        vm.prank(attacker);
+        bytes32 attackOrder = escrow.offer(terms(victimPolicy, victimPo, attacker, 1));
+        vm.prank(attacker);
+        escrow.close(attackOrder);
+        require(token.balanceOf(attacker) == 1, "funding refunded");
+        escrow.offer(terms(victimPolicy, victimPo, VENDOR, 3000));
     }
 }

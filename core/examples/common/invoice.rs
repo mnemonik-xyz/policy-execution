@@ -121,11 +121,13 @@ impl Doc {
 pub fn policy(rule: Rule, scope: Scope, base: u64) -> InvoicePolicy {
     InvoicePolicy {
         version: 1,
+        customer: [8; 20],
         scope,
         valid_after: base,
         valid_until: base + 4000,
         registry_key: public(&key(1)),
         po_key: public(&key(3)),
+        invoice_key: public(&key(5)),
         acceptance_key: Some(public(&key(2))),
         max_po_total: 5_000 * USDC,
         po_categories: vec![7, 9],
@@ -201,6 +203,8 @@ pub fn fixture_at(document: Vec<u8>, scope: Scope, base: u64) -> InvoiceInput {
         vendor_signature: vec![],
         po,
         po_signature: vec![],
+        invoice_attestation: None,
+        invoice_signature: None,
         acceptance: None,
         acceptance_signature: None,
         po_spent: 0,
@@ -212,4 +216,19 @@ pub fn fixture_at(document: Vec<u8>, scope: Scope, base: u64) -> InvoiceInput {
 pub fn resign(input: &mut InvoiceInput) {
     input.vendor_signature = sign(&key(1), &invoice_vendor_message(&input.vendor));
     input.po_signature = sign(&key(3), &po_message(&input.po));
+    attest(input);
+}
+
+/// The fixture issuer endorses these exact bytes. Tampering tests must NOT call this.
+pub fn attest(input: &mut InvoiceInput) {
+    let attestation = InvoiceAttestation {
+        scope: input.policy.scope.clone(),
+        customer: input.policy.customer,
+        po_id: input.po.po_id,
+        document_hash: invoice_document_hash(&input.document),
+        valid_after: input.policy.valid_after,
+        valid_until: input.policy.valid_until,
+    };
+    input.invoice_signature = Some(sign(&key(5), &invoice_attestation_message(&attestation)));
+    input.invoice_attestation = Some(attestation);
 }

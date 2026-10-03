@@ -69,7 +69,7 @@ fn e1_clean_invoice_matching_po_lines_is_allowed() {
     );
     assert_eq!(auth.po_id, reference_hash("PO-77"));
     let journal = auth.journal();
-    assert_eq!(journal.len(), 14 * 32);
+    assert_eq!(journal.len(), 15 * 32);
     assert_eq!(&journal[0..32], &invoice_policy_hash(&input.policy));
     assert_eq!(&journal[416..448][24..], &(3_000 * USDC).to_be_bytes());
 }
@@ -323,6 +323,163 @@ fn acceptance_is_optional_unless_the_rule_requires_it() {
 }
 
 #[test]
+fn customer_is_required_and_bound_to_the_policy_and_journal() {
+    let mut input = fixture(doc().xml());
+    let original = allowed(&input);
+    assert_eq!(&original.journal()[448..460], &[0; 12]);
+    assert_eq!(&original.journal()[460..480], &input.policy.customer);
+    input.policy.customer = [9; 20];
+    attest(&mut input);
+    let other = allowed(&input);
+    assert_ne!(
+        original.authorization.policy_hash,
+        other.authorization.policy_hash
+    );
+    assert_eq!(other.customer, [9; 20]);
+    input.policy.customer = [0; 20];
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidPolicy));
+}
+
+#[test]
+fn unknown_facts_do_not_override_a_decisive_branch() {
+    let mut input = fixture(doc().xml());
+    input.claims.clear();
+    input.policy.rule = Rule::Any(vec![
+        Rule::AmountAtMost(2_000 * USDC),
+        Rule::LineLabelsWithin(vec![7, 9]),
+    ]);
+    allowed(&input);
+    input.policy.rule = Rule::All(vec![
+        Rule::AmountAtMost(1_000 * USDC),
+        Rule::LineLabelsWithin(vec![7, 9]),
+    ]);
+    assert_eq!(authorize_invoice(&input), Err(Denial::PolicyDenied));
+}
+
+#[test]
+fn checked_labels_can_resolve_ask_to_allow() {
+    let mut input = fixture(doc().xml());
+    let claims = std::mem::take(&mut input.claims);
+    assert_eq!(asked(&input), vec![AskReason::UnlabeledLines(vec![0, 1])]);
+    input.claims = claims;
+    allowed(&input);
+}
+
+#[test]
+fn agent_cannot_renumber_or_inflate_an_attested_invoice() {
+    let original = fixture(doc().xml());
+    let mut altered = original.clone();
+    let mut document = doc();
+    document.number = "INV-1002";
+    altered.document = document.xml();
+    assert_eq!(authorize_invoice(&altered), Err(Denial::RequestMismatch));
+
+    document = doc();
+    document.lines[0].amount = "1500.00";
+    document.line_total = "1700.00";
+    document.tax = "170.00";
+    document.inclusive = "1870.00";
+    document.payable = "1870.00";
+    altered.document = document.xml();
+    assert!(parse_invoice(&altered.document).unwrap().totals_consistent);
+    assert_eq!(authorize_invoice(&altered), Err(Denial::RequestMismatch));
+
+    // Updating the document hash without the authority's new signature is insufficient.
+    altered.invoice_attestation.as_mut().unwrap().document_hash =
+        invoice_document_hash(&altered.document);
+    assert_eq!(authorize_invoice(&altered), Err(Denial::InvalidSignature));
+    assert_eq!(altered.vendor_signature, original.vendor_signature);
+    assert_eq!(altered.po_signature, original.po_signature);
+}
+
+#[test]
+fn missing_attestation_asks_even_when_a_rule_branch_allows() {
+    let mut input = fixture(doc().xml());
+    input.invoice_attestation = None;
+    input.invoice_signature = None;
+    input.policy.rule = Rule::Any(vec![Rule::AmountAtMost(2_000 * USDC), Rule::Accepted]);
+    assert_eq!(asked(&input), vec![AskReason::InvoiceAttestationMissing]);
+    let request = SignRequest::from(input.clone());
+    assert_eq!(
+        asked(&request.into_input(input.policy, 0)),
+        vec![AskReason::InvoiceAttestationMissing]
+    );
+}
+
+#[test]
+fn invoice_authority_signature_and_evidence_pair_are_required() {
+    let original = fixture(doc().xml());
+    for missing_statement in [true, false] {
+        let mut input = original.clone();
+        if missing_statement {
+            input.invoice_attestation = None;
+        } else {
+            input.invoice_signature = None;
+        }
+        assert_eq!(authorize_invoice(&input), Err(Denial::InvalidEvidence));
+    }
+    let mut input = original.clone();
+    input.invoice_signature = Some(sign(
+        &key(1),
+        &invoice_attestation_message(input.invoice_attestation.as_ref().unwrap()),
+    ));
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidSignature));
+    input = original.clone();
+    input.policy.invoice_key = public(&key(6));
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidSignature));
+    input.policy.invoice_key = vec![];
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidPolicy));
+}
+
+#[test]
+fn invoice_attestation_binds_customer_order_and_payment_domain() {
+    for field in 0..5 {
+        let mut input = fixture(doc().xml());
+        let attestation = input.invoice_attestation.as_mut().unwrap();
+        match field {
+            0 => attestation.customer = [99; 20],
+            1 => attestation.po_id = [99; 32],
+            2 => attestation.scope.chain_id += 1,
+            3 => attestation.scope.vault = [99; 20],
+            _ => attestation.scope.token = [99; 20],
+        }
+        input.invoice_signature = Some(sign(&key(5), &invoice_attestation_message(attestation)));
+        assert_eq!(
+            authorize_invoice(&input),
+            Err(if field < 2 {
+                Denial::RequestMismatch
+            } else {
+                Denial::ScopeMismatch
+            })
+        );
+    }
+}
+
+#[test]
+fn invoice_attestation_window_bounds_authorization() {
+    let mut input = fixture(doc().xml());
+    for (after, until, expected) in [
+        (1500, 2000, None),
+        (2000, 1500, Some(Denial::InvalidEvidence)),
+        (5001, 6000, Some(Denial::EmptyValidityWindow)),
+    ] {
+        let attestation = input.invoice_attestation.as_mut().unwrap();
+        attestation.valid_after = after;
+        attestation.valid_until = until;
+        input.invoice_signature = Some(sign(&key(5), &invoice_attestation_message(attestation)));
+        if let Some(denial) = expected {
+            assert_eq!(authorize_invoice(&input), Err(denial));
+        } else {
+            let authorization = allowed(&input).authorization;
+            assert_eq!(
+                (authorization.valid_after, authorization.valid_until),
+                (after, until)
+            );
+        }
+    }
+}
+
+#[test]
 fn unrepresentable_payable_asks() {
     let mut d = doc();
     d.payable = "1320.0000001";
@@ -411,6 +568,7 @@ fn solidity_journal_fixture_matches_rust_encoding() {
         "evidenceHash": hex(&a.evidence_hash),
         "poId": hex(&auth.po_id),
         "poMaxTotal": auth.po_max_total,
+        "customer": hex(&auth.customer),
     });
     let rendered = serde_json::to_string_pretty(&json).unwrap() + "\n";
     let path = concat!(

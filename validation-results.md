@@ -1,5 +1,87 @@
 # Warrant implementation validation
 
+## Invoice authentication and customer isolation — 2026-09-30
+
+This working revision changes invoice policy commitments and settlement encoding.
+It is not compatible with existing invoice receipts or an older invoice escrow.
+The task vault and task escrow authorization formats are unchanged.
+
+### Changes and regressions
+
+- Order IDs now include the funding customer (`msg.sender` at offer time).
+- Invoice policies require a nonzero `customer` and a valid `invoice_key`, and use commitment domain
+  `warrant/invoice-policy/v2`. The invoice journal is 15 ABI words, appending
+  customer after `poMaxTotal`.
+- Replay state is indexed by customer and obligation ID, across that customer's
+  orders and all three authenticators. Another buyer's arbitrary approval cannot
+  block payment. This is not company-wide or cross-deployment deduplication.
+- The two attack regression tests failed on the old code (`AlreadyPaid` and
+  `InvalidState`) and pass after the fix. Additional tests bind the customer to
+  the signature/proof journal, reject legacy journals, retain cross-policy replay
+  rejection for the same customer and exercise unknown-fact semantics.
+
+- Mandatory invoice-source attestations bind exact document bytes, customer,
+  PO, payment scope and validity. They are checked before the rule tree, so
+  `Any` cannot bypass authentication. Missing evidence asks; mismatched or forged
+  evidence rejects. Tests reproduce the old renumbering and consistent-amount
+  attacks and confirm rejection without a fresh source signature.
+- Issuer tooling prepares statements from exact XML bytes and signs them under
+  `warrant/invoice-attestation/v1`; both commands refuse output overwrite.
+  The checker version is now 2.
+
+### Observed validation
+
+- **62 Rust tests passed:** 48 native policy/XML/invoice, 3 signer, 3 template,
+  2 issuer CLI and 6 guest execution tests. **3 receipt tests skipped** because
+  they require separate real receipts. No skipped test is counted as passing.
+- **62 Solidity tests passed**, including 29 invoice escrow tests and a current
+  real invoice proof settlement test. Each of the three fuzz tests ran 256 cases.
+  The current proof rejects mutations to all 15 journal words and rejects replay
+  after settlement. The older task receipt remains a separate verifier fixture.
+- Rebuilt invoice guest execution agrees with native authorization for two customers.
+- `python3 scripts/invoice-demo.py` deployed fresh local contracts, funded and
+  accepted an order, and settled by signature, buyer approval and real proof.
+  Replay, invoice tampering, smuggled spend inputs and an unnamed signing key
+  were rejected; missing invoice attestation produced Ask. Synthetic Anvil funds
+  only: 1,320 + 330 + 1,320 paid from a 3,000 ceiling, leaving 30.
+- One sample: signed flow **0.04 s**, succinct proving **445.65 s**, Groth16
+  wrapping **79.73 s**. The guest used **2,097,152 cycles / eight segments**;
+  receipts were **224,186 / 1,457 bytes**, respectively. Host: macOS ARM64,
+  14 reported CPUs, four Rayon workers, segment exponent 18. Wrapping used
+  an x86 Docker image under emulation. These are not repeated benchmarks;
+  peak memory and reproducible Docker guest compilation were not validated.
+- The Verus evaluator source is unchanged; the prior 16-obligation result is
+  historical evidence, not a fresh proof of the modified authorization pipeline.
+
+Commands (from `policy-execution/`):
+
+```sh
+RISC0_BUILD_LOCKED=1 cargo test -p warrant-policy -p warrant-host --locked -- --test-threads=1
+forge test --offline --root contracts
+python3 scripts/invoice-demo.py
+```
+
+Guest execution and Anvil need permission to start local processes/listeners.
+The run summary and artifact hashes are recorded under `invoiceAuthentication20260930`
+in [validation-evidence.json](validation-evidence.json); the earlier customer-isolation-only and original task-proof
+records are retained separately. Local generated artifacts are ignored by Git.
+
+### Deployment and trust boundary
+
+A local guest build is not the Docker-based reproducible build. Deploy a new
+escrow with the reviewed current image and approve newly computed invoice
+policy commitments; old invoice approvals and receipts are incompatible.
+No public-network deployment or production audit is part of this local check.
+
+The buyer must choose and operate the invoice authority whose key the policy
+pins. That authority must obtain or issue invoices independently of the agent.
+Its signature prevents agent edits; it does not prove delivery, fair pricing or
+that an authority has not endorsed the same debt under multiple numbers. Buyer
+approval remains an explicit override. Source trust and debt deduplication are
+operational assumptions, not undecided protocol behavior.
+
+## Historical task prototype — 2026-09-23
+
 Verified 2026-09-23. These results describe a CLI and smart-contract prototype,
 not an audited production deployment or a hosted marketplace.
 

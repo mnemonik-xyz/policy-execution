@@ -6,7 +6,7 @@ second), an undecided invoice by the buyer's own approval, and a third by real
 proof (prove, wrap for EVM, settle). Rejects replay and smuggled inputs.
 Uses only Anvil's public test accounts and keys. Never connects to a public network.
 """
-import argparse, json, os, pathlib, socket, subprocess, time, urllib.request
+import argparse, json, os, pathlib, platform, socket, subprocess, time, urllib.request
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--deploy-only", action="store_true", help="Exercise deployment, funding and acceptance without proving")
 parser.add_argument("--signed-only", action="store_true", help="Stop after the signed settlement; skip proving")
@@ -73,12 +73,12 @@ try:
     # The fixture's windows nest inside [base, base + 4000]; start slightly in the past.
     base=now-300
     run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
-        str(out),'31337',escrow,token,VENDOR,str(base))
+        str(out),'31337',escrow,token,VENDOR,CUSTOMER,str(base))
     terms=json.loads((out/'terms.json').read_text())
     ceiling, amount = terms['maxTotal'], terms['amount']
     send(CUSTOMER,token,'mint(address,uint256)',CUSTOMER,ceiling)
     send(CUSTOMER,token,'approve(address,uint256)',escrow,ceiling)
-    order=call(escrow,'orderIdFor(bytes32,bytes32)(bytes32)',terms['policyHash'],terms['poId'])
+    order=call(escrow,'orderIdFor(address,bytes32,bytes32)(bytes32)',CUSTOMER,terms['policyHash'],terms['poId'])
     # The buyer names the signer for this order: up to half the ceiling may settle on
     # its word, and only invoices under 2000 USDC; the rest needs proofs or approval.
     threshold=2000*10**6
@@ -107,6 +107,19 @@ try:
     except RuntimeError: pass
     else: raise AssertionError('Signed replay unexpectedly accepted')
     print(f'Signed settlement done in {signed_seconds:.2f}s (read order, evaluate, sign, submit). Artifacts:',out,flush=True)
+    # The agent cannot renumber an invoice or remove its source authentication
+    # and still obtain an automatic settlement signature.
+    tampered=json.loads((out/'request.json').read_text())
+    tampered['document']=list(bytes(tampered['document']).replace(b'INV-1001',b'INV-9001'))
+    (out/'tampered.json').write_text(json.dumps(tampered))
+    sign(out/'tampered.json',out/'tampered-out.json',expect=1)
+    assert not (out/'tampered-out.json').exists()
+    missing=json.loads((out/'request.json').read_text())
+    missing['invoice_attestation']=None
+    missing['invoice_signature']=None
+    (out/'missing-attestation.json').write_text(json.dumps(missing))
+    sign(out/'missing-attestation.json',out/'missing-attestation-out.json',expect=3)
+    assert json.loads((out/'missing-attestation-out.json').read_text())['ask']==['InvoiceAttestationMissing']
     # The service refuses what the agent may not supply: a policy or a spend figure.
     smuggled=json.loads((out/'request.json').read_text()); smuggled['po_spent']=0
     (out/'smuggled.json').write_text(json.dumps(smuggled))
@@ -121,7 +134,7 @@ try:
     # An undecided invoice: a line nobody can label. The service signs nothing and
     # records why; the buyer settles it on their own authority, within the same bounds.
     run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
-        str(out/'ask'),'31337',escrow,token,VENDOR,str(base),'INV-1003','ask')
+        str(out/'ask'),'31337',escrow,token,VENDOR,CUSTOMER,str(base),'INV-1003','ask')
     sign(out/'ask/request.json',out/'ask.json',expect=3)
     ask=json.loads((out/'ask.json').read_text())
     assert ask['ask']==['UnlabeledLines([1])'] and 'signature' not in ask
@@ -139,11 +152,17 @@ try:
         raise SystemExit(0)
     # Proof mode for a second invoice against the same order; the first is already consumed.
     run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
-        str(out/'proof'),'31337',escrow,token,VENDOR,str(base),'INV-1002')
+        str(out/'proof'),'31337',escrow,token,VENDOR,CUSTOMER,str(base),'INV-1002')
     print('Generating real invoice proof for a second invoice; artifacts:',out,flush=True)
-    run('target/release/warrant-host','invoice-prove',str(out/'proof/input.json'),str(out/'invoice.receipt'))
+    started=time.perf_counter()
+    proof_log=run('target/release/warrant-host','invoice-prove',str(out/'proof/input.json'),str(out/'invoice.receipt'))
+    prove_seconds=time.perf_counter()-started
+    (out/'prove.log').write_text(proof_log+'\n')
     print('Wrapping real proof for EVM verification',flush=True)
-    run('target/release/warrant-host','wrap',str(out/'invoice.receipt'),str(out/'invoice-groth16.receipt'))
+    started=time.perf_counter()
+    wrap_log=run('target/release/warrant-host','wrap',str(out/'invoice.receipt'),str(out/'invoice-groth16.receipt'))
+    wrap_seconds=time.perf_counter()-started
+    (out/'wrap.log').write_text(wrap_log+'\n')
     run('target/release/warrant-host','export-evm',str(out/'invoice-groth16.receipt'),str(out/'evm.json'))
     proof=json.loads((out/'evm.json').read_text())
     assert proof['imageId']==image
@@ -160,7 +179,13 @@ try:
         policyHash=terms['policyHash'],poId=terms['poId'],recipient=VENDOR,amount=amount,ceiling=ceiling,
         signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],signedSeconds=round(signed_seconds,2),
         approvedTransaction=approved['transactionHash'],approvedAmount=ask['payable'],
-        provenTransaction=settled['transactionHash'],provenGasUsed=settled['gasUsed'],realProof=True,replayRejected=True)
+        provenTransaction=settled['transactionHash'],provenGasUsed=settled['gasUsed'],realProof=True,replayRejected=True,
+        invoiceTamperingRejected=True,missingAttestationAsked=True,
+        proveSeconds=round(prove_seconds,2),wrapSeconds=round(wrap_seconds,2),
+        succinctReceiptBytes=(out/'invoice.receipt').stat().st_size,
+        groth16ReceiptBytes=(out/'invoice-groth16.receipt').stat().st_size,
+        hostPlatform=platform.platform(),hostCpuCount=os.cpu_count(),rayonThreads=ENV['RAYON_NUM_THREADS'],
+        segmentPo2=ENV.get('WARRANT_SEGMENT_PO2','18'),rustVersion=run('rustc','--version'))
     (out/'result.json').write_text(json.dumps(summary,indent=2)+'\n')
     print('Signed, approved and proven invoices settled; vendor paid three times; replays rejected. Result:',out/'result.json',flush=True)
 finally:

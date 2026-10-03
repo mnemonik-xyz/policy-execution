@@ -27,17 +27,17 @@ fn hex(b: &[u8]) -> String {
 fn main() {
     let args: Vec<String> = env::args().collect();
     assert!(
-        (7..=9).contains(&args.len()),
-        "invoice_fixture out_dir chain_id escrow token vendor base_timestamp [invoice_number] [ask]"
+        (8..=10).contains(&args.len()),
+        "invoice_fixture out_dir chain_id escrow token vendor customer base_timestamp [invoice_number] [ask]"
     );
-    let ask = args.get(8).map(String::as_str) == Some("ask");
+    let ask = args.get(9).map(String::as_str) == Some("ask");
     let scope = Scope {
         chain_id: args[2].parse().unwrap(),
         vault: bytes(&args[3]),
         token: bytes(&args[4]),
     };
     let mut document = doc();
-    if let Some(number) = args.get(7) {
+    if let Some(number) = args.get(8) {
         document.number = number.clone().leak();
     }
     if ask {
@@ -54,8 +54,9 @@ fn main() {
         document.inclusive = "330.00";
         document.payable = "330.00";
     }
-    let mut input = fixture_at(document.xml(), scope, args[6].parse().unwrap());
+    let mut input = fixture_at(document.xml(), scope, args[7].parse().unwrap());
     input.vendor.recipient = bytes(&args[5]);
+    input.policy.customer = bytes(&args[6]);
     if ask {
         input.claims.truncate(1);
     }

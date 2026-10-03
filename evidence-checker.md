@@ -1,6 +1,6 @@
 # Evidence checker: design draft
 
-Status: 2026-09-23. Steps 1–4 of §11 are implemented in `core/src/evidence.rs`,
+Status: implemented scope corrected 2026-09-30; original design dated 2026-09-23. Steps 1–4 of §11 are implemented in `core/src/evidence.rs`,
 `core/src/xml.rs` and `verified/src/lib.rs`, with fixtures in
 `core/tests/invoice.rs`. Step 5 is [`InvoiceEscrow`](invoice-escrow.md), built on
 `TaskEscrow` rather than a vault, plus an invoice guest (`methods/invoice-guest`).
@@ -28,23 +28,24 @@ re-check them from the exact bytes received.
 
 ## 2. Invariants
 
-1. **Every fact has one of three provenances**, recorded next to its value:
-   - `Signed` — issued by an owner-approved key (existing registry/reviewer path,
-     plus a new PO authority, §5);
-   - `Derived` — a deterministic function of the hashed source document (Tier 0);
-   - `Checked` — an agent claim whose evidence passed a deterministic check (Tier 1).
-   Anything else is `Unknown`. The agent's bare assertion is never a fact.
-2. **Fields that select are never taken from the invoice or the model.** Payment
-   address, vendor category and spending ceiling come from signed credentials.
-   The invoice may only *quantify* (amount) and *reference* (invoice number, PO ID).
-   An invoice's own payment details (`cac:PayeeFinancialAccount` in UBL) are ignored.
-3. **Tier 1 can only restrict.** No rule may grant more authority because of a
-   Tier 1 fact than it grants when that fact is `Unknown`. Tier 1 labels feed only
-   conjunctive requirements (§6), so a fooled model can at worst cause `Ask`.
-4. **Positive claims need evidence; negative facts are scanned exhaustively.**
-   The model cannot suppress a denied term by staying silent about a line.
-5. **Unknown is a first-class outcome.** Evaluation returns `Allow`, `Deny` or
-   `Ask`; only `Allow` produces an `Authorization`.
+1. **Evidence has distinct checking paths.** Credentials are signed, document
+   values are derived, and label evidence is checked. These sources are reflected
+   in types and code; the runtime does not attach a general provenance tag to
+   every evaluator value. Unsupported claims leave facts unknown.
+2. **Recipient and vendor category come from credentials.** The signed PO and
+   funded order constrain spend. Invoice amounts, numbers and references remain
+   security-relevant document inputs. A mandatory invoice-source attestation
+   authenticates their exact bytes before automatic authorization.
+3. **Admitted labels can resolve Ask to Allow.** `LineLabelsWithin` can appear
+   under `All` or `Any`. A failed claim may leave the decision unknown, but an
+   independent decisive branch can still allow or deny.
+4. **The deny scan is independent of claims.** It scans parsed item names and
+   descriptions for the configured ASCII terms. This is a literal text check,
+   not a semantic classification of all prohibited goods. `NoDeniedTerm` must be
+   required by the policy for a hit to block payment.
+5. **Only Allow emits authorization.** The verified three-valued evaluator is
+   sound for all completions of unknown facts. This does not authenticate those
+   facts or establish that the approved policy captures the buyer's intent.
 
 ## 3. Pipeline
 
@@ -55,7 +56,7 @@ flowchart LR
   D --> A[Agent / LLM<br/>untrusted]
   A -- "claims: label + evidence" --> C[Tier 1 checker]
   P -- "Derived facts + line text ranges" --> C
-  S[Signed credentials<br/>vendor, PO, optional acceptance] --> V[Signature + binding checks]
+  S[Signed evidence<br/>vendor, PO, invoice, optional acceptance] --> V[Signature + binding checks]
   P --> F[Facts with provenance]
   C --> F
   V --> F
@@ -64,16 +65,16 @@ flowchart LR
 ```
 
 TCB for the decision: parser, Tier 1 checker, binding checks, `evaluate3`, vault.
-The agent, the LLM, and the channel the invoice arrived through are outside it.
+The agent, the LLM, and the delivery channel are untrusted. A buyer-approved
+invoice authority must independently establish invoice provenance and sign its
+exact bytes; the checker verifies that attestation before evaluating rules.
 
 ## 4. Tier 0 — facts derived from the document
 
-**Accepted formats (v1).** UBL 2.1 `Invoice` XML, and the CII XML embedded in a
-Factur-X/ZUGFeRD PDF/A-3 (the checker receives the extracted `factur-x.xml`;
-extraction from the PDF is outside the TCB and the hash binds the XML bytes).
-Plain PDFs and free text have no Tier 0 facts in v1 — they resolve to `Ask`.
-Sources: [UBL 2.1](https://docs.oasis-open.org/ubl/UBL-2.1.html),
-[Factur-X structure](https://www.invoicenavigator.eu/blog/factur-x-technical-reference).
+**Implemented format.** UBL 2.1 `Invoice` XML only. CII and Factur-X extraction
+remain proposals. Unsupported roots and malformed documents return
+`InvalidDocument`, not `Ask`; parsed non-USD invoices return `Ask(NotUsd)`.
+Source: [UBL 2.1](https://docs.oasis-open.org/ubl/UBL-2.1.html).
 
 **Parser profile.** A fixed allowlist of element paths, rejecting any `DOCTYPE`,
 entity declaration, processing instruction outside the prolog, or duplicate
@@ -93,7 +94,7 @@ Unknown elements are ignored, never interpreted.
 | `lines[i].amount` | `InvoiceLine/LineExtensionAmount` | Signed integers: credit lines can be negative |
 | `lines[i].text` | `InvoiceLine/Item/Name`, `Item/Description` | Kept as **byte ranges** into the document, for Tier 1 spans |
 | `lines[i].item_id` | `Item/SellersItemIdentification/ID` | For PO-line evidence |
-| `po_ref` | `OrderReference/ID` | Must name a signed PO, else `Ask` |
+| `po_ref` | `OrderReference/ID` | Must name the signed PO, else `PoMismatch` |
 | `totals_consistent` | the `LegalMonetaryTotal` fields vs line sums | See the warning below |
 | `denied_term_found` | scan of every line text against the policy's deny lexicon | Invariant 4 |
 
@@ -129,6 +130,17 @@ pub struct PoLine { pub item_id: Hash, pub category: u16 }
 `Acceptance` becomes optional: required only when the policy contains `Accepted`.
 That removes the reviewer from the default path while keeping it for milestone
 work where a human sign-off is the point.
+
+### Invoice authority (implemented 2026-09-30)
+
+The policy requires `invoice_key`. An `InvoiceAttestation` signed by that key
+binds exact document SHA-256, customer, PO ID, scope and a validity interval.
+It is mandatory before automatic authorization, regardless of the rule tree.
+Both fields absent return `Ask(InvoiceAttestationMissing)`; a partial pair,
+invalid signature or mismatch is rejected. Attestation validity intersects the
+other evidence windows, and the evidence hash covers the attestation/signature.
+Checker version 2 records this change. See
+[issuer commands and operational trust](invoice-escrow.md#invoice-source-authentication).
 
 ## 6. Tier 1 — agent claims with checkable evidence
 
@@ -189,31 +201,31 @@ pub struct Facts {
 **New rule atoms:** `LineLabelsWithin(Vec<u16>)` (every line `Known` and in the
 set), `NoDeniedTerm`, `WithinPo`. Existing atoms keep their meaning.
 
-**`evaluate3`.** `Rule` has no negation, so every atom is monotone. Evaluate twice
-through the verified evaluator, mapping each `Unknown` atom to `false`
-(pessimistic) and to `true` (optimistic):
-
-- pessimistic `true` → `Allow` (true under every completion);
-- optimistic `false` → `Deny` (false under every completion);
-- otherwise → `Ask`.
-
-Proof obligation for Verus: `evaluate3 == Allow ⇒ ∀ completions, satisfies`, and
-`== Deny ⇒ ∀ completions, ¬satisfies`. The monotonicity argument makes this a
-small extension of the existing `evaluate` proof. Invariant 3 then follows from
-the rule grammar: Tier 1 facts appear only in `LineLabelsWithin`, a conjunctive
-atom, so `Unknown` can never be more permissive than `Known`.
+**`evaluate3`.** The implementation recursively evaluates strong Kleene logic,
+not two Boolean passes. `All` short-circuits on false and `Any` on true; an
+otherwise undecided combination remains unknown. Thus `Any(true, unknown)`
+allows and `All(false, unknown)` denies. The Verus theorem proves soundness of
+Allow and Deny for every completion, not the converse. Conservative Ask results
+can occur even if all completions agree.
 
 ## 8. What the authorization binds
 
-- `task_id = H("warrant/obligation/v1", seller_tax_id, invoice_number)` — derived
-  on the trusted side, so the agent cannot mint fresh IDs for a duplicate invoice.
-  The planned vault must consume task IDs permanently (see README, "Payment
-  integration boundary"), as the Circom prototype's vault already does.
-- `deliverable_hash = doc_hash`.
-- `evidence_hash` also covers the claims, the PO and the checker version.
-- **Journal change:** a vendor can reissue the same work under a new invoice
-  number, so the vault must track cumulative spend per PO. That needs `po_id` as a
-  13th journal word and `poSpent[po_id]` state in the vault.
+- `task_id` hashes the normalized seller tax ID and trimmed invoice number under
+  `warrant/obligation/v1`. The agent cannot change the attested number without
+  a new authority signature. Reissues endorsed by that authority can still
+  produce different IDs; this does not identify duplicate business debts.
+- `deliverable_hash = sha256(document)` commits to the supplied bytes. It is
+  authenticated by a mandatory `InvoiceAttestation` under `policy.invoice_key`.
+  Optional reviewer acceptance, when required by policy, additionally binds this
+  hash and the payment fields.
+- `evidence_hash` covers document hash, claims, signed credentials, PO, optional
+  acceptance, invoice attestation/signature and checker version.
+- The invoice journal has 15 words: the 12 base authorization words, `poId`,
+  `poMaxTotal`, and `customer`. Customer is included in the v2 invoice policy
+  commitment and in the signed or proven journal.
+- The contract reserves and bounds each order. Replay state spans all orders
+  and settlement paths of one customer. Other customer addresses, contracts
+  and chains have separate replay domains.
 
 ## 9. Where it runs
 
@@ -286,10 +298,9 @@ credentials.
 **Key roles.**
 
 - **Buyer** holds `po_key` and signs purchase orders.
-- **Policy is immutable once published.** The vault takes `policyHash` in its
-  constructor and has no `setPolicy`; a new policy means a new vault and moving
-  the remaining funds. Budget can only grow by deposit, not by a setter. (Both
-  current prototypes still allow `setPolicy`; the Circom vault also has `setBudget`.)
+- **Policy commitments are immutable per funded order.** `InvoiceEscrow.offer`
+  fixes the policy hash for that order. A customer can fund a different order
+  with another policy; this does not replace the first order's terms.
 - **POs are bounded by the policy.** The policy fixes the maximum per-PO total and
   the allowed categories, and `WithinPo` checks the PO against them. Otherwise
   signing a generous PO would loosen the policy without changing it.
@@ -311,8 +322,9 @@ credentials.
   `InvoicePolicy`, vendor credential (`InvoiceVendorCredential`, adds `tax_id`) and
   `PurchaseOrder`. The existing `authorize()` path, its journal and its policy
   hashes are unchanged; it rejects the invoice-only atoms.
-- **Journal is 14 words**, not 13: the 12 base words, `poId`, then `poMaxTotal`,
-  because the vault needs the order's ceiling to enforce cumulative spend.
+- **Original journal was 14 words**: the 12 base words, `poId`, `poMaxTotal`.
+  The 2026-09-30 revision adds `customer` as word 15 and requires a new image and
+  deployment; invoice policy commitments use `warrant/invoice-policy/v2`.
 - **Spans index the decoded line text** (item name, then descriptions, joined
   with newlines), not raw document bytes; that text is a deterministic function
   of the hashed bytes.

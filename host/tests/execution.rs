@@ -1,9 +1,81 @@
 #[path = "../../core/examples/common/mod.rs"]
 mod common;
 
+#[path = "../../core/examples/common/invoice.rs"]
+mod invoice_fixture;
+
 use risc0_zkvm::{default_executor, ExecutorEnv};
 use warrant_methods::WARRANT_GUEST_ELF;
 use warrant_policy::{authorize, Input, Rule};
+
+#[test]
+fn invoice_guest_rejects_tampered_and_unauthenticated_documents() {
+    use warrant_methods::WARRANT_INVOICE_GUEST_ELF;
+    let original = invoice_fixture::fixture_at(
+        invoice_fixture::doc().xml(),
+        warrant_policy::Scope {
+            chain_id: 31337,
+            vault: [3; 20],
+            token: [4; 20],
+        },
+        1000,
+    );
+    for missing in [false, true] {
+        let mut input = original.clone();
+        if missing {
+            input.invoice_attestation = None;
+            input.invoice_signature = None;
+        } else {
+            let mut document = invoice_fixture::doc();
+            document.number = "TAMPERED";
+            input.document = document.xml();
+        }
+        let env = ExecutorEnv::builder()
+            .segment_limit_po2(18)
+            .write(&input)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(default_executor()
+            .execute(env, WARRANT_INVOICE_GUEST_ELF)
+            .is_err());
+    }
+}
+
+#[test]
+fn invoice_guest_matches_native_customer_bound_journal() {
+    use warrant_methods::WARRANT_INVOICE_GUEST_ELF;
+    use warrant_policy::evidence::{authorize_invoice, InvoiceOutcome};
+    let mut input = invoice_fixture::fixture_at(
+        invoice_fixture::doc().xml(),
+        warrant_policy::Scope {
+            chain_id: 31337,
+            vault: [3; 20],
+            token: [4; 20],
+        },
+        1000,
+    );
+    for customer in [[8; 20], [9; 20]] {
+        input.policy.customer = customer;
+        invoice_fixture::attest(&mut input);
+        let native = match authorize_invoice(&input).unwrap() {
+            InvoiceOutcome::Allow(auth) => auth.journal(),
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        let env = ExecutorEnv::builder()
+            .segment_limit_po2(18)
+            .write(&input)
+            .unwrap()
+            .build()
+            .unwrap();
+        let session = default_executor()
+            .execute(env, WARRANT_INVOICE_GUEST_ELF)
+            .unwrap();
+        assert_eq!(session.journal.bytes, native);
+        assert_eq!(native.len(), 480);
+        assert_eq!(&native[460..], &customer);
+    }
+}
 
 fn execute(input: &Input) -> anyhow::Result<Vec<u8>> {
     let env = ExecutorEnv::builder()

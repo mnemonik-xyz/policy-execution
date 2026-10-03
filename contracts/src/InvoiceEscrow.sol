@@ -11,7 +11,7 @@ import {PolicyExecutionVault, IZkvmVerifier} from "./PolicyExecutionVault.sol";
 /// or approved by the buyer.
 /// @dev Same trust model as TaskEscrow: no administrator, one immutable verifier,
 /// interpreter and standard ERC-20 per deployment. One funded order backs many
-/// invoices; each invoice's obligation ID pays at most once, and cumulative
+/// invoices; each customer pays an obligation ID at most once, and cumulative
 /// payments never exceed the order's ceiling. Every path pays the order's
 /// accepted vendor and nobody else.
 ///
@@ -21,7 +21,8 @@ import {PolicyExecutionVault, IZkvmVerifier} from "./PolicyExecutionVault.sol";
 ///   which runs that interpreter natively; only below the order's proof threshold
 ///   and within its signer allowance. The buyer can revoke it per order.
 /// - `settleApproved`: the buyer settles an invoice the interpreter could not decide
-///   (Ask) on their own authority, within the same ceiling and replay protection.
+///   on their own authority, within the same ceiling and replay protection.
+///   The contract does not require a prior Ask result.
 contract InvoiceEscrow is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -73,8 +74,8 @@ contract InvoiceEscrow is ReentrancyGuard {
     }
 
     // Rust InvoiceAuthorization::journal(): the twelve Authorization words, then
-    // poId and poMaxTotal. Fourteen static ABI words.
-    uint256 internal constant JOURNAL_LENGTH = 14 * 32;
+    // poId, poMaxTotal and customer. Fifteen static ABI words.
+    uint256 internal constant JOURNAL_LENGTH = 15 * 32;
     // Rust evidence::signer_digest(): sha256 over this tag, chain, escrow, sha256(journal).
     bytes internal constant SIGNER_TAG = "warrant/invoice-signer/v1";
 
@@ -83,8 +84,8 @@ contract InvoiceEscrow is ReentrancyGuard {
     bytes32 public immutable imageId;
     uint256 public totalReserved;
     mapping(bytes32 => Order) internal orders;
-    /// @notice Obligation IDs are consumed across all orders and every authenticator.
-    mapping(bytes32 => bool) public consumed;
+    /// @notice Each customer consumes an obligation across their orders and authenticators.
+    mapping(address => mapping(bytes32 => bool)) public consumed;
 
     error InvalidTerms();
     error InvalidState();
@@ -116,10 +117,10 @@ contract InvoiceEscrow is ReentrancyGuard {
         imageId = imageId_;
     }
 
-    /// @notice Order numbers are chosen by buyers and repeat across buyers; the
-    /// policy commitment, which includes the buyer's key, keeps them apart.
-    function orderIdFor(bytes32 policyHash, bytes32 poId) public view returns (bytes32) {
-        return keccak256(abi.encode(block.chainid, address(this), policyHash, poId));
+    /// @notice The funding customer owns the order namespace, even if another customer
+    /// copies the policy commitment and PO identifier from a pending offer.
+    function orderIdFor(address customer, bytes32 policyHash, bytes32 poId) public view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), customer, policyHash, poId));
     }
 
     function order(bytes32 orderId) external view returns (Order memory) {
@@ -139,7 +140,7 @@ contract InvoiceEscrow is ReentrancyGuard {
     /// @notice Reserves the full order ceiling immediately. The signer, its allowance
     /// and the proof threshold are the buyer's choice for this order alone.
     function offer(Terms calldata t) external nonReentrant returns (bytes32 orderId) {
-        orderId = orderIdFor(t.policyHash, t.poId);
+        orderId = orderIdFor(msg.sender, t.policyHash, t.poId);
         if (orders[orderId].state != State.Missing) revert InvalidState();
         if (
             t.recipient == address(0) || t.recipient == address(this) || t.policyHash == bytes32(0)
@@ -185,7 +186,7 @@ contract InvoiceEscrow is ReentrancyGuard {
 
     /// @notice The customer turns off signature settlement for one order, for
     /// example after a suspected signer compromise. It only tightens: proven and
-    /// approved invoices still settle, so the vendor's guarantee is unchanged.
+    /// approved invoices remain available subject to evidence and settlement deadlines.
     function revokeSigner(bytes32 orderId) external {
         Order storage o = orders[orderId];
         if (o.state == State.Missing || o.state == State.Closed) revert InvalidState();
@@ -235,7 +236,8 @@ contract InvoiceEscrow is ReentrancyGuard {
 
     /// @notice The customer pays an invoice the interpreter left undecided (Ask) on
     /// their own authority. The same bounds apply: the order's vendor, its ceiling
-    /// and its deadline, and the obligation pays once across every path.
+    /// and its deadline, and the obligation pays once across this customer's orders
+    /// and every path. No Ask result is required on chain.
     /// @param obligationId `evidence::obligation_id` of the invoice: seller tax ID and number.
     /// @param documentHash sha256 of the invoice bytes, for the record.
     function settleApproved(bytes32 orderId, bytes32 obligationId, uint64 amount, bytes32 documentHash)
@@ -246,7 +248,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         if (o.state != State.Accepted || block.timestamp > o.settleBy) revert InvalidState();
         if (msg.sender != o.customer) revert Unauthorized();
         if (amount == 0 || obligationId == bytes32(0) || documentHash == bytes32(0)) revert InvalidAuthorization();
-        if (consumed[obligationId]) revert AlreadyPaid();
+        if (consumed[o.customer][obligationId]) revert AlreadyPaid();
         if (amount > o.maxTotal - o.spent) revert OrderExceeded();
         _pay(orderId, o, obligationId, amount, Authenticator.BuyerApproval, documentHash, bytes32(0));
     }
@@ -260,8 +262,10 @@ contract InvoiceEscrow is ReentrancyGuard {
         if (journal.length != JOURNAL_LENGTH) revert InvalidAuthorization();
         bytes32 poId;
         uint64 poMaxTotal;
-        (a, poId, poMaxTotal) = abi.decode(journal, (PolicyExecutionVault.Authorization, bytes32, uint64));
-        orderId = orderIdFor(a.policyHash, poId);
+        address customer;
+        (a, poId, poMaxTotal, customer) =
+            abi.decode(journal, (PolicyExecutionVault.Authorization, bytes32, uint64, address));
+        orderId = orderIdFor(customer, a.policyHash, poId);
         o = orders[orderId];
         if (o.state != State.Accepted || block.timestamp > o.settleBy) revert InvalidState();
         if (
@@ -272,7 +276,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         ) {
             revert InvalidAuthorization();
         }
-        if (consumed[a.taskId]) revert AlreadyPaid();
+        if (consumed[o.customer][a.taskId]) revert AlreadyPaid();
         if (a.amount > o.maxTotal - o.spent) revert OrderExceeded();
     }
 
@@ -285,7 +289,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         bytes32 deliverableHash,
         bytes32 evidenceHash
     ) internal {
-        consumed[taskId] = true;
+        consumed[o.customer][taskId] = true;
         o.spent += amount;
         totalReserved -= amount;
         token.safeTransfer(o.recipient, amount);

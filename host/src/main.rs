@@ -18,7 +18,7 @@ mod signer;
 fn image_for(journal: &[u8]) -> Result<[u32; 8]> {
     match journal.len() {
         384 => Ok(WARRANT_GUEST_ID),
-        448 => Ok(WARRANT_INVOICE_GUEST_ID),
+        480 => Ok(WARRANT_INVOICE_GUEST_ID),
         _ => bail!("Unexpected journal schema"),
     }
 }
