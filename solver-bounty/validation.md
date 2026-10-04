@@ -41,11 +41,35 @@ The guest regression tests and real receipt mutation test also passed.
 
 The workspace has no Docker daemon. Local Groth16 wrapping and real solver
 settlement have not been demonstrated here.
-The `Solver bounty` CI workflow runs the default demonstration with Docker.
-A workflow definition is not evidence that its run passed.
+The complete flow passed on a GitHub Actions runner with Docker, as recorded below.
 
 The existing invoice and task proof fixtures pass the contract regression suite.
 They do not establish solver proof settlement.
+
+## Real solver settlement in CI
+
+[Run 37177967347](https://github.com/mnemonik-xyz/policy-execution/actions/runs/37177967347)
+passed on 2026-10-04 at commit `476063dee1e872e1706e23258f5b3ccb53740a72`.
+It generated a fresh succinct receipt, wrapped it as Groth16, and settled through
+the real verifier on a private Anvil chain.
+
+- The seller received 10,000,000 test token base units.
+- The escrow published the exact schedule, with computed cost 14.
+- The buyer sent no transaction after acceptance.
+- Buyer cancellation, result substitution, and replay failed as expected.
+- The run recorded `realProof: true`, `mockVerifier: false`, and `chainSettlement: true`.
+
+The succinct proof took 147.57 seconds in this sample.
+This excludes Groth16 wrapping and setup. It is not a benchmark distribution.
+
+The [evidence archive](https://github.com/mnemonik-xyz/policy-execution/actions/runs/37177967347/artifacts/11294136738)
+contains both receipts, deployment data, the EVM journal, and the settlement receipt.
+Its SHA-256 is `0834d6fa710d7d0cb1afe1bc9a549e1b52124c4dbc56db1cbee85246faec873e`.
+The downloaded archive matched that digest.
+The [saved result](ci-result.json) preserves the run's summary.
+
+This was a local test chain with a synthetic workload and test funds.
+It was not a public deployment or a customer transaction.
 
 ## Reproduce
 
