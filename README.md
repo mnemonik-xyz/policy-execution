@@ -1,5 +1,9 @@
 # Warrant policy interpreter
 
+The [solver bounty showcase](solver-bounty/README.md) adds reviewer-free acceptance
+for compute schedules. It checks the committed workload, publishes the result,
+and pays the seller through a separate solver guest and escrow.
+
 An owner approves **policy data and evidence authorities**. An agent proposes a
 payment. A fixed Rust interpreter authenticates the evidence, evaluates the
 policy, and emits an authorization. A RISC Zero guest proves that execution.

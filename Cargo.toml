@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "methods", "host", "verified"]
+members = ["core", "methods", "host", "verified", "solver-cli"]
 default-members = ["core"]
 resolver = "2"
 

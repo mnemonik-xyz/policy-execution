@@ -6,10 +6,12 @@ use risc0_zkvm::{
 use std::{fs, io::Write, path::Path, time::Instant};
 use warrant_methods::{
     WARRANT_GUEST_ELF, WARRANT_GUEST_ID, WARRANT_INVOICE_GUEST_ELF, WARRANT_INVOICE_GUEST_ID,
+    WARRANT_SOLVER_GUEST_ELF, WARRANT_SOLVER_GUEST_ID,
 };
 use warrant_policy::evidence::{
     authorize_invoice, InvoiceAuthorization, InvoiceInput, InvoiceOutcome,
 };
+use warrant_policy::solver::{authorize_solver, SolverInput};
 use warrant_policy::{authorize, Input};
 
 mod signer;
@@ -18,6 +20,7 @@ mod signer;
 fn image_for(journal: &[u8]) -> Result<[u32; 8]> {
     match journal.len() {
         384 => Ok(WARRANT_GUEST_ID),
+        416 => Ok(WARRANT_SOLVER_GUEST_ID),
         480 => Ok(WARRANT_INVOICE_GUEST_ID),
         _ => bail!("Unexpected journal schema"),
     }
@@ -47,6 +50,19 @@ fn read_input(path: &str) -> Result<Input> {
         "Input exceeds the 64 KiB host limit"
     );
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_solver(path: &str) -> Result<SolverInput> {
+    let bytes = fs::read(path)?;
+    ensure!(bytes.len() <= 1024 * 1024, "Solver input exceeds 1 MiB");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn solver_env(input: &SolverInput) -> Result<ExecutorEnv<'_>> {
+    Ok(ExecutorEnv::builder()
+        .segment_limit_po2(segment_po2()?)
+        .write(input)?
+        .build()?)
 }
 
 fn segment_po2() -> Result<u32> {
@@ -85,9 +101,68 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     ensure!(
         args.len() >= 2 && (args[1].ends_with("image-id") || args.len() >= 3),
-        "Usage: warrant-host [invoice-]image-id | [invoice-]evaluate|execute|prove input.json [receipt.bin] | invoice-sign signer-key.hex policy.json rpc-url request.json output.json | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
+        "Usage: warrant-host [invoice-|solver-]image-id | [invoice-|solver-]evaluate|execute|prove input.json [receipt.bin] | invoice-sign signer-key.hex policy.json rpc-url request.json output.json | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
     );
     match args[1].as_str() {
+        "solver-image-id" => println!(
+            "0x{}",
+            hex::encode(Digest::from(WARRANT_SOLVER_GUEST_ID).as_bytes())
+        ),
+        "solver-evaluate" => println!(
+            "{}",
+            serde_json::to_string_pretty(&authorize_solver(&read_solver(&args[2])?)?)?
+        ),
+        "solver-execute" => {
+            let input = read_solver(&args[2])?;
+            let expected = authorize_solver(&input)?;
+            let session =
+                default_executor().execute(solver_env(&input)?, WARRANT_SOLVER_GUEST_ELF)?;
+            ensure!(
+                session.journal.bytes == expected.journal(),
+                "Journal mismatch"
+            );
+            println!(
+                "Solver guest execution succeeded (not a proof); {} cycles",
+                session.cycles()
+            );
+        }
+        "solver-prove" => {
+            let output = args.get(3).context("Missing output receipt path")?;
+            ensure!(!Path::new(output).exists(), "Output already exists");
+            let input = read_solver(&args[2])?;
+            let expected = authorize_solver(&input)?;
+            let started = Instant::now();
+            eprintln!(
+                "Generating real solver proof; image: {:?}",
+                WARRANT_SOLVER_GUEST_ID
+            );
+            let info = default_prover().prove_with_opts(
+                solver_env(&input)?,
+                WARRANT_SOLVER_GUEST_ELF,
+                &ProverOpts::succinct(),
+            )?;
+            ensure!(
+                matches!(info.receipt.inner, InnerReceipt::Succinct(_)),
+                "Expected a real succinct receipt"
+            );
+            info.receipt.verify(WARRANT_SOLVER_GUEST_ID)?;
+            ensure!(
+                info.receipt.journal.bytes == expected.journal(),
+                "Journal mismatch"
+            );
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?
+                .write_all(&bincode::serialize(&info.receipt)?)?;
+            println!(
+                "Real solver receipt verified; {} cycles; {} segments; {:.2}s; computed cost {}",
+                info.stats.total_cycles,
+                info.stats.segments,
+                started.elapsed().as_secs_f64(),
+                expected.total_cost
+            );
+        }
         "image-id" => println!(
             "0x{}",
             hex::encode(Digest::from(WARRANT_GUEST_ID).as_bytes())
