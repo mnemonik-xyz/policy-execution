@@ -1,6 +1,8 @@
 /target/
 /artifacts/
 /methods/guest/target/
+/methods/invoice-guest/target/
+/methods/solver-guest/target/
 /contracts/node_modules/
 /contracts/out/
 /contracts/cache/

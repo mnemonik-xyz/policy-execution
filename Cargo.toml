@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "methods", "host", "verified"]
+members = ["core", "methods", "host", "verified", "solver-cli"]
 default-members = ["core"]
 resolver = "2"
 
@@ -12,4 +12,10 @@ risc0-zkvm = { version = "=3.0.5", default-features = false }
 
 [profile.release]
 debug = 1
-lto = "thin"
+# The prover runs separately; disable native ThinLTO to avoid linker symbol loss.
+lto = false
+
+# Avoid cross-codegen-unit symbol loss in the Verus procedural macro build.
+# This affects native build tools, not the separately configured zkVM guests.
+[profile.release.package.verus_builtin_macros]
+codegen-units = 1

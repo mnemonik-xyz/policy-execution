@@ -8,6 +8,7 @@ pub use warrant_verified_policy::Rule;
 use warrant_verified_policy::{evaluate, Facts};
 
 pub mod evidence;
+pub mod solver;
 mod xml;
 
 pub type Hash = [u8; 32];

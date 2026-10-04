@@ -1,0 +1,11 @@
+{
+  "machines": [
+    {"capacity": 2, "price_per_unit_tick": 3},
+    {"capacity": 2, "price_per_unit_tick": 1}
+  ],
+  "jobs": [
+    {"units": 1, "durations": [2, 4], "release": 0, "deadline": 20, "dependencies": []},
+    {"units": 1, "durations": [2, 4], "release": 0, "deadline": 20, "dependencies": []},
+    {"units": 2, "durations": [2, 3], "release": 0, "deadline": 20, "dependencies": [0, 1]}
+  ]
+}
