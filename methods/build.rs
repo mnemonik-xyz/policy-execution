@@ -1,4 +1,4 @@
-//! Builds both guests. With `RISC0_USE_DOCKER=1` the guests are compiled inside
+//! Builds all three guests. With `RISC0_USE_DOCKER=1` the guests are compiled inside
 //! RISC Zero's pinned Docker image, which makes the ELF, and so the image ID,
 //! reproducible on any x86 machine; that is the ID to deploy with. Without it the
 //! build is local and its image ID is specific to this toolchain and machine.
@@ -25,7 +25,7 @@ fn main() {
         GuestOptionsBuilder::default().build().expect("guest options")
     };
     let mut per_guest = HashMap::new();
-    for guest in ["warrant-guest", "warrant-invoice-guest"] {
+    for guest in ["warrant-guest", "warrant-invoice-guest", "warrant-solver-guest"] {
         per_guest.insert(guest, options.clone());
     }
     risc0_build::embed_methods_with_options(per_guest);

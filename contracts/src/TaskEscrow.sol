@@ -121,9 +121,16 @@ contract TaskEscrow is ReentrancyGuard {
     }
 
     /// @notice Anyone can relay, but only the accepted recipient receives the fixed, reserved amount.
-    function settle(bytes calldata seal, bytes calldata journal) external nonReentrant {
+    function settle(bytes calldata seal, bytes calldata journal) external virtual nonReentrant {
         if (journal.length != 384) revert InvalidAuthorization();
         PolicyExecutionVault.Authorization memory a = abi.decode(journal, (PolicyExecutionVault.Authorization));
+        _settle(seal, journal, a);
+    }
+
+    /// @dev Derived escrows must validate their full journal schema and enforce nonReentrant at entry.
+    function _settle(bytes calldata seal, bytes calldata journal, PolicyExecutionVault.Authorization memory a)
+        internal
+    {
         Task storage t = tasks[a.taskId];
         if (t.state != State.Accepted || block.timestamp > t.settleBy) revert InvalidState();
         if (

@@ -3141,6 +3141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrant-solver"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "warrant-policy",
+]
+
+[[package]]
 name = "warrant-verified-policy"
 version = "0.1.0"
 dependencies = [

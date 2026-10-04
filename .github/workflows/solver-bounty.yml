@@ -1,0 +1,59 @@
+name: Solver bounty
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  solver-deal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RISC0_BUILD_LOCKED: "1"
+      RAYON_NUM_THREADS: "4"
+      WARRANT_SEGMENT_PO2: "18"
+      RUSTUP_TOOLCHAIN: "1.98.1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and prover
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          curl -fsSL https://risczero.com/install -o /tmp/rzup-install.sh
+          bash /tmp/rzup-install.sh
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust 1.88.0
+          "$HOME/.risc0/bin/rzup" install r0vm 3.0.5
+      - name: Install Foundry and contract dependencies
+        run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
+          curl -fsSL https://foundry.paradigm.xyz -o /tmp/foundry-install.sh
+          bash /tmp/foundry-install.sh
+          "$HOME/.foundry/bin/foundryup" --install v1.8.4
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          npm ci --prefix contracts --ignore-scripts
+          docker info
+      - name: Native and contract regression tests
+        run: |
+          cargo test --locked -p warrant-policy -p warrant-solver
+          forge test --root contracts
+      - name: Guest execution agrees with native checks
+        run: cargo test --release --locked -p warrant-host --test solver_execution
+      - name: Real proof, delivery, and payment
+        run: python3 scripts/solver-demo.py
+      - name: Real receipt rejects image and journal mutations
+        run: |
+          # Cargo runs integration tests from the package directory, not the workspace root.
+          receipt_dir="$(python3 -c 'from pathlib import Path; print(max(Path("artifacts").glob("solver-*/solver.receipt"), key=lambda p: p.stat().st_mtime).parent.resolve())')"
+          test -s "$receipt_dir/solver.receipt"
+          test -s "$receipt_dir/input.json"
+          WARRANT_SOLVER_RECEIPT_DIR="$receipt_dir" cargo test --release --locked -p warrant-host --test solver_receipt -- --ignored
+      - name: Preserve proof and settlement evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solver-bounty-evidence
+          path: artifacts/solver-*/
+          if-no-files-found: ignore
