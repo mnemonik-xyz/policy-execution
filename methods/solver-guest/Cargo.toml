@@ -21,4 +21,3 @@ crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", rev
 [profile.release]
 codegen-units = 1
 lto = "thin"
-

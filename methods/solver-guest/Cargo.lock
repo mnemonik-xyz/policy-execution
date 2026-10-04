@@ -1669,14 +1669,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "warrant-solver-guest"
-version = "0.1.0"
-dependencies = [
- "risc0-zkvm",
- "warrant-policy",
-]
-
-[[package]]
 name = "warrant-policy"
 version = "0.1.0"
 dependencies = [
@@ -1685,6 +1677,14 @@ dependencies = [
  "serde",
  "sha2",
  "warrant-verified-policy",
+]
+
+[[package]]
+name = "warrant-solver-guest"
+version = "0.1.0"
+dependencies = [
+ "risc0-zkvm",
+ "warrant-policy",
 ]
 
 [[package]]
@@ -1764,4 +1764,3 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
