@@ -16,10 +16,14 @@ The implementation PR targets `invoice-authentication` to keep invoice changes s
 | Mock settlement demonstration | Buyer cancellation rejected; seller paid; result published; substitution and replay rejected |
 | Solver guest build | Compiled with the pinned RISC Zero Rust 1.88.0 toolchain |
 | Solver guest execution | 59,446 cycles; journal matched native authorization |
+| Guest regression tests | 2 passed, including invalid schedule and instance rejection |
+| Real receipt mutation test | Passed; all 13 journal words and wrong image rejected |
 
-The native compiler is Rust 1.98.1. Rust 1.99.0 linked the native checker but
-failed to link the proof host with thin LTO in this environment.
-The workspace now pins the documented 1.98.1 version.
+The native compiler is Rust 1.98.1. Native builds produced undefined-symbol errors
+with Rust 1.98.1 and 1.99.0 in this environment.
+The tested fix disables native ThinLTO and uses one codegen unit for the Verus
+procedural macro. The workspace pins the documented 1.98.1 version.
+Each guest retains its separate release profile.
 Contracts used Foundry 1.8.4 and Solidity 0.8.28.
 
 The example instance contains three synthetic jobs. Its computed cost is 14.
@@ -33,7 +37,7 @@ The run used one segment and 131,072 padded prover cycles.
 It took 135.29 seconds with four Rayon workers. The receipt contains 224,058 bytes.
 This is one sample, not a benchmark distribution.
 The separate `verify` command also accepted the receipt.
-The guest regression and receipt mutation tests are still in progress.
+The guest regression tests and real receipt mutation test also passed.
 
 The workspace has no Docker daemon. Local Groth16 wrapping and real solver
 settlement have not been demonstrated here.

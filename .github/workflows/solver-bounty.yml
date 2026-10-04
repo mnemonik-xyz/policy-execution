@@ -43,6 +43,10 @@ jobs:
         run: cargo test --release --locked -p warrant-host --test solver_execution
       - name: Real proof, delivery, and payment
         run: python3 scripts/solver-demo.py
+      - name: Real receipt rejects image and journal mutations
+        run: |
+          receipt_dir="$(python3 -c 'from pathlib import Path; print(max(Path("artifacts").glob("solver-*/solver.receipt"), key=lambda p: p.stat().st_mtime).parent)')"
+          WARRANT_SOLVER_RECEIPT_DIR="$receipt_dir" cargo test --release --locked -p warrant-host --test solver_receipt -- --ignored
       - name: Preserve proof and settlement evidence
         if: always()
         uses: actions/upload-artifact@v4
