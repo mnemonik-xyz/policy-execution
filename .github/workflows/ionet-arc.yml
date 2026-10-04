@@ -1,0 +1,27 @@
+name: io.net Arc pilot
+
+on:
+  pull_request:
+    paths:
+      - 'showcases/ionet_arc/**'
+      - 'scripts/ionet-showcase.py'
+      - '.github/workflows/ionet-arc.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r showcases/ionet_arc/requirements.txt
+      - name: Exercise budgets, recovery, payment validation, and HTTP worker
+        run: python -m unittest showcases.ionet_arc.test_pilot -v
+      - name: Check CLI imports
+        run: python scripts/ionet-showcase.py --help

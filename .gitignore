@@ -8,3 +8,7 @@
 /contracts/cache/
 
 /contracts/broadcast/
+
+__pycache__/
+.venv/
+.env
