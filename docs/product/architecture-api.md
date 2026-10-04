@@ -2,6 +2,8 @@
 
 Proposed implementation contract. These HTTP endpoints do not exist in the current pilot.
 
+The backend supports every entry and authenticator in the [policy catalog](policy-catalog.md). The original solver-specific endpoints below remain one family adapter; they must not be reused with incompatible journals or assumed to cover invoice orders and revocable vaults.
+
 ## Components and responsibilities
 
 | Component | Owns | Must not claim |
@@ -13,6 +15,8 @@ Proposed implementation contract. These HTTP endpoints do not exist in the curre
 | io.net runner | Quote, provision, workload, collect, terminate | A provider estimate is a hard billing cap |
 | Funding service | Transfer intents, wallet policy, CCTP progress, provider payment | An atomic cross-chain purchase |
 | Artifact store | Immutable input/output/evidence objects, digests, retention | That a hash proves off-chain facts |
+| Catalog / deployment resolver | Template digest, family schemas, supported rules, compatible ABI and image/verifier manifest | That changing an ID authorizes a different contract or trust mode |
+| Settlement adapters | Task, solver, invoice proof/signature/approval, policy vault and Circom routes | A single journal or state machine works for all families |
 
 Use PostgreSQL as the authoritative application store, an outbox and durable queue for work, and private object storage for artifacts. At-least-once delivery is assumed. Claim operations with database leases and uniqueness constraints; reconcile expired leases before repeating an external write. The contract remains authoritative for escrow.
 
@@ -29,6 +33,10 @@ Use PostgreSQL as the authoritative application store, an outbox and durable que
 | Operation | Kind, immutable intent hash, idempotency key, status, attempts, external IDs, timestamps, last observed error, reconciliation record |
 | Artifact | SHA-256, byte length, type, provenance, visibility, retention expiry, storage reference |
 | Event | Workspace, deal, monotonically ordered cursor, type, timestamp, source, operation ID, payload version |
+| Policy configuration | Family, template digest/version, canonical bytes/hash, rule tree or circuit fields, approved authorities, compatible adapter |
+| Purchase order / invoice | Order terms and confirmed spend; each child invoice's exact bytes/hash, obligation ID, evidence, decision and actual authenticator |
+| Vault / payment request | Owner, confirmed policy/version, token balance, lifetime budget/spend, pause/revocation and per-request evidence/consumption |
+| Deployment manifest | Chain, contract/token, ABI, guest image or verifier-key hash, source/build provenance and readiness evidence |
 
 Amounts, cost values, block numbers and all unsigned 64-bit values use decimal strings in the HTTP API. Never parse them as JavaScript Number. Addresses/hashes have schema-validated lengths. UI display decimals do not change atomic amounts. Exact canonical commitment bytes are produced by the pinned Rust implementation and preserved; arbitrary JSON reserialization in the browser is not a hashing specification.
 
@@ -37,6 +45,8 @@ Example money object: `{"asset":"USDC","chainId":"5042","token":"0x3600000000000
 ## State ownership
 
 `escrowState = missing | offered | accepted | paid | refunded` mirrors the contract. Draft is an application state before an offer. Funding/acceptance/settlement/refund transactions have their own `operationState = prepared | awaiting_signature | submitted | confirming | succeeded | failed | outcome_unknown`.
+
+That escrow enum applies to task/solver adapters only. Invoice `orderState = missing | offered | accepted | closed` coexists with per-invoice payment state, `decision = allow | ask | deny | invalid` and `authenticator = proof | signature | buyer_approval`. An order can remain accepted after its entire ceiling is spent; do not invent a contract state. Vault state includes policy/version, paused flag, budget/spend and cancellation/facts-revocation mappings; no escrow acceptance/refund. Swap state is separate in [defi-swaps.md](defi-swaps.md).
 
 `proofState = not_started | computing | proving | ready | rejected | published` and `executionState = not_authorized | queued | provisioning | running | collecting | completed | failed | interrupted` are independent. Cleanup is `not_needed | active | requested | outcome_unknown | confirmed`. Bridge/payment states are specified in [execution and funding](execution-funding.md).
 
@@ -70,6 +80,25 @@ Return an operation object for async work: `id`, `kind`, `state`, `intentHash`, 
 
 Event envelope: `{id,cursor,type,version,workspaceId,dealId,operationId,occurredAt,observedAt,source,data}`. Chain events also carry chain ID, block number/hash, transaction hash, log index and confirmation status. Uniqueness uses chain/transaction/log identity; reconnecting clients reduce by event ID and reconcile from a snapshot cursor. Event payloads are redacted and versioned.
 
+## Additional catalog and settlement endpoints
+
+These proposed routes share the authentication, idempotency, canonicalization and operation-journal requirements above. Use family-specific request schemas and capability checks, not arbitrary calldata supplied by clients.
+
+| Route under `/v1` | Behavior |
+| --- | --- |
+| `GET /policy-catalog`, `GET /deployments` | Versioned presets, supported rules/modes and verified environment-specific deployments |
+| `POST /policies/preview` | Instantiate or import typed policy, validate by family, produce concrete commitment and review summary; no authorization |
+| `POST /orders`, `POST /orders/{id}/offer-intents`, `POST /orders/{id}/accept-intents` | Invoice order draft and fully decoded funding/acceptance intents |
+| `POST /orders/{id}/invoices`, `POST /invoices/{id}/evaluations` | Store exact document/evidence; re-derive facts and read authoritative order spend |
+| `POST /invoices/{id}/settlement-intents` | Explicit mode `proof`, `signature` or `buyer_approval`; verify compatibility and current limits; buyer mode requires buyer authority and separate review |
+| `POST /orders/{id}/revoke-signer-intents`, `POST /orders/{id}/close-intents` | Buyer signer revocation or contract-eligible close; verify confirmed effects |
+| `POST /vaults/{id}/{control}-intents`, where control is `policy`, `budget`, `pause`, `withdrawal` | Owner-only controls; bind exact next policy version and explain pending-payment impact; pause body explicitly selects pause/unpause |
+| `POST /vaults/{id}/payment-requests`, `POST /payment-requests/{id}/settlement-intents` | Native-family evidence verification and correct proof arguments; no generic hash-only transfer |
+| `POST /payment-requests/{id}/revocation-intents` | Adapter-specific task cancellation or facts revocation, with exact authority and permanent-ID semantics |
+| `POST /vaults/{id}/facts-approval-intents` | Circom-only owner review/registration of exact facts commitment before proving/payment |
+
+All mutations include immutable policy/deployment identity and environment. Proof requests dispatch to pinned task, solver, invoice or Circom tooling. A confirmed old agreement remains on its pinned adapter after a catalog upgrade. Invoice authority, vendor registry, PO signer, reviewer and settlement signer have distinct roles; the site must integrate issuance or authenticated import without treating agent-uploaded unsigned facts as authority.
+
 ## Autonomous agent boundary
 
 Wrap the existing `warrant.solver.v1` subprocess protocol behind the seller adapter. It currently exchanges RFQ, quote and work messages; it is not a published general agent interoperability standard. A hosted adapter authenticates each message, binds it to a deal revision and rejects replay or payload changes. The initial deterministic solver can demonstrate agent automation without claiming an LLM optimizer.
@@ -84,5 +113,7 @@ An agent authorization specifies chain, escrow, token, recipient constraints, ma
 - BE-4: Out-of-order/duplicate events, RPC failure and chain reorganization produce correct reconciliation and visible uncertainty.
 - BE-5: Signing intents are revalidated just before broadcast against current chain state, committed bytes, deadlines, balances and environment.
 - BE-6: Submitted receipt bytes, image ID and public journal are verified before relay; a successful local checker alone is never accepted as a proof.
+- BE-7: CAT-1–7 coverage is part of service acceptance; APIs reject incompatible family/mode combinations. Invoice approvals cannot bypass buyer authentication or be requested as an automatic mode fallback.
+- BE-8: Proof jobs are isolated by commitment/guest/verifier identity; no 384/416/480-byte or Circom public-signal confusion. Old deployment support remains available for existing obligations.
 
 Provide a generated OpenAPI document and schema-derived client as an implementation deliverable. This document defines behavior; it is not a claim that an OpenAPI validator or service is already shipped.

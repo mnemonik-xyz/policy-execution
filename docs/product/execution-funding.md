@@ -2,6 +2,8 @@
 
 Proposed product integration based on [pilot PR #5](https://github.com/mnemonik-xyz/policy-execution/pull/5). The pilot implements bounded deployment and a payment plan, not automatic bridging or payment.
 
+This is the optional compute adapter of the multi-policy site. Invoice, contractor, vault and Circom settlement do not require an io.net account or transcription workload. CCTP funding is distinct from the newly proposed [DeFi swap flow](defi-swaps.md); neither a provider payment nor a bridge receipt establishes swap execution.
+
 ## Resource mapping and billing
 
 Commit a mapping from each solver machine to a provider hardware/location configuration, worker image digest and unit/tick definition. Record duration estimates and how they were obtained. The runner must reject schedules outside its supported template rather than silently reinterpret them.

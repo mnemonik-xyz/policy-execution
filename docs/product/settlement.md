@@ -2,6 +2,8 @@
 
 Baseline: merged commit `b85532c003c43597adda3249d7b11a69f13b6c2d`. Source links: [TaskEscrow](../../contracts/src/TaskEscrow.sol), [SolverBountyEscrow](../../contracts/src/SolverBountyEscrow.sol), [solver checker](../../core/src/solver.rs), [solver demo](../../solver-bounty/README.md).
 
+This document details the solver agreement. The [complete catalog](policy-catalog.md) defines all other supported policy families, funding arrangements, authenticators and their exact entry points. They are required site scope, not deferred compute extensions. Only the new [swap executor](defi-swaps.md) is a proposed execution family.
+
 ## What is proven
 
 A pinned solver guest checks that a submitted schedule satisfies the committed instance: job compatibility, capacity, releases, deadlines, dependency order, canonical assignments and checked arithmetic. It computes modeled cost and checks the committed bound and policy. Settlement verifies the real receipt against the deployment's immutable image ID, binds the authorization to the escrow and pays the recorded recipient.
@@ -61,5 +63,6 @@ Before offering real deals, verify the RPC chain, token behavior/decimals, deplo
 - CHAIN-3: Refund behavior passes tests before, at and after both deadlines and across acceptance/cancellation races.
 - CHAIN-4: Six-decimal token and 18-decimal gas handling preserve exact balances; wallet funding leaves an explicit gas reserve.
 - CHAIN-5: Independent review covers the solver checker, projection, escrow, proving build and signing boundary. Mainnet rollout requires recorded resolution of findings.
+- CHAIN-6: Each enabled task, invoice and revocable-vault deployment has its own verified manifest and settlement evidence; the Circom deployment uses its own reviewed key/setup. CAT coverage prevents presenting a solver-only deployment as complete site support.
 
 Sources: [Arc network configuration](https://docs.arc.io/arc/references/connect-to-arc), [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses), [Arc EVM differences](https://docs.arc.io/integrate/evm-differences).
