@@ -28,6 +28,7 @@ jobs:
           "$HOME/.risc0/bin/rzup" install r0vm 3.0.5
       - name: Install Foundry and contract dependencies
         run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
           curl -fsSL https://foundry.paradigm.xyz -o /tmp/foundry-install.sh
           bash /tmp/foundry-install.sh
           "$HOME/.foundry/bin/foundryup" --install v1.8.4
