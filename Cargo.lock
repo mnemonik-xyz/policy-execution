@@ -3150,6 +3150,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrant-swap-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "warrant-swap-verified",
+]
+
+[[package]]
+name = "warrant-swap-verified"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vstd",
+]
+
+[[package]]
 name = "warrant-verified-policy"
 version = "0.1.0"
 dependencies = [
