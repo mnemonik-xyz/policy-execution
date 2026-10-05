@@ -5,8 +5,21 @@ edition = "2021"
 rust-version = "1.88"
 description = "Warrant swaps: facts, obligatory safety checks, chain profiles, transaction decoders and warrant payloads"
 
+# No network, clock, keys, RISC Zero or Mnemonik: time and chain state enter as inputs.
 [dependencies]
 warrant-swap-verified = { path = "../swap-verified" }
 serde.workspace = true
 serde_json = "1.0"
 sha2.workspace = true
+sha3 = { version = "0.10", default-features = false }
+blake3 = { version = "1.5", default-features = false }
+k256 = { workspace = true, features = ["arithmetic"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1.7", default-features = false }
+curve25519-dalek = { version = "4.1", default-features = false }
+
+[dev-dependencies]
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+solana-pubkey = { version = "2", features = ["curve25519"] }
