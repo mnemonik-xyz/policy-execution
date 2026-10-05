@@ -48,7 +48,9 @@ A bridge quote must cover fees while leaving enough net USDC for the full paymen
 
 ## Wallet and permission boundary
 
-Buyer funding and acceptance use explicit wallet signatures or a previously granted, bounded agent policy. Operational signers live in a secret-backed service with per-deal, per-day, token, chain and recipient limits. Separate provider credentials from worker tokens and chain keys. A provider payment request is untrusted input until schema, endpoint, route, asset, amount and current intent match.
+Buyer funding and seller acceptance each require the respective party's explicit wallet signature or previously granted, bounded agent policy. Funding executes as the buyer; `TaskEscrow.accept` must execute as the recorded seller/recipient, matching the seller-only acceptance intent in the API specification. A buyer's authorization cannot substitute for the seller's acceptance authority.
+
+Operational signers live in a secret-backed service with per-deal, per-day, token, chain and recipient limits. Separate provider credentials from worker tokens and chain keys. A provider payment request is untrusted input until schema, endpoint, route, asset, amount and current intent match.
 
 The initial pilot can use operator-provided credits with a recorded cap. This proves the compute path but does not satisfy the automated-funding release criterion. Do not expose a top-up control until the end-to-end signer, fee accounting and recovery service exists.
 
