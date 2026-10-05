@@ -71,5 +71,5 @@ cargo build -p warrant-swap-core --target wasm32-unknown-unknown
   requires a failing test. S1 is also enforced by the type (`HashAlg` has only
   `Sha256`).
 
-Results on 2026-10-05: 55 unit tests and 21 pipeline tests passed; 18 of 18
+Results on 2026-10-05: 55 unit tests and 22 pipeline tests passed; 18 of 18
 disabled checks caught; the wasm32 build succeeds.

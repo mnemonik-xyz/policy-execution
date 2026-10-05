@@ -747,3 +747,25 @@ fn responder_claim_is_an_exit() {
     let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], 0, 0xffff_ffff);
     assert_halt(&w.run(Action::Claim, terms(), Some(theft), Some(SECRET)), code::S24);
 }
+
+#[test]
+fn one_fixture_per_risk_flag() {
+    // The policy allows only `freezable_by_issuer`; two flags always deny.
+    for flag in RiskFlag::ALL {
+        let mut w = World::new(Role::Initiator);
+        let facts = AssetFacts { decimals: 6, risk_flags: vec![flag], transfer_fee: None };
+        w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, facts));
+        let out = w.run(Action::Accept, terms(), None, None);
+        if flag.always_denied() {
+            assert_denied(&out, code::S8_FLAG);
+        } else if flag == RiskFlag::FreezableByIssuer {
+            assert_allow(&out);
+        } else {
+            assert_denied(&out, "POLICY_DENY");
+        }
+    }
+    // Unknown asset facts: the risk is unknown, so the policy asks.
+    let mut w = World::new(Role::Initiator);
+    w.obs.assets.remove(&AssetId::parse(USDC).unwrap());
+    assert_eq!(w.run(Action::Accept, terms(), None, None).record_decision(), Some(RecordDecision::Ask));
+}

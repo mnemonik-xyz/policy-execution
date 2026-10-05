@@ -56,7 +56,7 @@ They do not touch the invoice `Rule`, so the invoice guest image id is unchanged
   rejected).
 - [`swap-core`](swap-core/README.md): facts with provenance, the obligatory
   checks S1 to S25, Bitcoin, EVM and Solana primitives, the policy DSL and
-  warrant payloads (76 tests; every check caught when disabled).
+  warrant payloads (77 tests; every check caught when disabled).
 
 ## Invoice authentication and compatibility (2026-09-30)
 
