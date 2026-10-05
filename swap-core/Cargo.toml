@@ -13,7 +13,7 @@ serde_json = "1.0"
 sha2.workspace = true
 sha3 = { version = "0.10", default-features = false }
 blake3 = { version = "1.5", default-features = false }
-k256 = { workspace = true, features = ["arithmetic"] }
+k256 = { version = "0.13.4", default-features = false, features = ["arithmetic"] }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false }
 zeroize = { version = "1.7", default-features = false }

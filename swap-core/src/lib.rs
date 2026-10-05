@@ -53,7 +53,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// Accepts lowercase or uppercase hexadecimal, with an optional `0x` prefix.
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
     let text = text.strip_prefix("0x").unwrap_or(text);
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digit = |c: u8| match c {

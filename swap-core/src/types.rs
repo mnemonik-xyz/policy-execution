@@ -104,7 +104,7 @@ impl Terms {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegName {
     A,
@@ -257,6 +257,14 @@ mod tests {
         assert_eq!(Action::Lock.leg(Role::Responder), Some(LegName::B));
         assert!(!Action::Reveal.allowed_for(Role::Responder));
         assert!(!Action::Claim.allowed_for(Role::Initiator));
+    }
+
+    #[test]
+    fn other_hash_functions_do_not_parse() {
+        assert!(serde_json::from_str::<HashAlg>("\"sha256\"").is_ok());
+        for other in ["keccak256", "sha3_256", "ripemd160", "SHA256"] {
+            assert!(serde_json::from_str::<HashAlg>(&format!("\"{other}\"")).is_err(), "{other}");
+        }
     }
 
     #[test]

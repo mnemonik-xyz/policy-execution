@@ -363,8 +363,10 @@ pub struct Psbt {
     pub inputs: Vec<PsbtInput>,
 }
 
+type KeyValue<'a> = (&'a [u8], &'a [u8]);
+
 /// Iterate one key-value map; returns (key, value) pairs.
-fn parse_map<'a>(r: &mut Reader<'a>) -> Result<Vec<(&'a [u8], &'a [u8])>, BtcError> {
+fn parse_map<'a>(r: &mut Reader<'a>) -> Result<Vec<KeyValue<'a>>, BtcError> {
     let mut pairs = Vec::new();
     loop {
         let key = r.var_bytes()?;
@@ -389,10 +391,8 @@ pub fn parse_psbt(bytes: &[u8]) -> Result<Psbt, BtcError> {
     for (key, value) in parse_map(&mut r)? {
         match key[0] {
             0x00 if key.len() == 1 => tx = Some(parse_unsigned_tx(value)?),
-            0xfb if key.len() == 1 => {
-                if value != [0, 0, 0, 0] {
-                    return Err(BtcError::Psbt("only PSBT version 0 is supported"));
-                }
+            0xfb if key.len() == 1 && value != [0, 0, 0, 0] => {
+                return Err(BtcError::Psbt("only PSBT version 0 is supported"));
             }
             _ => {}
         }

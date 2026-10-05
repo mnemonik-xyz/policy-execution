@@ -51,6 +51,12 @@ impl LedgerState {
 
     /// Spend in the window `(now − period, now]`; `None` when untrustworthy.
     pub fn period_spent(&self, period: u64, now: u64) -> Option<u64> {
+        self.period_spent_excluding(period, now, None)
+    }
+
+    /// As `period_spent`, without the spend of `swap_id`: the evaluator adds the
+    /// notional of the swap it decides, so an accepted swap is not counted twice.
+    pub fn period_spent_excluding(&self, period: u64, now: u64, swap_id: Option<&Hash32>) -> Option<u64> {
         if !self.trustworthy() {
             return None;
         }
@@ -58,7 +64,7 @@ impl LedgerState {
         self.ledger
             .spends
             .iter()
-            .filter(|s| s.time > start && s.time <= now)
+            .filter(|s| s.time > start && s.time <= now && Some(&s.swap_id) != swap_id)
             .try_fold(0u64, |acc, s| acc.checked_add(s.notional))
     }
 
