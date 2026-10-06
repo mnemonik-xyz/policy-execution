@@ -227,7 +227,7 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockF
     let facts = c
         .resolve(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
         .ok_or_else(|| Violation { code: code::S14, detail: format!("lock of leg {leg_name:?} not observed with agreeing evidence") })?;
-    let expected = leg.lock.timelock.absolute(None, None);
+    let expected = leg.refund_valid_from();
     checks::observed_lock(leg, &facts, expected)?;
     let contract = match &facts.script_pubkey {
         Some(spk) => Some(ContractObservation::Bitcoin { script_pubkey: spk.clone() }),
@@ -293,8 +293,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     let deviation = give_e8.zip(take_e8).and_then(|(g, t)| facts::deviation_bps(g, t));
 
     // Timelocks as agreed (absolute) or as observed.
-    let ta_terms = terms.leg_a.lock.timelock.absolute(None, None);
-    let tb_terms = terms.leg_b.lock.timelock.absolute(None, None);
+    let ta_terms = terms.leg_a.refund_valid_from();
+    let tb_terms = terms.leg_b.refund_valid_from();
     let mut ta = ta_terms;
     let mut counterparty_lock = None;
     let mut binding = None;

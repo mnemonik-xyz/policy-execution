@@ -76,6 +76,27 @@ pub struct Leg {
     pub lock: Lock,
 }
 
+impl Leg {
+    /// The first height or chain time at which the refund is valid: the input of
+    /// the verified clock arithmetic. Bitcoin `OP_CHECKLOCKTIMEVERIFY` with operand
+    /// `h` needs `nLockTime ≥ h`, and a transaction with `nLockTime = h` is final
+    /// only in a block above `h` (for times: once the median time past exceeds
+    /// `t`). The reference EVM and Solana HTLCs refund once the block time is at
+    /// least `t`. `None` for a relative timelock before the lock confirms.
+    pub fn refund_valid_from(&self) -> Option<Timelock> {
+        let t = self.lock.timelock.absolute(None, None)?;
+        if self.chain.family() == Some(crate::caip::Family::Bitcoin) {
+            if let TimelockSpec::Height(_) | TimelockSpec::Time(_) = self.lock.timelock {
+                return Some(match t {
+                    Timelock::Height(h) => Timelock::Height(h.checked_add(1)?),
+                    Timelock::Time(t) => Timelock::Time(t.checked_add(1)?),
+                });
+            }
+        }
+        Some(t)
+    }
+}
+
 /// The agreed terms that both parties sign in the ACCEPT message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

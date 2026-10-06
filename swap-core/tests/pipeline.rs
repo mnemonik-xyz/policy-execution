@@ -162,7 +162,8 @@ fn lock_a_facts(confirmations: u64) -> LockFacts {
         hash_alg: HashAlg::Sha256,
         hashlock: t.leg_a.lock.hashlock,
         preimage_len_enforced: true,
-        timelock: Timelock::Height(T_A),
+        // First block in which the CLTV refund is valid.
+        timelock: Timelock::Height(T_A + 1),
         receiver: t.leg_a.receiver.clone(),
         refund_to: t.leg_a.refund_to.clone(),
         asset: t.leg_a.asset.clone(),

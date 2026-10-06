@@ -81,6 +81,8 @@ pub struct LockFacts {
     pub hashlock: Hash32,
     /// The lock contract or script enforces `len(s) = 32`.
     pub preimage_len_enforced: bool,
+    /// The first height or chain time at which the refund is valid, as in
+    /// `Leg::refund_valid_from` (on Bitcoin: the CLTV operand plus one).
     pub timelock: Timelock,
     pub receiver: AccountId,
     pub refund_to: AccountId,
@@ -334,4 +336,48 @@ pub fn s23(policy: &CompiledPolicy, build: &Hash32) -> Check {
 /// Which leg an observation key names.
 pub fn leg_of(role: Role, own: bool) -> LegName {
     if own { role.own_leg() } else { role.counterparty_leg() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::reference;
+    use crate::types::Leg;
+
+    /// Review finding (PR #7): a Bitcoin CLTV refund with operand `h` becomes valid
+    /// only in block `h + 1`. S11 must use that block, or it underestimates the
+    /// latest refund of a Bitcoin leg B by one worst-case block interval.
+    #[test]
+    fn s11_counts_the_extra_cltv_block_on_a_bitcoin_leg_b() {
+        let btc = reference::bitcoin(reference::BITCOIN_MAINNET);
+        let eth = reference::ethereum();
+        let mut leg_b: Leg = serde_json::from_value(serde_json::json!({
+            "chain": reference::BITCOIN_MAINNET,
+            "asset": "bip122:000000000019d6689c085ae165831e93/slip44:0",
+            "amount": "1",
+            "sender": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "receiver": "bip122:000000000019d6689c085ae165831e93:bc1pb",
+            "refund_to": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "lock": { "contract": crate::bitcoin::TEMPLATE_ID, "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "height", "value": 900_010}, "swap_id": crate::to_hex(&[2; 32]) }
+        }))
+        .unwrap();
+        let now = 1_800_000_000;
+        let now_b = ChainNow { tip_height: 900_000, now_real: now };
+        let now_a = ChainNow { tip_height: 0, now_real: now };
+        let margin = 600;
+        let need = btc.d_observe_secs + eth.d_confirm_secs + margin;
+        // T_A exactly enough if the refund of B were valid at block 900,010.
+        let ta = Timelock::Time(now + 10 * btc.clock.max_block_secs + need + eth.clock.max_lead_secs);
+        assert!(s11(ta, now_a, &eth, Timelock::Height(900_010), now_b, &btc, margin).is_ok(), "raw operand passes");
+        let tb = leg_b.refund_valid_from().unwrap();
+        assert_eq!(tb, Timelock::Height(900_011));
+        assert!(s11(ta, now_a, &eth, tb, now_b, &btc, margin).is_err(), "the true first valid block fails");
+        // Times: nLockTime t is final once the median time past exceeds t.
+        leg_b.lock.timelock = crate::types::TimelockSpec::Time(1_900_000_000);
+        assert_eq!(leg_b.refund_valid_from(), Some(Timelock::Time(1_900_000_001)));
+        // CSV counts confirmations: no adjustment once confirmed, unknown before.
+        leg_b.lock.timelock = crate::types::TimelockSpec::RelativeBlocks(144);
+        assert_eq!(leg_b.refund_valid_from(), None);
+    }
 }
