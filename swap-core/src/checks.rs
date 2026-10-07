@@ -69,6 +69,7 @@ pub mod code {
     pub const TIMELOCK: &str = "TIMELOCK_FORM";
     pub const BAND: &str = "VALUE_BAND_EXCEEDED";
     pub const ACCEPT: &str = "ACCEPT_BINDING";
+    pub const PRICE: &str = "PRICE_UNKNOWN";
 }
 
 /// A lock as read from its chain by the profile's observation adapter. On
@@ -168,8 +169,10 @@ pub fn s4(terms: &Terms, ledger: &LedgerState) -> Check {
 }
 
 /// S5 and S6 on the terms: what this party receives goes to its own accounts,
-/// and every account and asset lives on its leg's chain.
-pub fn s5_s6_terms(terms: &Terms, role: Role, own: &[AccountId]) -> Check {
+/// and every account and asset lives on its leg's chain. On Bitcoin the leaf keys
+/// decide who can spend: the claim key of the counterparty leg and the refund key
+/// of the own leg must be own keys.
+pub fn s5_s6_terms(terms: &Terms, role: Role, own: &[AccountId], own_bitcoin_keys: &[Hash32]) -> Check {
     for leg in [&terms.leg_a, &terms.leg_b] {
         let on_chain = [&leg.sender, &leg.receiver, &leg.refund_to].iter().all(|a| a.chain() == leg.chain);
         ensure(on_chain && leg.asset.chain() == leg.chain, code::S8, "account or asset on another chain")?;
@@ -177,7 +180,17 @@ pub fn s5_s6_terms(terms: &Terms, role: Role, own: &[AccountId]) -> Check {
     let own_leg = terms.leg(role.own_leg());
     let their_leg = terms.leg(role.counterparty_leg());
     ensure(own.contains(&own_leg.refund_to), code::S6, "own refund does not pay an own account")?;
-    ensure(own.contains(&their_leg.receiver), code::S5, "counterparty claim does not pay an own account")
+    ensure(own.contains(&their_leg.receiver), code::S5, "counterparty claim does not pay an own account")?;
+    let bitcoin = |leg: &Leg| leg.chain.family() == Some(Family::Bitcoin);
+    if bitcoin(own_leg) {
+        let refund = own_leg.lock.keys.map(|k| k.refund);
+        ensure(refund.is_some_and(|k| own_bitcoin_keys.contains(&k)), code::S6, "own leg refund key is not an own key")?;
+    }
+    if bitcoin(their_leg) {
+        let claim = their_leg.lock.keys.map(|k| k.receiver);
+        ensure(claim.is_some_and(|k| own_bitcoin_keys.contains(&k)), code::S5, "counterparty leg claim key is not an own key")?;
+    }
+    Ok(())
 }
 
 /// S5, S6, S8, S9 and S10 on an observed lock: it is the agreed lock.
@@ -207,7 +220,8 @@ pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservat
             t == crate::bitcoin::TEMPLATE_ID
                 && leg.lock.contract == crate::bitcoin::TEMPLATE_ID
                 && match obs {
-                    // Before a lock exists, the template derivation itself is the identity.
+                    // Before a lock exists (accept, own lock), the template derivation is
+                    // the identity. An observed lock always passes its output script.
                     None => crate::bitcoin::htlc_script_pubkey(&leg.lock).is_ok(),
                     Some(ContractObservation::Bitcoin { script_pubkey }) => {
                         crate::bitcoin::htlc_script_pubkey(&leg.lock).as_ref() == Ok(script_pubkey)

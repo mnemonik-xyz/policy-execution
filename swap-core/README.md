@@ -51,6 +51,21 @@ flowchart LR
   the output script from the terms, which proves `H`, both keys and `T`.
 - The notional is known only when both legs have a value. An unknown notional
   takes the strictest value band for S14.
+- A missing price never goes to the owner as `Ask`. When the evaluator returns
+  `Ask` and the rule reads an unknown notional or price deviation, the trade is
+  denied (`PRICE_UNKNOWN`). An `Allow` that holds for every price stays.
+- On Bitcoin the leaf keys decide who can spend. S5 and S6 require the claim key
+  of the counterparty leg and the refund key of the own leg to be own keys
+  (`OwnAccounts::bitcoin_keys`).
+- A signed Bitcoin transaction never waits. A lock or a claim has an
+  `nLockTime` that is final now (0, or a height at or below the observed tip)
+  and no relative lock on any input (bit 31 of `nSequence` set). An absolute
+  refund has an `nLockTime` from `T` up to the observed tip, of the kind of `T`
+  (a time lock: exactly `T`), and an `nSequence` below `0xFFFFFFFF` with bit 31
+  set. A relative refund has `nSequence` exactly `T` and a final `nLockTime`.
+- An observed Bitcoin lock must carry its output script and outpoint. S7
+  compares that script with the derivation from the terms; nothing else proves
+  `H`, both keys and `T` on chain.
 - `authorize` issues no warrant unless the signer runtime supplies a verified
   ACCEPT (`Observations::accept`) whose `terms_hash` equals the hash of the
   proposed terms. The warrant takes `inner_sig_hash` from that evidence.

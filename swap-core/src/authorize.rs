@@ -14,7 +14,7 @@ use crate::secret::preimage_opens;
 use crate::solana::LookupTables;
 use crate::tx::{self, BindContext, OwnAccounts, ProposedTx};
 use crate::types::{Action, Leg, LegName, Role, Terms};
-use crate::verified::{self, ChainNow, Decision, ListCheck, LockObs, PeriodSpent, SwapFacts3, Timelock};
+use crate::verified::{self, ChainNow, Decision, ListCheck, LockObs, PeriodSpent, SwapFacts3, SwapRule, Timelock};
 use crate::warrant::{DecisionRecord, EvaluatorId, RecordDecision, SwapWarrant, TxBinding, DECISION_PROTOCOL, PROTOCOL};
 use crate::Hash32;
 use serde_json::{json, Value};
@@ -144,7 +144,9 @@ impl<'e> Collected<'e> {
         if let Provenance::Chain { method, .. } = &prov {
             self.weakest = Some(self.weakest.map_or(*method, |w| w.min(*method)));
         }
-        self.records.push(FactRecord::new(name, Value::Bool(true), Some(prov)));
+        if !self.records.iter().any(|r| r.name == name) {
+            self.records.push(FactRecord::new(name, Value::Bool(true), Some(prov)));
+        }
         Some(value)
     }
 
@@ -207,6 +209,15 @@ fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
         let env = c.env;
         ctx.token_program = c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program);
     }
+}
+
+/// The observed tip height of a Bitcoin leg chain, for the `nLockTime` checks.
+fn bitcoin_tip(c: &mut Collected, leg: &Leg) -> Option<u64> {
+    if leg.chain.family() != Some(Family::Bitcoin) {
+        return None;
+    }
+    let env = c.env;
+    c.resolve(&format!("tip:{}", leg.chain), env.obs.tips.get(&leg.chain))
 }
 
 /// The observed lookup tables, for a Solana leg only.
@@ -299,9 +310,15 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockF
         .ok_or_else(|| Violation { code: code::S14, detail: format!("lock of leg {leg_name:?} not observed with agreeing evidence") })?;
     let expected = leg.refund_valid_from();
     checks::observed_lock(leg, &facts, expected)?;
-    let contract = match &facts.script_pubkey {
-        Some(spk) => Some(ContractObservation::Bitcoin { script_pubkey: spk.clone() }),
-        None => c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name)),
+    let contract = if leg.chain.family() == Some(Family::Bitcoin) {
+        // On Bitcoin the observed output script is the only on-chain proof of H, both
+        // leaf keys and T. Without it, or without its outpoint, nothing is proved.
+        let (Some(spk), Some(_)) = (&facts.script_pubkey, &facts.outpoint) else {
+            return Err(checks::violation(code::S7, format!("observed lock of leg {leg_name:?} has no output script or outpoint")));
+        };
+        Some(ContractObservation::Bitcoin { script_pubkey: spk.clone() })
+    } else {
+        c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
     checks::s7(leg, env.policy, contract.as_ref())?;
     Ok(facts)
@@ -333,7 +350,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     if action == Action::Accept {
         checks::s4(terms, env.ledger)?;
     }
-    checks::s5_s6_terms(terms, role, &env.own.accounts)?;
+    checks::s5_s6_terms(terms, role, &env.own.accounts, &env.own.bitcoin_keys)?;
     checks::timelock_form(&terms.leg_a)?;
     checks::timelock_form(&terms.leg_b)?;
 
@@ -418,6 +435,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 transfer_fee: fee,
                 solana_mode: env.runtime.solana_mode.clone(),
                 max_fee: own_profile.fees.worst_lock,
+                tip_height: bitcoin_tip(c, own_leg),
                 lookup_tables: lookup_tables(c, own_leg),
                 token_program: own_asset.as_ref().and_then(|a| a.token_program),
                 ..Default::default()
@@ -443,6 +461,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 htlc_outpoint: facts.outpoint,
                 solana_mode: env.runtime.solana_mode.clone(),
                 max_fee: pb.fees.worst_claim,
+                tip_height: bitcoin_tip(c, &terms.leg_b),
                 ..Default::default()
             };
             solana_facts(c, &terms.leg_b, &mut ctx);
@@ -477,7 +496,23 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     });
     record_facts(c, &f3);
     let decision = verified::decide(&policy.rule, &f3);
+    // A missing price never goes to the owner as Ask: the trade is denied. The
+    // verified decision stays sound; this only turns Ask into Deny.
+    if matches!(decision, Decision::Ask) && reads_unknown_price(&policy.rule, notional, deviation) {
+        return Err(checks::violation(code::PRICE, "no valid price for a value that the policy reads"));
+    }
     Ok((decision, binding))
+}
+
+/// The rule reads a price-derived fact (notional, period notional or price
+/// deviation) that is unknown: a leg has no valid price or no asset facts.
+fn reads_unknown_price(rule: &SwapRule, notional: Option<u64>, deviation: Option<u64>) -> bool {
+    match rule {
+        SwapRule::All(rules) | SwapRule::Any(rules) => rules.iter().any(|r| reads_unknown_price(r, notional, deviation)),
+        SwapRule::NotionalAtMost(_) | SwapRule::PeriodNotionalAtMost(..) => notional.is_none(),
+        SwapRule::PriceDeviationAtMost(_) => deviation.is_none(),
+        _ => false,
+    }
 }
 
 struct FactsIn<'p> {
@@ -587,6 +622,7 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     };
     let max_fee = if action == Action::Refund { fees.worst_refund } else { fees.worst_claim };
     let mut ctx = BindContext { solana_mode: env.runtime.solana_mode.clone(), max_fee, ..Default::default() };
+    ctx.tip_height = bitcoin_tip(c, leg);
     solana_facts(c, leg, &mut ctx);
     match action {
         Action::Claim => {

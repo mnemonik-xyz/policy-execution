@@ -24,6 +24,22 @@ pub const NUMS_X: Hash32 = [
 const LEAF_VERSION: u8 = 0xc0;
 const LOCKTIME_THRESHOLD: u64 = 500_000_000;
 
+/// The input `nSequence` that a builder uses for a lock, a claim and an absolute
+/// refund (spec 8.2): below `0xFFFFFFFF`, so `nLockTime` and CLTV apply (BIP 65);
+/// the disable flag (bit 31) set, so BIP 68 adds no relative lock; replaceable
+/// (BIP 125). The checks accept any value with bit 31 set where it is safe.
+pub const SEQUENCE_NO_RELATIVE_LOCK: u32 = 0xFFFF_FFFD;
+
+/// The BIP 68 disable flag: an input with bit 31 set carries no relative lock.
+const SEQUENCE_DISABLE_FLAG: u32 = 1 << 31;
+
+/// An `nLockTime` that is final in the next block: 0, or a height at or below the
+/// observed tip (wallets set the tip against fee sniping). Without a tip, only 0.
+fn final_now(lock_time: u32, tip: Option<u64>) -> bool {
+    let lt = u64::from(lock_time);
+    lock_time == 0 || (lt < LOCKTIME_THRESHOLD && tip.is_some_and(|t| lt <= t))
+}
+
 const OP_0: u8 = 0x00;
 const OP_DROP: u8 = 0x75;
 const OP_EQUALVERIFY: u8 = 0x88;
@@ -548,11 +564,30 @@ fn check_fee(psbt: &Psbt, max_fee: u64) -> Result<(), BtcError> {
     }
 }
 
+/// A lock or a claim can be mined at once: an `nLockTime` that is final now and no
+/// relative lock on any input. A signed transaction that has to wait can miss its
+/// deadline (spec 8.2).
+fn check_no_delay(tx: &Transaction, tip: Option<u64>) -> Result<(), BtcError> {
+    if !final_now(tx.lock_time, tip) || tx.inputs.iter().any(|i| i.sequence & SEQUENCE_DISABLE_FLAG == 0) {
+        return Err(BtcError::Mismatch("a lock or claim must be final now and carry no relative lock".into()));
+    }
+    Ok(())
+}
+
 /// A lock transaction: own Taproot coins in; exactly one HTLC output with the
 /// derived script and the leg amount; at most one change output to an own script;
-/// a fee of at most `max_fee`; nothing else.
-pub fn check_lock_psbt(psbt: &Psbt, lock: &Lock, amount: u64, own_scripts: &[Vec<u8>], max_fee: u64) -> Result<BtcBinding, BtcError> {
+/// a fee of at most `max_fee`; no delay; nothing else. `tip` is the observed
+/// chain height.
+pub fn check_lock_psbt(
+    psbt: &Psbt,
+    lock: &Lock,
+    amount: u64,
+    own_scripts: &[Vec<u8>],
+    max_fee: u64,
+    tip: Option<u64>,
+) -> Result<BtcBinding, BtcError> {
     let types = check_sighash_types(psbt)?;
+    check_no_delay(&psbt.tx, tip)?;
     let htlc = htlc_script_pubkey(lock)?;
     for input in &psbt.inputs {
         let utxo = input.witness_utxo.as_ref().ok_or(BtcError::Mismatch("input without witness UTXO".into()))?;
@@ -591,8 +626,8 @@ pub enum Leaf {
 }
 
 /// A claim or refund: one input, the HTLC output; every output to an own script;
-/// a fee of at most `max_fee`. A refund must satisfy its own timelock in the
-/// transaction fields.
+/// a fee of at most `max_fee`. A claim has no delay. A refund is valid from `T` and
+/// never later (a late refund of leg B breaks S11). `tip` is the observed height.
 pub fn check_spend_psbt(
     psbt: &Psbt,
     lock: &Lock,
@@ -600,6 +635,7 @@ pub fn check_spend_psbt(
     leaf: Leaf,
     own_scripts: &[Vec<u8>],
     max_fee: u64,
+    tip: Option<u64>,
 ) -> Result<BtcBinding, BtcError> {
     let types = check_sighash_types(psbt)?;
     let htlc = htlc_script_pubkey(lock)?;
@@ -620,20 +656,25 @@ pub fn check_spend_psbt(
     }
     check_fee(psbt, max_fee)?;
     let (claim, refund) = htlc_leaves(lock)?;
-    if leaf == Leaf::Refund {
+    if leaf == Leaf::Claim {
+        check_no_delay(tx, tip)?;
+    } else {
+        let lt = u64::from(tx.lock_time);
+        // CLTV needs a sequence below 0xFFFFFFFF; bit 31 keeps BIP 68 off.
+        let absolute_sequence = input.sequence != u32::MAX && input.sequence & SEQUENCE_DISABLE_FLAG != 0;
         let ok = match lock.timelock {
+            // From T up to the observed tip, never above: a later value delays it.
             TimelockSpec::Height(h) => {
-                (tx.lock_time as u64) >= h && (tx.lock_time as u64) < LOCKTIME_THRESHOLD && input.sequence != u32::MAX
+                lt >= h && lt < LOCKTIME_THRESHOLD && (lt == h || tip.is_some_and(|t| lt <= t)) && absolute_sequence
             }
-            TimelockSpec::Time(t) => (tx.lock_time as u64) >= t && input.sequence != u32::MAX,
-            TimelockSpec::RelativeBlocks(n) => {
-                tx.version >= 2 && input.sequence & (1 << 31) == 0 && input.sequence & (1 << 22) == 0
-                    && (input.sequence & 0xffff) as u64 >= n
-            }
+            // Without the median time past, only T itself is surely final after T.
+            TimelockSpec::Time(t) => lt == t && absolute_sequence,
+            // The input encodes exactly n blocks: bit 31 and the time flag (bit 22) clear.
+            TimelockSpec::RelativeBlocks(n) => tx.version >= 2 && u64::from(input.sequence) == n && final_now(tx.lock_time, tip),
             TimelockSpec::RelativeSeconds(_) => false,
         };
         if !ok {
-            return Err(BtcError::Mismatch("refund does not satisfy its timelock".into()));
+            return Err(BtcError::Mismatch("refund does not meet its timelock exactly".into()));
         }
     }
     let script = if leaf == Leaf::Claim { claim } else { refund };
@@ -770,14 +811,14 @@ mod tests {
         let psbt = rb_psbt(&[(1, 0, own[0].clone()), (2, 1, own[1].clone())], &[(50_000, htlc.clone()), (1_000, own[0].clone())], 0, 0xffff_fffd, None);
         let parsed = parse_psbt(&psbt.serialize()).unwrap();
         assert_eq!(parsed.tx.txid_hex(), psbt.unsigned_tx.compute_txid().to_string());
-        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE).unwrap();
+        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE, None).unwrap();
         for i in 0..2 {
             assert_eq!(binding.sighashes[i], rb_sighash(&psbt, i, None, rb::TapSighashType::Default));
         }
         // SIGHASH_ALL also commits to everything.
         let psbt_all = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, 0xffff_fffd, Some(1));
         let parsed = parse_psbt(&psbt_all.serialize()).unwrap();
-        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE).unwrap();
+        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE, None).unwrap();
         assert_eq!(binding.sighashes[0], rb_sighash(&psbt_all, 0, None, rb::TapSighashType::All));
     }
 
@@ -786,20 +827,20 @@ mod tests {
         let l = lock(TimelockSpec::Height(850_000));
         let htlc = htlc_script_pubkey(&l).unwrap();
         let own = vec![own_spk(3)];
-        let check = |p: rb::Psbt| check_lock_psbt(&parse_psbt(&p.serialize()).unwrap(), &l, 50_000, &own, MAX_FEE);
+        let check = |p: rb::Psbt| check_lock_psbt(&parse_psbt(&p.serialize()).unwrap(), &l, 50_000, &own, MAX_FEE, None);
         // Fault test 7: one extra output.
-        let extra = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (10, own_spk(9))], 0, 0, None);
+        let extra = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (10, own_spk(9))], 0, SEQUENCE_NO_RELATIVE_LOCK, None);
         assert!(check(extra).is_err());
         // Short payment.
-        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(49_999, htlc.clone())], 0, 0, None)).is_err());
+        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(49_999, htlc.clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None)).is_err());
         // Foreign input.
-        assert!(check(rb_psbt(&[(1, 0, own_spk(8))], &[(50_000, htlc.clone())], 0, 0, None)).is_err());
+        assert!(check(rb_psbt(&[(1, 0, own_spk(8))], &[(50_000, htlc.clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None)).is_err());
         // No HTLC output, or two.
-        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, own[0].clone())], 0, 0, None)).is_err());
-        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (50_000, htlc.clone())], 0, 0, None)).is_err());
+        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, own[0].clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None)).is_err());
+        assert!(check(rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (50_000, htlc.clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None)).is_err());
         // Sighash types that do not commit to everything (review finding P1).
         for t in [2u32, 3, 0x81, 0x82, 0x83] {
-            let p = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, 0, Some(t));
+            let p = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, Some(t));
             assert!(check(p).is_err(), "sighash type {t:#x}");
         }
     }
@@ -813,24 +854,28 @@ mod tests {
         let txid = [6u8; 32];
         let spend = |lock_time: u32, seq: u32, out: Vec<u8>| rb_psbt(&[(6, 0, htlc.clone())], &[(49_000, out)], lock_time, seq, None);
 
-        let p = spend(0, 0xffff_ffff, own[0].clone());
+        let p = spend(0, SEQUENCE_NO_RELATIVE_LOCK, own[0].clone());
         let parsed = parse_psbt(&p.serialize()).unwrap();
-        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Claim, &own, MAX_FEE).unwrap();
+        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Claim, &own, MAX_FEE, None).unwrap();
         assert_eq!(b.sighashes[0], rb_sighash(&p, 0, Some(&claim), rb::TapSighashType::Default));
 
-        let p = spend(850_000, 0xffff_fffe, own[0].clone());
+        let p = spend(850_000, SEQUENCE_NO_RELATIVE_LOCK, own[0].clone());
         let parsed = parse_psbt(&p.serialize()).unwrap();
-        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE).unwrap();
+        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE, None).unwrap();
         assert_eq!(b.sighashes[0], rb_sighash(&p, 0, Some(&refund), rb::TapSighashType::Default));
 
         // Refund before its timelock, refund with locktime disabled, and a foreign payee.
-        for p in [spend(849_999, 0xffff_fffe, own[0].clone()), spend(850_000, 0xffff_ffff, own[0].clone()), spend(850_000, 0, own_spk(9))] {
+        for p in [
+            spend(849_999, SEQUENCE_NO_RELATIVE_LOCK, own[0].clone()),
+            spend(850_000, 0xffff_ffff, own[0].clone()),
+            spend(850_000, SEQUENCE_NO_RELATIVE_LOCK, own_spk(9)),
+        ] {
             let parsed = parse_psbt(&p.serialize()).unwrap();
-            assert!(check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE).is_err());
+            assert!(check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE, None).is_err());
         }
         // Wrong outpoint.
-        let parsed = parse_psbt(&spend(0, 0, own[0].clone()).serialize()).unwrap();
-        assert!(check_spend_psbt(&parsed, &l, (&[7u8; 32], 0), Leaf::Claim, &own, MAX_FEE).is_err());
+        let parsed = parse_psbt(&spend(0, SEQUENCE_NO_RELATIVE_LOCK, own[0].clone()).serialize()).unwrap();
+        assert!(check_spend_psbt(&parsed, &l, (&[7u8; 32], 0), Leaf::Claim, &own, MAX_FEE, None).is_err());
     }
 
     #[test]
@@ -839,16 +884,92 @@ mod tests {
         let htlc = htlc_script_pubkey(&l).unwrap();
         let own = vec![own_spk(3)];
         // One input of 100 000 sat into a 50 000 sat lock and no change: a 50 000 sat fee.
-        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, 0, None).serialize()).unwrap();
-        assert!(check_lock_psbt(&p, &l, 50_000, &own, 50_000).is_ok());
-        assert!(check_lock_psbt(&p, &l, 50_000, &own, 49_999).is_err());
+        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None).serialize()).unwrap();
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, 50_000, None).is_ok());
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, 49_999, None).is_err());
         // Outputs above the inputs.
-        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (60_000, own[0].clone())], 0, 0, None).serialize()).unwrap();
-        assert!(check_lock_psbt(&p, &l, 50_000, &own, MAX_FEE).is_err());
+        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (60_000, own[0].clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None).serialize()).unwrap();
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, MAX_FEE, None).is_err());
         // A claim that leaves most of the 100 000 sat HTLC output to the miners.
-        let p = parse_psbt(&rb_psbt(&[(6, 0, htlc.clone())], &[(1_000, own[0].clone())], 0, 0xffff_ffff, None).serialize()).unwrap();
-        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 50_000).is_err());
-        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 99_000).is_ok());
+        let p = parse_psbt(&rb_psbt(&[(6, 0, htlc.clone())], &[(1_000, own[0].clone())], 0, SEQUENCE_NO_RELATIVE_LOCK, None).serialize()).unwrap();
+        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 50_000, None).is_err());
+        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 99_000, None).is_ok());
+    }
+
+    #[test]
+    fn timing_fields_never_delay_a_spend() {
+        // A signed transaction that cannot be mined in time can lose funds: a late
+        // refund of leg B lets the initiator claim it after refunding leg A.
+        let l = lock(TimelockSpec::Height(850_000));
+        let htlc = htlc_script_pubkey(&l).unwrap();
+        let own = vec![own_spk(5)];
+        let txid = [6u8; 32];
+        let spend = |lock_time: u32, seq: u32| {
+            parse_psbt(&rb_psbt(&[(6, 0, htlc.clone())], &[(99_000, own[0].clone())], lock_time, seq, None).serialize()).unwrap()
+        };
+        let refund = |p: &Psbt, tip| check_spend_psbt(p, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE, tip);
+        let claim = |p: &Psbt, tip| check_spend_psbt(p, &l, (&txid, 0), Leaf::Claim, &own, MAX_FEE, tip);
+        // A refund is valid from T; a later nLockTime only up to the observed tip.
+        for (lock_time, seq, tip) in [
+            (850_000, SEQUENCE_NO_RELATIVE_LOCK, None),
+            (850_000, 0xffff_fffe, None),
+            (850_000, 0x8000_ffff, None),
+            (850_001, SEQUENCE_NO_RELATIVE_LOCK, Some(850_001)),
+        ] {
+            assert!(refund(&spend(lock_time, seq), tip).is_ok(), "refund {lock_time} {seq:#x}");
+        }
+        // A BIP 68 relative lock of 65 535 blocks, CLTV disabled, nLockTime above the tip.
+        for (lock_time, seq, tip) in [
+            (850_000, 0x0000_ffff, None),
+            (850_000, 0xffff_ffff, None),
+            (850_001, SEQUENCE_NO_RELATIVE_LOCK, None),
+            (850_001, SEQUENCE_NO_RELATIVE_LOCK, Some(850_000)),
+        ] {
+            assert!(refund(&spend(lock_time, seq), tip).is_err(), "refund {lock_time} {seq:#x}");
+        }
+        // A claim: final now, no relative lock. Wallets set nLockTime to the tip.
+        for (lock_time, seq, tip) in [(0, SEQUENCE_NO_RELATIVE_LOCK, None), (0, 0xffff_ffff, None), (900_000, SEQUENCE_NO_RELATIVE_LOCK, Some(900_000))] {
+            assert!(claim(&spend(lock_time, seq), tip).is_ok(), "claim {lock_time} {seq:#x}");
+        }
+        for (lock_time, seq, tip) in [
+            (0, 0x0000_ffff, None),
+            (900_000, SEQUENCE_NO_RELATIVE_LOCK, None),
+            (900_001, SEQUENCE_NO_RELATIVE_LOCK, Some(900_000)),
+            (1_800_000_000, SEQUENCE_NO_RELATIVE_LOCK, Some(900_000)),
+        ] {
+            assert!(claim(&spend(lock_time, seq), tip).is_err(), "claim {lock_time} {seq:#x}");
+        }
+        // A lock waits for nothing either.
+        let lock_tx = |lock_time: u32, seq: u32, tip| {
+            let p = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (49_000, own[0].clone())], lock_time, seq, None);
+            check_lock_psbt(&parse_psbt(&p.serialize()).unwrap(), &l, 50_000, &own, MAX_FEE, tip)
+        };
+        assert!(lock_tx(0, SEQUENCE_NO_RELATIVE_LOCK, None).is_ok());
+        assert!(lock_tx(900_000, SEQUENCE_NO_RELATIVE_LOCK, Some(900_000)).is_ok());
+        assert!(lock_tx(0, 0x0000_ffff, None).is_err());
+        assert!(lock_tx(900_000, SEQUENCE_NO_RELATIVE_LOCK, None).is_err());
+        // A time lock refund: exactly T, because the median time past is not observed.
+        let timed = lock(TimelockSpec::Time(1_800_000_000));
+        let timed_htlc = htlc_script_pubkey(&timed).unwrap();
+        let timed_refund = |lock_time: u32| {
+            let p = rb_psbt(&[(6, 0, timed_htlc.clone())], &[(99_000, own[0].clone())], lock_time, SEQUENCE_NO_RELATIVE_LOCK, None);
+            check_spend_psbt(&parse_psbt(&p.serialize()).unwrap(), &timed, (&txid, 0), Leaf::Refund, &own, MAX_FEE, Some(900_000))
+        };
+        assert!(timed_refund(1_800_000_000).is_ok());
+        assert!(timed_refund(1_800_000_001).is_err());
+        assert!(timed_refund(850_000).is_err(), "a height for a time lock");
+        // A relative refund encodes exactly its block count and no time flag.
+        let rel = lock(TimelockSpec::RelativeBlocks(144));
+        let rel_htlc = htlc_script_pubkey(&rel).unwrap();
+        let rel_refund = |lock_time: u32, seq: u32, tip| {
+            let p = rb_psbt(&[(6, 0, rel_htlc.clone())], &[(99_000, own[0].clone())], lock_time, seq, None);
+            check_spend_psbt(&parse_psbt(&p.serialize()).unwrap(), &rel, (&txid, 0), Leaf::Refund, &own, MAX_FEE, tip)
+        };
+        assert!(rel_refund(0, 144, None).is_ok());
+        assert!(rel_refund(900_000, 144, Some(900_000)).is_ok());
+        for (lock_time, seq, tip) in [(0, 145, None), (0, 144 | 1 << 22, None), (0, 0x1_0090, None), (1, 144, None)] {
+            assert!(rel_refund(lock_time, seq, tip).is_err(), "relative refund {lock_time} {seq:#x}");
+        }
     }
 
     #[test]

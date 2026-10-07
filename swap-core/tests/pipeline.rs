@@ -255,11 +255,13 @@ impl World {
             Role::Initiator => OwnAccounts {
                 accounts: vec![t.leg_a.refund_to.clone(), t.leg_b.receiver.clone()],
                 bitcoin_scripts: vec![p2tr(10)],
+                bitcoin_keys: vec![xonly(10)],
                 solana_fee_payer: None,
             },
             Role::Responder => OwnAccounts {
                 accounts: vec![t.leg_b.refund_to.clone(), t.leg_a.receiver.clone()],
                 bitcoin_scripts: vec![p2tr(20)],
+                bitcoin_keys: vec![xonly(20)],
                 solana_fee_payer: None,
             },
         };
@@ -530,7 +532,7 @@ fn bitcoin_fees_stay_within_the_profile() {
     assert_denied(&w.run(Action::Lock, terms(), Some(burn), None), code::S24);
     // A claim that leaves the HTLC amount to the miners halts.
     let w = responder_lock_world(3);
-    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(1_000, p2tr(20))], 0, 0xffff_ffff);
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(1_000, p2tr(20))], 0, 0xffff_fffd);
     assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some(SECRET)), code::S24);
 }
 
@@ -556,26 +558,46 @@ fn fault_10_initiator_outage_refunds_regardless_of_policy() {
     w.build = [0xef; 32];
     w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, lock_a_facts(300)));
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
-    let refund = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(10))], T_A as u32, 0xffff_fffe);
+    let refund = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(10))], T_A as u32, 0xffff_fffd);
     let out = w.run(Action::Refund, terms(), Some(refund), None);
     assert_allow(&out);
     assert_eq!(out.reasons(), ["EXIT_ACTION"]);
     // A refund that pays someone else halts instead.
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
-    let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], T_A as u32, 0xffff_fffe);
+    let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], T_A as u32, 0xffff_fffd);
     assert_halt(&w.run(Action::Refund, terms(), Some(theft), None), code::S24);
 }
 
 #[test]
-fn unknown_prices_ask() {
+fn unknown_prices_deny() {
+    // The policy reads the notional and the deviation, so a missing price denies;
+    // it never goes to the owner as Ask.
     let mut w = World::new(Role::Initiator);
     w.obs.prices.clear();
-    let out = w.run(Action::Accept, terms(), None, None);
-    assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
     // A stale price is unknown as well.
     w.obs.prices = vec![PriceReport { publish_time: NOW - 120, ..price(BTC, 60_000_00000000) }, price(USDC, 1_00000000)];
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
+}
+
+#[test]
+fn a_missing_price_never_reaches_the_owner() {
+    let mut w = World::new(Role::Initiator);
+    w.obs.prices.clear();
+    // A known counterparty satisfies the rule whatever the price is: Allow stays.
+    w.policy = policy_with(serde_json::json!({ "any": [
+        { "counterparty_in": [RESPONDER] },
+        { "notional_at_most": ["USD", 1000] }
+    ]}), 3);
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
+    // The deviation atom reads both prices as well.
+    w.policy = policy_with(serde_json::json!({ "price_deviation_at_most": 50 }), 3);
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
+    // A rule without price atoms keeps Ask for its own unknown facts.
+    w.policy = policy_with(serde_json::json!({ "counterparty_in": [RESPONDER] }), 3);
+    w.obs.identity = None;
     let out = w.run(Action::Accept, terms(), None, None);
-    assert_eq!(out.record_decision(), Some(RecordDecision::Ask));
+    assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
 }
 
 #[test]
@@ -586,7 +608,7 @@ fn bad_price_denies() {
 }
 
 #[test]
-fn one_missing_price_leaves_notional_unknown() {
+fn one_missing_price_denies() {
     let mut w = World::new(Role::Initiator);
     // No deviation atom, so only the notional can stop a mispriced trade.
     w.policy = policy_with(serde_json::json!({ "all": [
@@ -594,10 +616,10 @@ fn one_missing_price_leaves_notional_unknown() {
         { "notional_at_most": ["USD", 50000] }
     ]}), 3);
     assert_allow(&w.run(Action::Accept, terms(), None, None));
-    // Without the BTC price, the BTC leg can be the larger one: the notional is unknown.
+    // Without the BTC price, the BTC leg can be the larger one: the notional is
+    // unknown, and the trade is denied.
     w.obs.prices = vec![price(USDC, 1_00000000)];
-    let out = w.run(Action::Accept, terms(), None, None);
-    assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
 }
 
 #[test]
@@ -622,9 +644,65 @@ fn warrant_needs_a_verified_accept_of_the_terms() {
     // An exit for terms without a verified ACCEPT halts.
     let mut w = responder_lock_world(3);
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
-    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(20))], 0, 0xffff_ffff);
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(20))], 0, 0xffff_fffd);
     w.accept_override = Some(None);
     assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some(SECRET)), code::ACCEPT);
+}
+
+#[test]
+fn bitcoin_leaf_keys_are_own_keys() {
+    // Leg A names the responder's address, but its claim key is the initiator's: the
+    // initiator could claim both legs. The responder must not accept or lock.
+    let mut stolen = terms();
+    stolen.leg_a.lock.keys = Some(HtlcKeys { receiver: xonly(10), refund: xonly(10) });
+    let w = responder_lock_world(3);
+    assert_denied(&w.run(Action::Accept, stolen.clone(), None, None), code::S5);
+    assert_denied(&w.run(Action::Lock, stolen, Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S5);
+    // The initiator's own refund key must be its own, or it cannot refund leg A.
+    let mut lost = terms();
+    lost.leg_a.lock.keys = Some(HtlcKeys { receiver: xonly(20), refund: xonly(20) });
+    let w = World::new(Role::Initiator);
+    assert_denied(&w.run(Action::Accept, lost.clone(), None, None), code::S6);
+    assert_denied(&w.run(Action::Lock, lost, Some(initiator_lock_psbt(false)), None), code::S6);
+    // A Bitcoin leg without leaf keys has no claim key and no refund key.
+    let mut keyless = terms();
+    keyless.leg_a.lock.keys = None;
+    assert_denied(&responder_lock_world(3).run(Action::Accept, keyless.clone(), None, None), code::S5);
+    assert_denied(&World::new(Role::Initiator).run(Action::Accept, keyless, None, None), code::S6);
+}
+
+#[test]
+fn an_observed_bitcoin_lock_needs_its_output_script() {
+    // Only the output script proves H, both leaf keys and T on Bitcoin. An observation
+    // without it, even with a separate contract observation, proves nothing.
+    let mut w = responder_lock_world(3);
+    let mut facts = lock_a_facts(3);
+    facts.script_pubkey = None;
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, facts.clone()));
+    // The responder waits for the initiator's lock (S13), which fails S7 here.
+    let lock = Some(responder_lock_txs(30_000_000_000, 30_000_000_000));
+    let denied_by_s7 = |o: &Outcome| {
+        assert_denied(o, code::S13);
+        assert!(reason(o).contains(code::S7), "{}", reason(o));
+    };
+    denied_by_s7(&w.run(Action::Lock, terms(), lock.clone(), None));
+    let script = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
+    w.obs.contracts.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, ContractObservation::Bitcoin { script_pubkey: script.clone() }));
+    denied_by_s7(&w.run(Action::Lock, terms(), lock, None));
+    // The responder's claim of leg A halts as well.
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, script)], &[(49_990_000, p2tr(20))], 0, 0xffff_fffd);
+    assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some(SECRET)), code::S7);
+}
+
+#[test]
+fn a_claim_may_carry_the_tip_as_nlocktime() {
+    // Wallets set nLockTime to the tip against fee sniping; such a claim is final now.
+    let w = responder_lock_world(3);
+    let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
+    let claim = |lock_time: u32| psbt(&[([0x77; 32], 0, 50_000_000, htlc.clone())], &[(49_990_000, p2tr(20))], lock_time, 0xffff_fffd);
+    assert_allow(&w.run(Action::Claim, terms(), Some(claim(TIP as u32)), Some(SECRET)));
+    // One block above the tip, it would wait: the claim halts.
+    assert_halt(&w.run(Action::Claim, terms(), Some(claim(TIP as u32 + 1)), Some(SECRET)), code::S24);
 }
 
 #[test]
@@ -804,13 +882,13 @@ fn responder_claim_is_an_exit() {
     // Even a policy that now denies everything cannot block the claim.
     w.policy = policy_with(serde_json::json!({ "notional_at_most": ["USD", 0] }), 3);
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
-    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc.clone())], &[(49_990_000, p2tr(20))], 0, 0xffff_ffff);
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc.clone())], &[(49_990_000, p2tr(20))], 0, 0xffff_fffd);
     let out = w.run(Action::Claim, terms(), Some(claim.clone()), Some(SECRET));
     assert_allow(&out);
     // A wrong preimage halts (it would never open the lock).
     assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some([0; 32])), code::S2);
     // A claim that pays a foreign script halts.
-    let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], 0, 0xffff_ffff);
+    let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], 0, 0xffff_fffd);
     assert_halt(&w.run(Action::Claim, terms(), Some(theft), Some(SECRET)), code::S24);
 }
 
@@ -830,8 +908,11 @@ fn one_fixture_per_risk_flag() {
             assert_denied(&out, "POLICY_DENY");
         }
     }
-    // Unknown asset facts: the risk is unknown, so the policy asks.
+    // Unknown asset facts: the leg value is unknown too, so a policy that reads
+    // prices denies. A policy that reads only the risk asks.
     let mut w = World::new(Role::Initiator);
     w.obs.assets.remove(&AssetId::parse(USDC).unwrap());
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
+    w.policy = policy_with(serde_json::json!({ "asset_risk_within": ["freezable_by_issuer"] }), 3);
     assert_eq!(w.run(Action::Accept, terms(), None, None).record_decision(), Some(RecordDecision::Ask));
 }

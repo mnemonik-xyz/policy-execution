@@ -30,6 +30,9 @@ pub struct OwnAccounts {
     pub accounts: Vec<crate::caip::AccountId>,
     /// Own Taproot `scriptPubKey`s: inputs and change on Bitcoin.
     pub bitcoin_scripts: Vec<Vec<u8>>,
+    /// Own x-only keys that claim or refund a Bitcoin HTLC (S5, S6). On Bitcoin the
+    /// key in the leaf, not the CAIP-10 account, decides who can spend.
+    pub bitcoin_keys: Vec<Hash32>,
     /// Fee payer on Solana.
     pub solana_fee_payer: Option<Hash32>,
 }
@@ -51,6 +54,8 @@ pub struct BindContext {
     pub lookup_tables: LookupTables,
     /// Solana token leg: the program that owns the mint, read from the chain.
     pub token_program: Option<Hash32>,
+    /// Bitcoin: the observed tip height of the leg chain, for `nLockTime` checks.
+    pub tip_height: Option<u64>,
 }
 
 fn evm_addr(account: &crate::caip::AccountId) -> Result<[u8; 20], String> {
@@ -88,12 +93,12 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
             let binding = match action {
                 Action::Lock => {
                     let amount = u64::try_from(leg.amount).map_err(|_| "amount exceeds the Bitcoin range")?;
-                    bitcoin::check_lock_psbt(&psbt, lock, amount, &own.bitcoin_scripts, max_fee)
+                    bitcoin::check_lock_psbt(&psbt, lock, amount, &own.bitcoin_scripts, max_fee, ctx.tip_height)
                 }
                 Action::Reveal | Action::Claim | Action::Refund => {
                     let (txid, vout) = ctx.htlc_outpoint.ok_or("the HTLC output is not observed")?;
                     let leaf = if action == Action::Refund { Leaf::Refund } else { Leaf::Claim };
-                    bitcoin::check_spend_psbt(&psbt, lock, (&txid, vout), leaf, &own.bitcoin_scripts, max_fee)
+                    bitcoin::check_spend_psbt(&psbt, lock, (&txid, vout), leaf, &own.bitcoin_scripts, max_fee, ctx.tip_height)
                 }
                 Action::Accept => return Err("accept has no transaction".into()),
             }
