@@ -80,7 +80,10 @@ pub struct ChainProfile {
     pub value_bands: Vec<ValueBand>,
     pub fees: Fees,
     pub refund: RefundMethod,
-    pub swap_id_binding: bool,
+    /// The lock template keys each lock by `lock_id` (spec 8.1, S10): the Bitcoin
+    /// claim leaf commits to it, the EVM contract stores the lock under it, the
+    /// Solana escrow PDA has it as a seed. True for the three reference families.
+    pub lock_id_binding: bool,
     pub template_enforces_len32: bool,
     /// Source and date of the measured clock bounds (spec 8.8 item 3).
     pub clock_source: String,
@@ -193,7 +196,7 @@ pub mod reference {
             ],
             fees: Fees { worst_lock: 50_000, worst_claim: 50_000, worst_refund: 50_000, raise: FeeRaise::RbfOrCpfp },
             refund: RefundMethod::Prepared,
-            swap_id_binding: true,
+            lock_id_binding: true,
             template_enforces_len32: true,
             clock_source: "reference values for tests, not measured".into(),
         }
@@ -230,7 +233,7 @@ pub mod reference {
                 raise: FeeRaise::SameNonceReplacement,
             },
             refund: RefundMethod::Permissionless,
-            swap_id_binding: true,
+            lock_id_binding: true,
             template_enforces_len32: true,
             clock_source: "reference values for tests, not measured".into(),
         }
@@ -261,7 +264,7 @@ pub mod reference {
             ],
             fees: Fees { worst_lock: 1_000_000, worst_claim: 1_000_000, worst_refund: 1_000_000, raise: FeeRaise::Resubmit },
             refund: RefundMethod::Permissionless,
-            swap_id_binding: true,
+            lock_id_binding: true,
             template_enforces_len32: true,
             clock_source: "reference values for tests, not measured".into(),
         }

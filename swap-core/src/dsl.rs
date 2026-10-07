@@ -347,7 +347,7 @@ pub(crate) mod tests {
             "ref_ccy": "USD",
             "evaluator_id": crate::to_hex(&[0xee; 32]),
             "chains": {
-                (reference::BITCOIN_MAINNET): { "profile_hash": crate::to_hex(&btc.hash()), "contracts": [{"bitcoin_template": "warrant-htlc-tr-v1"}] },
+                (reference::BITCOIN_MAINNET): { "profile_hash": crate::to_hex(&btc.hash()), "contracts": [{"bitcoin_template": crate::bitcoin::TEMPLATE_ID}] },
                 (reference::ETHEREUM_MAINNET): { "profile_hash": crate::to_hex(&eth.hash()), "contracts": [{"evm": {"address": HTLC_EVM, "code_hash": crate::to_hex(&[0xc0; 32])}}] }
             },
             "authorities": { "oracle": ["pyth"], "identity": ["mnemonik"], "list": ["ofac-mirror"] },
@@ -419,6 +419,9 @@ pub(crate) mod tests {
         let mut doc = policy_json(example_rule());
         doc["chains"][reference::BITCOIN_MAINNET]["contracts"] = serde_json::json!([{"bitcoin_template": "other"}]);
         assert!(validate_policy(&doc.to_string(), &p).is_err(), "unknown template");
+        // Version 1 of the template has no lock_id in the claim leaf (G4).
+        doc["chains"][reference::BITCOIN_MAINNET]["contracts"] = serde_json::json!([{"bitcoin_template": "warrant-htlc-tr-v1"}]);
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "template version 1");
         // A profile that misses an obligatory item makes every policy naming the chain invalid.
         let mut broken = reference::ethereum();
         broken.refund = crate::profile::RefundMethod::None;

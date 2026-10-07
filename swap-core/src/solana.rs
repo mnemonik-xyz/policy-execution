@@ -14,7 +14,7 @@ pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuE
 pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const ED25519_PROGRAM: &str = "Ed25519SigVerify111111111111111111111111111";
 
-/// PDA seed prefix of the reference HTLC escrow: `[b"htlc", swap_id]`.
+/// PDA seed prefix of the reference HTLC escrow: `[b"htlc", lock_id]` (spec 8.2).
 pub const ESCROW_SEED: &[u8] = b"htlc";
 
 /// The first 8 data bytes of a reference HTLC escrow account:
@@ -337,9 +337,12 @@ pub fn check_message(bytes: &[u8], tables: &LookupTables, intent: &SolanaIntent)
 // ---------------------------------------------------------------------------
 
 /// `mint` is all zero for native SOL. For a Token-2022 mint with a transfer fee,
-/// `amount` is the gross debit.
+/// `amount` is the gross debit. The data carries `swap_id` and the leg: the program
+/// derives `lock_id = sha256(swap_id ‖ leg ‖ sender)` from them and the signing
+/// sender, and requires the escrow account at `[b"htlc", lock_id]`.
 pub struct LockData {
     pub swap_id: Hash32,
+    pub leg: crate::types::LegName,
     pub receiver: Hash32,
     pub refund_to: Hash32,
     pub mint: Hash32,
@@ -352,6 +355,7 @@ impl LockData {
     pub fn encode(&self) -> Vec<u8> {
         let mut d = vec![0u8];
         d.extend(self.swap_id);
+        d.push(self.leg.lock_byte());
         d.extend(self.receiver);
         d.extend(self.refund_to);
         d.extend(self.mint);
@@ -362,16 +366,16 @@ impl LockData {
     }
 }
 
-pub fn claim_data(swap_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
+pub fn claim_data(lock_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
     let mut d = vec![1u8];
-    d.extend(swap_id);
+    d.extend(lock_id);
     d.extend(preimage);
     d
 }
 
-pub fn refund_data(swap_id: &Hash32) -> Vec<u8> {
+pub fn refund_data(lock_id: &Hash32) -> Vec<u8> {
     let mut d = vec![2u8];
-    d.extend(swap_id);
+    d.extend(lock_id);
     d
 }
 
@@ -406,8 +410,8 @@ fn merge_duplicates(mut metas: Vec<AccountMeta>) -> Vec<AccountMeta> {
 /// writable), the escrow PDA (writable); for a token, the sender's and the escrow's
 /// associated token accounts (writable), the mint and the token program; then the
 /// System Program.
-pub fn lock_accounts(program: &Hash32, swap_id: &Hash32, sender: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
-    let escrow = escrow_address(program, swap_id)?;
+pub fn lock_accounts(program: &Hash32, lock_id: &Hash32, sender: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, lock_id)?;
     let mut v = vec![AccountMeta::signer_writable(*sender), AccountMeta::writable(escrow)];
     if let Some(t) = token {
         v.push(AccountMeta::writable(associated_token_address(sender, t)?));
@@ -424,8 +428,8 @@ pub fn lock_accounts(program: &Hash32, swap_id: &Hash32, sender: &Hash32, token:
 /// for a refund, writable). For a token, the payee's associated token account takes
 /// the payee's place, followed by the escrow's token account, the mint and the
 /// token program.
-pub fn spend_accounts(program: &Hash32, swap_id: &Hash32, caller: &Hash32, payee: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
-    let escrow = escrow_address(program, swap_id)?;
+pub fn spend_accounts(program: &Hash32, lock_id: &Hash32, caller: &Hash32, payee: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, lock_id)?;
     let mut v = vec![AccountMeta::signer_writable(*caller), AccountMeta::writable(escrow)];
     match token {
         None => v.push(AccountMeta::writable(*payee)),
@@ -469,8 +473,9 @@ pub fn find_program_address(seeds: &[&[u8]], program: &Hash32) -> Option<(Hash32
     })
 }
 
-pub fn escrow_address(program: &Hash32, swap_id: &Hash32) -> Option<Hash32> {
-    find_program_address(&[ESCROW_SEED, swap_id], program).map(|(a, _)| a)
+/// The escrow PDA of the lock with key `lock_id`: seeds `[b"htlc", lock_id]`.
+pub fn escrow_address(program: &Hash32, lock_id: &Hash32) -> Option<Hash32> {
+    find_program_address(&[ESCROW_SEED, lock_id], program).map(|(a, _)| a)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -525,7 +530,7 @@ impl ProgramPin {
     /// is none or the pinned account, and the escrow address is the expected PDA.
     /// `locked`: the lock exists now; see `ProgramFacts::escrow_ready` for the
     /// escrow account before and after the lock.
-    pub fn matches(&self, program: &Hash32, swap_id: &Hash32, facts: &ProgramFacts, locked: bool) -> bool {
+    pub fn matches(&self, program: &Hash32, lock_id: &Hash32, facts: &ProgramFacts, locked: bool) -> bool {
         let Some(pinned) = parse_key(&self.program) else {
             return false;
         };
@@ -539,7 +544,7 @@ impl ProgramPin {
             && facts.executable
             && authority_ok
             && escrow_ok
-            && escrow_address(program, swap_id) == Some(facts.escrow_address)
+            && escrow_address(program, lock_id) == Some(facts.escrow_address)
     }
 }
 
@@ -762,6 +767,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Spec 3.2 and 8.2: the reference lock data carries `swap_id` and the leg byte
+    /// after the tag, in the order of the EVM ABI; claim and refund carry `lock_id`.
+    #[test]
+    fn htlc_data_layout() {
+        use crate::types::LegName;
+        let d = LockData { swap_id: [1; 32], leg: LegName::A, receiver: [2; 32], refund_to: [3; 32], mint: [0; 32], amount: 5, hashlock: [4; 32], timelock: 6 }.encode();
+        assert_eq!(d.len(), 1 + 32 + 1 + 32 * 3 + 8 + 32 + 8);
+        assert_eq!((d[0], &d[1..33], d[33], &d[34..66]), (0, &[1u8; 32][..], 0x41, &[2u8; 32][..]));
+        assert_eq!(&claim_data(&[7; 32], &[8; 32])[1..33], &[7; 32]);
+        assert_eq!(refund_data(&[7; 32]), [&[2u8][..], &[7; 32]].concat());
+    }
+
     #[test]
     fn program_pins() {
         let program = key(TOKEN_PROGRAM);
@@ -774,7 +791,7 @@ pub(crate) mod tests {
             escrow: Some(escrow.clone()),
         };
         assert!(pin.matches(&program, &[7; 32], &facts, true));
-        assert!(!pin.matches(&program, &[8; 32], &facts, true), "escrow of another swap");
+        assert!(!pin.matches(&program, &[8; 32], &facts, true), "escrow of another lock");
         assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { upgrade_authority: Some([1; 32]), ..facts.clone() }, true), "upgradeable");
         let foreign = EscrowAccount { owner: [3; 32], ..escrow.clone() };
         assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { escrow: Some(foreign), ..facts.clone() }, true), "foreign owner");
@@ -815,7 +832,7 @@ pub(crate) mod tests {
         assert!(!pin.matches(&program, &[7; 32], &with(Some(allocated)), false), "System-owned account with data");
         let foreign = EscrowAccount { owner: [3; 32], ..funded };
         assert!(!pin.matches(&program, &[7; 32], &with(Some(foreign)), false), "account of another owner");
-        assert!(!pin.matches(&program, &[8; 32], &with(None), false), "address of another swap");
+        assert!(!pin.matches(&program, &[8; 32], &with(None), false), "address of another lock");
         let upgradeable = ProgramFacts { upgrade_authority: Some([1; 32]), ..with(None) };
         assert!(!pin.matches(&program, &[7; 32], &upgradeable, false), "program checks still apply");
     }

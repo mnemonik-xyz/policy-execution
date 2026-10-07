@@ -12,7 +12,9 @@ use k256::elliptic_curve::PrimeField;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 use std::fmt;
 
-pub const TEMPLATE_ID: &str = "warrant-htlc-tr-v1";
+/// Version 2: the claim leaf starts with `<lock_id> OP_DROP` (spec 8.2). A policy
+/// that pinned version 1 pinned another script, so it no longer validates.
+pub const TEMPLATE_ID: &str = "warrant-htlc-tr-v2";
 
 /// BIP 341 NUMS point `H`, x-only: no one knows its discrete logarithm, so the
 /// key path is unspendable.
@@ -62,7 +64,7 @@ pub enum BtcError {
 impl fmt::Display for BtcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BtcError::MissingKeys => f.write_str("Bitcoin lock without HTLC keys"),
+            BtcError::MissingKeys => f.write_str("Bitcoin lock without claim_key and refund_key"),
             BtcError::InvalidKey => f.write_str("not a valid x-only public key"),
             BtcError::BadTimelock => f.write_str("timelock not expressible in the template"),
             BtcError::Psbt(e) => write!(f, "PSBT: {e}"),
@@ -118,21 +120,24 @@ fn push_int(script: &mut Vec<u8>, n: u64) {
     push_bytes(script, &bytes);
 }
 
-/// `OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <H> OP_EQUALVERIFY <receiver> OP_CHECKSIG`.
-pub fn claim_leaf(hashlock: &Hash32, receiver: &Hash32) -> Vec<u8> {
-    let mut s = vec![OP_SIZE];
+/// `<lock_id> OP_DROP OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <H> OP_EQUALVERIFY <claim_key> OP_CHECKSIG`
+/// (spec 8.2). The `lock_id` push binds the output key to this lock (S10).
+pub fn claim_leaf(lock_id: &Hash32, hashlock: &Hash32, claim_key: &Hash32) -> Vec<u8> {
+    let mut s = Vec::new();
+    push_bytes(&mut s, lock_id);
+    s.extend([OP_DROP, OP_SIZE]);
     push_int(&mut s, 32);
     s.extend([OP_EQUALVERIFY, OP_SHA256]);
     push_bytes(&mut s, hashlock);
     s.push(OP_EQUALVERIFY);
-    push_bytes(&mut s, receiver);
+    push_bytes(&mut s, claim_key);
     s.push(OP_CHECKSIG);
     s
 }
 
-/// `<T> OP_CHECKLOCKTIMEVERIFY OP_DROP <refund> OP_CHECKSIG`, or the
+/// `<T> OP_CHECKLOCKTIMEVERIFY OP_DROP <refund_key> OP_CHECKSIG`, or the
 /// `OP_CHECKSEQUENCEVERIFY` form for a relative block count.
-pub fn refund_leaf(timelock: &TimelockSpec, refund: &Hash32) -> Result<Vec<u8>, BtcError> {
+pub fn refund_leaf(timelock: &TimelockSpec, refund_key: &Hash32) -> Result<Vec<u8>, BtcError> {
     let mut s = Vec::new();
     match *timelock {
         TimelockSpec::Height(h) if h > 0 && h < LOCKTIME_THRESHOLD => {
@@ -150,7 +155,7 @@ pub fn refund_leaf(timelock: &TimelockSpec, refund: &Hash32) -> Result<Vec<u8>, 
         _ => return Err(BtcError::BadTimelock),
     }
     s.push(OP_DROP);
-    push_bytes(&mut s, refund);
+    push_bytes(&mut s, refund_key);
     s.push(OP_CHECKSIG);
     Ok(s)
 }
@@ -204,12 +209,14 @@ pub fn tweak_xonly(internal: &Hash32, merkle_root: &Hash32) -> Option<Hash32> {
 
 /// The two leaves of a lock: (claim, refund).
 pub fn htlc_leaves(lock: &Lock) -> Result<(Vec<u8>, Vec<u8>), BtcError> {
-    let keys = lock.keys.as_ref().ok_or(BtcError::MissingKeys)?;
+    let (Some(claim_key), Some(refund_key)) = (lock.claim_key, lock.refund_key) else {
+        return Err(BtcError::MissingKeys);
+    };
     // An invalid key makes a leaf unspendable: the claim or the refund would be lost.
-    if !is_valid_xonly(&keys.receiver) || !is_valid_xonly(&keys.refund) {
+    if !is_valid_xonly(&claim_key) || !is_valid_xonly(&refund_key) {
         return Err(BtcError::InvalidKey);
     }
-    Ok((claim_leaf(&lock.hashlock, &keys.receiver), refund_leaf(&lock.timelock, &keys.refund)?))
+    Ok((claim_leaf(&lock.lock_id, &lock.hashlock, &claim_key), refund_leaf(&lock.timelock, &refund_key)?))
 }
 
 /// The `scriptPubKey` of the HTLC output: `OP_1 <32-byte output key>` (BIP 341, BIP 350).
@@ -688,7 +695,7 @@ mod tests {
 
     /// The test inputs hold 100 000 sat or more; this limit admits their fees.
     const MAX_FEE: u64 = 150_000;
-    use crate::types::{HashAlg, HtlcKeys};
+    use crate::types::HashAlg;
     use ::bitcoin as rb;
     use rb::hashes::Hash as _;
 
@@ -706,7 +713,9 @@ mod tests {
             preimage_len: 32,
             timelock,
             swap_id: [9; 32],
-            keys: Some(HtlcKeys { receiver: xonly(1), refund: xonly(2) }),
+            lock_id: [8; 32],
+            claim_key: Some(xonly(1)),
+            refund_key: Some(xonly(2)),
         }
     }
 
@@ -739,18 +748,48 @@ mod tests {
         let l = lock(TimelockSpec::Height(850_000));
         let (claim, refund) = htlc_leaves(&l).unwrap();
         let asm = rb_script(&claim).to_asm_string();
-        assert!(asm.starts_with("OP_SIZE OP_PUSHBYTES_1 20 OP_EQUALVERIFY OP_SHA256 OP_PUSHBYTES_32"), "{asm}");
+        let prefix = format!("OP_PUSHBYTES_32 {} OP_DROP OP_SIZE OP_PUSHBYTES_1 20 OP_EQUALVERIFY OP_SHA256 OP_PUSHBYTES_32", crate::to_hex(&l.lock_id));
+        assert!(asm.starts_with(&prefix), "{asm}");
         assert!(asm.ends_with("OP_CHECKSIG"));
+        // Spec 8.2, byte for byte, built with rust-bitcoin.
+        use rb::opcodes::all::*;
+        let expected = rb::script::Builder::new()
+            .push_slice(l.lock_id)
+            .push_opcode(OP_DROP)
+            .push_opcode(OP_SIZE)
+            .push_int(32)
+            .push_opcode(OP_EQUALVERIFY)
+            .push_opcode(OP_SHA256)
+            .push_slice(l.hashlock)
+            .push_opcode(OP_EQUALVERIFY)
+            .push_slice(l.claim_key.unwrap())
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+        assert_eq!(claim, expected.to_bytes());
         let asm = rb_script(&refund).to_asm_string();
         assert!(asm.starts_with("OP_PUSHBYTES_3 50f80c OP_CLTV OP_DROP"), "{asm}");
+    }
+
+    /// S10 (spec 8.2): the output key commits to `lock_id`. Two locks that differ
+    /// only in `lock_id`, for example the two legs of one swap or one lock of two
+    /// swaps, have different output scripts.
+    #[test]
+    fn output_key_commits_to_the_lock_id() {
+        let a = lock(TimelockSpec::Height(850_000));
+        let b = Lock { lock_id: [7; 32], ..a.clone() };
+        assert_ne!(htlc_script_pubkey(&a).unwrap(), htlc_script_pubkey(&b).unwrap());
+        assert_eq!(htlc_leaves(&a).unwrap().1, htlc_leaves(&b).unwrap().1, "the refund leaf does not carry it");
     }
 
     #[test]
     fn invalid_keys_and_timelocks_are_rejected() {
         let mut l = lock(TimelockSpec::Height(850_000));
-        l.keys.as_mut().unwrap().receiver = [0xff; 32];
+        l.claim_key = Some([0xff; 32]);
         assert_eq!(htlc_script_pubkey(&l), Err(BtcError::InvalidKey));
-        l.keys = None;
+        l.claim_key = None;
+        assert_eq!(htlc_script_pubkey(&l), Err(BtcError::MissingKeys));
+        let mut l = lock(TimelockSpec::Height(850_000));
+        l.refund_key = None;
         assert_eq!(htlc_script_pubkey(&l), Err(BtcError::MissingKeys));
         let l = lock(TimelockSpec::Height(600_000_000));
         assert_eq!(htlc_script_pubkey(&l), Err(BtcError::BadTimelock));

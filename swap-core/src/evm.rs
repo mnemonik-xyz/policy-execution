@@ -212,8 +212,14 @@ impl Eip1559Tx {
 // Reference HTLC ABI
 // ---------------------------------------------------------------------------
 
-pub const LOCK_SIG: &str = "lock(bytes32,address,address,address,uint256,bytes32,uint64)";
+/// `lock(bytes32 swapId, bytes1 leg, address receiver, address refundTo, address token,
+/// uint256 amount, bytes32 hashlock, uint64 timelock)`. The contract derives the key
+/// `lockId = sha256(abi.encodePacked(swapId, leg, msg.sender))` (spec 3.2) and
+/// reverts when that key was ever used, so no third party can take it first.
+pub const LOCK_SIG: &str = "lock(bytes32,bytes1,address,address,address,uint256,bytes32,uint64)";
+/// `claim(bytes32 lockId, bytes32 preimage)`.
 pub const CLAIM_SIG: &str = "claim(bytes32,bytes32)";
+/// `refund(bytes32 lockId)`.
 pub const REFUND_SIG: &str = "refund(bytes32)";
 pub const APPROVE_SIG: &str = "approve(address,uint256)";
 
@@ -224,6 +230,13 @@ pub fn selector(signature: &str) -> [u8; 4] {
 fn word_address(a: &[u8; 20]) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[12..].copy_from_slice(a);
+    w
+}
+
+/// ABI `bytes1`: the byte first, then zero padding.
+fn word_bytes1(b: u8) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[0] = b;
     w
 }
 
@@ -242,9 +255,12 @@ fn call(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
 }
 
 /// Arguments of the reference `lock`. `token` is the zero address for the native
-/// coin. For a token with a transfer fee, `amount` is the gross debit.
+/// coin. For a token with a transfer fee, `amount` is the gross debit. The call
+/// carries `swap_id` and the leg, not `lock_id`: the contract derives `lock_id`
+/// from them and the caller.
 pub struct LockCall {
     pub swap_id: Hash32,
+    pub leg: crate::types::LegName,
     pub receiver: [u8; 20],
     pub refund_to: [u8; 20],
     pub token: [u8; 20],
@@ -259,6 +275,7 @@ impl LockCall {
             LOCK_SIG,
             &[
                 self.swap_id,
+                word_bytes1(self.leg.lock_byte()),
                 word_address(&self.receiver),
                 word_address(&self.refund_to),
                 word_address(&self.token),
@@ -270,12 +287,12 @@ impl LockCall {
     }
 }
 
-pub fn claim_calldata(swap_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
-    call(CLAIM_SIG, &[*swap_id, *preimage])
+pub fn claim_calldata(lock_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
+    call(CLAIM_SIG, &[*lock_id, *preimage])
 }
 
-pub fn refund_calldata(swap_id: &Hash32) -> Vec<u8> {
-    call(REFUND_SIG, &[*swap_id])
+pub fn refund_calldata(lock_id: &Hash32) -> Vec<u8> {
+    call(REFUND_SIG, &[*lock_id])
 }
 
 pub fn approve_calldata(spender: &[u8; 20], amount: u128) -> Vec<u8> {
@@ -432,6 +449,7 @@ mod tests {
     fn intent() -> EvmIntent {
         let call = LockCall {
             swap_id: [1; 32],
+            leg: crate::types::LegName::B,
             receiver: [2; 20],
             refund_to: [3; 20],
             token: [0; 20],
@@ -459,7 +477,9 @@ mod tests {
     #[test]
     fn intent_matching() {
         let i = intent();
-        assert_eq!(i.data.len(), 4 + 7 * 32);
+        assert_eq!(i.data.len(), 4 + 8 * 32);
+        // The leg is an ABI bytes1: 0x42, then zero padding.
+        assert_eq!(&i.data[4 + 32..4 + 64], &{ let mut w = [0u8; 32]; w[0] = 0x42; w });
         assert!(check_tx(&tx_for(&i).encode_unsigned(), &i).is_ok());
         let cases: Vec<Box<dyn Fn(&mut Eip1559Tx)>> = vec![
             Box::new(|t| t.chain_id = 10),
@@ -479,6 +499,24 @@ mod tests {
         let bytes = tx_for(&i).encode_with_access_list(&[0xc1, 0x80]);
         assert_eq!(parse_unsigned(&bytes).unwrap().access_list_len, 1);
         assert!(check_tx(&bytes, &i).is_err());
+    }
+
+    /// Spec 3.2: the reference contract's `sha256(abi.encodePacked(swapId, leg,
+    /// msg.sender))` is `lock_id` with the 20-byte caller as the sender bytes.
+    #[test]
+    fn contract_lock_id_is_the_spec_derivation() {
+        use crate::types::{lock_id, LegName};
+        let (swap_id, sender) = ([0x51u8; 32], [0xbbu8; 20]);
+        let mut packed = swap_id.to_vec();
+        packed.push(0x42);
+        packed.extend(sender);
+        assert_eq!(packed.len(), 32 + 1 + 20);
+        assert_eq!(crate::sha256(&packed), lock_id(&swap_id, LegName::B, &sender));
+        assert_ne!(lock_id(&swap_id, LegName::A, &sender), lock_id(&swap_id, LegName::B, &sender));
+        // claim and refund name the lock by lock_id.
+        let id = lock_id(&swap_id, LegName::B, &sender);
+        assert_eq!(&claim_calldata(&id, &[9; 32])[4..36], &id);
+        assert_eq!(&refund_calldata(&id)[4..], &id);
     }
 
     #[test]

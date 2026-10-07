@@ -414,6 +414,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
         checks::s4(terms, env.ledger)?;
     }
     checks::s5_s6_terms(terms, role, &env.own.accounts, &env.own.bitcoin_keys)?;
+    checks::s10_lock_id(terms)?;
+    checks::s10_lock_binding(terms, role, &env.own.accounts, pa, pb)?;
     checks::timelock_form(&terms.leg_a)?;
     checks::timelock_form(&terms.leg_b)?;
     checks::leg_b_absolute(terms)?;
@@ -531,7 +533,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 token_program: own_asset.as_ref().and_then(|a| a.token_program),
                 ..Default::default()
             };
-            binding = Some(s24(tx::bind(action, own_leg, need_tx(req)?, env.own, &ctx))?);
+            binding = Some(s24(tx::bind(action, own_name, own_leg, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Reveal => {
             let (facts, _) = observed_leg(c, LegName::B, &terms.leg_b)?;
@@ -558,7 +560,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 ..Default::default()
             };
             solana_facts(c, &terms.leg_b, &mut ctx);
-            binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
+            binding = Some(s24(tx::bind(action, LegName::B, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
             if terms.leg_a.lock.timelock.is_relative() {
                 // The own leg A lock exists now: a relative T_A counts from its observed
                 // confirmation (spec 7.3), never from the adapter's value. Only an
@@ -717,6 +719,8 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     }
     checks::s1(terms)?;
     checks::s3(terms)?;
+    // The claim or refund names the lock by lock_id: it must be this lock's key.
+    checks::s10_lock_id(terms)?;
     let leg_name = action.leg(role).expect("exits touch a leg");
     let leg = terms.leg(leg_name);
     // The profile, not the policy, sets the fee limit: the policy never blocks an exit.
@@ -746,6 +750,6 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
         }
         _ => unreachable!(),
     }
-    let binding = s24(tx::bind(action, leg, need_tx(req)?, env.own, &ctx))?;
+    let binding = s24(tx::bind(action, leg_name, leg, need_tx(req)?, env.own, &ctx))?;
     Ok(Some(binding))
 }

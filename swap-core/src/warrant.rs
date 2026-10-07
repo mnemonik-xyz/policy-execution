@@ -161,6 +161,9 @@ pub struct Expected<'a> {
     pub swap_id: &'a Hash32,
     pub chain: Option<&'a crate::caip::ChainId>,
     pub contract: Option<&'a str>,
+    /// The key of the lock that the action touches (spec 3.2), with `chain` and
+    /// `contract`; `None` for `accept`.
+    pub lock_id: Option<&'a Hash32>,
     /// The verifier's real time (Unix seconds), never chain time. One clock for
     /// every action, `accept` included (spec 4.1).
     pub now_real: u64,
@@ -169,7 +172,7 @@ pub struct Expected<'a> {
     pub skew_secs: u64,
 }
 
-/// S20: the warrant binds chain id, contract, swap id, nonce and validity window,
+/// S20: the warrant binds chain id, contract, swap id, lock id, nonce and validity window,
 /// and it is an authorization, not a decision record. The window is in the policy
 /// signer's real time; the verifier accepts it at its own real time within the
 /// stated skew: `valid_after - skew <= now_real <= valid_until + skew`.
@@ -183,9 +186,9 @@ pub fn check_binding(w: &SwapWarrant, e: &Expected) -> Result<(), &'static str> 
     if &w.swap_id != e.swap_id {
         return Err("other swap");
     }
-    match (&w.leg, e.chain, e.contract) {
-        (None, None, None) => {}
-        (Some(leg), Some(chain), Some(contract)) => {
+    match (&w.leg, e.chain, e.contract, e.lock_id) {
+        (None, None, None, None) => {}
+        (Some(leg), Some(chain), Some(contract), Some(lock_id)) => {
             if &leg.chain != chain {
                 return Err("other chain");
             }
@@ -194,6 +197,9 @@ pub fn check_binding(w: &SwapWarrant, e: &Expected) -> Result<(), &'static str> 
             }
             if &leg.lock.swap_id != e.swap_id {
                 return Err("lock of another swap");
+            }
+            if &leg.lock.lock_id != lock_id {
+                return Err("other lock");
             }
         }
         _ => return Err("leg binding missing"),
@@ -222,6 +228,8 @@ pub(crate) mod tests {
     use crate::caip::{AccountId, AssetId, ChainId};
     use crate::types::{HashAlg, Lock, TimelockSpec};
 
+    const LOCK_ID: Hash32 = [9; 32];
+
     fn leg() -> Leg {
         Leg {
             chain: ChainId::parse("eip155:1").unwrap(),
@@ -237,7 +245,9 @@ pub(crate) mod tests {
                 preimage_len: 32,
                 timelock: TimelockSpec::Time(1_800_000_000),
                 swap_id: [1; 32],
-                keys: None,
+                lock_id: LOCK_ID,
+                claim_key: None,
+                refund_key: None,
             },
         }
     }
@@ -272,6 +282,8 @@ pub(crate) mod tests {
         assert!(text.contains(r#""amount":"1000000000000000000000000""#), "amounts are decimal strings");
         assert!(text.contains(r#""prev_warrant":null"#));
         assert!(text.contains(r#""tx_binding":{"family":"evm","signing_hashes":["0505"#));
+        assert!(text.contains(&format!(r#""lock_id":"{}""#, crate::to_hex(&LOCK_ID))), "the leg carries its lock_id");
+        assert!(!text.contains("claim_key") && !text.contains("refund_key"), "Bitcoin keys only on Bitcoin");
         assert!(!text.contains(' '));
         let back: SwapWarrant = serde_json::from_slice(&w.payload().unwrap()).unwrap();
         assert_eq!(back, w);
@@ -296,7 +308,7 @@ pub(crate) mod tests {
         let w = warrant();
         let chain = ChainId::parse("eip155:1").unwrap();
         let contract = format!("0x{}", "33".repeat(20));
-        let ok = Expected { action: Action::Lock, swap_id: &[1; 32], chain: Some(&chain), contract: Some(&contract), now_real: 150, skew_secs: 0 };
+        let ok = Expected { action: Action::Lock, swap_id: &[1; 32], chain: Some(&chain), contract: Some(&contract), lock_id: Some(&LOCK_ID), now_real: 150, skew_secs: 0 };
         assert!(check_binding(&w, &ok).is_ok());
         let other_chain = ChainId::parse("eip155:10").unwrap();
         let other_contract = format!("0x{}", "34".repeat(20));
@@ -304,6 +316,8 @@ pub(crate) mod tests {
             Expected { swap_id: &[9; 32], ..ok },
             Expected { chain: Some(&other_chain), ..ok },
             Expected { contract: Some(&other_contract), ..ok },
+            Expected { lock_id: Some(&[1; 32]), ..ok },
+            Expected { lock_id: None, ..ok },
             Expected { action: Action::Reveal, ..ok },
             Expected { now_real: 201, ..ok },
             Expected { now_real: 99, ..ok },
@@ -325,7 +339,7 @@ pub(crate) mod tests {
         w.tx_binding = None;
         w.valid_after = valid_after;
         w.valid_until = valid_until;
-        let e = Expected { action: Action::Accept, swap_id: &[1; 32], chain: None, contract: None, now_real, skew_secs };
+        let e = Expected { action: Action::Accept, swap_id: &[1; 32], chain: None, contract: None, lock_id: None, now_real, skew_secs };
         check_binding(&w, &e)
     }
 
@@ -385,6 +399,7 @@ pub(crate) mod tests {
             swap_id: &[1; 32],
             chain: Some(&chain),
             contract: Some(&contract),
+            lock_id: Some(&LOCK_ID),
             now_real,
             skew_secs,
         };
