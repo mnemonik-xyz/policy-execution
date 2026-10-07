@@ -83,6 +83,7 @@ pub struct SwapWarrant {
     pub policy_version: u64,
     pub evaluator_id: EvaluatorId,
     pub decision: String,
+    /// Fixed reason codes from `checks::code::ALL` only, never detail text (spec 4.1).
     pub reasons: Vec<String>,
     pub valid_after: u64,
     pub valid_until: u64,
@@ -113,6 +114,7 @@ pub struct DecisionRecord {
     #[serde(with = "enc::hex32")]
     pub terms_hash: Hash32,
     pub decision: RecordDecision,
+    /// Fixed reason codes from `checks::code::ALL` only, never detail text (spec 4.1).
     pub reasons: Vec<String>,
     pub facts: Vec<FactRecord>,
     #[serde(with = "enc::hex32")]
@@ -148,6 +150,10 @@ impl DecisionRecord {
     }
 }
 
+/// The largest clock skew allowance, in seconds, that a verifier can state (S20).
+/// A larger stated skew is rejected: it would extend the validity window too far.
+pub const MAX_SKEW_SECS: u64 = 60;
+
 /// What a verifier expects a warrant to authorize.
 #[derive(Clone, Copy)]
 pub struct Expected<'a> {
@@ -155,12 +161,18 @@ pub struct Expected<'a> {
     pub swap_id: &'a Hash32,
     pub chain: Option<&'a crate::caip::ChainId>,
     pub contract: Option<&'a str>,
-    /// Chain time of the leg chain (or the signer's time for `accept`).
-    pub now: u64,
+    /// The verifier's real time (Unix seconds), never chain time. One clock for
+    /// every action, `accept` included (spec 4.1).
+    pub now_real: u64,
+    /// The stated clock skew allowance between the verifier and the policy signer,
+    /// at most `MAX_SKEW_SECS`.
+    pub skew_secs: u64,
 }
 
 /// S20: the warrant binds chain id, contract, swap id, nonce and validity window,
-/// and it is an authorization, not a decision record.
+/// and it is an authorization, not a decision record. The window is in the policy
+/// signer's real time; the verifier accepts it at its own real time within the
+/// stated skew: `valid_after - skew <= now_real <= valid_until + skew`.
 pub fn check_binding(w: &SwapWarrant, e: &Expected) -> Result<(), &'static str> {
     if w.protocol != PROTOCOL || w.decision != "allow" {
         return Err("not an authorization");
@@ -189,7 +201,16 @@ pub fn check_binding(w: &SwapWarrant, e: &Expected) -> Result<(), &'static str> 
     if w.nonce == [0; 16] {
         return Err("missing nonce");
     }
-    if e.now < w.valid_after || e.now > w.valid_until {
+    if w.valid_after > w.valid_until {
+        return Err("inverted validity window");
+    }
+    if e.skew_secs > MAX_SKEW_SECS {
+        return Err("skew allowance too large");
+    }
+    // Saturation is exact here: a bound that leaves the u64 range admits every u64 time.
+    let earliest = w.valid_after.saturating_sub(e.skew_secs);
+    let latest = w.valid_until.saturating_add(e.skew_secs);
+    if e.now_real < earliest || e.now_real > latest {
         return Err("outside the validity window");
     }
     Ok(())
@@ -275,7 +296,7 @@ pub(crate) mod tests {
         let w = warrant();
         let chain = ChainId::parse("eip155:1").unwrap();
         let contract = format!("0x{}", "33".repeat(20));
-        let ok = Expected { action: Action::Lock, swap_id: &[1; 32], chain: Some(&chain), contract: Some(&contract), now: 150 };
+        let ok = Expected { action: Action::Lock, swap_id: &[1; 32], chain: Some(&chain), contract: Some(&contract), now_real: 150, skew_secs: 0 };
         assert!(check_binding(&w, &ok).is_ok());
         let other_chain = ChainId::parse("eip155:10").unwrap();
         let other_contract = format!("0x{}", "34".repeat(20));
@@ -284,8 +305,8 @@ pub(crate) mod tests {
             Expected { chain: Some(&other_chain), ..ok },
             Expected { contract: Some(&other_contract), ..ok },
             Expected { action: Action::Reveal, ..ok },
-            Expected { now: 201, ..ok },
-            Expected { now: 99, ..ok },
+            Expected { now_real: 201, ..ok },
+            Expected { now_real: 99, ..ok },
         ];
         for (i, e) in cases.iter().enumerate() {
             assert!(check_binding(&w, e).is_err(), "case {i}");
@@ -293,6 +314,87 @@ pub(crate) mod tests {
         let mut record_like = w.clone();
         record_like.protocol = DECISION_PROTOCOL.into();
         assert!(check_binding(&record_like, &ok).is_err());
+    }
+
+    /// An `accept` warrant (no leg) with the given window, checked at the verifier's
+    /// real time with a stated skew.
+    fn window_at(valid_after: u64, valid_until: u64, now_real: u64, skew_secs: u64) -> Result<(), &'static str> {
+        let mut w = warrant();
+        w.action = Action::Accept;
+        w.leg = None;
+        w.tx_binding = None;
+        w.valid_after = valid_after;
+        w.valid_until = valid_until;
+        let e = Expected { action: Action::Accept, swap_id: &[1; 32], chain: None, contract: None, now_real, skew_secs };
+        check_binding(&w, &e)
+    }
+
+    #[test]
+    fn window_uses_real_time_with_stated_skew() {
+        for now in [970, 985, 1_000, 1_300, 1_600, 1_615, 1_630] {
+            assert_eq!(window_at(1_000, 1_600, now, 30), Ok(()), "now {now}");
+        }
+        for now in [969, 1_631] {
+            assert_eq!(window_at(1_000, 1_600, now, 30), Err("outside the validity window"), "now {now}");
+        }
+        for now in [999, 1_601] {
+            assert_eq!(window_at(1_000, 1_600, now, 0), Err("outside the validity window"), "now {now}");
+        }
+        assert_eq!(window_at(1_000, 1_600, 1_000, 0), Ok(()));
+        assert_eq!(window_at(1_000, 1_600, 1_600, 0), Ok(()));
+    }
+
+    #[test]
+    fn skew_allowance_is_bounded() {
+        let (after, until) = (1_000_000, 1_000_600);
+        assert_eq!(window_at(after, until, after - MAX_SKEW_SECS, MAX_SKEW_SECS), Ok(()));
+        assert_eq!(window_at(after, until, until + MAX_SKEW_SECS, MAX_SKEW_SECS), Ok(()));
+        assert_eq!(window_at(after, until, after - MAX_SKEW_SECS - 1, MAX_SKEW_SECS), Err("outside the validity window"));
+        assert_eq!(window_at(after, until, after + 300, MAX_SKEW_SECS + 1), Err("skew allowance too large"));
+        assert_eq!(window_at(after, until, after + 300, u64::MAX), Err("skew allowance too large"));
+    }
+
+    #[test]
+    fn inverted_window_is_rejected() {
+        // With the skew, 1_000 and 1_001 are inside [1_001 - 1, 1_000 + 1].
+        assert_eq!(window_at(1_001, 1_000, 1_000, 1), Err("inverted validity window"));
+        assert_eq!(window_at(1_001, 1_000, 1_001, 1), Err("inverted validity window"));
+        // valid_after == valid_until is a valid zero-length window, not an inverted one.
+        assert_eq!(window_at(1_000, 1_000, 1_000, 0), Ok(()));
+    }
+
+    #[test]
+    fn window_bounds_saturate_at_the_u64_range() {
+        let k = MAX_SKEW_SECS;
+        assert_eq!(window_at(k - 1, u64::MAX, 0, k), Ok(()));
+        assert_eq!(window_at(k - 1, u64::MAX, u64::MAX, k), Ok(()));
+        assert_eq!(window_at(u64::MAX, u64::MAX, u64::MAX - k, k), Ok(()));
+        assert_eq!(window_at(u64::MAX, u64::MAX, u64::MAX - k - 1, k), Err("outside the validity window"));
+        assert_eq!(window_at(0, 0, k, k), Ok(()));
+        assert_eq!(window_at(0, 0, k + 1, k), Err("outside the validity window"));
+    }
+
+    /// One clock for every action (spec 4.1): the same rules hold for a leg action.
+    #[test]
+    fn window_rules_hold_for_leg_actions() {
+        let chain = ChainId::parse("eip155:1").unwrap();
+        let contract = format!("0x{}", "33".repeat(20));
+        let w = warrant();
+        let lock = |now_real, skew_secs| Expected {
+            action: Action::Lock,
+            swap_id: &[1; 32],
+            chain: Some(&chain),
+            contract: Some(&contract),
+            now_real,
+            skew_secs,
+        };
+        assert_eq!(check_binding(&w, &lock(70, 30)), Ok(()));
+        assert_eq!(check_binding(&w, &lock(230, 30)), Ok(()));
+        assert_eq!(check_binding(&w, &lock(69, 30)), Err("outside the validity window"));
+        assert_eq!(check_binding(&w, &lock(150, MAX_SKEW_SECS + 1)), Err("skew allowance too large"));
+        let mut inverted = w.clone();
+        (inverted.valid_after, inverted.valid_until) = (201, 200);
+        assert_eq!(check_binding(&inverted, &lock(200, 1)), Err("inverted validity window"));
     }
 
     #[test]

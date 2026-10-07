@@ -17,6 +17,10 @@ pub const ED25519_PROGRAM: &str = "Ed25519SigVerify111111111111111111111111111";
 /// PDA seed prefix of the reference HTLC escrow: `[b"htlc", swap_id]`.
 pub const ESCROW_SEED: &[u8] = b"htlc";
 
+/// The first 8 data bytes of a reference HTLC escrow account:
+/// `sha256("account:Escrow")[..8]` (implementation spec 4.6).
+pub const ESCROW_DISCRIMINATOR: [u8; 8] = [0x1f, 0xd5, 0x7b, 0xbb, 0xba, 0x16, 0xda, 0x9b];
+
 pub fn key(base58: &str) -> Hash32 {
     bs58::decode(base58).into_vec().ok().and_then(|v| v.try_into().ok()).expect("valid program id constant")
 }
@@ -479,19 +483,49 @@ pub struct ProgramPin {
     pub upgrade_authority: Option<String>,
 }
 
+/// The account at the escrow address, as read from the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EscrowAccount {
+    pub owner: Hash32,
+    /// The length of the account data in bytes.
+    pub data_len: u64,
+    /// The first 8 bytes of the account data. `None` when the data is shorter.
+    pub discriminator: Option<[u8; 8]>,
+}
+
 /// Observed facts about the program and the escrow account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramFacts {
     pub executable: bool,
     pub upgrade_authority: Option<Hash32>,
+    /// The address that the escrow account was read from.
     pub escrow_address: Hash32,
-    pub escrow_owner: Hash32,
+    /// The account at `escrow_address`. `None`: no account exists there.
+    pub escrow: Option<EscrowAccount>,
+}
+
+impl ProgramFacts {
+    /// The escrow account is in the state that the action needs. `locked`: the
+    /// lock exists now, so the program owns the escrow account and its data starts
+    /// with `ESCROW_DISCRIMINATOR`. Before the own lock, the address holds no
+    /// account, or only lamports: a System-owned account without data, which the
+    /// lock instruction can still take (anyone can send lamports to an address).
+    pub fn escrow_ready(&self, program: &Hash32, locked: bool) -> bool {
+        match (&self.escrow, locked) {
+            (Some(e), true) => e.owner == *program && e.discriminator == Some(ESCROW_DISCRIMINATOR),
+            (None, false) => true,
+            (Some(e), false) => e.owner == key(SYSTEM_PROGRAM) && e.data_len == 0,
+            (None, true) => false,
+        }
+    }
 }
 
 impl ProgramPin {
     /// S7 for Solana: the program is pinned and executable, its upgrade authority
-    /// is none or the pinned account, and the escrow is the expected PDA owned by it.
-    pub fn matches(&self, program: &Hash32, swap_id: &Hash32, facts: &ProgramFacts) -> bool {
+    /// is none or the pinned account, and the escrow address is the expected PDA.
+    /// `locked`: the lock exists now; see `ProgramFacts::escrow_ready` for the
+    /// escrow account before and after the lock.
+    pub fn matches(&self, program: &Hash32, swap_id: &Hash32, facts: &ProgramFacts, locked: bool) -> bool {
         let Some(pinned) = parse_key(&self.program) else {
             return false;
         };
@@ -500,10 +534,11 @@ impl ProgramPin {
             (Some(a), Some(actual)) => parse_key(a) == Some(actual),
             (None, Some(_)) => false,
         };
+        let escrow_ok = facts.escrow_ready(program, locked);
         &pinned == program
             && facts.executable
             && authority_ok
-            && facts.escrow_owner == *program
+            && escrow_ok
             && escrow_address(program, swap_id) == Some(facts.escrow_address)
     }
 }
@@ -731,16 +766,62 @@ pub(crate) mod tests {
     fn program_pins() {
         let program = key(TOKEN_PROGRAM);
         let pin = ProgramPin { program: TOKEN_PROGRAM.into(), upgrade_authority: None };
+        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
         let facts = ProgramFacts {
             executable: true,
             upgrade_authority: None,
             escrow_address: escrow_address(&program, &[7; 32]).unwrap(),
-            escrow_owner: program,
+            escrow: Some(escrow.clone()),
         };
-        assert!(pin.matches(&program, &[7; 32], &facts));
-        assert!(!pin.matches(&program, &[8; 32], &facts), "escrow of another swap");
-        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { upgrade_authority: Some([1; 32]), ..facts.clone() }), "upgradeable");
-        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { escrow_owner: [3; 32], ..facts.clone() }), "foreign owner");
-        assert!(!pin.matches(&key(ATA_PROGRAM), &[7; 32], &facts), "other program");
+        assert!(pin.matches(&program, &[7; 32], &facts, true));
+        assert!(!pin.matches(&program, &[8; 32], &facts, true), "escrow of another swap");
+        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { upgrade_authority: Some([1; 32]), ..facts.clone() }, true), "upgradeable");
+        let foreign = EscrowAccount { owner: [3; 32], ..escrow.clone() };
+        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { escrow: Some(foreign), ..facts.clone() }, true), "foreign owner");
+        assert!(!pin.matches(&key(ATA_PROGRAM), &[7; 32], &facts, true), "other program");
+    }
+
+    /// Spec 8.4 Solana (D3): a lock that exists has a program-owned escrow with the
+    /// reference discriminator. Before the own lock, the escrow PDA holds no account
+    /// or only lamports.
+    #[test]
+    fn escrow_account_state() {
+        let program = key(TOKEN_PROGRAM);
+        let pin = ProgramPin { program: TOKEN_PROGRAM.into(), upgrade_authority: None };
+        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
+        let facts = ProgramFacts {
+            executable: true,
+            upgrade_authority: None,
+            escrow_address: escrow_address(&program, &[7; 32]).unwrap(),
+            escrow: Some(escrow.clone()),
+        };
+        let with = |e: Option<EscrowAccount>| ProgramFacts { escrow: e, ..facts.clone() };
+        // A lock that exists.
+        assert!(pin.matches(&program, &[7; 32], &facts, true));
+        let other = EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(other)), true), "another account type");
+        let closed = EscrowAccount { discriminator: Some([0xff; 8]), ..escrow.clone() };
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(closed)), true), "closed account");
+        let short = EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(short)), true), "data shorter than 8 bytes");
+        assert!(!pin.matches(&program, &[7; 32], &with(None), true), "no escrow account");
+        // Before the own lock.
+        assert!(pin.matches(&program, &[7; 32], &with(None), false));
+        assert!(!pin.matches(&program, &[7; 32], &facts, false), "escrow exists before the lock");
+        let funded = EscrowAccount { owner: key(SYSTEM_PROGRAM), data_len: 0, discriminator: None };
+        assert!(pin.matches(&program, &[7; 32], &with(Some(funded.clone())), false), "lamports only: the lock can take it");
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(funded.clone())), true), "lamports only is not a lock");
+        let allocated = EscrowAccount { data_len: 1, ..funded.clone() };
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(allocated)), false), "System-owned account with data");
+        let foreign = EscrowAccount { owner: [3; 32], ..funded };
+        assert!(!pin.matches(&program, &[7; 32], &with(Some(foreign)), false), "account of another owner");
+        assert!(!pin.matches(&program, &[8; 32], &with(None), false), "address of another swap");
+        let upgradeable = ProgramFacts { upgrade_authority: Some([1; 32]), ..with(None) };
+        assert!(!pin.matches(&program, &[7; 32], &upgradeable, false), "program checks still apply");
+    }
+
+    #[test]
+    fn escrow_discriminator_is_the_anchor_account_hash() {
+        assert_eq!(crate::sha256(b"account:Escrow")[..8], ESCROW_DISCRIMINATOR);
     }
 }

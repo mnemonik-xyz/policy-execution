@@ -14,22 +14,31 @@ use crate::verified::{self, ChainNow, Timelock};
 use crate::Hash32;
 use std::fmt;
 
+/// A failed check. `code`, and `cause` when a check wraps another one, are the
+/// fixed reason codes that a decision record carries. `detail` is a local
+/// diagnostic only: it can contain text from the proposed terms, so it never goes
+/// into `reasons` (spec 4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
     pub code: &'static str,
+    /// The code of the inner check that failed, when `code` wraps it (S13).
+    pub cause: Option<&'static str>,
     pub detail: String,
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.detail)
+        match self.cause {
+            Some(cause) => write!(f, "{} ({cause}): {}", self.code, self.detail),
+            None => write!(f, "{}: {}", self.code, self.detail),
+        }
     }
 }
 
 pub type Check = Result<(), Violation>;
 
 pub fn violation(code: &'static str, detail: impl Into<String>) -> Violation {
-    Violation { code, detail: detail.into() }
+    Violation { code, cause: None, detail: detail.into() }
 }
 
 pub fn fail(code: &'static str, detail: impl Into<String>) -> Check {
@@ -71,6 +80,17 @@ pub mod code {
     pub const ACCEPT: &str = "ACCEPT_BINDING";
     pub const PRICE: &str = "PRICE_UNKNOWN";
     pub const S27: &str = "S27_RECEIVER";
+    pub const TERMS: &str = "TERMS_ENCODING";
+    pub const ALLOW: &str = "POLICY_ALLOW";
+    pub const ASK: &str = "POLICY_ASK";
+    pub const DENY: &str = "POLICY_DENY";
+    pub const EXIT: &str = "EXIT_ACTION";
+
+    /// Every fixed reason code. `reasons` holds values from this list only.
+    pub const ALL: &[&str] = &[
+        S1, S2, S3, S4, S5, S6, S7, S8, S8_FLAG, S9, S10, S11, S12, S13, S14, S15, S16, S17, S19, S21, S22, S23, S24, S27,
+        CHAIN, ROLE, TIMELOCK, BAND, ACCEPT, PRICE, TERMS, ALLOW, ASK, DENY, EXIT,
+    ];
 }
 
 /// A lock as read from its chain by the profile's observation adapter. On
@@ -85,13 +105,18 @@ pub struct LockFacts {
     /// The lock contract or script enforces `len(s) = 32`.
     pub preimage_len_enforced: bool,
     /// The first height or chain time at which the refund is valid, as in
-    /// `Leg::refund_valid_from` (on Bitcoin: the CLTV operand plus one).
+    /// `Leg::refund_valid_from` (on Bitcoin: the CLTV operand plus one). For a
+    /// relative block count: the confirming block plus the count. `swap-core`
+    /// computes this value from the terms and the observation and denies another.
     pub timelock: Timelock,
     pub receiver: AccountId,
     pub refund_to: AccountId,
     pub asset: AssetId,
     /// Amount held by the lock, net of any transfer fee.
     pub net_amount: u128,
+    /// Blocks from the block that contains the lock up to the block at which the
+    /// provider read the lock (the report height), both included, as Bitcoin Core
+    /// counts: 1 when the lock is in that block, 0 when it is unconfirmed.
     pub confirmations: u64,
     pub finalized: Option<bool>,
     /// Bitcoin: the HTLC output and its script.
@@ -167,7 +192,7 @@ pub fn profile_for<'a>(chain: &ChainId, policy: &CompiledPolicy, profiles: &'a P
     let profile = profiles.get(chain).filter(|p| p.missing_obligatory().is_empty());
     match (profile, policy.policy.chains.get(chain)) {
         (Some(p), Some(entry)) if p.hash() == entry.profile_hash => Ok(p),
-        _ => Err(Violation { code: code::CHAIN, detail: format!("{chain} has no pinned, complete profile") }),
+        _ => Err(violation(code::CHAIN, format!("{chain} has no pinned, complete profile"))),
     }
 }
 
@@ -247,7 +272,10 @@ pub fn observed_lock(leg: &Leg, facts: &LockFacts, expected_timelock: Option<Tim
 }
 
 /// S7: the lock contract is a pinned contract, proved by its chain identity.
-pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservation>) -> Check {
+/// `locked`: the lock of this leg exists now. It is false only for the own lock
+/// before it is made; on Solana the escrow address then holds no account, or only
+/// lamports (`ProgramFacts::escrow_ready`).
+pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservation>, locked: bool) -> Check {
     let pin = policy.pin_for(&leg.chain, &leg.lock.contract);
     let ok = match (pin, observed) {
         (Some(ContractPinSpec::BitcoinTemplate(t)), obs) => {
@@ -267,10 +295,19 @@ pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservat
             crate::from_hex_array::<20>(&leg.lock.contract).is_some_and(|a| p.matches(&a, facts))
         }
         (Some(ContractPinSpec::Solana(p)), Some(ContractObservation::Solana(facts))) => {
-            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| p.matches(&program, &leg.lock.swap_id, facts))
+            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| p.matches(&program, &leg.lock.swap_id, facts, locked))
         }
         _ => false,
     };
+    let escrow_state = match observed {
+        Some(ContractObservation::Solana(f)) => {
+            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| !f.escrow_ready(&program, locked))
+        }
+        _ => false,
+    };
+    if escrow_state {
+        return fail(code::S7, "the escrow account is not in the state that the action needs");
+    }
     ensure(ok, code::S7, format!("{} on {} is not a pinned contract", leg.lock.contract, leg.chain))
 }
 
@@ -356,6 +393,49 @@ pub fn timelock_form(leg: &Leg) -> Check {
     ensure(ok, code::TIMELOCK, format!("timelock form not supported on {}", leg.chain))
 }
 
+/// Spec 3.2: leg B always has an absolute timelock. A relative one counts from the
+/// confirmation of the responder's own lock, which S13 cannot observe (spec 7.3).
+/// Checked at every entry action, so no party accepts such terms and the initiator
+/// never locks leg A for them.
+pub fn leg_b_absolute(terms: &Terms) -> Check {
+    ensure(!terms.leg_b.lock.timelock.is_relative(), code::TIMELOCK, "leg B needs an absolute timelock")
+}
+
+/// The timelock of a lock that does not exist yet, for S11 at accept (spec 7.3). A
+/// relative timelock counts from the confirmation of the lock, at the earliest in
+/// the block after the observed `tip`. A later confirmation only moves the timelock
+/// later, so S11 with this value holds for every lock that confirms after now. S13
+/// checks again with the observed confirmation. An absolute timelock needs no tip.
+pub fn unconfirmed_timelock(leg: &Leg, tip: Option<u64>) -> Option<Timelock> {
+    if !leg.lock.timelock.is_relative() {
+        return leg.refund_valid_from();
+    }
+    leg.refund_valid_from_confirmed(tip?.checked_add(1)?)
+}
+
+/// The timelock of an observed lock (spec 7.3), from the terms and the observation,
+/// never from the adapter's `LockFacts::timelock`. A relative block count counts
+/// from the block that confirms the lock: read at block `seen_at` with
+/// `confirmations` (1 in that block), the lock is in block
+/// `seen_at + 1 - confirmations`. `None` for an unconfirmed lock, for more
+/// confirmations than blocks, and for an observation above the observed `tip`: the
+/// tip is then stale, and S11 would count blocks that may have passed.
+pub fn observed_timelock(leg: &Leg, facts: &LockFacts, seen_at: u64, tip: Option<u64>) -> Option<Timelock> {
+    if !leg.lock.timelock.is_relative() {
+        return leg.refund_valid_from();
+    }
+    if facts.confirmations == 0 || seen_at > tip? {
+        return None;
+    }
+    leg.refund_valid_from_confirmed(seen_at.checked_add(1)?.checked_sub(facts.confirmations)?)
+}
+
+/// S13: the observed leg A lock reports exactly the timelock that the terms and its
+/// observed confirmation give (`observed_timelock`). Another adapter value denies.
+pub fn s13_timelock(facts: &LockFacts, ta: Timelock) -> Check {
+    ensure(facts.timelock == ta, code::S13, "observed timelock differs from the terms and the confirmation")
+}
+
 /// S11 through the verified arithmetic.
 pub fn s11(
     ta: Timelock, now_a: ChainNow, pa: &ChainProfile,
@@ -384,8 +464,8 @@ pub fn s14(facts: &LockFacts, method: crate::facts::EvidenceMethod, band: &Value
 /// The value band for a notional; an unknown notional takes the strictest band.
 pub fn band(profile: &ChainProfile, notional: Option<u64>) -> Result<&ValueBand, Violation> {
     match notional {
-        Some(n) => profile.band(n).ok_or_else(|| Violation { code: code::BAND, detail: format!("notional {n} above every band") }),
-        None => profile.value_bands.last().ok_or_else(|| Violation { code: code::BAND, detail: "no band".into() }),
+        Some(n) => profile.band(n).ok_or_else(|| violation(code::BAND, format!("notional {n} above every band"))),
+        None => profile.value_bands.last().ok_or_else(|| violation(code::BAND, "no band")),
     }
 }
 
@@ -428,8 +508,8 @@ pub fn s21(ledger: &LedgerState, warrant_hash: &Hash32) -> Check {
 
 pub fn s22(ledger: &LedgerState, policy: &CompiledPolicy) -> Check {
     ledger
-        .check_policy_version(policy.policy.version)
-        .map_err(|e| Violation { code: code::S22, detail: format!("{e:?}") })
+        .check_policy(policy.policy.version, &policy.policy_hash)
+        .map_err(|e| violation(code::S22, format!("{e:?}")))
 }
 
 pub fn s23(policy: &CompiledPolicy, build: &Hash32) -> Check {
@@ -567,6 +647,136 @@ mod tests {
         let mut native = leg.clone();
         native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
         assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
+    }
+
+    /// Spec 4.1 (D7): `code::ALL` lists every code of `mod code`, each a fixed token
+    /// that cannot carry a detail.
+    #[test]
+    fn reason_codes_are_fixed_tokens() {
+        let source = include_str!("checks.rs");
+        let start = source.find("pub mod code {").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let declared: Vec<&str> = source[start..end]
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const ")?.split_once(": &str = \"")?.1.strip_suffix("\";"))
+            .collect();
+        assert!(declared.len() >= 35, "{declared:?}");
+        let mut all = code::ALL.to_vec();
+        all.sort_unstable();
+        let mut sorted = declared.clone();
+        sorted.sort_unstable();
+        assert_eq!(all, sorted, "code::ALL must list every code");
+        for (i, c) in code::ALL.iter().enumerate() {
+            assert!(!c.is_empty() && c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'), "{c}");
+            assert!(!code::ALL[..i].contains(c), "duplicate {c}");
+        }
+    }
+
+    /// Spec 7.3 (G2): a relative leg A timelock counts from the observed
+    /// confirmation of the lock, never from the adapter's value.
+    #[test]
+    fn relative_timelock_counts_from_the_observed_confirmation() {
+        let mut leg: Leg = serde_json::from_value(serde_json::json!({
+            "chain": reference::BITCOIN_MAINNET,
+            "asset": "bip122:000000000019d6689c085ae165831e93/slip44:0",
+            "amount": "1",
+            "sender": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "receiver": "bip122:000000000019d6689c085ae165831e93:bc1pb",
+            "refund_to": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "lock": { "contract": crate::bitcoin::TEMPLATE_ID, "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "relative_blocks", "value": 144}, "swap_id": crate::to_hex(&[2; 32]) }
+        }))
+        .unwrap();
+        let facts = |confirmations| LockFacts {
+            contract: leg.lock.contract.clone(),
+            swap_id: leg.lock.swap_id,
+            hash_alg: HashAlg::Sha256,
+            hashlock: leg.lock.hashlock,
+            preimage_len_enforced: true,
+            timelock: Timelock::Height(900_152),
+            receiver: leg.receiver.clone(),
+            refund_to: leg.refund_to.clone(),
+            asset: leg.asset.clone(),
+            net_amount: 1,
+            confirmations,
+            finalized: None,
+            outpoint: None,
+            script_pubkey: None,
+        };
+        // Read at 900,010 with 3 confirmations: in block 900,008, refund from 900,152.
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, Some(900_010)), Some(Timelock::Height(900_152)));
+        // Read below the tip: the confirmation counts from the read height.
+        assert_eq!(observed_timelock(&leg, &facts(1), 900_010, Some(900_012)), Some(Timelock::Height(900_154)));
+        assert_eq!(observed_timelock(&leg, &facts(0), 900_010, Some(900_010)), None, "unconfirmed");
+        assert_eq!(observed_timelock(&leg, &facts(3), 1, Some(900_010)), None, "more confirmations than blocks");
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_011, Some(900_010)), None, "read above a stale tip");
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, None), None, "tip unknown");
+        // Before the lock exists: the earliest confirmation is the next block.
+        assert_eq!(unconfirmed_timelock(&leg, Some(900_000)), Some(Timelock::Height(900_145)));
+        assert_eq!(unconfirmed_timelock(&leg, None), None);
+        assert!(s13_timelock(&facts(3), Timelock::Height(900_152)).is_ok());
+        assert_eq!(s13_timelock(&facts(3), Timelock::Height(900_151)).unwrap_err().code, code::S13);
+        // An absolute timelock needs no observation.
+        leg.lock.timelock = TimelockSpec::Height(900_100);
+        assert_eq!(observed_timelock(&leg, &facts(0), 0, None), Some(Timelock::Height(900_101)));
+        assert_eq!(unconfirmed_timelock(&leg, None), Some(Timelock::Height(900_101)));
+        // A relative time has no observed BIP 68 base.
+        leg.lock.timelock = TimelockSpec::RelativeSeconds(3_600);
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, Some(900_010)), None);
+        assert_eq!(unconfirmed_timelock(&leg, Some(900_000)), None);
+    }
+
+    /// S7 on Solana (spec 8.4, D3): a lock that exists needs the program-owned escrow
+    /// with the reference discriminator; before the own lock, no escrow account.
+    #[test]
+    fn s7_solana_escrow_state() {
+        use crate::solana::{escrow_address, EscrowAccount, ProgramFacts, ESCROW_DISCRIMINATOR};
+        let chain = reference::SOLANA_MAINNET;
+        let (program, swap_id) = ([2u8; 32], [2u8; 32]);
+        let program_b58 = bs58::encode(program).into_string();
+        let owner = bs58::encode([4u8; 32]).into_string();
+        let leg: Leg = serde_json::from_value(serde_json::json!({
+            "chain": chain,
+            "asset": format!("{chain}/slip44:501"),
+            "amount": "1",
+            "sender": format!("{chain}:{owner}"),
+            "receiver": format!("{chain}:{owner}"),
+            "refund_to": format!("{chain}:{owner}"),
+            "lock": { "contract": program_b58, "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "time", "value": 1_900_000_000}, "swap_id": crate::to_hex(&swap_id) }
+        }))
+        .unwrap();
+        let mut doc = crate::dsl::tests::policy_json(crate::dsl::tests::example_rule());
+        doc["chains"][chain] = serde_json::json!({
+            "profile_hash": crate::to_hex(&reference::solana().hash()),
+            "contracts": [{"solana": {"program": program_b58}}]
+        });
+        let policy = crate::dsl::validate_policy(&doc.to_string(), &crate::dsl::tests::profiles()).unwrap();
+        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
+        let facts = |e: Option<EscrowAccount>| {
+            ContractObservation::Solana(ProgramFacts {
+                executable: true,
+                upgrade_authority: None,
+                escrow_address: escrow_address(&program, &swap_id).unwrap(),
+                escrow: e,
+            })
+        };
+        let other = EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
+        let short = EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
+        // An observed lock (responder's S13, reveal, claim).
+        assert!(s7(&leg, &policy, Some(&facts(Some(escrow.clone()))), true).is_ok());
+        for e in [Some(other), Some(short), None] {
+            let v = s7(&leg, &policy, Some(&facts(e.clone())), true).unwrap_err();
+            assert_eq!(v.code, code::S7, "{e:?}");
+        }
+        // The own lock, before the escrow exists. Lamports at the address do not block it.
+        assert!(s7(&leg, &policy, Some(&facts(None)), false).is_ok());
+        let funded = EscrowAccount { owner: [0; 32], data_len: 0, discriminator: None };
+        assert!(s7(&leg, &policy, Some(&facts(Some(funded.clone()))), false).is_ok());
+        assert_eq!(s7(&leg, &policy, Some(&facts(Some(funded))), true).unwrap_err().code, code::S7);
+        assert_eq!(s7(&leg, &policy, Some(&facts(Some(escrow))), false).unwrap_err().code, code::S7);
+        // Unknown contract facts fail closed.
+        assert!(s7(&leg, &policy, None, false).is_err());
     }
 
     /// Spec 7.3: a Bitcoin claim stays valid after T_B until the refund is final,

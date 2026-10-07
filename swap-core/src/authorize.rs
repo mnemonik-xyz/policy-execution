@@ -110,7 +110,10 @@ pub struct Env<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Warrant(Box<SwapWarrant>),
-    Record(Box<DecisionRecord>),
+    /// A decision record, and the failed check when a check decided. The violation
+    /// is a local diagnostic: it is not part of the record, and its detail can
+    /// contain text from the proposed terms. Never sign, store or anchor it.
+    Record(Box<DecisionRecord>, Option<Violation>),
 }
 
 impl Outcome {
@@ -120,7 +123,15 @@ impl Outcome {
 
     pub fn record_decision(&self) -> Option<RecordDecision> {
         match self {
-            Outcome::Record(r) => Some(r.decision),
+            Outcome::Record(r, _) => Some(r.decision),
+            Outcome::Warrant(_) => None,
+        }
+    }
+
+    /// The failed check with its detail, for local logs only.
+    pub fn diagnostic(&self) -> Option<&Violation> {
+        match self {
+            Outcome::Record(_, v) => v.as_ref(),
             Outcome::Warrant(_) => None,
         }
     }
@@ -128,7 +139,7 @@ impl Outcome {
     pub fn reasons(&self) -> &[String] {
         match self {
             Outcome::Warrant(w) => &w.reasons,
-            Outcome::Record(r) => &r.reasons,
+            Outcome::Record(r, _) => &r.reasons,
         }
     }
 }
@@ -184,29 +195,31 @@ pub fn authorize(req: &Request, env: &Env) -> Outcome {
     let mut c = Collected { env, records: Vec::new(), weakest: None };
     let terms_hash = match req.terms.hash() {
         Ok(h) => h,
-        Err(e) => return record(req, env, [0; 32], RecordDecision::Deny, vec![format!("TERMS_ENCODING: {e}")], vec![]),
+        Err(e) => return rejected(req, env, [0; 32], halt_or_deny(req), checks::violation(code::TERMS, e.to_string()), vec![]),
     };
     // No warrant for terms that the signed ACCEPT does not cover.
     let inner_sig_hash = match accepted(env, &terms_hash) {
         Ok(h) => h,
-        Err(v) => {
-            let decision = if req.action.is_exit() { RecordDecision::Halt } else { RecordDecision::Deny };
-            return record(req, env, terms_hash, decision, vec![v.to_string()], vec![]);
-        }
+        Err(v) => return rejected(req, env, terms_hash, halt_or_deny(req), v, vec![]),
     };
     if req.action.is_exit() {
         match exit(req, env, &mut c) {
-            Ok(binding) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["EXIT_ACTION".into()], c.records),
-            Err(v) => record(req, env, terms_hash, RecordDecision::Halt, vec![v.to_string()], c.records),
+            Ok(binding) => warrant(req, env, terms_hash, inner_sig_hash, binding, &[code::EXIT], c.records),
+            Err(v) => rejected(req, env, terms_hash, RecordDecision::Halt, v, c.records),
         }
     } else {
         match entry(req, env, &mut c) {
-            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["POLICY_ALLOW".into()], c.records),
-            Ok((Decision::Ask, _)) => record(req, env, terms_hash, RecordDecision::Ask, vec!["POLICY_ASK".into()], c.records),
-            Ok((Decision::Deny, _)) => record(req, env, terms_hash, RecordDecision::Deny, vec!["POLICY_DENY".into()], c.records),
-            Err(v) => record(req, env, terms_hash, RecordDecision::Deny, vec![v.to_string()], c.records),
+            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, inner_sig_hash, binding, &[code::ALLOW], c.records),
+            Ok((Decision::Ask, _)) => record(req, env, terms_hash, RecordDecision::Ask, &[code::ASK], None, c.records),
+            Ok((Decision::Deny, _)) => record(req, env, terms_hash, RecordDecision::Deny, &[code::DENY], None, c.records),
+            Err(v) => rejected(req, env, terms_hash, RecordDecision::Deny, v, c.records),
         }
     }
+}
+
+/// A failed check before the action-specific checks: an exit halts, an entry is denied.
+fn halt_or_deny(req: &Request) -> RecordDecision {
+    if req.action.is_exit() { RecordDecision::Halt } else { RecordDecision::Deny }
 }
 
 /// Solana chain facts of a claim or reveal binding: the lookup tables and the
@@ -279,7 +292,7 @@ fn warrant(
     terms_hash: Hash32,
     inner_sig_hash: Hash32,
     binding: Option<TxBinding>,
-    reasons: Vec<String>,
+    reasons: &[&'static str],
     facts: Vec<FactRecord>,
 ) -> Outcome {
     let leg = req.action.leg(req.role).map(|l| req.terms.leg(l).clone());
@@ -296,7 +309,7 @@ fn warrant(
         policy_version: env.policy.policy.version,
         evaluator_id: EvaluatorId::Build(env.policy.policy.evaluator_id),
         decision: "allow".into(),
-        reasons,
+        reasons: codes(reasons),
         valid_after: env.now_real,
         valid_until: env.now_real.saturating_add(req.valid_for_secs),
         nonce: req.nonce,
@@ -304,14 +317,35 @@ fn warrant(
     }))
 }
 
-fn record(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision, reasons: Vec<String>, facts: Vec<FactRecord>) -> Outcome {
+/// `reasons` holds fixed codes only (spec 4.1): `&'static str` values from
+/// `checks::code`, never text built from the request.
+fn codes(reasons: &[&'static str]) -> Vec<String> {
+    reasons.iter().map(|r| (*r).to_owned()).collect()
+}
+
+/// A record for a failed check: its code (and the code of the inner check that it
+/// wraps) go into `reasons`, the detail stays in the local diagnostic.
+fn rejected(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision, v: Violation, facts: Vec<FactRecord>) -> Outcome {
+    let reasons: Vec<&'static str> = std::iter::once(v.code).chain(v.cause).collect();
+    record(req, env, terms_hash, decision, &reasons, Some(v), facts)
+}
+
+fn record(
+    req: &Request,
+    env: &Env,
+    terms_hash: Hash32,
+    decision: RecordDecision,
+    reasons: &[&'static str],
+    diagnostic: Option<Violation>,
+    facts: Vec<FactRecord>,
+) -> Outcome {
     Outcome::Record(Box::new(DecisionRecord {
         protocol: DECISION_PROTOCOL.into(),
         action: req.action,
         swap_id: req.terms.swap_id,
         terms_hash,
         decision,
-        reasons,
+        reasons: codes(reasons),
         facts,
         policy_hash: env.policy.policy_hash,
         policy_version: env.policy.policy.version,
@@ -319,23 +353,24 @@ fn record(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision
         at: env.now_real,
         nonce: req.nonce,
         prev_warrant: req.prev_warrant,
-    }))
+    }), diagnostic)
 }
 
 fn need_tx(req: &Request) -> Result<&ProposedTx, Violation> {
-    req.tx.as_ref().ok_or_else(|| Violation { code: code::S24, detail: "no transaction proposed".into() })
+    req.tx.as_ref().ok_or_else(|| checks::violation(code::S24, "no transaction proposed"))
 }
 
 fn s24(r: Result<TxBinding, String>) -> Result<TxBinding, Violation> {
-    r.map_err(|detail| Violation { code: code::S24, detail })
+    r.map_err(|detail| checks::violation(code::S24, detail))
 }
 
-/// Observed lock and contract identity of one leg (S5–S10, S7).
-fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockFacts, Violation> {
+/// Observed lock and contract identity of one leg (S5–S10, S7), and the height of
+/// the block at which the providers read the lock.
+fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<(LockFacts, u64), Violation> {
     let env = c.env;
-    let facts = c
-        .resolve(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
-        .ok_or_else(|| Violation { code: code::S14, detail: format!("lock of leg {leg_name:?} not observed with agreeing evidence") })?;
+    let (facts, seen_at) = c
+        .resolve_at(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
+        .ok_or_else(|| checks::violation(code::S14, format!("lock of leg {leg_name:?} not observed with agreeing evidence")))?;
     let expected = leg.refund_valid_from();
     checks::observed_lock(leg, &facts, expected)?;
     let contract = if leg.chain.family() == Some(Family::Bitcoin) {
@@ -348,8 +383,8 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockF
     } else {
         c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
-    checks::s7(leg, env.policy, contract.as_ref())?;
-    Ok(facts)
+    checks::s7(leg, env.policy, contract.as_ref(), true)?;
+    Ok((facts, seen_at))
 }
 
 fn price(env: &Env, asset: &AssetId) -> Option<u128> {
@@ -381,6 +416,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     checks::s5_s6_terms(terms, role, &env.own.accounts, &env.own.bitcoin_keys)?;
     checks::timelock_form(&terms.leg_a)?;
     checks::timelock_form(&terms.leg_b)?;
+    checks::leg_b_absolute(terms)?;
 
     let own_name = role.own_leg();
     let their_name = role.counterparty_leg();
@@ -421,37 +457,59 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                     return Err(checks::violation(code::S7, format!("{} on {} is not pinned", leg.lock.contract, leg.chain)));
                 }
             }
-            if let (Role::Responder, Some(ta), Some(tb)) = (role, ta_terms, tb_terms) {
-                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta), c.chain_now(&terms.leg_b.chain, tb));
+            // No leg A lock exists yet: a relative T_A counts from the earliest block
+            // that can confirm it (spec 7.3). S13 checks it again.
+            let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+            let ta_now = checks::unconfirmed_timelock(&terms.leg_a, tip_a);
+            if role == Role::Responder {
+                let (Some(ta_now), Some(tb)) = (ta_now, tb_terms) else {
+                    return Err(checks::violation(code::S11, "timelock or chain tip unknown"));
+                };
+                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta_now), c.chain_now(&terms.leg_b.chain, tb));
                 let (Some(now_a), Some(now_b)) = (now_a, now_b) else {
                     return Err(checks::violation(code::S11, "chain tip unknown"));
                 };
-                checks::s11(ta, now_a, pa, tb, now_b, pb, margin)?;
+                checks::s11(ta_now, now_a, pa, tb, now_b, pb, margin)?;
             }
+            ta = ta_now;
         }
         Action::Lock => {
             let own_contract = c.resolve(&format!("contract:{own_name:?}"), env.obs.contracts.get(&own_name));
-            checks::s7(own_leg, policy, own_contract.as_ref())?;
+            // The own lock does not exist yet: on Solana its escrow address holds no account, or only lamports.
+            checks::s7(own_leg, policy, own_contract.as_ref(), false)?;
             checks::s15(&env.obs.fee_reserves, own_profile, their_profile)?;
             checks::s16(env.runtime)?;
             checks::s17(own_profile, env.runtime)?;
             checks::s19(own_profile)?;
+            if role == Role::Initiator {
+                // The own leg A lock confirms after now: a relative T_A counts from the
+                // earliest block that can confirm it (spec 7.3), as at accept.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                ta = checks::unconfirmed_timelock(&terms.leg_a, tip_a);
+            }
             if role == Role::Responder {
                 // S13: the initiator lock is final and leaves room for T_B.
-                let facts = observed_leg(c, LegName::A, &terms.leg_a)
-                    .map_err(|v| Violation { code: code::S13, detail: v.to_string() })?;
+                let (facts, seen_at) = observed_leg(c, LegName::A, &terms.leg_a)
+                    .map_err(|v| Violation { code: code::S13, cause: Some(v.code), detail: v.detail })?;
                 let method = c.weakest.unwrap_or(EvidenceMethod::SingleRpc);
                 checks::s14(&facts, method, checks::band(pa, notional)?)?;
                 let Some(tb) = tb_terms else {
                     return Err(checks::violation(code::TIMELOCK, "the second leg needs an absolute timelock"));
                 };
-                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, facts.timelock), c.chain_now(&terms.leg_b.chain, tb));
+                // T_A from the terms and the observed confirmation of the leg A lock
+                // (spec 7.3), never the adapter's value.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                let Some(ta_lock) = checks::observed_timelock(&terms.leg_a, &facts, seen_at, tip_a) else {
+                    return Err(checks::violation(code::S13, "leg A timelock unknown: no consistent observed confirmation"));
+                };
+                checks::s13_timelock(&facts, ta_lock)?;
+                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta_lock), c.chain_now(&terms.leg_b.chain, tb));
                 let (Some(now_a), Some(now_b)) = (now_a, now_b) else {
                     return Err(checks::violation(code::S13, "chain tip unknown"));
                 };
-                checks::s11(facts.timelock, now_a, pa, tb, now_b, pb, margin)
-                    .map_err(|v| Violation { code: code::S13, detail: v.detail })?;
-                ta = Some(facts.timelock);
+                checks::s11(ta_lock, now_a, pa, tb, now_b, pb, margin)
+                    .map_err(|v| Violation { code: code::S13, cause: Some(v.code), detail: v.detail })?;
+                ta = Some(ta_lock);
                 counterparty_lock = Some(LockObs { chain: terms.leg_a.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             }
             // S27: the own receiver on the counterparty leg and the own refund account
@@ -476,7 +534,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             binding = Some(s24(tx::bind(action, own_leg, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Reveal => {
-            let facts = observed_leg(c, LegName::B, &terms.leg_b)?;
+            let (facts, _) = observed_leg(c, LegName::B, &terms.leg_b)?;
             let method = c.weakest.unwrap_or(EvidenceMethod::SingleRpc);
             checks::s14(&facts, method, checks::band(pb, notional)?)?;
             let now_b = c.chain_now(&terms.leg_b.chain, facts.timelock);
@@ -501,6 +559,16 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             };
             solana_facts(c, &terms.leg_b, &mut ctx);
             binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
+            if terms.leg_a.lock.timelock.is_relative() {
+                // The own leg A lock exists now: a relative T_A counts from its observed
+                // confirmation (spec 7.3), never from the adapter's value. Only an
+                // observation that matches leg A (S5-S10, S7) counts. Without one, the
+                // timeout_gap fact stays unknown.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                ta = observed_leg(c, LegName::A, &terms.leg_a)
+                    .ok()
+                    .and_then(|(facts, seen_at)| checks::observed_timelock(&terms.leg_a, &facts, seen_at, tip_a));
+            }
         }
         Action::Claim | Action::Refund => unreachable!("exit actions take the exit path"),
     }
@@ -645,7 +713,7 @@ fn record_facts(c: &mut Collected, f: &SwapFacts3) {
 fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>, Violation> {
     let (terms, role, action) = (&req.terms, req.role, req.action);
     if !action.allowed_for(role) {
-        return Err(Violation { code: code::ROLE, detail: format!("{action:?} is not an action of the {role:?}") });
+        return Err(checks::violation(code::ROLE, format!("{action:?} is not an action of the {role:?}")));
     }
     checks::s1(terms)?;
     checks::s3(terms)?;
@@ -661,10 +729,10 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     solana_facts(c, leg, &mut ctx);
     match action {
         Action::Claim => {
-            let facts = observed_leg(c, leg_name, leg)?;
+            let (facts, _) = observed_leg(c, leg_name, leg)?;
             let preimage = req.preimage.filter(|p| preimage_opens(p, &leg.lock.hashlock));
             if preimage.is_none() {
-                return Err(Violation { code: code::S2, detail: "the observed preimage does not open the hashlock".into() });
+                return Err(checks::violation(code::S2, "the observed preimage does not open the hashlock"));
             }
             c.record("preimage_opens_hashlock", Value::Bool(true), None);
             ctx.preimage = preimage;

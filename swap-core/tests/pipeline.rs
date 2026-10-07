@@ -1,7 +1,8 @@
 //! End-to-end tests of the authorization pipeline: a BTC (Bitcoin, leg A) for USDC
 //! (Ethereum, leg B) swap, from both sides. Each obligatory check has a test in
 //! which only that check fails; the fault-injection tests of spec 13.3 that do
-//! not need a running signer are here too (1, 2, 3, 5, 6, 7, 8, 10).
+//! not need a running signer are here too (1, 2, 3, 5, 6, 7, 8, 10). A BTC for SOL
+//! variant covers the Solana escrow account in S7.
 
 use bitcoin as rb;
 use rb::hashes::Hash as _;
@@ -17,7 +18,7 @@ use warrant_swap_core::tx::{OwnAccounts, ProposedTx};
 use warrant_swap_core::types::{Action, HashAlg, HtlcKeys, Leg, LegName, Lock, RiskFlag, Role, Terms, TimelockSpec};
 use warrant_swap_core::verified::Timelock;
 use warrant_swap_core::warrant::{RecordDecision, TxBinding};
-use warrant_swap_core::{bitcoin as btc, Hash32};
+use warrant_swap_core::{bitcoin as btc, solana as sol, Hash32};
 
 const NOW: u64 = 1_800_000_000;
 const TIP: u64 = 900_000;
@@ -332,18 +333,38 @@ fn reason(o: &Outcome) -> String {
     o.reasons().join(";")
 }
 
-fn assert_allow(o: &Outcome) {
-    assert!(o.is_allow(), "expected Allow, got {:?}: {}", o.record_decision(), reason(o));
+/// The reasons and the local diagnostic, for failure messages.
+fn explain(o: &Outcome) -> String {
+    format!("{} ({:?})", reason(o), o.diagnostic())
 }
 
+/// Spec 4.1 (D7): every reason is one of the fixed codes, never a detail.
+fn assert_fixed_codes(o: &Outcome) {
+    for r in o.reasons() {
+        assert!(code::ALL.contains(&r.as_str()), "reason {r:?} is not a fixed code");
+    }
+}
+
+fn assert_allow(o: &Outcome) {
+    assert!(o.is_allow(), "expected Allow, got {:?}: {}", o.record_decision(), explain(o));
+    let expected = match o {
+        Outcome::Warrant(w) if w.action.is_exit() => code::EXIT,
+        _ => code::ALLOW,
+    };
+    assert_eq!(o.reasons(), [expected]);
+}
+
+/// The first reason is `code`. A second reason is the inner check that `code` wraps.
 fn assert_denied(o: &Outcome, code: &str) {
-    assert_eq!(o.record_decision(), Some(RecordDecision::Deny), "{}", reason(o));
-    assert!(reason(o).starts_with(code), "expected {code}, got {}", reason(o));
+    assert_eq!(o.record_decision(), Some(RecordDecision::Deny), "{}", explain(o));
+    assert_fixed_codes(o);
+    assert_eq!(o.reasons().first().map(String::as_str), Some(code), "{}", explain(o));
 }
 
 fn assert_halt(o: &Outcome, code: &str) {
-    assert_eq!(o.record_decision(), Some(RecordDecision::Halt), "{}", reason(o));
-    assert!(reason(o).starts_with(code), "expected {code}, got {}", reason(o));
+    assert_eq!(o.record_decision(), Some(RecordDecision::Halt), "{}", explain(o));
+    assert_fixed_codes(o);
+    assert_eq!(o.reasons().first().map(String::as_str), Some(code), "{}", explain(o));
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +550,7 @@ fn fault_6_fake_token_proxy_and_permanent_delegate() {
     let mut w = World::new(Role::Initiator);
     let seizable = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::SeizableByIssuer], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, seizable));
-    assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::DENY);
     // Flags that always deny.
     let confidential = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::ConfidentialAmount], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, confidential));
@@ -561,11 +582,29 @@ fn bitcoin_fees_stay_within_the_profile() {
 #[test]
 fn fault_8_policy_rollback_and_evaluator_substitution() {
     let mut w = World::new(Role::Initiator);
-    w.ledger.accept_policy_version(4).unwrap();
+    w.ledger.accept_policy(4, [0x44; 32]).unwrap();
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::S22);
     let mut w = World::new(Role::Initiator);
     w.build = [0xef; 32];
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::S23);
+}
+
+#[test]
+fn fault_8_same_policy_version_with_another_text() {
+    // The signer accepted version 3 of the owner's policy.
+    let mut w = World::new(Role::Initiator);
+    w.ledger.accept_policy(w.policy.policy.version, w.policy.policy_hash).unwrap();
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
+    // A weaker policy text that also says version 3 is a different policy.
+    let mut weaker = rule();
+    weaker["all"][1] = serde_json::json!({ "notional_at_most": ["USD", 100000] });
+    let weaker = policy_with(weaker, 3);
+    assert_ne!(weaker.policy_hash, w.policy.policy_hash);
+    w.policy = weaker;
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::S22);
+    // A higher version replaces the policy.
+    w.policy = policy_with(rule(), 4);
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
 }
 
 #[test]
@@ -576,14 +615,14 @@ fn fault_10_initiator_outage_refunds_regardless_of_policy() {
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S12);
     // … and the refund of leg A after T_A is never blocked by policy, even with a
     // rolled-back policy and a different evaluator build (S18).
-    w.ledger.accept_policy_version(9).unwrap();
+    w.ledger.accept_policy(9, [0x99; 32]).unwrap();
     w.build = [0xef; 32];
     w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, lock_a_facts(300)));
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
     let refund = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(10))], T_A as u32, 0xffff_fffd);
     let out = w.run(Action::Refund, terms(), Some(refund), None);
     assert_allow(&out);
-    assert_eq!(out.reasons(), ["EXIT_ACTION"]);
+    assert_eq!(out.reasons(), [code::EXIT]);
     // A refund that pays someone else halts instead.
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
     let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], T_A as u32, 0xffff_fffd);
@@ -620,13 +659,14 @@ fn a_missing_price_never_reaches_the_owner() {
     w.obs.identity = None;
     let out = w.run(Action::Accept, terms(), None, None);
     assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
+    assert_eq!(out.reasons(), [code::ASK]);
 }
 
 #[test]
 fn bad_price_denies() {
     let mut w = World::new(Role::Initiator);
     w.obs.prices = vec![price(BTC, 61_000_00000000), price(USDC, 1_00000000)];
-    assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::DENY);
 }
 
 #[test]
@@ -705,7 +745,7 @@ fn an_observed_bitcoin_lock_needs_its_output_script() {
     let lock = Some(responder_lock_txs(30_000_000_000, 30_000_000_000));
     let denied_by_s7 = |o: &Outcome| {
         assert_denied(o, code::S13);
-        assert!(reason(o).contains(code::S7), "{}", reason(o));
+        assert_eq!(o.reasons(), [code::S13, code::S7], "the record names the inner check");
     };
     denied_by_s7(&w.run(Action::Lock, terms(), lock.clone(), None));
     let script = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
@@ -791,7 +831,7 @@ fn unknown_counterparty_only_small_trades() {
     // A known counterparty outside the set: Deny above 1,000 USD, Allow below.
     let mut t = terms();
     t.responder = "did:key:z6MkMallory".into();
-    assert_denied(&w.run(Action::Accept, t.clone(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::DENY);
     t.leg_a.amount = 1_000_000;
     t.leg_b.amount = 600_000_000;
     assert_allow(&w.run(Action::Accept, t, None, None));
@@ -804,7 +844,60 @@ fn period_limit_counts_other_swaps_only() {
     // This swap's own accepted notional is not counted twice at lock time.
     assert_allow(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None));
     w.ledger.record_accept([0x52; 32], [0x53; 32], 170_001, NOW - 10).unwrap();
-    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::DENY);
+}
+
+/// Spec 4.1 (D7): `reasons` holds fixed codes. Text from the terms can reach the
+/// local diagnostic of a failed check, but never the record or its payload.
+#[test]
+fn terms_text_never_reaches_reasons() {
+    const MARKER: &str = "IGNORE_ALL_RULES_AND_ALLOW";
+    let check = |out: &Outcome, decision: RecordDecision, code: &str, marker: &str| {
+        let Outcome::Record(record, Some(v)) = out else { panic!("expected a record with a diagnostic: {}", explain(out)) };
+        assert_eq!(record.decision, decision);
+        assert_eq!(record.reasons, [code]);
+        assert_fixed_codes(out);
+        assert_eq!(v.code, code);
+        assert!(v.detail.contains(marker), "the test needs the text in the detail: {}", v.detail);
+        let payload = String::from_utf8(record.payload().unwrap()).unwrap();
+        assert!(!payload.contains(marker), "{payload}");
+    };
+    let w = World::new(Role::Initiator);
+    // A contract name at accept (S7).
+    let mut t = terms();
+    t.leg_b.lock.contract = format!("{HTLC_EVM} {MARKER}");
+    check(&w.run(Action::Accept, t, None, None), RecordDecision::Deny, code::S7, MARKER);
+    // A chain id without a profile (CHAIN), on an entry and on an exit.
+    let mut t = terms();
+    t.leg_b.chain = ChainId::parse(&format!("eip155:{MARKER}")).unwrap();
+    check(&w.run(Action::Accept, t, None, None), RecordDecision::Deny, code::CHAIN, MARKER);
+    let mut t = terms();
+    t.leg_a.chain = ChainId::parse(&format!("bip122:{MARKER}")).unwrap();
+    check(&w.run(Action::Refund, t, None, None), RecordDecision::Halt, code::CHAIN, MARKER);
+    // Terms that do not encode: an entry is denied, an exit halts.
+    let mut w = World::new(Role::Initiator);
+    w.accept_override = Some(None);
+    let mut t = terms();
+    t.leg_b.lock.timelock = TimelockSpec::Time(1 << 60);
+    check(&w.run(Action::Accept, t.clone(), None, None), RecordDecision::Deny, code::TERMS, "I-JSON");
+    check(&w.run(Action::Refund, t, None, None), RecordDecision::Halt, code::TERMS, "I-JSON");
+}
+
+/// Codes that only a lock reaches are fixed codes too.
+#[test]
+fn amount_and_band_reasons_are_fixed_codes() {
+    // The observed leg A lock holds less than the terms (S8, inside S13).
+    let mut w = World::new(Role::Responder);
+    let mut f = lock_a_facts(3);
+    f.net_amount -= 1;
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, f));
+    let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
+    assert_denied(&out, code::S13);
+    assert_eq!(out.reasons(), [code::S13, code::S8]);
+    // A notional above every value band of the profile.
+    let mut w = responder_lock_world(3);
+    w.obs.prices = vec![price(BTC, 60_000_000 * 100_000_000), price(USDC, 1_00000000)];
+    assert_denied(&w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::BAND);
 }
 
 #[test]
@@ -928,6 +1021,146 @@ fn responder_waits_for_initiator_finality() {
     assert_denied(&w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S14);
 }
 
+// ---------------------------------------------------------------------------
+// Relative timelocks (G2, spec 3.2 and 7.3)
+// ---------------------------------------------------------------------------
+
+/// Leg B on Bitcoin with a relative timelock of `n` blocks.
+fn relative_leg_b_terms(n: u64) -> Terms {
+    let mut t = terms();
+    let a = t.leg_a.clone();
+    t.leg_b = Leg {
+        sender: a.receiver.clone(),
+        receiver: a.refund_to.clone(),
+        refund_to: a.receiver.clone(),
+        lock: Lock { timelock: TimelockSpec::RelativeBlocks(n), keys: Some(HtlcKeys { receiver: xonly(10), refund: xonly(20) }), ..a.lock.clone() },
+        ..a
+    };
+    t
+}
+
+#[test]
+fn relative_leg_b_is_denied_at_every_entry_action() {
+    let mut t = relative_leg_b_terms(144);
+    assert_denied(&World::new(Role::Responder).run(Action::Accept, t.clone(), None, None), code::TIMELOCK);
+    let w = World::new(Role::Initiator);
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::TIMELOCK);
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(initiator_lock_psbt(false)), None), code::TIMELOCK);
+    assert_denied(&w.run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::TIMELOCK);
+    // Control: the same terms with an absolute leg B fail only on the policy (BTC for BTC).
+    t.leg_b.lock.timelock = TimelockSpec::Height(TIP + 100);
+    assert_denied(&w.run(Action::Accept, t, None, None), code::DENY);
+}
+
+/// Leg A with a relative timelock of `n` blocks.
+fn relative_leg_a_terms(n: u64) -> Terms {
+    let mut t = terms();
+    t.leg_a.lock.timelock = TimelockSpec::RelativeBlocks(n);
+    t
+}
+
+/// The responder sees the relative leg A lock at block `seen_at` with three
+/// confirmations; the adapter reports `adapter` as its timelock.
+fn relative_lock_a_world(n: u64, seen_at: u64, adapter: u64) -> World {
+    let mut f = lock_a_facts(3);
+    f.timelock = Timelock::Height(adapter);
+    f.script_pubkey = Some(btc::htlc_script_pubkey(&relative_leg_a_terms(n).leg_a.lock).unwrap());
+    let mut w = World::new(Role::Responder);
+    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], seen_at, f));
+    w
+}
+
+#[test]
+fn relative_leg_a_counts_from_the_observed_confirmation() {
+    let lock = |n, seen_at, adapter| {
+        relative_lock_a_world(n, seen_at, adapter).run(Action::Lock, relative_leg_a_terms(n), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None)
+    };
+    // Seen at the tip with 3 confirmations: in block TIP - 2, so T_A = TIP - 2 + n.
+    // S11 against T_B needs T_A - TIP >= 137 with the reference profiles.
+    let out = lock(139, TIP, TIP + 137);
+    assert_allow(&out);
+    let Outcome::Warrant(wr) = &out else { unreachable!() };
+    let gap = wr.facts.iter().find(|f| f.name == "timeout_gap").map(|f| f.value.clone());
+    assert_eq!(gap, Some(serde_json::json!(13_041)), "the gap uses the computed T_A");
+    assert_denied(&lock(138, TIP, TIP + 136), code::S13);
+    // An adapter value that hides the short gap.
+    assert_denied(&lock(138, TIP, TIP + 289), code::S13);
+    // Any value other than the computed one.
+    assert_denied(&lock(139, TIP, TIP + 138), code::S13);
+    // Read above the observed tip: the tip is stale.
+    assert_denied(&lock(139, TIP + 1, TIP + 138), code::S13);
+    // More confirmations than blocks.
+    assert_denied(&lock(139, 1, TIP + 137), code::S13);
+    // Read five blocks below the tip: the lock is in block TIP - 7, so it needs n = 144.
+    assert_allow(&lock(144, TIP - 5, TIP + 137));
+    assert_denied(&lock(143, TIP - 5, TIP + 136), code::S13);
+}
+
+#[test]
+fn relative_leg_a_at_accept_counts_from_the_next_block() {
+    let mut w = World::new(Role::Responder);
+    // T_A = TIP + 1 + n.
+    assert_allow(&w.run(Action::Accept, relative_leg_a_terms(136), None, None));
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(135), None, None), code::S11);
+    w.obs.tips.remove(&ChainId::parse(BTC_CHAIN).unwrap());
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(136), None, None), code::S11);
+    // The initiator's timeout_gap uses the same earliest T_A, so the policy can decide.
+    let mut w = World::new(Role::Initiator);
+    assert_allow(&w.run(Action::Accept, relative_leg_a_terms(136), None, None));
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(1), None, None), code::DENY);
+    // The initiator's own lock: the same earliest T_A.
+    let t = relative_leg_a_terms(136);
+    let htlc = btc::htlc_script_pubkey(&t.leg_a.lock).unwrap();
+    let lock = psbt(&[([1; 32], 0, 60_000_000, p2tr(10))], &[(50_000_000, htlc), (9_990_000, p2tr(10))], 0, 0xffff_fffd);
+    assert_allow(&w.run(Action::Lock, t, Some(lock), None));
+    // Without the tip of chain A, the gap is unknown.
+    w.obs.tips.remove(&ChainId::parse(BTC_CHAIN).unwrap());
+    assert_eq!(w.run(Action::Accept, relative_leg_a_terms(136), None, None).record_decision(), Some(RecordDecision::Ask));
+}
+
+#[test]
+fn relative_leg_a_reveal_counts_from_the_observed_confirmation() {
+    // The initiator's own leg A lock exists at reveal: T_A comes from its confirmation.
+    let t = relative_leg_a_terms(136);
+    let mut w = initiator_reveal_world();
+    let reveal = |w: &World| w.run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET));
+    // Without the observation the gap is unknown, and the rule asks.
+    assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    // Read at the tip with 3 confirmations: T_A = TIP - 2 + 136. The adapter's value is not read.
+    let mut f = lock_a_facts(3);
+    f.timelock = Timelock::Height(1);
+    f.script_pubkey = Some(btc::htlc_script_pubkey(&t.leg_a.lock).unwrap());
+    let at = |height, facts: LockFacts| Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], height, facts);
+    w.obs.locks.insert(LegName::A, at(TIP, f.clone()));
+    let out = reveal(&w);
+    assert_allow(&out);
+    let Outcome::Warrant(wr) = &out else { unreachable!() };
+    let gap = wr.facts.iter().find(|f| f.name == "timeout_gap").map(|f| f.value.clone());
+    assert_eq!(gap, Some(serde_json::json!(11_841)));
+    // A read above the observed tip gives no T_A.
+    w.obs.locks.insert(LegName::A, at(TIP + 1, f.clone()));
+    assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    // An observation that does not match leg A gives no T_A: another output script,
+    // another receiver, less than the agreed amount.
+    let other_script = LockFacts { script_pubkey: Some(p2tr(99)), ..f.clone() };
+    let other_receiver = LockFacts { receiver: t.leg_a.refund_to.clone(), ..f.clone() };
+    let short = LockFacts { net_amount: t.leg_a.amount - 1, ..f };
+    for bad in [other_script, other_receiver, short] {
+        w.obs.locks.insert(LegName::A, at(TIP, bad));
+        assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    }
+}
+
+#[test]
+fn relative_leg_a_claim_is_an_exit() {
+    // The adapter's timelock is wrong, but the claim never reads it (S18).
+    let w = relative_lock_a_world(139, TIP, TIP + 999);
+    let t = relative_leg_a_terms(139);
+    let htlc = btc::htlc_script_pubkey(&t.leg_a.lock).unwrap();
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(20))], 0, 0xffff_fffd);
+    assert_allow(&w.run(Action::Claim, t, Some(claim), Some(SECRET)));
+}
+
 #[test]
 fn fee_token_lock_approves_the_exact_gross_debit() {
     let mut w = responder_lock_world(3);
@@ -980,7 +1213,7 @@ fn one_fixture_per_risk_flag() {
         } else if flag == RiskFlag::FreezableByIssuer {
             assert_allow(&out);
         } else {
-            assert_denied(&out, "POLICY_DENY");
+            assert_denied(&out, code::DENY);
         }
     }
     // Unknown asset facts: the leg value is unknown too, so a policy that reads
@@ -990,4 +1223,115 @@ fn one_fixture_per_risk_flag() {
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::PRICE);
     w.policy = policy_with(serde_json::json!({ "asset_risk_within": ["freezable_by_issuer"] }), 3);
     assert_eq!(w.run(Action::Accept, terms(), None, None).record_decision(), Some(RecordDecision::Ask));
+}
+
+#[test]
+fn d8_window_uses_the_signer_real_time() {
+    use warrant_swap_core::warrant::{check_binding, Expected, MAX_SKEW_SECS};
+    let w = World::new(Role::Initiator);
+    let accept = w.run(Action::Accept, terms(), None, None);
+    let Outcome::Warrant(aw) = &accept else { panic!("expected Allow") };
+    assert_eq!((aw.valid_after, aw.valid_until), (NOW, NOW + 600));
+    let at = |now_real, skew_secs| {
+        check_binding(aw, &Expected { action: Action::Accept, swap_id: &SWAP_ID, chain: None, contract: None, now_real, skew_secs })
+    };
+    // A verifier clock 30 seconds behind the policy signer needs a stated skew.
+    assert_eq!(at(NOW - 30, 0), Err("outside the validity window"));
+    assert_eq!(at(NOW - 30, 30), Ok(()));
+    assert_eq!(at(NOW + 630, 30), Ok(()));
+    assert_eq!(at(NOW + 631, 30), Err("outside the validity window"));
+    assert_eq!(at(NOW, MAX_SKEW_SECS + 1), Err("skew allowance too large"));
+}
+
+// ---------------------------------------------------------------------------
+// Solana leg B: the escrow account of the reference HTLC (spec 8.4, D3)
+// ---------------------------------------------------------------------------
+
+const SOL_CHAIN: &str = reference::SOLANA_MAINNET;
+const SOL: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501";
+const HTLC_SOL: Hash32 = [0x22; 32];
+
+fn sol_account(key: Hash32) -> AccountId {
+    acct(&format!("{SOL_CHAIN}:{}", bs58::encode(key).into_string()))
+}
+
+/// The swap of `terms()` with leg B as native SOL in the reference Solana HTLC.
+fn sol_terms() -> Terms {
+    let mut t = terms();
+    let lock = Lock { contract: bs58::encode(HTLC_SOL).into_string(), ..t.leg_b.lock.clone() };
+    t.leg_b = Leg {
+        chain: ChainId::parse(SOL_CHAIN).unwrap(),
+        asset: AssetId::parse(SOL).unwrap(),
+        amount: 200_000_000_000,
+        sender: sol_account([0xbb; 32]),
+        receiver: sol_account([0xaa; 32]),
+        refund_to: sol_account([0xbb; 32]),
+        lock,
+    };
+    t
+}
+
+fn sol_contract(escrow: Option<sol::EscrowAccount>) -> Observed<ContractObservation> {
+    let escrow_address = sol::escrow_address(&HTLC_SOL, &SWAP_ID).unwrap();
+    let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address, escrow };
+    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts))
+}
+
+fn sol_world(role: Role) -> World {
+    let t = sol_terms();
+    let profiles = ProfileSet::new(vec![reference::bitcoin(BTC_CHAIN), reference::solana()]);
+    let profile_hash = |chain: &str| warrant_swap_core::to_hex(&profiles.get(&ChainId::parse(chain).unwrap()).unwrap().hash());
+    let doc = serde_json::json!({
+        "version": 3,
+        "ref_ccy": "USD",
+        "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": {
+            (BTC_CHAIN): { "profile_hash": profile_hash(BTC_CHAIN), "contracts": [{"bitcoin_template": btc::TEMPLATE_ID}] },
+            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract}}] }
+        },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 },
+        "quorum": 2,
+        "margin_secs": 1800,
+        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC]] }
+    });
+    let mut w = World::new(role);
+    w.policy = validate_policy(&doc.to_string(), &profiles).unwrap();
+    w.profiles = profiles;
+    w.obs.tips.insert(t.leg_b.chain.clone(), chain_obs(EvidenceMethod::LightClient, 300_000_000));
+    let sol_facts = AssetFacts { decimals: 9, risk_flags: vec![], transfer_fee: None, token_program: None };
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, sol_facts));
+    w.obs.fee_reserves.insert(t.leg_b.chain.clone(), 10u128.pow(12));
+    w.own.accounts = match role {
+        Role::Initiator => vec![t.leg_a.refund_to.clone(), t.leg_b.receiver.clone()],
+        Role::Responder => vec![t.leg_b.refund_to.clone(), t.leg_a.receiver.clone()],
+    };
+    w
+}
+
+#[test]
+fn a_solana_lock_needs_the_escrow_discriminator() {
+    let t = sol_terms();
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    // Reveal: the observed leg B lock needs its escrow account with the discriminator.
+    let mut w = sol_world(Role::Initiator);
+    let lock_b = LockFacts { contract: t.leg_b.lock.contract.clone(), receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() };
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, lock_b));
+    let other = sol::EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
+    let short = sol::EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
+    for e in [None, Some(other), Some(short)] {
+        w.obs.contracts.insert(LegName::B, sol_contract(e));
+        assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    }
+    w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow.clone())));
+    let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
+    // The responder's own lock: the escrow account does not exist yet.
+    let mut w = sol_world(Role::Responder);
+    w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow)));
+    assert_denied(&w.run(Action::Lock, t.clone(), None, None), code::S7);
+    for e in [None, Some(sol::EscrowAccount { owner: [0; 32], data_len: 0, discriminator: None })] {
+        w.obs.contracts.insert(LegName::B, sol_contract(e));
+        let o = w.run(Action::Lock, t.clone(), None, None);
+        assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
+    }
 }

@@ -24,13 +24,23 @@ pub enum TimelockSpec {
 }
 
 impl TimelockSpec {
-    /// The absolute timelock; `None` for a relative timelock before confirmation.
-    pub fn absolute(&self, confirmed_height: Option<u64>, confirmed_time: Option<u64>) -> Option<Timelock> {
+    /// Whether the timelock counts from the confirmation of the lock.
+    pub fn is_relative(&self) -> bool {
+        matches!(self, TimelockSpec::RelativeBlocks(_) | TimelockSpec::RelativeSeconds(_))
+    }
+
+    /// The absolute timelock. A relative block count needs the height of the block
+    /// that confirms the lock: BIP 68 permits a spend with a relative lock of `n`
+    /// blocks first in that block plus `n`. A relative time is always `None`: BIP 68
+    /// counts it from the median time past of the block before the confirming
+    /// block, in units of 512 seconds, which no observation carries, and no profile
+    /// accepts it (`checks::timelock_form`).
+    pub fn absolute(&self, confirmed_height: Option<u64>) -> Option<Timelock> {
         match *self {
             TimelockSpec::Height(h) => Some(Timelock::Height(h)),
             TimelockSpec::Time(t) => Some(Timelock::Time(t)),
             TimelockSpec::RelativeBlocks(n) => Some(Timelock::Height(confirmed_height?.checked_add(n)?)),
-            TimelockSpec::RelativeSeconds(n) => Some(Timelock::Time(confirmed_time?.checked_add(n)?)),
+            TimelockSpec::RelativeSeconds(_) => None,
         }
     }
 }
@@ -84,7 +94,7 @@ impl Leg {
     /// `t`). The reference EVM and Solana HTLCs refund once the block time is at
     /// least `t`. `None` for a relative timelock before the lock confirms.
     pub fn refund_valid_from(&self) -> Option<Timelock> {
-        let t = self.lock.timelock.absolute(None, None)?;
+        let t = self.lock.timelock.absolute(None)?;
         if self.chain.family() == Some(crate::caip::Family::Bitcoin) {
             if let TimelockSpec::Height(_) | TimelockSpec::Time(_) = self.lock.timelock {
                 return Some(match t {
@@ -94,6 +104,15 @@ impl Leg {
             }
         }
         Some(t)
+    }
+
+    /// As `refund_valid_from`, for a lock in block `confirmed_height`: a relative
+    /// block count becomes absolute (spec 7.3). BIP 68 needs no CLTV adjustment.
+    pub fn refund_valid_from_confirmed(&self, confirmed_height: u64) -> Option<Timelock> {
+        match self.lock.timelock {
+            TimelockSpec::RelativeBlocks(_) => self.lock.timelock.absolute(Some(confirmed_height)),
+            _ => self.refund_valid_from(),
+        }
     }
 }
 
@@ -264,10 +283,14 @@ mod tests {
 
     #[test]
     fn relative_timelocks_become_absolute() {
-        assert_eq!(TimelockSpec::RelativeBlocks(144).absolute(Some(800_000), None), Some(Timelock::Height(800_144)));
-        assert_eq!(TimelockSpec::RelativeBlocks(144).absolute(None, None), None);
-        assert_eq!(TimelockSpec::Time(5).absolute(None, None), Some(Timelock::Time(5)));
-        assert_eq!(TimelockSpec::RelativeSeconds(u64::MAX).absolute(None, Some(1)), None);
+        assert_eq!(TimelockSpec::RelativeBlocks(144).absolute(Some(800_000)), Some(Timelock::Height(800_144)));
+        assert_eq!(TimelockSpec::RelativeBlocks(144).absolute(None), None);
+        assert_eq!(TimelockSpec::RelativeBlocks(u64::MAX).absolute(Some(1)), None);
+        assert_eq!(TimelockSpec::Time(5).absolute(None), Some(Timelock::Time(5)));
+        // No observation carries the BIP 68 time base: a relative time stays unknown.
+        assert_eq!(TimelockSpec::RelativeSeconds(3_600).absolute(Some(800_000)), None);
+        assert!(TimelockSpec::RelativeBlocks(1).is_relative() && TimelockSpec::RelativeSeconds(1).is_relative());
+        assert!(!TimelockSpec::Height(1).is_relative() && !TimelockSpec::Time(1).is_relative());
     }
 
     #[test]
