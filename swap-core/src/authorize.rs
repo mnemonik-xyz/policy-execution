@@ -348,7 +348,7 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockF
     } else {
         c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
-    checks::s7(leg, env.policy, contract.as_ref())?;
+    checks::s7(leg, env.policy, contract.as_ref(), true)?;
     Ok(facts)
 }
 
@@ -431,7 +431,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
         }
         Action::Lock => {
             let own_contract = c.resolve(&format!("contract:{own_name:?}"), env.obs.contracts.get(&own_name));
-            checks::s7(own_leg, policy, own_contract.as_ref())?;
+            // The own lock does not exist yet: on Solana its escrow address holds no account, or only lamports.
+            checks::s7(own_leg, policy, own_contract.as_ref(), false)?;
             checks::s15(&env.obs.fee_reserves, own_profile, their_profile)?;
             checks::s16(env.runtime)?;
             checks::s17(own_profile, env.runtime)?;

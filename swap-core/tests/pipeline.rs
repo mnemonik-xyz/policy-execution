@@ -1,7 +1,8 @@
 //! End-to-end tests of the authorization pipeline: a BTC (Bitcoin, leg A) for USDC
 //! (Ethereum, leg B) swap, from both sides. Each obligatory check has a test in
 //! which only that check fails; the fault-injection tests of spec 13.3 that do
-//! not need a running signer are here too (1, 2, 3, 5, 6, 7, 8, 10).
+//! not need a running signer are here too (1, 2, 3, 5, 6, 7, 8, 10). A BTC for SOL
+//! variant covers the Solana escrow account in S7.
 
 use bitcoin as rb;
 use rb::hashes::Hash as _;
@@ -17,7 +18,7 @@ use warrant_swap_core::tx::{OwnAccounts, ProposedTx};
 use warrant_swap_core::types::{Action, HashAlg, HtlcKeys, Leg, LegName, Lock, RiskFlag, Role, Terms, TimelockSpec};
 use warrant_swap_core::verified::Timelock;
 use warrant_swap_core::warrant::{RecordDecision, TxBinding};
-use warrant_swap_core::{bitcoin as btc, Hash32};
+use warrant_swap_core::{bitcoin as btc, solana as sol, Hash32};
 
 const NOW: u64 = 1_800_000_000;
 const TIP: u64 = 900_000;
@@ -1026,4 +1027,97 @@ fn d8_window_uses_the_signer_real_time() {
     assert_eq!(at(NOW + 630, 30), Ok(()));
     assert_eq!(at(NOW + 631, 30), Err("outside the validity window"));
     assert_eq!(at(NOW, MAX_SKEW_SECS + 1), Err("skew allowance too large"));
+}
+
+// ---------------------------------------------------------------------------
+// Solana leg B: the escrow account of the reference HTLC (spec 8.4, D3)
+// ---------------------------------------------------------------------------
+
+const SOL_CHAIN: &str = reference::SOLANA_MAINNET;
+const SOL: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/slip44:501";
+const HTLC_SOL: Hash32 = [0x22; 32];
+
+fn sol_account(key: Hash32) -> AccountId {
+    acct(&format!("{SOL_CHAIN}:{}", bs58::encode(key).into_string()))
+}
+
+/// The swap of `terms()` with leg B as native SOL in the reference Solana HTLC.
+fn sol_terms() -> Terms {
+    let mut t = terms();
+    let lock = Lock { contract: bs58::encode(HTLC_SOL).into_string(), ..t.leg_b.lock.clone() };
+    t.leg_b = Leg {
+        chain: ChainId::parse(SOL_CHAIN).unwrap(),
+        asset: AssetId::parse(SOL).unwrap(),
+        amount: 200_000_000_000,
+        sender: sol_account([0xbb; 32]),
+        receiver: sol_account([0xaa; 32]),
+        refund_to: sol_account([0xbb; 32]),
+        lock,
+    };
+    t
+}
+
+fn sol_contract(escrow: Option<sol::EscrowAccount>) -> Observed<ContractObservation> {
+    let escrow_address = sol::escrow_address(&HTLC_SOL, &SWAP_ID).unwrap();
+    let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address, escrow };
+    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts))
+}
+
+fn sol_world(role: Role) -> World {
+    let t = sol_terms();
+    let profiles = ProfileSet::new(vec![reference::bitcoin(BTC_CHAIN), reference::solana()]);
+    let profile_hash = |chain: &str| warrant_swap_core::to_hex(&profiles.get(&ChainId::parse(chain).unwrap()).unwrap().hash());
+    let doc = serde_json::json!({
+        "version": 3,
+        "ref_ccy": "USD",
+        "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": {
+            (BTC_CHAIN): { "profile_hash": profile_hash(BTC_CHAIN), "contracts": [{"bitcoin_template": btc::TEMPLATE_ID}] },
+            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract}}] }
+        },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 },
+        "quorum": 2,
+        "margin_secs": 1800,
+        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC]] }
+    });
+    let mut w = World::new(role);
+    w.policy = validate_policy(&doc.to_string(), &profiles).unwrap();
+    w.profiles = profiles;
+    w.obs.tips.insert(t.leg_b.chain.clone(), chain_obs(EvidenceMethod::LightClient, 300_000_000));
+    let sol_facts = AssetFacts { decimals: 9, risk_flags: vec![], transfer_fee: None, token_program: None };
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, sol_facts));
+    w.obs.fee_reserves.insert(t.leg_b.chain.clone(), 10u128.pow(12));
+    w.own.accounts = match role {
+        Role::Initiator => vec![t.leg_a.refund_to.clone(), t.leg_b.receiver.clone()],
+        Role::Responder => vec![t.leg_b.refund_to.clone(), t.leg_a.receiver.clone()],
+    };
+    w
+}
+
+#[test]
+fn a_solana_lock_needs_the_escrow_discriminator() {
+    let t = sol_terms();
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    // Reveal: the observed leg B lock needs its escrow account with the discriminator.
+    let mut w = sol_world(Role::Initiator);
+    let lock_b = LockFacts { contract: t.leg_b.lock.contract.clone(), receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() };
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, lock_b));
+    let other = sol::EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
+    let short = sol::EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
+    for e in [None, Some(other), Some(short)] {
+        w.obs.contracts.insert(LegName::B, sol_contract(e));
+        assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    }
+    w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow.clone())));
+    let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+    assert!(!o.is_allow() && !reason(&o).contains(code::S7), "{}", reason(&o));
+    // The responder's own lock: the escrow account does not exist yet.
+    let mut w = sol_world(Role::Responder);
+    w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow)));
+    assert_denied(&w.run(Action::Lock, t.clone(), None, None), code::S7);
+    for e in [None, Some(sol::EscrowAccount { owner: [0; 32], data_len: 0, discriminator: None })] {
+        w.obs.contracts.insert(LegName::B, sol_contract(e));
+        let o = w.run(Action::Lock, t.clone(), None, None);
+        assert!(!o.is_allow() && !reason(&o).contains(code::S7), "{}", reason(&o));
+    }
 }

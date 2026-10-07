@@ -247,7 +247,10 @@ pub fn observed_lock(leg: &Leg, facts: &LockFacts, expected_timelock: Option<Tim
 }
 
 /// S7: the lock contract is a pinned contract, proved by its chain identity.
-pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservation>) -> Check {
+/// `locked`: the lock of this leg exists now. It is false only for the own lock
+/// before it is made; on Solana the escrow address then holds no account, or only
+/// lamports (`ProgramFacts::escrow_ready`).
+pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservation>, locked: bool) -> Check {
     let pin = policy.pin_for(&leg.chain, &leg.lock.contract);
     let ok = match (pin, observed) {
         (Some(ContractPinSpec::BitcoinTemplate(t)), obs) => {
@@ -267,10 +270,19 @@ pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservat
             crate::from_hex_array::<20>(&leg.lock.contract).is_some_and(|a| p.matches(&a, facts))
         }
         (Some(ContractPinSpec::Solana(p)), Some(ContractObservation::Solana(facts))) => {
-            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| p.matches(&program, &leg.lock.swap_id, facts))
+            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| p.matches(&program, &leg.lock.swap_id, facts, locked))
         }
         _ => false,
     };
+    let escrow_state = match observed {
+        Some(ContractObservation::Solana(f)) => {
+            crate::solana::parse_key(&leg.lock.contract).is_some_and(|program| !f.escrow_ready(&program, locked))
+        }
+        _ => false,
+    };
+    if escrow_state {
+        return fail(code::S7, "the escrow account is not in the state that the action needs");
+    }
     ensure(ok, code::S7, format!("{} on {} is not a pinned contract", leg.lock.contract, leg.chain))
 }
 
@@ -567,6 +579,59 @@ mod tests {
         let mut native = leg.clone();
         native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
         assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
+    }
+
+    /// S7 on Solana (spec 8.4, D3): a lock that exists needs the program-owned escrow
+    /// with the reference discriminator; before the own lock, no escrow account.
+    #[test]
+    fn s7_solana_escrow_state() {
+        use crate::solana::{escrow_address, EscrowAccount, ProgramFacts, ESCROW_DISCRIMINATOR};
+        let chain = reference::SOLANA_MAINNET;
+        let (program, swap_id) = ([2u8; 32], [2u8; 32]);
+        let program_b58 = bs58::encode(program).into_string();
+        let owner = bs58::encode([4u8; 32]).into_string();
+        let leg: Leg = serde_json::from_value(serde_json::json!({
+            "chain": chain,
+            "asset": format!("{chain}/slip44:501"),
+            "amount": "1",
+            "sender": format!("{chain}:{owner}"),
+            "receiver": format!("{chain}:{owner}"),
+            "refund_to": format!("{chain}:{owner}"),
+            "lock": { "contract": program_b58, "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "time", "value": 1_900_000_000}, "swap_id": crate::to_hex(&swap_id) }
+        }))
+        .unwrap();
+        let mut doc = crate::dsl::tests::policy_json(crate::dsl::tests::example_rule());
+        doc["chains"][chain] = serde_json::json!({
+            "profile_hash": crate::to_hex(&reference::solana().hash()),
+            "contracts": [{"solana": {"program": program_b58}}]
+        });
+        let policy = crate::dsl::validate_policy(&doc.to_string(), &crate::dsl::tests::profiles()).unwrap();
+        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
+        let facts = |e: Option<EscrowAccount>| {
+            ContractObservation::Solana(ProgramFacts {
+                executable: true,
+                upgrade_authority: None,
+                escrow_address: escrow_address(&program, &swap_id).unwrap(),
+                escrow: e,
+            })
+        };
+        let other = EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
+        let short = EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
+        // An observed lock (responder's S13, reveal, claim).
+        assert!(s7(&leg, &policy, Some(&facts(Some(escrow.clone()))), true).is_ok());
+        for e in [Some(other), Some(short), None] {
+            let v = s7(&leg, &policy, Some(&facts(e.clone())), true).unwrap_err();
+            assert_eq!(v.code, code::S7, "{e:?}");
+        }
+        // The own lock, before the escrow exists. Lamports at the address do not block it.
+        assert!(s7(&leg, &policy, Some(&facts(None)), false).is_ok());
+        let funded = EscrowAccount { owner: [0; 32], data_len: 0, discriminator: None };
+        assert!(s7(&leg, &policy, Some(&facts(Some(funded.clone()))), false).is_ok());
+        assert_eq!(s7(&leg, &policy, Some(&facts(Some(funded))), true).unwrap_err().code, code::S7);
+        assert_eq!(s7(&leg, &policy, Some(&facts(Some(escrow))), false).unwrap_err().code, code::S7);
+        // Unknown contract facts fail closed.
+        assert!(s7(&leg, &policy, None, false).is_err());
     }
 
     /// Spec 7.3: a Bitcoin claim stays valid after T_B until the refund is final,
