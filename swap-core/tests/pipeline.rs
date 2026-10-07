@@ -1119,6 +1119,28 @@ fn relative_leg_a_at_accept_counts_from_the_next_block() {
 }
 
 #[test]
+fn relative_leg_a_reveal_counts_from_the_observed_confirmation() {
+    // The initiator's own leg A lock exists at reveal: T_A comes from its confirmation.
+    let t = relative_leg_a_terms(136);
+    let mut w = initiator_reveal_world();
+    let reveal = |w: &World| w.run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET));
+    // Without the observation the gap is unknown, and the rule asks.
+    assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    // Read at the tip with 3 confirmations: T_A = TIP - 2 + 136. The adapter's value is not read.
+    let mut f = lock_a_facts(3);
+    f.timelock = Timelock::Height(1);
+    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], TIP, f.clone()));
+    let out = reveal(&w);
+    assert_allow(&out);
+    let Outcome::Warrant(wr) = &out else { unreachable!() };
+    let gap = wr.facts.iter().find(|f| f.name == "timeout_gap").map(|f| f.value.clone());
+    assert_eq!(gap, Some(serde_json::json!(11_841)));
+    // A read above the observed tip gives no T_A.
+    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], TIP + 1, f));
+    assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+}
+
+#[test]
 fn relative_leg_a_claim_is_an_exit() {
     // The adapter's timelock is wrong, but the claim never reads it (S18).
     let w = relative_lock_a_world(139, TIP, TIP + 999);

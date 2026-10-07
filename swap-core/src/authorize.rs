@@ -559,6 +559,15 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             };
             solana_facts(c, &terms.leg_b, &mut ctx);
             binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
+            if terms.leg_a.lock.timelock.is_relative() {
+                // The own leg A lock exists now: a relative T_A counts from its observed
+                // confirmation (spec 7.3), never from the adapter's value. Without the
+                // observation, the timeout_gap fact stays unknown.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                ta = c
+                    .resolve_at("lock:A", env.obs.locks.get(&LegName::A))
+                    .and_then(|(facts, seen_at)| checks::observed_timelock(&terms.leg_a, &facts, seen_at, tip_a));
+            }
         }
         Action::Claim | Action::Refund => unreachable!("exit actions take the exit path"),
     }
