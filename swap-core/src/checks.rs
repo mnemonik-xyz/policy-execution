@@ -85,13 +85,18 @@ pub struct LockFacts {
     /// The lock contract or script enforces `len(s) = 32`.
     pub preimage_len_enforced: bool,
     /// The first height or chain time at which the refund is valid, as in
-    /// `Leg::refund_valid_from` (on Bitcoin: the CLTV operand plus one).
+    /// `Leg::refund_valid_from` (on Bitcoin: the CLTV operand plus one). For a
+    /// relative block count: the confirming block plus the count. `swap-core`
+    /// computes this value from the terms and the observation and denies another.
     pub timelock: Timelock,
     pub receiver: AccountId,
     pub refund_to: AccountId,
     pub asset: AssetId,
     /// Amount held by the lock, net of any transfer fee.
     pub net_amount: u128,
+    /// Blocks from the block that contains the lock up to the block at which the
+    /// provider read the lock (the report height), both included, as Bitcoin Core
+    /// counts: 1 when the lock is in that block, 0 when it is unconfirmed.
     pub confirmations: u64,
     pub finalized: Option<bool>,
     /// Bitcoin: the HTLC output and its script.
@@ -368,6 +373,49 @@ pub fn timelock_form(leg: &Leg) -> Check {
     ensure(ok, code::TIMELOCK, format!("timelock form not supported on {}", leg.chain))
 }
 
+/// Spec 3.2: leg B always has an absolute timelock. A relative one counts from the
+/// confirmation of the responder's own lock, which S13 cannot observe (spec 7.3).
+/// Checked at every entry action, so no party accepts such terms and the initiator
+/// never locks leg A for them.
+pub fn leg_b_absolute(terms: &Terms) -> Check {
+    ensure(!terms.leg_b.lock.timelock.is_relative(), code::TIMELOCK, "leg B needs an absolute timelock")
+}
+
+/// The timelock of a lock that does not exist yet, for S11 at accept (spec 7.3). A
+/// relative timelock counts from the confirmation of the lock, at the earliest in
+/// the block after the observed `tip`. A later confirmation only moves the timelock
+/// later, so S11 with this value holds for every lock that confirms after now. S13
+/// checks again with the observed confirmation. An absolute timelock needs no tip.
+pub fn unconfirmed_timelock(leg: &Leg, tip: Option<u64>) -> Option<Timelock> {
+    if !leg.lock.timelock.is_relative() {
+        return leg.refund_valid_from();
+    }
+    leg.refund_valid_from_confirmed(tip?.checked_add(1)?)
+}
+
+/// The timelock of an observed lock (spec 7.3), from the terms and the observation,
+/// never from the adapter's `LockFacts::timelock`. A relative block count counts
+/// from the block that confirms the lock: read at block `seen_at` with
+/// `confirmations` (1 in that block), the lock is in block
+/// `seen_at + 1 - confirmations`. `None` for an unconfirmed lock, for more
+/// confirmations than blocks, and for an observation above the observed `tip`: the
+/// tip is then stale, and S11 would count blocks that may have passed.
+pub fn observed_timelock(leg: &Leg, facts: &LockFacts, seen_at: u64, tip: Option<u64>) -> Option<Timelock> {
+    if !leg.lock.timelock.is_relative() {
+        return leg.refund_valid_from();
+    }
+    if facts.confirmations == 0 || seen_at > tip? {
+        return None;
+    }
+    leg.refund_valid_from_confirmed(seen_at.checked_add(1)?.checked_sub(facts.confirmations)?)
+}
+
+/// S13: the observed leg A lock reports exactly the timelock that the terms and its
+/// observed confirmation give (`observed_timelock`). Another adapter value denies.
+pub fn s13_timelock(facts: &LockFacts, ta: Timelock) -> Check {
+    ensure(facts.timelock == ta, code::S13, "observed timelock differs from the terms and the confirmation")
+}
+
 /// S11 through the verified arithmetic.
 pub fn s11(
     ta: Timelock, now_a: ChainNow, pa: &ChainProfile,
@@ -579,6 +627,60 @@ mod tests {
         let mut native = leg.clone();
         native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
         assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
+    }
+
+    /// Spec 7.3 (G2): a relative leg A timelock counts from the observed
+    /// confirmation of the lock, never from the adapter's value.
+    #[test]
+    fn relative_timelock_counts_from_the_observed_confirmation() {
+        let mut leg: Leg = serde_json::from_value(serde_json::json!({
+            "chain": reference::BITCOIN_MAINNET,
+            "asset": "bip122:000000000019d6689c085ae165831e93/slip44:0",
+            "amount": "1",
+            "sender": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "receiver": "bip122:000000000019d6689c085ae165831e93:bc1pb",
+            "refund_to": "bip122:000000000019d6689c085ae165831e93:bc1pa",
+            "lock": { "contract": crate::bitcoin::TEMPLATE_ID, "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "relative_blocks", "value": 144}, "swap_id": crate::to_hex(&[2; 32]) }
+        }))
+        .unwrap();
+        let facts = |confirmations| LockFacts {
+            contract: leg.lock.contract.clone(),
+            swap_id: leg.lock.swap_id,
+            hash_alg: HashAlg::Sha256,
+            hashlock: leg.lock.hashlock,
+            preimage_len_enforced: true,
+            timelock: Timelock::Height(900_152),
+            receiver: leg.receiver.clone(),
+            refund_to: leg.refund_to.clone(),
+            asset: leg.asset.clone(),
+            net_amount: 1,
+            confirmations,
+            finalized: None,
+            outpoint: None,
+            script_pubkey: None,
+        };
+        // Read at 900,010 with 3 confirmations: in block 900,008, refund from 900,152.
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, Some(900_010)), Some(Timelock::Height(900_152)));
+        // Read below the tip: the confirmation counts from the read height.
+        assert_eq!(observed_timelock(&leg, &facts(1), 900_010, Some(900_012)), Some(Timelock::Height(900_154)));
+        assert_eq!(observed_timelock(&leg, &facts(0), 900_010, Some(900_010)), None, "unconfirmed");
+        assert_eq!(observed_timelock(&leg, &facts(3), 1, Some(900_010)), None, "more confirmations than blocks");
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_011, Some(900_010)), None, "read above a stale tip");
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, None), None, "tip unknown");
+        // Before the lock exists: the earliest confirmation is the next block.
+        assert_eq!(unconfirmed_timelock(&leg, Some(900_000)), Some(Timelock::Height(900_145)));
+        assert_eq!(unconfirmed_timelock(&leg, None), None);
+        assert!(s13_timelock(&facts(3), Timelock::Height(900_152)).is_ok());
+        assert_eq!(s13_timelock(&facts(3), Timelock::Height(900_151)).unwrap_err().code, code::S13);
+        // An absolute timelock needs no observation.
+        leg.lock.timelock = TimelockSpec::Height(900_100);
+        assert_eq!(observed_timelock(&leg, &facts(0), 0, None), Some(Timelock::Height(900_101)));
+        assert_eq!(unconfirmed_timelock(&leg, None), Some(Timelock::Height(900_101)));
+        // A relative time has no observed BIP 68 base.
+        leg.lock.timelock = TimelockSpec::RelativeSeconds(3_600);
+        assert_eq!(observed_timelock(&leg, &facts(3), 900_010, Some(900_010)), None);
+        assert_eq!(unconfirmed_timelock(&leg, Some(900_000)), None);
     }
 
     /// S7 on Solana (spec 8.4, D3): a lock that exists needs the program-owned escrow

@@ -330,11 +330,12 @@ fn s24(r: Result<TxBinding, String>) -> Result<TxBinding, Violation> {
     r.map_err(|detail| Violation { code: code::S24, detail })
 }
 
-/// Observed lock and contract identity of one leg (S5–S10, S7).
-fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockFacts, Violation> {
+/// Observed lock and contract identity of one leg (S5–S10, S7), and the height of
+/// the block at which the providers read the lock.
+fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<(LockFacts, u64), Violation> {
     let env = c.env;
-    let facts = c
-        .resolve(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
+    let (facts, seen_at) = c
+        .resolve_at(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
         .ok_or_else(|| Violation { code: code::S14, detail: format!("lock of leg {leg_name:?} not observed with agreeing evidence") })?;
     let expected = leg.refund_valid_from();
     checks::observed_lock(leg, &facts, expected)?;
@@ -349,7 +350,7 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<LockF
         c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
     checks::s7(leg, env.policy, contract.as_ref(), true)?;
-    Ok(facts)
+    Ok((facts, seen_at))
 }
 
 fn price(env: &Env, asset: &AssetId) -> Option<u128> {
@@ -381,6 +382,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     checks::s5_s6_terms(terms, role, &env.own.accounts, &env.own.bitcoin_keys)?;
     checks::timelock_form(&terms.leg_a)?;
     checks::timelock_form(&terms.leg_b)?;
+    checks::leg_b_absolute(terms)?;
 
     let own_name = role.own_leg();
     let their_name = role.counterparty_leg();
@@ -421,13 +423,21 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                     return Err(checks::violation(code::S7, format!("{} on {} is not pinned", leg.lock.contract, leg.chain)));
                 }
             }
-            if let (Role::Responder, Some(ta), Some(tb)) = (role, ta_terms, tb_terms) {
-                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta), c.chain_now(&terms.leg_b.chain, tb));
+            // No leg A lock exists yet: a relative T_A counts from the earliest block
+            // that can confirm it (spec 7.3). S13 checks it again.
+            let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+            let ta_now = checks::unconfirmed_timelock(&terms.leg_a, tip_a);
+            if role == Role::Responder {
+                let (Some(ta_now), Some(tb)) = (ta_now, tb_terms) else {
+                    return Err(checks::violation(code::S11, "timelock or chain tip unknown"));
+                };
+                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta_now), c.chain_now(&terms.leg_b.chain, tb));
                 let (Some(now_a), Some(now_b)) = (now_a, now_b) else {
                     return Err(checks::violation(code::S11, "chain tip unknown"));
                 };
-                checks::s11(ta, now_a, pa, tb, now_b, pb, margin)?;
+                checks::s11(ta_now, now_a, pa, tb, now_b, pb, margin)?;
             }
+            ta = ta_now;
         }
         Action::Lock => {
             let own_contract = c.resolve(&format!("contract:{own_name:?}"), env.obs.contracts.get(&own_name));
@@ -437,22 +447,35 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             checks::s16(env.runtime)?;
             checks::s17(own_profile, env.runtime)?;
             checks::s19(own_profile)?;
+            if role == Role::Initiator {
+                // The own leg A lock confirms after now: a relative T_A counts from the
+                // earliest block that can confirm it (spec 7.3), as at accept.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                ta = checks::unconfirmed_timelock(&terms.leg_a, tip_a);
+            }
             if role == Role::Responder {
                 // S13: the initiator lock is final and leaves room for T_B.
-                let facts = observed_leg(c, LegName::A, &terms.leg_a)
+                let (facts, seen_at) = observed_leg(c, LegName::A, &terms.leg_a)
                     .map_err(|v| Violation { code: code::S13, detail: v.to_string() })?;
                 let method = c.weakest.unwrap_or(EvidenceMethod::SingleRpc);
                 checks::s14(&facts, method, checks::band(pa, notional)?)?;
                 let Some(tb) = tb_terms else {
                     return Err(checks::violation(code::TIMELOCK, "the second leg needs an absolute timelock"));
                 };
-                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, facts.timelock), c.chain_now(&terms.leg_b.chain, tb));
+                // T_A from the terms and the observed confirmation of the leg A lock
+                // (spec 7.3), never the adapter's value.
+                let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
+                let Some(ta_lock) = checks::observed_timelock(&terms.leg_a, &facts, seen_at, tip_a) else {
+                    return Err(checks::violation(code::S13, "leg A timelock unknown: no consistent observed confirmation"));
+                };
+                checks::s13_timelock(&facts, ta_lock)?;
+                let (now_a, now_b) = (c.chain_now(&terms.leg_a.chain, ta_lock), c.chain_now(&terms.leg_b.chain, tb));
                 let (Some(now_a), Some(now_b)) = (now_a, now_b) else {
                     return Err(checks::violation(code::S13, "chain tip unknown"));
                 };
-                checks::s11(facts.timelock, now_a, pa, tb, now_b, pb, margin)
+                checks::s11(ta_lock, now_a, pa, tb, now_b, pb, margin)
                     .map_err(|v| Violation { code: code::S13, detail: v.detail })?;
-                ta = Some(facts.timelock);
+                ta = Some(ta_lock);
                 counterparty_lock = Some(LockObs { chain: terms.leg_a.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             }
             // S27: the own receiver on the counterparty leg and the own refund account
@@ -477,7 +500,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             binding = Some(s24(tx::bind(action, own_leg, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Reveal => {
-            let facts = observed_leg(c, LegName::B, &terms.leg_b)?;
+            let (facts, _) = observed_leg(c, LegName::B, &terms.leg_b)?;
             let method = c.weakest.unwrap_or(EvidenceMethod::SingleRpc);
             checks::s14(&facts, method, checks::band(pb, notional)?)?;
             let now_b = c.chain_now(&terms.leg_b.chain, facts.timelock);
@@ -662,7 +685,7 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     solana_facts(c, leg, &mut ctx);
     match action {
         Action::Claim => {
-            let facts = observed_leg(c, leg_name, leg)?;
+            let (facts, _) = observed_leg(c, leg_name, leg)?;
             let preimage = req.preimage.filter(|p| preimage_opens(p, &leg.lock.hashlock));
             if preimage.is_none() {
                 return Err(Violation { code: code::S2, detail: "the observed preimage does not open the hashlock".into() });

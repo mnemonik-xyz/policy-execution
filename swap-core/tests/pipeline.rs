@@ -947,6 +947,113 @@ fn responder_waits_for_initiator_finality() {
     assert_denied(&w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S14);
 }
 
+// ---------------------------------------------------------------------------
+// Relative timelocks (G2, spec 3.2 and 7.3)
+// ---------------------------------------------------------------------------
+
+/// Leg B on Bitcoin with a relative timelock of `n` blocks.
+fn relative_leg_b_terms(n: u64) -> Terms {
+    let mut t = terms();
+    let a = t.leg_a.clone();
+    t.leg_b = Leg {
+        sender: a.receiver.clone(),
+        receiver: a.refund_to.clone(),
+        refund_to: a.receiver.clone(),
+        lock: Lock { timelock: TimelockSpec::RelativeBlocks(n), keys: Some(HtlcKeys { receiver: xonly(10), refund: xonly(20) }), ..a.lock.clone() },
+        ..a
+    };
+    t
+}
+
+#[test]
+fn relative_leg_b_is_denied_at_every_entry_action() {
+    let mut t = relative_leg_b_terms(144);
+    assert_denied(&World::new(Role::Responder).run(Action::Accept, t.clone(), None, None), code::TIMELOCK);
+    let w = World::new(Role::Initiator);
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::TIMELOCK);
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(initiator_lock_psbt(false)), None), code::TIMELOCK);
+    assert_denied(&w.run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::TIMELOCK);
+    // Control: the same terms with an absolute leg B fail only on the policy (BTC for BTC).
+    t.leg_b.lock.timelock = TimelockSpec::Height(TIP + 100);
+    assert_denied(&w.run(Action::Accept, t, None, None), "POLICY_DENY");
+}
+
+/// Leg A with a relative timelock of `n` blocks.
+fn relative_leg_a_terms(n: u64) -> Terms {
+    let mut t = terms();
+    t.leg_a.lock.timelock = TimelockSpec::RelativeBlocks(n);
+    t
+}
+
+/// The responder sees the relative leg A lock at block `seen_at` with three
+/// confirmations; the adapter reports `adapter` as its timelock.
+fn relative_lock_a_world(n: u64, seen_at: u64, adapter: u64) -> World {
+    let mut f = lock_a_facts(3);
+    f.timelock = Timelock::Height(adapter);
+    f.script_pubkey = Some(btc::htlc_script_pubkey(&relative_leg_a_terms(n).leg_a.lock).unwrap());
+    let mut w = World::new(Role::Responder);
+    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], seen_at, f));
+    w
+}
+
+#[test]
+fn relative_leg_a_counts_from_the_observed_confirmation() {
+    let lock = |n, seen_at, adapter| {
+        relative_lock_a_world(n, seen_at, adapter).run(Action::Lock, relative_leg_a_terms(n), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None)
+    };
+    // Seen at the tip with 3 confirmations: in block TIP - 2, so T_A = TIP - 2 + n.
+    // S11 against T_B needs T_A - TIP >= 137 with the reference profiles.
+    let out = lock(139, TIP, TIP + 137);
+    assert_allow(&out);
+    let Outcome::Warrant(wr) = &out else { unreachable!() };
+    let gap = wr.facts.iter().find(|f| f.name == "timeout_gap").map(|f| f.value.clone());
+    assert_eq!(gap, Some(serde_json::json!(13_041)), "the gap uses the computed T_A");
+    assert_denied(&lock(138, TIP, TIP + 136), code::S13);
+    // An adapter value that hides the short gap.
+    assert_denied(&lock(138, TIP, TIP + 289), code::S13);
+    // Any value other than the computed one.
+    assert_denied(&lock(139, TIP, TIP + 138), code::S13);
+    // Read above the observed tip: the tip is stale.
+    assert_denied(&lock(139, TIP + 1, TIP + 138), code::S13);
+    // More confirmations than blocks.
+    assert_denied(&lock(139, 1, TIP + 137), code::S13);
+    // Read five blocks below the tip: the lock is in block TIP - 7, so it needs n = 144.
+    assert_allow(&lock(144, TIP - 5, TIP + 137));
+    assert_denied(&lock(143, TIP - 5, TIP + 136), code::S13);
+}
+
+#[test]
+fn relative_leg_a_at_accept_counts_from_the_next_block() {
+    let mut w = World::new(Role::Responder);
+    // T_A = TIP + 1 + n.
+    assert_allow(&w.run(Action::Accept, relative_leg_a_terms(136), None, None));
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(135), None, None), code::S11);
+    w.obs.tips.remove(&ChainId::parse(BTC_CHAIN).unwrap());
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(136), None, None), code::S11);
+    // The initiator's timeout_gap uses the same earliest T_A, so the policy can decide.
+    let mut w = World::new(Role::Initiator);
+    assert_allow(&w.run(Action::Accept, relative_leg_a_terms(136), None, None));
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(1), None, None), "POLICY_DENY");
+    // The initiator's own lock: the same earliest T_A.
+    let t = relative_leg_a_terms(136);
+    let htlc = btc::htlc_script_pubkey(&t.leg_a.lock).unwrap();
+    let lock = psbt(&[([1; 32], 0, 60_000_000, p2tr(10))], &[(50_000_000, htlc), (9_990_000, p2tr(10))], 0, 0xffff_fffd);
+    assert_allow(&w.run(Action::Lock, t, Some(lock), None));
+    // Without the tip of chain A, the gap is unknown.
+    w.obs.tips.remove(&ChainId::parse(BTC_CHAIN).unwrap());
+    assert_eq!(w.run(Action::Accept, relative_leg_a_terms(136), None, None).record_decision(), Some(RecordDecision::Ask));
+}
+
+#[test]
+fn relative_leg_a_claim_is_an_exit() {
+    // The adapter's timelock is wrong, but the claim never reads it (S18).
+    let w = relative_lock_a_world(139, TIP, TIP + 999);
+    let t = relative_leg_a_terms(139);
+    let htlc = btc::htlc_script_pubkey(&t.leg_a.lock).unwrap();
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(20))], 0, 0xffff_fffd);
+    assert_allow(&w.run(Action::Claim, t, Some(claim), Some(SECRET)));
+}
+
 #[test]
 fn fee_token_lock_approves_the_exact_gross_debit() {
     let mut w = responder_lock_world(3);
