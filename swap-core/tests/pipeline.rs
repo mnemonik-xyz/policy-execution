@@ -7,7 +7,7 @@ use bitcoin as rb;
 use rb::hashes::Hash as _;
 use warrant_swap_core::authorize::{authorize, AcceptEvidence, Env, IdentityCredential, Observations, Outcome, Request};
 use warrant_swap_core::caip::{AccountId, AssetId, ChainId};
-use warrant_swap_core::checks::{code, AssetFacts, ContractObservation, LockFacts, Runtime};
+use warrant_swap_core::checks::{code, AssetFacts, ContractObservation, LockFacts, Payee, ReceiverFacts, Runtime};
 use warrant_swap_core::dsl::{validate_policy, CompiledPolicy};
 use warrant_swap_core::evm::{self, ContractFacts, Eip1559Tx, LockCall};
 use warrant_swap_core::facts::{EvidenceMethod, Observed, PriceReport, Report, TransferFee};
@@ -21,6 +21,7 @@ use warrant_swap_core::{bitcoin as btc, Hash32};
 
 const NOW: u64 = 1_800_000_000;
 const TIP: u64 = 900_000;
+const EVM_TIP: u64 = 20_000_000;
 const T_A: u64 = TIP + 288;
 const T_B: u64 = NOW + 6 * 3_600;
 const BTC_CHAIN: &str = reference::BITCOIN_MAINNET;
@@ -141,6 +142,11 @@ fn policy_with(rule: serde_json::Value, version: u64) -> CompiledPolicy {
     validate_policy(&doc.to_string(), &p).unwrap()
 }
 
+/// One own-node report at `height`.
+fn chain_obs_at<T: Clone + PartialEq>(height: u64, value: T) -> Observed<T> {
+    Observed::single(EvidenceMethod::OwnNode, "own", [0xb2; 32], height, value)
+}
+
 fn chain_obs<T: Clone + PartialEq>(method: EvidenceMethod, value: T) -> Observed<T> {
     match method {
         EvidenceMethod::RpcQuorum => Observed {
@@ -207,6 +213,17 @@ fn price(asset: &str, price_e8: u128) -> PriceReport {
     }
 }
 
+fn usdc_receiver(payee: [u8; 20]) -> ReceiverFacts {
+    ReceiverFacts::Evm {
+        token: AssetId::parse(USDC).unwrap().erc20_address().unwrap(),
+        payee,
+        htlc: warrant_swap_core::from_hex_array(HTLC_EVM).unwrap(),
+        payee_blocked: false,
+        htlc_blocked: false,
+        paused: false,
+    }
+}
+
 fn htlc_contract() -> ContractObservation {
     ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], proxy_implementation: None, proxy_admin: None })
 }
@@ -236,7 +253,7 @@ impl World {
         let t = terms();
         let mut obs = Observations::default();
         obs.tips.insert(t.leg_a.chain.clone(), chain_obs(EvidenceMethod::LightClient, TIP));
-        obs.tips.insert(t.leg_b.chain.clone(), chain_obs(EvidenceMethod::LightClient, 20_000_000));
+        obs.tips.insert(t.leg_b.chain.clone(), chain_obs(EvidenceMethod::LightClient, EVM_TIP));
         obs.assets.insert(t.leg_a.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 8, risk_flags: vec![], transfer_fee: None, token_program: None }));
         obs.assets.insert(
             t.leg_b.asset.clone(),
@@ -251,6 +268,11 @@ impl World {
         obs.fee_reserves.insert(t.leg_a.chain.clone(), 1_000_000);
         obs.fee_reserves.insert(t.leg_b.chain.clone(), 10u128.pow(18));
         obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, htlc_contract()));
+        // S27: both own payees of the USDC leg can receive (neither blocked, not
+        // paused), read at the observed tip of leg B.
+        for (payee, account) in [(Payee::Receiver, &t.leg_b.receiver), (Payee::RefundTo, &t.leg_b.refund_to)] {
+            obs.receivers.insert((LegName::B, payee), chain_obs_at(EVM_TIP, usdc_receiver(account.evm_address().unwrap())));
+        }
         let own = match role {
             Role::Initiator => OwnAccounts {
                 accounts: vec![t.leg_a.refund_to.clone(), t.leg_b.receiver.clone()],
@@ -706,6 +728,58 @@ fn a_claim_may_carry_the_tip_as_nlocktime() {
 }
 
 #[test]
+fn own_payees_must_be_able_to_receive() {
+    // S27: the counterparty could claim with s while the own claim fails.
+    let blocked = |w: &mut World, payee: Payee, edit: &dyn Fn(&mut ReceiverFacts)| {
+        let account = if payee == Payee::Receiver { terms().leg_b.receiver } else { terms().leg_b.refund_to };
+        let mut facts = usdc_receiver(account.evm_address().unwrap());
+        edit(&mut facts);
+        w.obs.receivers.insert((LegName::B, payee), chain_obs_at(EVM_TIP, facts));
+    };
+    let set = |f: &mut ReceiverFacts, which: &str| {
+        if let ReceiverFacts::Evm { token, payee, htlc, payee_blocked, htlc_blocked, paused } = f {
+            match which {
+                "payee" => *payee_blocked = true,
+                "htlc" => *htlc_blocked = true,
+                "paused" => *paused = true,
+                "other token" => *token = [0xdd; 20],
+                "other htlc" => *htlc = [0xcc; 20],
+                _ => *payee = [0xee; 20],
+            }
+        }
+    };
+    // The initiator's receiver on leg B: blocked, HTLC blocked, paused, or facts read
+    // for another account, another token or another HTLC.
+    for which in ["payee", "htlc", "paused", "other account", "other token", "other htlc"] {
+        let mut w = World::new(Role::Initiator);
+        blocked(&mut w, Payee::Receiver, &|f| set(f, which));
+        assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::S27);
+    }
+    // No facts: the receiver may not exist or may not receive.
+    let mut w = World::new(Role::Initiator);
+    w.obs.receivers.clear();
+    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::S27);
+    // Facts from a block before the observed tip are stale: the token may have
+    // blocked the receiver since. Without a tip, no facts are current.
+    let mut w = World::new(Role::Initiator);
+    let current = usdc_receiver(terms().leg_b.receiver.evm_address().unwrap());
+    w.obs.receivers.insert((LegName::B, Payee::Receiver), chain_obs_at(EVM_TIP - 1, current.clone()));
+    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::S27);
+    w.obs.receivers.insert((LegName::B, Payee::Receiver), chain_obs_at(EVM_TIP + 1, current));
+    assert_allow(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None));
+    w.obs.tips.remove(&terms().leg_b.chain);
+    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::S27);
+    // The responder's own refund account on leg B.
+    let mut w = responder_lock_world(3);
+    blocked(&mut w, Payee::RefundTo, &|f| set(f, "payee"));
+    assert_denied(&w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S27);
+    // The initiator checks its receiver again before reveal.
+    let mut w = initiator_reveal_world();
+    blocked(&mut w, Payee::Receiver, &|f| set(f, "payee"));
+    assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S27);
+}
+
+#[test]
 fn unknown_counterparty_only_small_trades() {
     let mut w = World::new(Role::Initiator);
     w.obs.identity = None;
@@ -826,9 +900,10 @@ fn responder_happy_path() {
 #[test]
 fn responder_requires_timeout_gap() {
     // T_B so late that leg A could be refunded before the responder's claim is final.
+    // Earliest refund of leg A: 289 blocks of the reference bound, 289 * 400 - 20 000 s.
     let w = World::new(Role::Responder);
     let mut t = terms();
-    t.leg_b.lock.timelock = TimelockSpec::Time(NOW + 21 * 3_600);
+    t.leg_b.lock.timelock = TimelockSpec::Time(NOW + 24 * 3_600);
     assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::S11);
     // The initiator does not need S11 for its own safety.
     let w = World::new(Role::Initiator);

@@ -371,6 +371,11 @@ pub fn refund_data(swap_id: &Hash32) -> Vec<u8> {
     d
 }
 
+/// The two token programs that the reference HTLC and the decoder accept.
+pub fn is_token_program(program: &Hash32) -> bool {
+    *program == key(TOKEN_PROGRAM) || *program == key(TOKEN_2022_PROGRAM)
+}
+
 /// A token leg's mint and the program that owns the mint (Token or Token-2022).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenAccounts {

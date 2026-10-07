@@ -13,7 +13,7 @@ SOURCE = Path(__file__).resolve().parent / "src" / "checks.rs"
 # hash function cannot be parsed (test `types::tests::other_hash_functions_do_not_parse`).
 # S19 is also enforced by `validate_policy`, which rejects a profile without a fee-raise method.
 CHECKS = ["s2", "s3", "s4", "s5_s6_terms", "observed_lock", "s7", "s8_flags", "s10",
-          "timelock_form", "s11", "s12", "s14", "s15", "s16", "s17", "s21", "s22", "s23"]
+          "timelock_form", "s11", "s12", "s14", "s15", "s16", "s17", "s21", "s22", "s23", "s27"]
 
 
 def main():

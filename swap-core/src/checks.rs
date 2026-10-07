@@ -1,4 +1,4 @@
-//! The obligatory safety checks S1 to S25 (spec section 7). The policy cannot
+//! The obligatory safety checks S1 to S25 and S27 (spec section 7). The policy cannot
 //! switch them off. Each returns `Ok(())` or a `Violation` with a fixed reason
 //! code. On an entry action a violation denies; on an exit action it halts.
 
@@ -70,6 +70,7 @@ pub mod code {
     pub const BAND: &str = "VALUE_BAND_EXCEEDED";
     pub const ACCEPT: &str = "ACCEPT_BINDING";
     pub const PRICE: &str = "PRICE_UNKNOWN";
+    pub const S27: &str = "S27_RECEIVER";
 }
 
 /// A lock as read from its chain by the profile's observation adapter. On
@@ -96,6 +97,39 @@ pub struct LockFacts {
     /// Bitcoin: the HTLC output and its script.
     pub outpoint: Option<(Hash32, u32)>,
     pub script_pubkey: Option<Vec<u8>>,
+}
+
+/// An own payee of a leg: the receiver of a claim or the `refund_to` of a refund.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Payee {
+    Receiver,
+    RefundTo,
+}
+
+/// Whether an own payee can receive the leg asset now (S27), read from the chain by
+/// the profile's reader. Each variant names the accounts it was read for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiverFacts {
+    /// An EVM token: its blocklist state (for example USDC `isBlacklisted`) for the
+    /// payee and for the HTLC that pays it, and its pause flag.
+    Evm { token: [u8; 20], payee: [u8; 20], htlc: [u8; 20], payee_blocked: bool, htlc_blocked: bool, paused: bool },
+    /// A Solana token account of the payee.
+    Solana {
+        account: Hash32,
+        initialized: bool,
+        frozen: bool,
+        /// Token-2022 `MemoTransfer` with required incoming memos.
+        memo_required: bool,
+        mint: Hash32,
+        owner: Hash32,
+        program: Hash32,
+        /// Token-2022 `Pausable`: the leg mint is paused now. False for a mint
+        /// without the extension.
+        mint_paused: bool,
+        /// The token account of the escrow that pays this payee, and whether it is
+        /// frozen. Read once that lock exists.
+        escrow: Option<(Hash32, bool)>,
+    },
 }
 
 /// Asset metadata read from the chain, never from the counterparty (S9).
@@ -240,6 +274,58 @@ pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservat
     ensure(ok, code::S7, format!("{} on {} is not a pinned contract", leg.lock.contract, leg.chain))
 }
 
+/// S27: the own `payee` of `leg` can receive the leg asset now. A Bitcoin output and
+/// a native coin need no facts. An EVM token must block neither the payee nor the
+/// HTLC and must not be paused; the facts name the leg's ERC-20 contract, the payee
+/// and the leg's HTLC. A Solana token account must be the payee's associated account
+/// for the leg mint under the mint's token program (`token_program`, read from the
+/// chain; SPL Token or Token-2022), initialized, not frozen and without required
+/// incoming memos, and the mint must not be paused. When the lock that pays the payee
+/// already exists (`locked`), its escrow token account must not be frozen either.
+/// Unknown facts fail: the account must already exist and be able to receive.
+pub fn s27(leg: &Leg, payee: Payee, facts: Option<&ReceiverFacts>, token_program: Option<Hash32>, locked: bool) -> Check {
+    let account = match payee {
+        Payee::Receiver => &leg.receiver,
+        Payee::RefundTo => &leg.refund_to,
+    };
+    let family = leg.chain.family();
+    if family == Some(Family::Bitcoin) || leg.asset.is_native() {
+        return Ok(());
+    }
+    let ok = match (family, facts) {
+        (Some(Family::Evm), Some(ReceiverFacts::Evm { token, payee: p, htlc, payee_blocked, htlc_blocked, paused })) => {
+            leg.asset.erc20_address() == Some(*token)
+                && account.evm_address() == Some(*p)
+                && crate::from_hex_array::<20>(&leg.lock.contract) == Some(*htlc)
+                && !payee_blocked
+                && !htlc_blocked
+                && !paused
+        }
+        (
+            Some(Family::Solana),
+            Some(ReceiverFacts::Solana { account: a, initialized, frozen, memo_required, mint, owner, program, mint_paused, escrow }),
+        ) => {
+            let token = leg.asset.spl_mint().zip(token_program.filter(crate::solana::is_token_program));
+            let token = token.map(|(m, tp)| crate::solana::TokenAccounts { mint: m, token_program: tp });
+            let expected = token.zip(account.solana_key()).and_then(|(t, o)| {
+                crate::solana::associated_token_address(&o, &t).map(|ata| (ata, t.mint, o, t.token_program))
+            });
+            // The escrow token account of an existing lock: the payee is paid from it.
+            let escrow_ok = !locked
+                || token
+                    .zip(crate::solana::parse_key(&leg.lock.contract))
+                    .and_then(|(t, program)| {
+                        crate::solana::escrow_address(&program, &leg.lock.swap_id)
+                            .and_then(|e| crate::solana::associated_token_address(&e, &t))
+                    })
+                    .is_some_and(|expected_escrow| *escrow == Some((expected_escrow, false)));
+            expected == Some((*a, *mint, *owner, *program)) && *initialized && !frozen && !memo_required && !mint_paused && escrow_ok
+        }
+        _ => false,
+    };
+    ensure(ok, code::S27, format!("own {payee:?} on {} cannot receive the leg asset now", leg.chain))
+}
+
 /// S8: flags that always deny.
 pub fn s8_flags(assets: &[&AssetFacts]) -> Check {
     for a in assets {
@@ -277,9 +363,9 @@ pub fn s11(
     margin: u64,
 ) -> Check {
     ensure(
-        verified::s11_holds(ta, now_a, pa.clock, tb, now_b, pb.clock, pb.d_observe_secs, pa.d_confirm_secs, margin),
+        verified::s11_holds(ta, now_a, pa.clock, tb, now_b, pb.clock, pb.d_refund(), pb.d_observe_secs, pa.d_confirm_secs, margin),
         code::S11,
-        "timeout gap below D_observe(B) + D_confirm(A) + D_margin",
+        "timeout gap below D_refund(B) + D_observe(B) + D_confirm(A) + D_margin",
     )
 }
 
@@ -383,9 +469,11 @@ mod tests {
         let now_b = ChainNow { tip_height: 900_000, now_real: now };
         let now_a = ChainNow { tip_height: 0, now_real: now };
         let margin = 600;
-        let need = btc.d_observe_secs + eth.d_confirm_secs + margin;
+        // Bitcoin claims stay valid after T, so D_refund(B) counts.
+        let need = btc.d_refund() + btc.d_observe_secs + eth.d_confirm_secs + margin;
         // T_A exactly enough if the refund of B were valid at block 900,010.
-        let ta = Timelock::Time(now + 10 * btc.clock.max_block_secs + need + eth.clock.max_lead_secs);
+        let latest_10 = 10 * btc.clock.slow_block_secs + btc.clock.slow_slack_secs;
+        let ta = Timelock::Time(now + latest_10 + need + eth.clock.max_lead_secs);
         assert!(s11(ta, now_a, &eth, Timelock::Height(900_010), now_b, &btc, margin).is_ok(), "raw operand passes");
         let tb = leg_b.refund_valid_from().unwrap();
         assert_eq!(tb, Timelock::Height(900_011));
@@ -396,5 +484,117 @@ mod tests {
         // CSV counts confirmations: no adjustment once confirmed, unknown before.
         leg_b.lock.timelock = crate::types::TimelockSpec::RelativeBlocks(144);
         assert_eq!(leg_b.refund_valid_from(), None);
+    }
+
+    /// S27 on Solana: the payee's associated token account for the leg mint exists,
+    /// is initialized, is not frozen and does not require incoming memos.
+    #[test]
+    fn s27_solana_token_account() {
+        let owner_key = [4u8; 32];
+        let mint_b58 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let chain = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+        let owner = bs58::encode(owner_key).into_string();
+        let leg: Leg = serde_json::from_value(serde_json::json!({
+            "chain": chain,
+            "asset": format!("{chain}/token:{mint_b58}"),
+            "amount": "1",
+            "sender": format!("{chain}:{owner}"),
+            "receiver": format!("{chain}:{owner}"),
+            "refund_to": format!("{chain}:{owner}"),
+            "lock": { "contract": bs58::encode([2u8; 32]).into_string(), "hash_alg": "sha256", "hashlock": crate::to_hex(&[1; 32]),
+                      "preimage_len": 32, "timelock": {"kind": "time", "value": 1_900_000_000}, "swap_id": crate::to_hex(&[2; 32]) }
+        }))
+        .unwrap();
+        let program = crate::solana::key(crate::solana::TOKEN_2022_PROGRAM);
+        let mint = crate::solana::parse_key(mint_b58).unwrap();
+        let ata = crate::solana::associated_token_address(&owner_key, &crate::solana::TokenAccounts { mint, token_program: program }).unwrap();
+        let good = ReceiverFacts::Solana {
+            account: ata,
+            initialized: true,
+            frozen: false,
+            memo_required: false,
+            mint,
+            owner: owner_key,
+            program,
+            mint_paused: false,
+            escrow: None,
+        };
+        assert!(s27(&leg, Payee::Receiver, Some(&good), Some(program), false).is_ok());
+        assert!(s27(&leg, Payee::RefundTo, Some(&good), Some(program), false).is_ok());
+        let with = |edit: &dyn Fn(&mut ReceiverFacts)| {
+            let mut f = good.clone();
+            edit(&mut f);
+            f
+        };
+        let bad = [
+            with(&|f| if let ReceiverFacts::Solana { frozen, .. } = f { *frozen = true }),
+            with(&|f| if let ReceiverFacts::Solana { memo_required, .. } = f { *memo_required = true }),
+            with(&|f| if let ReceiverFacts::Solana { initialized, .. } = f { *initialized = false }),
+            with(&|f| if let ReceiverFacts::Solana { account, .. } = f { *account = [9; 32] }),
+            with(&|f| if let ReceiverFacts::Solana { mint, .. } = f { *mint = [9; 32] }),
+            with(&|f| if let ReceiverFacts::Solana { owner, .. } = f { *owner = [9; 32] }),
+            with(&|f| if let ReceiverFacts::Solana { program, .. } = f { *program = crate::solana::key(crate::solana::TOKEN_PROGRAM) }),
+            with(&|f| if let ReceiverFacts::Solana { mint_paused, .. } = f { *mint_paused = true }),
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            assert!(s27(&leg, Payee::Receiver, Some(f), Some(program), false).is_err(), "case {i}");
+        }
+        // Once the paying lock exists, its escrow token account must not be frozen.
+        let token = crate::solana::TokenAccounts { mint, token_program: program };
+        let escrow = crate::solana::escrow_address(&[2u8; 32], &[2u8; 32]).unwrap();
+        let escrow_ata = crate::solana::associated_token_address(&escrow, &token).unwrap();
+        let with_escrow = |e: Option<(Hash32, bool)>| with(&|f| if let ReceiverFacts::Solana { escrow, .. } = f { *escrow = e });
+        assert!(s27(&leg, Payee::Receiver, Some(&with_escrow(Some((escrow_ata, false)))), Some(program), true).is_ok());
+        for e in [None, Some((escrow_ata, true)), Some(([9; 32], false))] {
+            assert!(s27(&leg, Payee::Receiver, Some(&with_escrow(e)), Some(program), true).is_err(), "escrow {e:?}");
+        }
+        // Unknown facts, an unknown token program, a token program other than SPL
+        // Token or Token-2022, or facts of another family fail.
+        assert!(s27(&leg, Payee::Receiver, None, Some(program), false).is_err());
+        assert!(s27(&leg, Payee::Receiver, Some(&good), None, false).is_err());
+        let other = [0x0e; 32];
+        let other_ata = crate::solana::associated_token_address(&owner_key, &crate::solana::TokenAccounts { mint, token_program: other }).unwrap();
+        let foreign = with(&|f| {
+            if let ReceiverFacts::Solana { account, program, .. } = f {
+                *account = other_ata;
+                *program = other;
+            }
+        });
+        assert!(s27(&leg, Payee::Receiver, Some(&foreign), Some(other), false).is_err());
+        let evm = ReceiverFacts::Evm { token: [0; 20], payee: [0; 20], htlc: [0; 20], payee_blocked: false, htlc_blocked: false, paused: false };
+        assert!(s27(&leg, Payee::Receiver, Some(&evm), Some(program), false).is_err());
+        // A native coin needs no facts.
+        let mut native = leg.clone();
+        native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
+        assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
+    }
+
+    /// Spec 7.3: a Bitcoin claim stays valid after T_B until the refund is final,
+    /// so S11 adds D_refund(B). A lock that rejects a late claim needs none.
+    #[test]
+    fn s11_counts_d_refund_while_a_claim_stays_valid() {
+        let btc = reference::bitcoin(reference::BITCOIN_MAINNET);
+        let eth = reference::ethereum();
+        let now = 1_800_000_000;
+        let margin = 600;
+        let now_btc = ChainNow { tip_height: 900_000, now_real: now };
+        let now_eth = ChainNow { tip_height: 0, now_real: now };
+        // Leg B on Bitcoin, leg A on Ethereum: T_A covers all but D_refund(B).
+        let tb = Timelock::Height(900_011);
+        let latest_b = 11 * btc.clock.slow_block_secs + btc.clock.slow_slack_secs;
+        let without_refund = btc.d_observe_secs + eth.d_confirm_secs + margin;
+        let ta = |extra: u64| Timelock::Time(now + latest_b + without_refund + extra + eth.clock.max_lead_secs);
+        assert!(s11(ta(0), now_eth, &eth, tb, now_btc, &btc, margin).is_err());
+        assert!(s11(ta(btc.d_refund() - 1), now_eth, &eth, tb, now_btc, &btc, margin).is_err());
+        assert!(s11(ta(btc.d_refund()), now_eth, &eth, tb, now_btc, &btc, margin).is_ok());
+        // Leg B on Ethereum, whose reference claim closes at T_B: no D_refund.
+        let tb = Timelock::Time(now + 4 * 3_600);
+        let latest_b = 4 * 3_600 + eth.clock.max_lag_secs + eth.clock.slow_block_secs + eth.clock.slow_slack_secs;
+        let need = eth.d_observe_secs + btc.d_confirm_secs + margin;
+        // Leg A on Bitcoin: the n-block lower bound gives the earliest refund.
+        let blocks = (latest_b + need + btc.clock.fast_slack_secs).div_ceil(btc.clock.fast_block_secs);
+        let ta = Timelock::Height(900_000 + blocks);
+        assert!(s11(ta, now_btc, &btc, tb, now_eth, &eth, margin).is_ok());
+        assert!(s11(Timelock::Height(900_000 + blocks - 1), now_btc, &btc, tb, now_eth, &eth, margin).is_err());
     }
 }

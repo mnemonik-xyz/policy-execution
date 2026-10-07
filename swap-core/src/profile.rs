@@ -68,6 +68,14 @@ pub struct ChainProfile {
     pub d_observe_secs: u64,
     /// Time to get a claim on this chain to finality at the worst-case fee (S11, S12).
     pub d_confirm_secs: u64,
+    /// Time for a refund on this chain to become final after `T` at the worst-case
+    /// fee (S11 `D_refund`). It counts while a claim stays valid after `T`.
+    pub d_refund_secs: u64,
+    /// The lock rejects a claim after `T`; then S11 needs no `D_refund`. Never
+    /// true on Bitcoin, where script has no "before T" check.
+    pub claim_closes_at_timelock: bool,
+    /// The failure probability at which the clock bounds hold, for example "1e-6".
+    pub clock_failure_probability: String,
     /// Bands in increasing order; a notional above the last band is not supported.
     pub value_bands: Vec<ValueBand>,
     pub fees: Fees,
@@ -83,6 +91,11 @@ impl ChainProfile {
         crate::blake3(&crate::jcs::to_vec(self).expect("profile has no floats"))
     }
 
+    /// S11 `D_refund`: 0 only when the lock rejects a claim after `T`.
+    pub fn d_refund(&self) -> u64 {
+        if self.claim_closes_at_timelock { 0 } else { self.d_refund_secs }
+    }
+
     /// Obligatory items that the profile lacks (spec 8.1). Empty means supported.
     pub fn missing_obligatory(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
@@ -93,12 +106,16 @@ impl ChainProfile {
             missing.push("lock template with a 32-byte preimage check");
         }
         let c = &self.clock;
-        let bitcoin_without_floor = c.min_block_secs == 0 && self.family == Family::Bitcoin;
-        if bitcoin_without_floor || c.min_block_secs > c.max_block_secs || c.max_block_secs == 0 {
+        let bitcoin = self.family == Family::Bitcoin;
+        // A Bitcoin time lock reads the median time past of 11 blocks (BIP 113).
+        if c.fast_block_secs > c.slow_block_secs || c.slow_block_secs == 0 || (bitcoin && c.time_settle_blocks < 6) {
             missing.push("clock bounds");
         }
-        if self.clock_source.trim().is_empty() {
+        if self.clock_source.trim().is_empty() || self.clock_failure_probability.trim().is_empty() {
             missing.push("clock bound source");
+        }
+        if (bitcoin && self.claim_closes_at_timelock) || (!self.claim_closes_at_timelock && self.d_refund_secs == 0) {
+            missing.push("refund finality time");
         }
         if self.value_bands.is_empty()
             || self.value_bands.windows(2).any(|w| w[0].max_notional >= w[1].max_notional)
@@ -154,9 +171,21 @@ pub mod reference {
             chain: ChainId::parse(chain).unwrap(),
             mainnet: chain == BITCOIN_MAINNET,
             family: Family::Bitcoin,
-            clock: ClockBounds { min_block_secs: 300, max_block_secs: 3_600, max_lead_secs: 7_200, max_lag_secs: 3_600 },
+            // The real time of n blocks: at least 400 n - 20 000 s, at most 900 n + 20 000 s.
+            clock: ClockBounds {
+                fast_block_secs: 400,
+                fast_slack_secs: 20_000,
+                slow_block_secs: 900,
+                slow_slack_secs: 20_000,
+                max_lead_secs: 7_200,
+                max_lag_secs: 3_600,
+                time_settle_blocks: 6,
+            },
             d_observe_secs: 600,
             d_confirm_secs: 3 * 3_600,
+            d_refund_secs: 3 * 3_600,
+            claim_closes_at_timelock: false,
+            clock_failure_probability: "1e-6".into(),
             value_bands: vec![
                 ValueBand { max_notional: 10_000, confirmations: 1, finalized_tag: false, min_evidence: EvidenceMethod::RpcQuorum },
                 ValueBand { max_notional: 100_000, confirmations: 3, finalized_tag: false, min_evidence: EvidenceMethod::LightClient },
@@ -175,9 +204,21 @@ pub mod reference {
             chain: ChainId::parse(ETHEREUM_MAINNET).unwrap(),
             mainnet: true,
             family: Family::Evm,
-            clock: ClockBounds { min_block_secs: 12, max_block_secs: 12, max_lead_secs: 15, max_lag_secs: 15 },
+            // 12-second slots; missed slots make blocks slower.
+            clock: ClockBounds {
+                fast_block_secs: 12,
+                fast_slack_secs: 0,
+                slow_block_secs: 24,
+                slow_slack_secs: 120,
+                max_lead_secs: 15,
+                max_lag_secs: 15,
+                time_settle_blocks: 1,
+            },
             d_observe_secs: 60,
             d_confirm_secs: 30 * 60,
+            d_refund_secs: 30 * 60,
+            claim_closes_at_timelock: true,
+            clock_failure_probability: "1e-6".into(),
             value_bands: vec![
                 ValueBand { max_notional: 1_000, confirmations: 3, finalized_tag: false, min_evidence: EvidenceMethod::RpcQuorum },
                 ValueBand { max_notional: 1_000_000, confirmations: 0, finalized_tag: true, min_evidence: EvidenceMethod::LightClient },
@@ -200,9 +241,20 @@ pub mod reference {
             chain: ChainId::parse(SOLANA_MAINNET).unwrap(),
             mainnet: true,
             family: Family::Solana,
-            clock: ClockBounds { min_block_secs: 0, max_block_secs: 2, max_lead_secs: 60, max_lag_secs: 60 },
+            clock: ClockBounds {
+                fast_block_secs: 0,
+                fast_slack_secs: 0,
+                slow_block_secs: 2,
+                slow_slack_secs: 60,
+                max_lead_secs: 60,
+                max_lag_secs: 60,
+                time_settle_blocks: 1,
+            },
             d_observe_secs: 30,
             d_confirm_secs: 5 * 60,
+            d_refund_secs: 5 * 60,
+            claim_closes_at_timelock: true,
+            clock_failure_probability: "1e-6".into(),
             value_bands: vec![
                 ValueBand { max_notional: 1_000, confirmations: 32, finalized_tag: false, min_evidence: EvidenceMethod::RpcQuorum },
                 ValueBand { max_notional: 1_000_000, confirmations: 0, finalized_tag: true, min_evidence: EvidenceMethod::OwnNode },
@@ -234,6 +286,25 @@ mod tests {
         p.refund = RefundMethod::None;
         p.template_enforces_len32 = false;
         assert_eq!(p.missing_obligatory().len(), 3);
+    }
+
+    #[test]
+    fn clock_and_refund_rules() {
+        let btc = reference::bitcoin(reference::BITCOIN_MAINNET);
+        // No positive floor on Bitcoin block intervals is needed (spec 7.3).
+        let floorless = ChainProfile { clock: ClockBounds { fast_block_secs: 0, fast_slack_secs: 0, ..btc.clock }, ..btc.clone() };
+        assert!(floorless.missing_obligatory().is_empty());
+        let check = |p: ChainProfile, item: &str| assert!(p.missing_obligatory().contains(&item), "{item}: {:?}", p.missing_obligatory());
+        check(ChainProfile { clock: ClockBounds { fast_block_secs: 901, ..btc.clock }, ..btc.clone() }, "clock bounds");
+        check(ChainProfile { clock: ClockBounds { time_settle_blocks: 5, ..btc.clock }, ..btc.clone() }, "clock bounds");
+        check(ChainProfile { clock_failure_probability: " ".into(), ..btc.clone() }, "clock bound source");
+        // A Bitcoin claim never closes at T, and an open claim needs a refund time.
+        check(ChainProfile { claim_closes_at_timelock: true, ..btc.clone() }, "refund finality time");
+        check(ChainProfile { d_refund_secs: 0, ..btc.clone() }, "refund finality time");
+        assert_eq!(btc.d_refund(), 3 * 3_600);
+        let eth = reference::ethereum();
+        assert_eq!(eth.d_refund(), 0, "the reference EVM claim closes at T");
+        assert!(ChainProfile { d_refund_secs: 0, ..eth }.missing_obligatory().is_empty());
     }
 
     #[test]

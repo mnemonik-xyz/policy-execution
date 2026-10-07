@@ -49,18 +49,18 @@ or a Lean-proved specification. The rule evaluator now has a
 [Verus correctness proof](verified/README.md); the surrounding authorization
 pipeline remains outside that proof.
 
-## Swaps (2026-10-05, in progress)
+## Swaps (2026-10-07, in progress)
 
 Two new crates implement steps W1 and W2 of
 [Warrant for swaps](../swap/spec.md) ([implementation specification](../swap/implementation.md)).
 They do not touch the invoice `Rule`, so the invoice guest image id is unchanged.
 
 - [`swap-verified`](swap-verified/README.md): the swap evaluator and the S11/S12
-  timeout arithmetic, proved with Verus (49 obligations, 29 of 29 mutations
-  rejected).
+  timeout arithmetic with the n-block clock model of spec 7.3, proved with
+  Verus (52 obligations, 35 of 35 mutations rejected).
 - [`swap-core`](swap-core/README.md): facts with provenance, the obligatory
-  checks S1 to S25, Bitcoin, EVM and Solana primitives, the policy DSL and
-  warrant payloads (78 tests; every check caught when disabled).
+  checks S1 to S25 and S27, Bitcoin, EVM and Solana primitives, the policy DSL
+  and warrant payloads (94 tests; every check caught when disabled).
 
 ## Invoice authentication and compatibility (2026-09-30)
 

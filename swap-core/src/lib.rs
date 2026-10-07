@@ -1,7 +1,7 @@
 //! Warrant for swaps: the deterministic core of the policy signer (step W2).
 //!
 //! The agent proposes; this crate decides what may be signed. It builds facts with
-//! provenance, runs the obligatory safety checks S1 to S25, calls the verified
+//! provenance, runs the obligatory safety checks S1 to S25 and S27, calls the verified
 //! evaluator of `warrant-swap-verified` and produces unsigned warrant payloads.
 //! It reads no network, no clock and no key. Time and chain state are inputs.
 
