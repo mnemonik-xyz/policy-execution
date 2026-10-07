@@ -157,7 +157,7 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
             } else {
                 let mint = leg.asset.spl_mint().ok_or("unsupported Solana asset")?;
                 let token_program = ctx.token_program.ok_or("the token program of the mint is not observed")?;
-                if token_program != solana::key(solana::TOKEN_PROGRAM) && token_program != solana::key(solana::TOKEN_2022_PROGRAM) {
+                if !solana::is_token_program(&token_program) {
                     return Err("the mint is not owned by a token program".into());
                 }
                 Some(TokenAccounts { mint, token_program })

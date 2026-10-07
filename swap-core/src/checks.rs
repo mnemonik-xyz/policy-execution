@@ -1,4 +1,4 @@
-//! The obligatory safety checks S1 to S25 (spec section 7). The policy cannot
+//! The obligatory safety checks S1 to S25 and S27 (spec section 7). The policy cannot
 //! switch them off. Each returns `Ok(())` or a `Violation` with a fixed reason
 //! code. On an entry action a violation denies; on an exit action it halts.
 
@@ -123,6 +123,12 @@ pub enum ReceiverFacts {
         mint: Hash32,
         owner: Hash32,
         program: Hash32,
+        /// Token-2022 `Pausable`: the leg mint is paused now. False for a mint
+        /// without the extension.
+        mint_paused: bool,
+        /// The token account of the escrow that pays this payee, and whether it is
+        /// frozen. Read once that lock exists.
+        escrow: Option<(Hash32, bool)>,
     },
 }
 
@@ -270,11 +276,14 @@ pub fn s7(leg: &Leg, policy: &CompiledPolicy, observed: Option<&ContractObservat
 
 /// S27: the own `payee` of `leg` can receive the leg asset now. A Bitcoin output and
 /// a native coin need no facts. An EVM token must block neither the payee nor the
-/// HTLC and must not be paused. A Solana token account must be the payee's associated
-/// account for the leg mint under the mint's token program (`token_program`, read from
-/// the chain), initialized, not frozen and without required incoming memos. Unknown
-/// facts fail: the account must already exist and be able to receive.
-pub fn s27(leg: &Leg, payee: Payee, facts: Option<&ReceiverFacts>, token_program: Option<Hash32>) -> Check {
+/// HTLC and must not be paused; the facts name the leg's ERC-20 contract, the payee
+/// and the leg's HTLC. A Solana token account must be the payee's associated account
+/// for the leg mint under the mint's token program (`token_program`, read from the
+/// chain; SPL Token or Token-2022), initialized, not frozen and without required
+/// incoming memos, and the mint must not be paused. When the lock that pays the payee
+/// already exists (`locked`), its escrow token account must not be frozen either.
+/// Unknown facts fail: the account must already exist and be able to receive.
+pub fn s27(leg: &Leg, payee: Payee, facts: Option<&ReceiverFacts>, token_program: Option<Hash32>, locked: bool) -> Check {
     let account = match payee {
         Payee::Receiver => &leg.receiver,
         Payee::RefundTo => &leg.refund_to,
@@ -292,12 +301,25 @@ pub fn s27(leg: &Leg, payee: Payee, facts: Option<&ReceiverFacts>, token_program
                 && !htlc_blocked
                 && !paused
         }
-        (Some(Family::Solana), Some(ReceiverFacts::Solana { account: a, initialized, frozen, memo_required, mint, owner, program })) => {
-            let expected = leg.asset.spl_mint().zip(account.solana_key()).zip(token_program).and_then(|((m, o), tp)| {
-                crate::solana::associated_token_address(&o, &crate::solana::TokenAccounts { mint: m, token_program: tp })
-                    .map(|ata| (ata, m, o, tp))
+        (
+            Some(Family::Solana),
+            Some(ReceiverFacts::Solana { account: a, initialized, frozen, memo_required, mint, owner, program, mint_paused, escrow }),
+        ) => {
+            let token = leg.asset.spl_mint().zip(token_program.filter(crate::solana::is_token_program));
+            let token = token.map(|(m, tp)| crate::solana::TokenAccounts { mint: m, token_program: tp });
+            let expected = token.zip(account.solana_key()).and_then(|(t, o)| {
+                crate::solana::associated_token_address(&o, &t).map(|ata| (ata, t.mint, o, t.token_program))
             });
-            expected == Some((*a, *mint, *owner, *program)) && *initialized && !frozen && !memo_required
+            // The escrow token account of an existing lock: the payee is paid from it.
+            let escrow_ok = !locked
+                || token
+                    .zip(crate::solana::parse_key(&leg.lock.contract))
+                    .and_then(|(t, program)| {
+                        crate::solana::escrow_address(&program, &leg.lock.swap_id)
+                            .and_then(|e| crate::solana::associated_token_address(&e, &t))
+                    })
+                    .is_some_and(|expected_escrow| *escrow == Some((expected_escrow, false)));
+            expected == Some((*a, *mint, *owner, *program)) && *initialized && !frozen && !memo_required && !mint_paused && escrow_ok
         }
         _ => false,
     };
@@ -486,9 +508,19 @@ mod tests {
         let program = crate::solana::key(crate::solana::TOKEN_2022_PROGRAM);
         let mint = crate::solana::parse_key(mint_b58).unwrap();
         let ata = crate::solana::associated_token_address(&owner_key, &crate::solana::TokenAccounts { mint, token_program: program }).unwrap();
-        let good = ReceiverFacts::Solana { account: ata, initialized: true, frozen: false, memo_required: false, mint, owner: owner_key, program };
-        assert!(s27(&leg, Payee::Receiver, Some(&good), Some(program)).is_ok());
-        assert!(s27(&leg, Payee::RefundTo, Some(&good), Some(program)).is_ok());
+        let good = ReceiverFacts::Solana {
+            account: ata,
+            initialized: true,
+            frozen: false,
+            memo_required: false,
+            mint,
+            owner: owner_key,
+            program,
+            mint_paused: false,
+            escrow: None,
+        };
+        assert!(s27(&leg, Payee::Receiver, Some(&good), Some(program), false).is_ok());
+        assert!(s27(&leg, Payee::RefundTo, Some(&good), Some(program), false).is_ok());
         let with = |edit: &dyn Fn(&mut ReceiverFacts)| {
             let mut f = good.clone();
             edit(&mut f);
@@ -502,19 +534,39 @@ mod tests {
             with(&|f| if let ReceiverFacts::Solana { mint, .. } = f { *mint = [9; 32] }),
             with(&|f| if let ReceiverFacts::Solana { owner, .. } = f { *owner = [9; 32] }),
             with(&|f| if let ReceiverFacts::Solana { program, .. } = f { *program = crate::solana::key(crate::solana::TOKEN_PROGRAM) }),
+            with(&|f| if let ReceiverFacts::Solana { mint_paused, .. } = f { *mint_paused = true }),
         ];
         for (i, f) in bad.iter().enumerate() {
-            assert!(s27(&leg, Payee::Receiver, Some(f), Some(program)).is_err(), "case {i}");
+            assert!(s27(&leg, Payee::Receiver, Some(f), Some(program), false).is_err(), "case {i}");
         }
-        // Unknown facts, an unknown token program, or facts of another family fail.
-        assert!(s27(&leg, Payee::Receiver, None, Some(program)).is_err());
-        assert!(s27(&leg, Payee::Receiver, Some(&good), None).is_err());
+        // Once the paying lock exists, its escrow token account must not be frozen.
+        let token = crate::solana::TokenAccounts { mint, token_program: program };
+        let escrow = crate::solana::escrow_address(&[2u8; 32], &[2u8; 32]).unwrap();
+        let escrow_ata = crate::solana::associated_token_address(&escrow, &token).unwrap();
+        let with_escrow = |e: Option<(Hash32, bool)>| with(&|f| if let ReceiverFacts::Solana { escrow, .. } = f { *escrow = e });
+        assert!(s27(&leg, Payee::Receiver, Some(&with_escrow(Some((escrow_ata, false)))), Some(program), true).is_ok());
+        for e in [None, Some((escrow_ata, true)), Some(([9; 32], false))] {
+            assert!(s27(&leg, Payee::Receiver, Some(&with_escrow(e)), Some(program), true).is_err(), "escrow {e:?}");
+        }
+        // Unknown facts, an unknown token program, a token program other than SPL
+        // Token or Token-2022, or facts of another family fail.
+        assert!(s27(&leg, Payee::Receiver, None, Some(program), false).is_err());
+        assert!(s27(&leg, Payee::Receiver, Some(&good), None, false).is_err());
+        let other = [0x0e; 32];
+        let other_ata = crate::solana::associated_token_address(&owner_key, &crate::solana::TokenAccounts { mint, token_program: other }).unwrap();
+        let foreign = with(&|f| {
+            if let ReceiverFacts::Solana { account, program, .. } = f {
+                *account = other_ata;
+                *program = other;
+            }
+        });
+        assert!(s27(&leg, Payee::Receiver, Some(&foreign), Some(other), false).is_err());
         let evm = ReceiverFacts::Evm { token: [0; 20], payee: [0; 20], htlc: [0; 20], payee_blocked: false, htlc_blocked: false, paused: false };
-        assert!(s27(&leg, Payee::Receiver, Some(&evm), Some(program)).is_err());
+        assert!(s27(&leg, Payee::Receiver, Some(&evm), Some(program), false).is_err());
         // A native coin needs no facts.
         let mut native = leg.clone();
         native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
-        assert!(s27(&native, Payee::Receiver, None, None).is_ok());
+        assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
     }
 
     /// Spec 7.3: a Bitcoin claim stays valid after T_B until the refund is final,

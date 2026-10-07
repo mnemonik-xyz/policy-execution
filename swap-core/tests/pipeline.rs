@@ -730,17 +730,20 @@ fn own_payees_must_be_able_to_receive() {
         w.obs.receivers.insert((LegName::B, payee), chain_obs(EvidenceMethod::OwnNode, facts));
     };
     let set = |f: &mut ReceiverFacts, which: &str| {
-        if let ReceiverFacts::Evm { payee_blocked, htlc_blocked, paused, payee, .. } = f {
+        if let ReceiverFacts::Evm { token, payee, htlc, payee_blocked, htlc_blocked, paused } = f {
             match which {
                 "payee" => *payee_blocked = true,
                 "htlc" => *htlc_blocked = true,
                 "paused" => *paused = true,
+                "other token" => *token = [0xdd; 20],
+                "other htlc" => *htlc = [0xcc; 20],
                 _ => *payee = [0xee; 20],
             }
         }
     };
-    // The initiator's receiver on leg B: blocked, HTLC blocked, paused, facts for another account.
-    for which in ["payee", "htlc", "paused", "other account"] {
+    // The initiator's receiver on leg B: blocked, HTLC blocked, paused, or facts read
+    // for another account, another token or another HTLC.
+    for which in ["payee", "htlc", "paused", "other account", "other token", "other htlc"] {
         let mut w = World::new(Role::Initiator);
         blocked(&mut w, Payee::Receiver, &|f| set(f, which));
         assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::S27);

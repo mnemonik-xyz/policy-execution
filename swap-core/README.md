@@ -65,8 +65,11 @@ flowchart LR
 - S27 runs before `lock` for the own receiver on the counterparty leg and the
   own `refund_to` on the own leg, and again before `reveal`. An EVM token must
   block neither the payee nor the HTLC and must not be paused. A Solana payee
-  needs its associated token account for the leg mint, initialized, not frozen
-  and without required memos. Bitcoin and native coins need no facts.
+  needs its associated token account for the leg mint under SPL Token or
+  Token-2022, initialized, not frozen and without required memos, and the mint
+  must not be paused. Once the paying lock exists (the responder's lock, the
+  reveal), its escrow token account must not be frozen. Bitcoin and native
+  coins need no facts.
 - A signed Bitcoin transaction never waits. A lock or a claim has an
   `nLockTime` that is final now (0, or a height at or below the observed tip)
   and no relative lock on any input (bit 31 of `nSequence` set). An absolute
@@ -108,6 +111,10 @@ cargo build -p warrant-swap-core --target wasm32-unknown-unknown
 - `check_mutations.py` disables each check in `src/checks.rs` in turn and
   requires a failing test. S1 is also enforced by the type (`HashAlg` has only
   `Sha256`).
+
+Results on 2026-10-07, after the n-block clock model, `D_refund` and S27: 64
+unit tests and 30 pipeline tests passed; 19 of 19 disabled checks caught; the
+wasm32 build succeeds.
 
 Results on 2026-10-06: 56 unit tests and 22 pipeline tests passed; 18 of 18
 disabled checks caught; the wasm32 build succeeds.

@@ -214,7 +214,8 @@ fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
 }
 
 /// S27 for one own payee, from the receiver facts that the signer observed.
-fn receivable(c: &mut Collected, leg_name: LegName, leg: &Leg, payee: Payee, asset: Option<&AssetFacts>) -> Result<(), Violation> {
+/// `locked`: the lock that pays this payee exists now.
+fn receivable(c: &mut Collected, leg_name: LegName, leg: &Leg, payee: Payee, asset: Option<&AssetFacts>, locked: bool) -> Result<(), Violation> {
     let env = c.env;
     let needs_facts = leg.chain.family() != Some(Family::Bitcoin) && !leg.asset.is_native();
     let facts = if needs_facts {
@@ -222,7 +223,7 @@ fn receivable(c: &mut Collected, leg_name: LegName, leg: &Leg, payee: Payee, ass
     } else {
         None
     };
-    checks::s27(leg, payee, facts.as_ref(), asset.and_then(|a| a.token_program))
+    checks::s27(leg, payee, facts.as_ref(), asset.and_then(|a| a.token_program), locked)
 }
 
 /// The observed tip height of a Bitcoin leg chain, for the `nLockTime` checks.
@@ -442,8 +443,9 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             }
             // S27: the own receiver on the counterparty leg and the own refund account
             // can both receive the asset now.
-            receivable(c, their_name, their_leg, Payee::Receiver, their_asset.as_ref())?;
-            receivable(c, own_name, own_leg, Payee::RefundTo, own_asset.as_ref())?;
+            // The counterparty lock exists here only for the responder.
+            receivable(c, their_name, their_leg, Payee::Receiver, their_asset.as_ref(), role == Role::Responder)?;
+            receivable(c, own_name, own_leg, Payee::RefundTo, own_asset.as_ref(), false)?;
             let fee = match (&own_asset, own_leg.asset.is_native()) {
                 (Some(a), _) => a.transfer_fee,
                 (None, true) => None,
@@ -474,7 +476,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 return Err(checks::violation(code::S2, "the secret does not open the hashlock"));
             };
             // S27 again: the own receiver on leg B can still receive the asset.
-            receivable(c, LegName::B, &terms.leg_b, Payee::Receiver, their_asset.as_ref())?;
+            receivable(c, LegName::B, &terms.leg_b, Payee::Receiver, their_asset.as_ref(), true)?;
             counterparty_lock = Some(LockObs { chain: terms.leg_b.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             let mut ctx = BindContext {
                 preimage: Some(preimage),
