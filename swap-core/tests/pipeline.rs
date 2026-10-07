@@ -1009,3 +1009,21 @@ fn one_fixture_per_risk_flag() {
     w.policy = policy_with(serde_json::json!({ "asset_risk_within": ["freezable_by_issuer"] }), 3);
     assert_eq!(w.run(Action::Accept, terms(), None, None).record_decision(), Some(RecordDecision::Ask));
 }
+
+#[test]
+fn d8_window_uses_the_signer_real_time() {
+    use warrant_swap_core::warrant::{check_binding, Expected, MAX_SKEW_SECS};
+    let w = World::new(Role::Initiator);
+    let accept = w.run(Action::Accept, terms(), None, None);
+    let Outcome::Warrant(aw) = &accept else { panic!("expected Allow") };
+    assert_eq!((aw.valid_after, aw.valid_until), (NOW, NOW + 600));
+    let at = |now_real, skew_secs| {
+        check_binding(aw, &Expected { action: Action::Accept, swap_id: &SWAP_ID, chain: None, contract: None, now_real, skew_secs })
+    };
+    // A verifier clock 30 seconds behind the policy signer needs a stated skew.
+    assert_eq!(at(NOW - 30, 0), Err("outside the validity window"));
+    assert_eq!(at(NOW - 30, 30), Ok(()));
+    assert_eq!(at(NOW + 630, 30), Ok(()));
+    assert_eq!(at(NOW + 631, 30), Err("outside the validity window"));
+    assert_eq!(at(NOW, MAX_SKEW_SECS + 1), Err("skew allowance too large"));
+}
