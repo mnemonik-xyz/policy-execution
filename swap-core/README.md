@@ -24,14 +24,14 @@ flowchart LR
 |---|---|
 | `caip` | CAIP-2, CAIP-10 and CAIP-19 parsing; EVM addresses lowercased; `sha256` ids for the evaluator |
 | `jcs` | RFC 8785 canonical JSON; rejects floats and integers above 2^53 − 1 |
-| `types` | Legs, locks, terms, actions, roles and the nine risk flags |
+| `types` | Legs, locks, terms, actions, roles and the nine risk flags; the `lock_id` derivation and the sender bytes of each family |
 | `facts` | Provenance, quorum agreement, oracle freshness and confidence, notional, price deviation, transfer fees and the exact gross debit |
 | `profile` | Chain profiles, value bands, the obligatory-item check of spec 8.8, reference profiles |
 | `ledger` | Period spend, open swaps, consumed swap ids, hashlocks and warrants, the newest accepted policy (version and hash, S22), the S25 counter |
 | `secret` | The swap secret: caller-supplied CSPRNG, no `Debug`, no `Serialize`, zeroized |
 | `bitcoin` | Taproot HTLC template, PSBT version 0, BIP 341 sighashes, lock and spend intent checks, fee limits |
-| `evm` | RLP, EIP-1559, the reference HTLC ABI, exact calldata checks, contract and proxy pins |
-| `solana` | Legacy and version 0 messages, lookup tables from chain facts, the allowed instruction set per mode, reference HTLC accounts and privileges, PDAs, program pins |
+| `evm` | RLP, EIP-1559, the reference HTLC ABI keyed by `lock_id`, exact calldata checks, contract identity (code hash, proxy slots, diamond loupe) and pins |
+| `solana` | Legacy and version 0 messages, lookup tables from chain facts, the allowed instruction set per mode, reference HTLC accounts and privileges, the escrow PDA of `lock_id`, upgradeable loader states and the code hash, program pins |
 | `tx` | Intent from the terms per family and action; the transaction binding (S24) |
 | `checks` | S1 to S25 and S27 with fixed reason codes; `code::ALL` lists every code |
 | `dsl` | The JSON mini-DSL and `validate_policy` |
@@ -66,9 +66,24 @@ flowchart LR
 - A missing price never goes to the owner as `Ask`. When the evaluator returns
   `Ask` and the rule reads an unknown notional or price deviation, the trade is
   denied (`PRICE_UNKNOWN`). An `Allow` that holds for every price stays.
-- On Bitcoin the leaf keys decide who can spend. S5 and S6 require the claim key
-  of the counterparty leg and the refund key of the own leg to be own keys
-  (`OwnAccounts::bitcoin_keys`).
+- On Bitcoin the leaf keys decide who can spend. S5 and S6 require the
+  `claim_key` of the counterparty leg and the `refund_key` of the own leg to be
+  own keys (`OwnAccounts::bitcoin_keys`). The claim leaf starts with
+  `<lock_id> OP_DROP`, so the output key commits to the lock (template
+  `warrant-htlc-tr-v2`; a policy that pins version 1 does not load).
+- Each lock carries `lock_id = sha256(swap_id ‖ leg ‖ sender)` (spec 3.2), with
+  the leg byte `0x41` or `0x42`. The sender bytes are the ones that the lock
+  sees: the 20-byte EVM address that calls `lock` (`msg.sender`), the 32-byte
+  Solana key that signs the lock instruction, and on Bitcoin the 32-byte
+  `refund_key`, because a Taproot output sees no sender. `S10_LOCK_ID` checks
+  the derivation at every action, exits included (an exit halts), and the
+  `lock_id` of an observed lock. An entry action also needs `lock_id_binding`
+  on both profiles and, on EVM and Solana, an own funding sender: the
+  contract or program keys the own lock by the account that funds it. The EVM
+  lock call names the swap id and the leg byte; claim and refund name the
+  `lock_id`. The Solana lock data names the swap id and the leg byte; claim and
+  refund data and the escrow PDA seeds use `lock_id`. S20 binds the `lock_id`.
+  The two legs of a same-chain swap therefore have two keys.
 - S11 adds `D_refund(B)`, the time for the leg B refund to become final after
   `T_B`, because a claim stays valid until then. A profile sets it to 0 only
   with `claim_closes_at_timelock`, which a Bitcoin profile can never set. The
@@ -117,6 +132,32 @@ flowchart LR
   account without data. Anyone can send lamports to an address, so this case
   must not block the lock. A Solana program pin means the reference HTLC
   interface, including this account layout.
+- On Solana, S7 also requires the program account to be owned by the
+  upgradeable loader (`BPFLoaderUpgradeab1e11111111111111111111111`) and to name
+  the loader PDA of `[program id]` as its ProgramData account. The loader owns
+  that account. Its upgrade authority is none or the pinned account. Its
+  `code_hash` (the SHA-256 of the program bytes after the 45-byte header,
+  without trailing zero bytes; the value of `solana-verify get-program-hash`)
+  equals the pin's `code_hash`. Any other loader fails. Once a token lock exists
+  (the responder's check of leg A, the reveal, the claim), the escrow token
+  account must be the escrow PDA's associated token account for the leg mint
+  under the mint's token program (SPL Token or Token-2022, read from the
+  chain), initialized, with the escrow PDA as owner. S27 still checks that it
+  is not frozen. A Solana pin is `{"program", "code_hash", "upgrade_authority"?}`.
+- On EVM, S7 reads `EXTCODEHASH`, six proxy slots (`evm::proxy_slot`) and the
+  result of the diamond loupe call `facetAddresses()`. The slots are the
+  EIP-1967 implementation, admin and beacon slots, the two ZeppelinOS slots and
+  EIP-1822 `PROXIABLE`. Only one proxy form passes: EIP-1967 with both an
+  implementation and an admin address, whose admin, implementation and
+  implementation code hash a `ProxyPin` pins. A beacon, a legacy slot, a
+  diamond, a UUPS proxy without an admin and a slot word that is not an address
+  fail S7 for every pin. The reference HTLC must not have a fallback function,
+  so the loupe call reverts. An RPC error is no observation, never a revert.
+- A policy pins each contract once per chain: S7 uses the first pin of a
+  contract. A changed program or proxy (an upgrade during a swap) makes S7 halt
+  the claim until G9 rebuilds exits. A policy without the new pin fields
+  (`code_hash`, `implementation_code_hash`) does not load: the owner approves a
+  new policy with a higher version before the new signer runs.
 - S22: the ledger keeps the version and the `policy_hash` of the newest
   accepted policy. A higher version passes. The same version passes only with
   the same hash. A lower version is denied, also when the signer accepted it
@@ -146,11 +187,14 @@ cargo build -p warrant-swap-core --target wasm32-unknown-unknown
 ```
 
 - Cross-checks: the Taproot output, txids and BIP 341 sighashes (key path and
-  script path) against `rust-bitcoin`; PDAs against the Solana SDK.
+  script path) and the claim leaf against `rust-bitcoin`; PDAs and the
+  upgradeable loader states against the Solana SDK (`solana-pubkey`,
+  `solana-loader-v3-interface`, dev-dependencies only).
 - `tests/pipeline.rs`: a BTC/USDC swap from both sides, every action, and the
   fault-injection tests 1, 2, 3, 5, 6, 7, 8 and 10 of spec 13.3. Tests 4 and 9
   need the signer runtime (W3). A BTC for SOL variant covers the Solana escrow
-  account (S7). Every negative test checks that each reason is a fixed code.
+  account and program identity (S7). Same-chain ETH/USDC and SOL/SOL swaps
+  cover `lock_id`. Every negative test checks that each reason is a fixed code.
 - `check_mutations.py` disables each check in `src/checks.rs` in turn and
   requires a failing test. S1 is also enforced by the type (`HashAlg` has only
   `Sha256`).
