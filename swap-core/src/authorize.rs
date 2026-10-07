@@ -561,11 +561,12 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
             if terms.leg_a.lock.timelock.is_relative() {
                 // The own leg A lock exists now: a relative T_A counts from its observed
-                // confirmation (spec 7.3), never from the adapter's value. Without the
-                // observation, the timeout_gap fact stays unknown.
+                // confirmation (spec 7.3), never from the adapter's value. Only an
+                // observation that matches leg A (S5-S10, S7) counts. Without one, the
+                // timeout_gap fact stays unknown.
                 let tip_a = c.resolve(&format!("tip:{}", terms.leg_a.chain), env.obs.tips.get(&terms.leg_a.chain));
-                ta = c
-                    .resolve_at("lock:A", env.obs.locks.get(&LegName::A))
+                ta = observed_leg(c, LegName::A, &terms.leg_a)
+                    .ok()
                     .and_then(|(facts, seen_at)| checks::observed_timelock(&terms.leg_a, &facts, seen_at, tip_a));
             }
         }

@@ -1129,15 +1129,26 @@ fn relative_leg_a_reveal_counts_from_the_observed_confirmation() {
     // Read at the tip with 3 confirmations: T_A = TIP - 2 + 136. The adapter's value is not read.
     let mut f = lock_a_facts(3);
     f.timelock = Timelock::Height(1);
-    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], TIP, f.clone()));
+    f.script_pubkey = Some(btc::htlc_script_pubkey(&t.leg_a.lock).unwrap());
+    let at = |height, facts: LockFacts| Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], height, facts);
+    w.obs.locks.insert(LegName::A, at(TIP, f.clone()));
     let out = reveal(&w);
     assert_allow(&out);
     let Outcome::Warrant(wr) = &out else { unreachable!() };
     let gap = wr.facts.iter().find(|f| f.name == "timeout_gap").map(|f| f.value.clone());
     assert_eq!(gap, Some(serde_json::json!(11_841)));
     // A read above the observed tip gives no T_A.
-    w.obs.locks.insert(LegName::A, Observed::single(EvidenceMethod::LightClient, "own", [0xb1; 32], TIP + 1, f));
+    w.obs.locks.insert(LegName::A, at(TIP + 1, f.clone()));
     assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    // An observation that does not match leg A gives no T_A: another output script,
+    // another receiver, less than the agreed amount.
+    let other_script = LockFacts { script_pubkey: Some(p2tr(99)), ..f.clone() };
+    let other_receiver = LockFacts { receiver: t.leg_a.refund_to.clone(), ..f.clone() };
+    let short = LockFacts { net_amount: t.leg_a.amount - 1, ..f };
+    for bad in [other_script, other_receiver, short] {
+        w.obs.locks.insert(LegName::A, at(TIP, bad));
+        assert_eq!(reveal(&w).record_decision(), Some(RecordDecision::Ask));
+    }
 }
 
 #[test]
