@@ -142,14 +142,23 @@ struct Collected<'e> {
 
 impl<'e> Collected<'e> {
     fn resolve<T: Clone + PartialEq>(&mut self, name: &str, obs: Option<&Observed<T>>) -> Option<T> {
+        self.resolve_at(name, obs).map(|(value, _)| value)
+    }
+
+    /// Like `resolve`, with the height of the block that the providers agree on.
+    fn resolve_at<T: Clone + PartialEq>(&mut self, name: &str, obs: Option<&Observed<T>>) -> Option<(T, u64)> {
         let (value, prov) = obs?.resolve(self.env.policy.policy.quorum)?;
+        let height = match &prov {
+            Provenance::Chain { height, .. } => *height,
+            _ => 0,
+        };
         if let Provenance::Chain { method, .. } = &prov {
             self.weakest = Some(self.weakest.map_or(*method, |w| w.min(*method)));
         }
         if !self.records.iter().any(|r| r.name == name) {
             self.records.push(FactRecord::new(name, Value::Bool(true), Some(prov)));
         }
-        Some(value)
+        Some((value, height))
     }
 
     fn record(&mut self, name: &str, value: Value, prov: Option<Provenance>) {
@@ -219,7 +228,11 @@ fn receivable(c: &mut Collected, leg_name: LegName, leg: &Leg, payee: Payee, ass
     let env = c.env;
     let needs_facts = leg.chain.family() != Some(Family::Bitcoin) && !leg.asset.is_native();
     let facts = if needs_facts {
-        c.resolve(&format!("receiver:{leg_name:?}:{payee:?}"), env.obs.receivers.get(&(leg_name, payee)))
+        // "Can receive now": the facts come from the observed tip of the leg chain
+        // or a later block. A stale report, or an unknown tip, is no fact.
+        let tip = c.resolve(&format!("tip:{}", leg.chain), env.obs.tips.get(&leg.chain));
+        let observed = c.resolve_at(&format!("receiver:{leg_name:?}:{payee:?}"), env.obs.receivers.get(&(leg_name, payee)));
+        observed.filter(|(_, height)| tip.is_some_and(|t| *height >= t)).map(|(facts, _)| facts)
     } else {
         None
     };

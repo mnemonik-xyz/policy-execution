@@ -69,7 +69,8 @@ flowchart LR
   Token-2022, initialized, not frozen and without required memos, and the mint
   must not be paused. Once the paying lock exists (the responder's lock, the
   reveal), its escrow token account must not be frozen. Bitcoin and native
-  coins need no facts.
+  coins need no facts. The receiver facts must come from the observed tip of
+  the leg chain or a later block; a stale report is no fact.
 - A signed Bitcoin transaction never waits. A lock or a claim has an
   `nLockTime` that is final now (0, or a height at or below the observed tip)
   and no relative lock on any input (bit 31 of `nSequence` set). An absolute
