@@ -4,6 +4,10 @@ The [solver bounty showcase](solver-bounty/README.md) adds reviewer-free accepta
 for compute schedules. It checks the committed workload, publishes the result,
 and pays the seller through a separate solver guest and escrow.
 
+The [io.net / Arc pilot](showcases/ionet_arc/README.md) starts the real-workload
+integration: bounded GPU provisioning, a transcription worker, and Arc/CCTP
+funding design. Live execution and cross-chain payments remain validation gates.
+
 An owner approves **policy data and evidence authorities**. An agent proposes a
 payment. A fixed Rust interpreter authenticates the evidence, evaluates the
 policy, and emits an authorization. A RISC Zero guest proves that execution.
