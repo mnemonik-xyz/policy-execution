@@ -1,0 +1,23 @@
+[package]
+name = "warrant-swap-verified"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Verified swap policy evaluator and timeout arithmetic for Warrant swaps"
+
+[dependencies]
+vstd = "=0.0.0-2026-09-20-0158"
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)', 'cfg(verus_only)'] }
+
+[dev-dependencies]
+serde_json = "1.0"
