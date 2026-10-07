@@ -1118,6 +1118,12 @@ pub(crate) mod tests {
         assert_eq!(decode_programdata(&header(0, [0; 32])), Some((None, crate::sha256(b""))));
         assert_eq!(decode_programdata(&with_code(header(2, [6; 32]))), None, "bad option byte");
         assert_eq!(decode_programdata(&header(1, [6; 32])[..44]), None, "short header");
+        // The tag is a 4-byte little-endian u32: every byte counts.
+        for i in 1..4 {
+            let mut tagged = with_code(header(1, [6; 32]));
+            tagged[i] = 1;
+            assert_eq!(decode_programdata(&tagged), None, "tag byte {i}");
+        }
         let mut buffer = with_code(header(1, [6; 32]));
         buffer[0] = 1;
         assert_eq!(decode_programdata(&buffer), None, "a Buffer state");

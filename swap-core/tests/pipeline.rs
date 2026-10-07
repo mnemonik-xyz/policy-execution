@@ -1647,6 +1647,36 @@ fn sol_same_chain_terms() -> Terms {
     with_lock_ids(t)
 }
 
+/// G4: the program derives `lock_id` from the key that signs the lock, so the own
+/// Solana sender must be an own account.
+#[test]
+fn a_solana_own_lock_is_funded_by_an_own_account() {
+    let mut t = sol_same_chain_terms();
+    t.leg_b.sender = sol_account([0xcc; 32]);
+    let t = with_lock_ids(t);
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    let mut w = sol_same_chain_world(Role::Responder, (Some(escrow), None));
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::S10_LOCK);
+    w.own.accounts.push(sol_account([0xcc; 32]));
+    assert_allow(&w.run(Action::Accept, t, None, None));
+}
+
+/// G4: the initiator's Solana lock of leg A carries the leg byte 0x41 and uses the
+/// escrow of leg A's key.
+#[test]
+fn a_solana_leg_a_lock_names_leg_a() {
+    let t = sol_same_chain_terms();
+    let escrow_a = sol::escrow_address(&HTLC_SOL, &t.leg_a.lock.lock_id).unwrap();
+    let escrow_b = sol::escrow_address(&HTLC_SOL, &t.leg_b.lock.lock_id).unwrap();
+    let system = sol::key(sol::SYSTEM_PROGRAM);
+    let w = sol_same_chain_world(Role::Initiator, (None, None));
+    let data = sol::LockData { swap_id: SWAP_ID, leg: LegName::A, receiver: [0xbb; 32], refund_to: [0xaa; 32], mint: [0; 32], amount: t.leg_a.amount as u64, hashlock: t.leg_a.lock.hashlock, timelock: T_A_EVM as i64 };
+    let lock = |escrow: Hash32, data: &sol::LockData| sol_message(&[[0xaa; 32], escrow, HTLC_SOL, system], 2, 2, &[0, 1, 3], data.encode());
+    assert_allow(&w.run(Action::Lock, t.clone(), Some(lock(escrow_a, &data)), None));
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(lock(escrow_a, &sol::LockData { leg: LegName::B, ..data })), None), code::S24);
+    assert_denied(&w.run(Action::Lock, t, Some(lock(escrow_b, &data)), None), code::S24);
+}
+
 fn sol_same_chain_world(role: Role, (a, b): (Option<sol::EscrowAccount>, Option<sol::EscrowAccount>)) -> World {
     let t = sol_same_chain_terms();
     let mut w = sol_world(role);

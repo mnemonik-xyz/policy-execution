@@ -343,6 +343,16 @@ pub(crate) mod tests {
         check_binding(&w, &e)
     }
 
+    /// An accept warrant has no leg: a verifier that expects a lock never accepts it.
+    #[test]
+    fn accept_binding_has_no_lock() {
+        let mut w = warrant();
+        (w.action, w.leg, w.tx_binding) = (Action::Accept, None, None);
+        let accept = Expected { action: Action::Accept, swap_id: &[1; 32], chain: None, contract: None, lock_id: None, now_real: 150, skew_secs: 0 };
+        assert_eq!(check_binding(&w, &accept), Ok(()));
+        assert_eq!(check_binding(&w, &Expected { lock_id: Some(&LOCK_ID), ..accept }), Err("leg binding missing"));
+    }
+
     #[test]
     fn window_uses_real_time_with_stated_skew() {
         for now in [970, 985, 1_000, 1_300, 1_600, 1_615, 1_630] {
