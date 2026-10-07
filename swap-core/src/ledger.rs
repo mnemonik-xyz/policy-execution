@@ -1,10 +1,11 @@
 //! The policy signer's own state: ledger facts (spend per period, open swaps) and
-//! the consumed sets of S4, S10 and S21, the policy version of S22 and the
+//! the consumed sets of S4, S10 and S21, the newest accepted policy of S22 and the
 //! monotonic counter of S25. Persistence belongs to the signer (W3); this module
 //! defines the state and its rules.
 
 use crate::Hash32;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,12 +15,23 @@ pub struct Spend {
     pub swap_id: Hash32,
 }
 
+/// The newest policy that the signer has accepted (S22): its version and the
+/// `policy_hash` of its exact text. One version names one policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedPolicy {
+    pub version: u64,
+    pub hash: Hash32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     /// Increases with every change; persisted with the state.
     pub counter: u64,
-    /// Highest policy version that the signer has accepted (S22).
-    pub policy_version: u64,
+    /// The newest policy that the signer has accepted (S22); `None` before the
+    /// first. The field must be present when the ledger is loaded (`null` for
+    /// none): a snapshot without it does not load, so it cannot reset S22.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub policy: Option<AcceptedPolicy>,
     pub consumed_swap_ids: BTreeSet<Hash32>,
     pub consumed_hashlocks: BTreeSet<Hash32>,
     pub consumed_warrants: BTreeSet<Hash32>,
@@ -41,6 +53,7 @@ pub enum LedgerError {
     HashlockConsumed,
     WarrantConsumed,
     PolicyRollback { seen: u64, offered: u64 },
+    PolicyHashMismatch { version: u64 },
 }
 
 impl LedgerState {
@@ -77,12 +90,20 @@ impl LedgerState {
         Some(self.ledger.open_swaps.len() as u64 + extra)
     }
 
-    /// S22: the policy version only increases.
-    pub fn check_policy_version(&self, version: u64) -> Result<(), LedgerError> {
-        if version < self.ledger.policy_version {
-            return Err(LedgerError::PolicyRollback { seen: self.ledger.policy_version, offered: version });
+    /// S22: the policy version only increases, and one version names one policy.
+    /// A higher version passes. The stored version passes only with the stored
+    /// hash. A lower version fails, also when the signer accepted it before.
+    /// Before the first accepted policy, every policy passes.
+    pub fn check_policy(&self, version: u64, hash: &Hash32) -> Result<(), LedgerError> {
+        let Some(seen) = &self.ledger.policy else {
+            return Ok(());
+        };
+        match version.cmp(&seen.version) {
+            Ordering::Greater => Ok(()),
+            Ordering::Equal if hash == &seen.hash => Ok(()),
+            Ordering::Equal => Err(LedgerError::PolicyHashMismatch { version }),
+            Ordering::Less => Err(LedgerError::PolicyRollback { seen: seen.version, offered: version }),
         }
-        Ok(())
     }
 
     fn bump(&mut self) {
@@ -90,9 +111,10 @@ impl LedgerState {
         self.persisted_counter = self.ledger.counter;
     }
 
-    pub fn accept_policy_version(&mut self, version: u64) -> Result<(), LedgerError> {
-        self.check_policy_version(version)?;
-        self.ledger.policy_version = version;
+    /// Record the policy that the signer accepts (S22): its version and hash.
+    pub fn accept_policy(&mut self, version: u64, hash: Hash32) -> Result<(), LedgerError> {
+        self.check_policy(version, &hash)?;
+        self.ledger.policy = Some(AcceptedPolicy { version, hash });
         self.bump();
         Ok(())
     }
@@ -158,12 +180,72 @@ mod tests {
         assert_eq!(s.consume_warrant([5; 32]), Err(LedgerError::WarrantConsumed));
     }
 
-    #[test]
-    fn policy_rollback() {
+    /// A ledger that has accepted version 3 with hash `[3; 32]`.
+    fn at_version_3() -> LedgerState {
         let mut s = LedgerState::default();
-        s.accept_policy_version(3).unwrap();
-        assert_eq!(s.accept_policy_version(2), Err(LedgerError::PolicyRollback { seen: 3, offered: 2 }));
-        s.accept_policy_version(3).unwrap();
+        s.accept_policy(3, [3; 32]).unwrap();
+        assert_eq!(s.ledger.policy, Some(AcceptedPolicy { version: 3, hash: [3; 32] }));
+        s
+    }
+
+    #[test]
+    fn s22_first_policy_passes() {
+        let mut s = LedgerState::default();
+        assert_eq!(s.ledger.policy, None);
+        assert_eq!(s.check_policy(0, &[9; 32]), Ok(()));
+        assert_eq!(s.check_policy(7, &[9; 32]), Ok(()));
+        s.accept_policy(7, [9; 32]).unwrap();
+        assert_eq!(s.ledger.policy, Some(AcceptedPolicy { version: 7, hash: [9; 32] }));
+    }
+
+    #[test]
+    fn s22_same_version_same_hash_passes() {
+        let mut s = at_version_3();
+        assert_eq!(s.check_policy(3, &[3; 32]), Ok(()));
+        s.accept_policy(3, [3; 32]).unwrap();
+        assert_eq!(s.ledger.policy, Some(AcceptedPolicy { version: 3, hash: [3; 32] }));
+    }
+
+    #[test]
+    fn s22_same_version_other_hash_denied() {
+        let mut s = at_version_3();
+        let before = s.clone();
+        assert_eq!(s.check_policy(3, &[0x33; 32]), Err(LedgerError::PolicyHashMismatch { version: 3 }));
+        assert_eq!(s.accept_policy(3, [0x33; 32]), Err(LedgerError::PolicyHashMismatch { version: 3 }));
+        assert_eq!(s, before, "a failed accept changes nothing");
+    }
+
+    #[test]
+    fn s22_higher_version_passes_and_replaces_the_hash() {
+        let mut s = at_version_3();
+        assert_eq!(s.check_policy(4, &[4; 32]), Ok(()));
+        s.accept_policy(4, [4; 32]).unwrap();
+        assert_eq!(s.ledger.policy, Some(AcceptedPolicy { version: 4, hash: [4; 32] }));
+        assert_eq!(s.check_policy(4, &[3; 32]), Err(LedgerError::PolicyHashMismatch { version: 4 }));
+    }
+
+    #[test]
+    fn s22_lower_version_denied_even_if_accepted_before() {
+        let mut s = at_version_3();
+        assert_eq!(s.accept_policy(2, [2; 32]), Err(LedgerError::PolicyRollback { seen: 3, offered: 2 }));
+        s.accept_policy(4, [4; 32]).unwrap();
+        assert_eq!(s.check_policy(3, &[3; 32]), Err(LedgerError::PolicyRollback { seen: 4, offered: 3 }));
+    }
+
+    #[test]
+    fn s22_ledger_without_the_policy_field_does_not_load() {
+        let s = at_version_3();
+        let json = serde_json::to_value(&s.ledger).unwrap();
+        assert_eq!(serde_json::from_value::<Ledger>(json.clone()).unwrap(), s.ledger);
+        let mut none = json.clone();
+        none["policy"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<Ledger>(none).unwrap().policy, None);
+        // A snapshot in the old form (version only, no hash) must not load as "no policy".
+        let mut old = json;
+        let map = old.as_object_mut().unwrap();
+        map.remove("policy");
+        map.insert("policy_version".into(), serde_json::json!(3));
+        assert!(serde_json::from_value::<Ledger>(old).is_err());
     }
 
     #[test]

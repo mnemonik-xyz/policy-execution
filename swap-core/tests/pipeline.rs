@@ -561,11 +561,29 @@ fn bitcoin_fees_stay_within_the_profile() {
 #[test]
 fn fault_8_policy_rollback_and_evaluator_substitution() {
     let mut w = World::new(Role::Initiator);
-    w.ledger.accept_policy_version(4).unwrap();
+    w.ledger.accept_policy(4, [0x44; 32]).unwrap();
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::S22);
     let mut w = World::new(Role::Initiator);
     w.build = [0xef; 32];
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::S23);
+}
+
+#[test]
+fn fault_8_same_policy_version_with_another_text() {
+    // The signer accepted version 3 of the owner's policy.
+    let mut w = World::new(Role::Initiator);
+    w.ledger.accept_policy(w.policy.policy.version, w.policy.policy_hash).unwrap();
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
+    // A weaker policy text that also says version 3 is a different policy.
+    let mut weaker = rule();
+    weaker["all"][1] = serde_json::json!({ "notional_at_most": ["USD", 100000] });
+    let weaker = policy_with(weaker, 3);
+    assert_ne!(weaker.policy_hash, w.policy.policy_hash);
+    w.policy = weaker;
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::S22);
+    // A higher version replaces the policy.
+    w.policy = policy_with(rule(), 4);
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
 }
 
 #[test]
@@ -576,7 +594,7 @@ fn fault_10_initiator_outage_refunds_regardless_of_policy() {
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S12);
     // … and the refund of leg A after T_A is never blocked by policy, even with a
     // rolled-back policy and a different evaluator build (S18).
-    w.ledger.accept_policy_version(9).unwrap();
+    w.ledger.accept_policy(9, [0x99; 32]).unwrap();
     w.build = [0xef; 32];
     w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, lock_a_facts(300)));
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();

@@ -428,7 +428,7 @@ pub fn s21(ledger: &LedgerState, warrant_hash: &Hash32) -> Check {
 
 pub fn s22(ledger: &LedgerState, policy: &CompiledPolicy) -> Check {
     ledger
-        .check_policy_version(policy.policy.version)
+        .check_policy(policy.policy.version, &policy.policy_hash)
         .map_err(|e| Violation { code: code::S22, detail: format!("{e:?}") })
 }
 
