@@ -332,13 +332,106 @@ pub fn check_tx(unsigned: &[u8], intent: &EvmIntent) -> Result<Hash32, EvmError>
     Ok(signing_hash(unsigned))
 }
 
-/// Observed facts about a contract (spec 8.4), read at a finalized block.
+/// Storage slots that can hold a proxy's target or admin (spec 8.4): 32-byte keys
+/// in hex. The observation adapter reads the word at each slot of the contract at
+/// the fact block (`eth_getStorageAt`, or `eth_getProof`, EIP-1186) and reports it
+/// in the `ProxySlots` field of the same name.
+pub mod proxy_slot {
+    /// EIP-1967 implementation: `keccak256("eip1967.proxy.implementation") - 1`.
+    pub const EIP1967_IMPLEMENTATION: &str = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+    /// EIP-1967 admin: `keccak256("eip1967.proxy.admin") - 1`.
+    pub const EIP1967_ADMIN: &str = "b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+    /// EIP-1967 beacon: `keccak256("eip1967.proxy.beacon") - 1`.
+    pub const EIP1967_BEACON: &str = "a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
+    /// ZeppelinOS, before EIP-1967: `keccak256("org.zeppelinos.proxy.implementation")`.
+    pub const ZOS_IMPLEMENTATION: &str = "7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3";
+    /// ZeppelinOS, before EIP-1967: `keccak256("org.zeppelinos.proxy.admin")`.
+    pub const ZOS_ADMIN: &str = "10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b";
+    /// EIP-1822 (UUPS before EIP-1967): `keccak256("PROXIABLE")`.
+    pub const EIP1822_PROXIABLE: &str = "c5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7";
+}
+
+/// The EIP-2535 loupe function. Every diamond implements it; S7 needs the call to
+/// revert. The adapter calls it with the 4-byte selector and no arguments.
+pub const FACET_ADDRESSES_SIG: &str = "facetAddresses()";
+
+/// The words at the `proxy_slot` slots of a contract. A zero word is unset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySlots {
+    pub eip1967_implementation: Hash32,
+    pub eip1967_admin: Hash32,
+    pub eip1967_beacon: Hash32,
+    pub zos_implementation: Hash32,
+    pub zos_admin: Hash32,
+    pub eip1822_proxiable: Hash32,
+}
+
+/// The result of the call `facetAddresses()` (EIP-2535) to the contract at the fact
+/// block (`eth_call`). `Reverted` means that the call ran at that block and ended in
+/// REVERT or another exceptional halt. A JSON-RPC or transport error, a timeout or a
+/// node that cannot run the call is no result: the adapter then reports no contract
+/// observation, and S7 fails. It never reports such an error as `Reverted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loupe {
+    /// The call reverted: the contract has no diamond loupe.
+    Reverted,
+    /// The call returned, with data or without: a diamond, or a contract that S7
+    /// cannot tell from one.
+    Returned,
+}
+
+/// Observed facts about a contract (spec 8.4), read at one finalized block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContractFacts {
+    /// `EXTCODEHASH` (EIP-1052) of the contract.
     pub code_hash: Hash32,
-    /// EIP-1967 implementation and admin slots, if set.
-    pub proxy_implementation: Option<[u8; 20]>,
-    pub proxy_admin: Option<[u8; 20]>,
+    pub slots: ProxySlots,
+    pub loupe: Loupe,
+    /// The address in the EIP-1967 implementation slot and its `EXTCODEHASH`, read
+    /// at the same block. `None` when that slot is zero.
+    pub implementation_code: Option<([u8; 20], Hash32)>,
+}
+
+/// The proxy pattern that `ContractFacts` show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proxy {
+    /// No proxy slot is set and the loupe call reverts.
+    None,
+    /// EIP-1967 with an address in the implementation slot and in the admin slot,
+    /// and no other proxy slot set.
+    Eip1967 { implementation: [u8; 20], admin: [u8; 20] },
+    /// A beacon, a legacy slot, a diamond loupe, an implementation without an admin
+    /// (UUPS) or an admin without an implementation, or a slot word that is not an
+    /// address. S7 rejects it for every pin.
+    Unsupported,
+}
+
+/// The address in a slot word: 12 zero bytes, then 20 bytes that are not all zero.
+fn address_word(word: &Hash32) -> Option<[u8; 20]> {
+    let (high, low) = word.split_at(12);
+    if high.iter().any(|b| *b != 0) || low.iter().all(|b| *b == 0) {
+        return None;
+    }
+    let mut address = [0u8; 20];
+    address.copy_from_slice(low);
+    Some(address)
+}
+
+impl ContractFacts {
+    pub fn proxy(&self) -> Proxy {
+        let s = &self.slots;
+        let others = [s.eip1967_beacon, s.zos_implementation, s.zos_admin, s.eip1822_proxiable];
+        if self.loupe != Loupe::Reverted || others.iter().any(|w| *w != [0; 32]) {
+            return Proxy::Unsupported;
+        }
+        if s.eip1967_implementation == [0; 32] && s.eip1967_admin == [0; 32] {
+            return Proxy::None;
+        }
+        match (address_word(&s.eip1967_implementation), address_word(&s.eip1967_admin)) {
+            (Some(implementation), Some(admin)) => Proxy::Eip1967 { implementation, admin },
+            _ => Proxy::Unsupported,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -348,7 +441,8 @@ pub struct ContractPin {
     pub address: String,
     #[serde(with = "crate::enc::hex32")]
     pub code_hash: Hash32,
-    /// A proxy is accepted only with its admin and implementation pinned.
+    /// An EIP-1967 proxy is accepted only with its admin, implementation and
+    /// implementation code hash pinned. No pin accepts another proxy pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyPin>,
 }
@@ -356,8 +450,23 @@ pub struct ContractPin {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyPin {
+    /// Hex address.
     pub admin: String,
+    /// Hex address.
     pub implementation: String,
+    /// `EXTCODEHASH` of the implementation: the reviewed logic code.
+    #[serde(with = "crate::enc::hex32")]
+    pub implementation_code_hash: Hash32,
+}
+
+impl ProxyPin {
+    pub fn admin_bytes(&self) -> Option<[u8; 20]> {
+        crate::from_hex_array(&self.admin)
+    }
+
+    pub fn implementation_bytes(&self) -> Option<[u8; 20]> {
+        crate::from_hex_array(&self.implementation)
+    }
 }
 
 impl ContractPin {
@@ -365,17 +474,24 @@ impl ContractPin {
         crate::from_hex_array(&self.address)
     }
 
-    /// S7 for EVM: address and code hash match; a proxy matches its pinned admin
-    /// and implementation.
+    /// The pin is well formed: every address parses (`validate_policy`).
+    pub fn well_formed(&self) -> bool {
+        self.address_bytes().is_some() && self.proxy.as_ref().is_none_or(|p| p.admin_bytes().is_some() && p.implementation_bytes().is_some())
+    }
+
+    /// S7 for EVM: address and code hash match. A contract without proxy facts
+    /// matches a pin without `proxy`. An EIP-1967 proxy matches its pinned admin,
+    /// implementation and implementation code hash. Every other proxy pattern fails.
     pub fn matches(&self, address: &[u8; 20], facts: &ContractFacts) -> bool {
         if self.address_bytes().as_ref() != Some(address) || self.code_hash != facts.code_hash {
             return false;
         }
-        match (&self.proxy, facts.proxy_implementation, facts.proxy_admin) {
-            (None, None, None) => true,
-            (Some(p), Some(implementation), Some(admin)) => {
-                crate::from_hex_array::<20>(&p.implementation) == Some(implementation)
-                    && crate::from_hex_array::<20>(&p.admin) == Some(admin)
+        match (&self.proxy, facts.proxy()) {
+            (None, Proxy::None) => facts.implementation_code.is_none(),
+            (Some(p), Proxy::Eip1967 { implementation, admin }) => {
+                p.implementation_bytes() == Some(implementation)
+                    && p.admin_bytes() == Some(admin)
+                    && facts.implementation_code == Some((implementation, p.implementation_code_hash))
             }
             _ => false,
         }
@@ -527,21 +643,129 @@ mod tests {
         assert_eq!(u128::from_be_bytes(data[4 + 48..].try_into().unwrap()), 1_000_000);
     }
 
+    /// The slot keys follow from their published labels, and the loupe selector is
+    /// the EIP-2535 `facetAddresses()` selector.
+    #[test]
+    fn proxy_slot_constants() {
+        let minus_one = |label: &str| {
+            let mut h = crate::keccak256(label.as_bytes());
+            for b in h.iter_mut().rev() {
+                let (v, borrow) = b.overflowing_sub(1);
+                *b = v;
+                if !borrow {
+                    break;
+                }
+            }
+            crate::to_hex(&h)
+        };
+        let plain = |label: &str| crate::to_hex(&crate::keccak256(label.as_bytes()));
+        assert_eq!(proxy_slot::EIP1967_IMPLEMENTATION, minus_one("eip1967.proxy.implementation"));
+        assert_eq!(proxy_slot::EIP1967_ADMIN, minus_one("eip1967.proxy.admin"));
+        assert_eq!(proxy_slot::EIP1967_BEACON, minus_one("eip1967.proxy.beacon"));
+        assert_eq!(proxy_slot::ZOS_IMPLEMENTATION, plain("org.zeppelinos.proxy.implementation"));
+        assert_eq!(proxy_slot::ZOS_ADMIN, plain("org.zeppelinos.proxy.admin"));
+        assert_eq!(proxy_slot::EIP1822_PROXIABLE, plain("PROXIABLE"));
+        assert_eq!(crate::to_hex(&selector(FACET_ADDRESSES_SIG)), "52ef6b2c");
+    }
+
+    fn word(address: [u8; 20]) -> Hash32 {
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(&address);
+        w
+    }
+
+    fn unset() -> ProxySlots {
+        ProxySlots { eip1967_implementation: [0; 32], eip1967_admin: [0; 32], eip1967_beacon: [0; 32], zos_implementation: [0; 32], zos_admin: [0; 32], eip1822_proxiable: [0; 32] }
+    }
+
+    fn plain() -> ContractFacts {
+        ContractFacts { code_hash: [5; 32], slots: unset(), loupe: Loupe::Reverted, implementation_code: None }
+    }
+
+    /// An EIP-1967 proxy with implementation 0x07.., admin 0x08.. and implementation code hash 0x09...
+    fn proxied() -> ContractFacts {
+        let slots = ProxySlots { eip1967_implementation: word([7; 20]), eip1967_admin: word([8; 20]), ..unset() };
+        ContractFacts { slots, implementation_code: Some(([7; 20], [9; 32])), ..plain() }
+    }
+
+    fn pin() -> ContractPin {
+        ContractPin { address: format!("0x{}", crate::to_hex(&[0x11; 20])), code_hash: [5; 32], proxy: None }
+    }
+
+    fn proxy_pin() -> ContractPin {
+        let proxy = ProxyPin { admin: crate::to_hex(&[8; 20]), implementation: crate::to_hex(&[7; 20]), implementation_code_hash: [9; 32] };
+        ContractPin { proxy: Some(proxy), ..pin() }
+    }
+
     #[test]
     fn contract_pins() {
-        let pin = ContractPin { address: format!("0x{}", crate::to_hex(&[0x11; 20])), code_hash: [5; 32], proxy: None };
-        let plain = ContractFacts { code_hash: [5; 32], proxy_implementation: None, proxy_admin: None };
-        assert!(pin.matches(&[0x11; 20], &plain));
-        assert!(!pin.matches(&[0x12; 20], &plain), "look-alike address");
-        assert!(!pin.matches(&[0x11; 20], &ContractFacts { code_hash: [6; 32], ..plain.clone() }), "other code");
-        // Fault test 6: a proxy HTLC is rejected unless its admin and implementation are pinned.
-        let proxied = ContractFacts { proxy_implementation: Some([7; 20]), proxy_admin: Some([8; 20]), ..plain };
-        assert!(!pin.matches(&[0x11; 20], &proxied));
-        let pinned = ContractPin {
-            proxy: Some(ProxyPin { admin: crate::to_hex(&[8; 20]), implementation: crate::to_hex(&[7; 20]) }),
-            ..pin
-        };
-        assert!(pinned.matches(&[0x11; 20], &proxied));
-        assert!(!pinned.matches(&[0x11; 20], &ContractFacts { proxy_admin: Some([9; 20]), ..proxied }));
+        assert!(pin().matches(&[0x11; 20], &plain()));
+        assert!(!pin().matches(&[0x12; 20], &plain()), "look-alike address");
+        assert!(!pin().matches(&[0x11; 20], &ContractFacts { code_hash: [6; 32], ..plain() }), "other code");
+        assert!(!pin().matches(&[0x11; 20], &ContractFacts { implementation_code: Some(([7; 20], [9; 32])), ..plain() }), "implementation code without a proxy slot");
+        // Fault test 6: a proxy HTLC is rejected unless its admin, implementation and implementation code are pinned.
+        assert!(!pin().matches(&[0x11; 20], &proxied()));
+        assert!(proxy_pin().matches(&[0x11; 20], &proxied()));
+        assert!(!proxy_pin().matches(&[0x11; 20], &plain()), "a pinned proxy that is no proxy now");
+        let mut f = proxied();
+        f.slots.eip1967_admin = word([10; 20]);
+        assert!(!proxy_pin().matches(&[0x11; 20], &f), "other admin");
+        let mut f = proxied();
+        f.slots.eip1967_implementation = word([10; 20]);
+        f.implementation_code = Some(([10; 20], [9; 32]));
+        assert!(!proxy_pin().matches(&[0x11; 20], &f), "other implementation with the same code");
+        assert!(!proxy_pin().matches(&[0x11; 20], &ContractFacts { implementation_code: Some(([7; 20], [6; 32])), ..proxied() }), "other implementation code");
+        assert!(!proxy_pin().matches(&[0x11; 20], &ContractFacts { implementation_code: Some(([10; 20], [9; 32])), ..proxied() }), "code hash read at another address");
+        assert!(!proxy_pin().matches(&[0x11; 20], &ContractFacts { implementation_code: None, ..proxied() }), "implementation code not read");
+    }
+
+    /// Fault test 6: no pin accepts a beacon, a legacy slot, a diamond, a UUPS proxy
+    /// without an admin slot, or a slot word that is not an address.
+    #[test]
+    fn other_proxy_patterns_fail() {
+        type Mutation = fn(&mut ContractFacts);
+        let cases: [(&str, Mutation); 9] = [
+            ("beacon", |f| f.slots.eip1967_beacon = word([12; 20])),
+            ("zeppelinos implementation", |f| f.slots.zos_implementation = word([7; 20])),
+            ("zeppelinos admin", |f| f.slots.zos_admin = word([8; 20])),
+            ("eip-1822 proxiable", |f| f.slots.eip1822_proxiable = word([7; 20])),
+            ("diamond loupe", |f| f.loupe = Loupe::Returned),
+            ("no admin (uups)", |f| f.slots.eip1967_admin = [0; 32]),
+            ("no implementation", |f| f.slots.eip1967_implementation = [0; 32]),
+            ("implementation word with high bytes", |f| f.slots.eip1967_implementation[0] = 1),
+            ("admin word with high bytes", |f| f.slots.eip1967_admin[11] = 1),
+        ];
+        for (name, mutate) in &cases {
+            let mut f = proxied();
+            mutate(&mut f);
+            assert_eq!(f.proxy(), Proxy::Unsupported, "{name}");
+            assert!(!proxy_pin().matches(&[0x11; 20], &f), "pinned: {name}");
+            assert!(!pin().matches(&[0x11; 20], &f), "unpinned: {name}");
+            // The pattern alone on a contract that is otherwise plain.
+            let mut f = plain();
+            mutate(&mut f);
+            assert!(f == plain() || !pin().matches(&[0x11; 20], &f), "plain: {name}");
+        }
+        assert_eq!(plain().proxy(), Proxy::None);
+        assert_eq!(proxied().proxy(), Proxy::Eip1967 { implementation: [7; 20], admin: [8; 20] });
+    }
+
+    #[test]
+    fn malformed_proxy_pins() {
+        assert!(pin().well_formed() && proxy_pin().well_formed());
+        let mut p = proxy_pin();
+        if let Some(x) = p.proxy.as_mut() {
+            x.admin = "0x1234".into();
+        }
+        assert!(!p.well_formed(), "short admin");
+        let mut p = proxy_pin();
+        if let Some(x) = p.proxy.as_mut() {
+            x.implementation = "zz".into();
+        }
+        assert!(!p.well_formed(), "implementation not hex");
+        assert!(!ContractPin { address: "0x11".into(), ..pin() }.well_formed());
+        // The implementation code hash is required in the policy text.
+        let text = r#"{"address":"0x1111111111111111111111111111111111111111","code_hash":"0505050505050505050505050505050505050505050505050505050505050505","proxy":{"admin":"0808080808080808080808080808080808080808","implementation":"0707070707070707070707070707070707070707"}}"#;
+        assert!(serde_json::from_str::<ContractPin>(text).is_err());
     }
 }

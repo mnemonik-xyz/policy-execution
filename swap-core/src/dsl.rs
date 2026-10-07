@@ -303,7 +303,7 @@ pub fn validate_policy(text: &str, profiles: &ProfileSet) -> Result<CompiledPoli
         for c in &entry.contracts {
             let ok = match c {
                 ContractPinSpec::BitcoinTemplate(t) => t == crate::bitcoin::TEMPLATE_ID,
-                ContractPinSpec::Evm(p) => p.address_bytes().is_some(),
+                ContractPinSpec::Evm(p) => p.well_formed(),
                 ContractPinSpec::Solana(p) => crate::solana::parse_key(&p.program).is_some(),
             };
             if !ok {
@@ -422,6 +422,16 @@ pub(crate) mod tests {
         // Version 1 of the template has no lock_id in the claim leaf (G4).
         doc["chains"][reference::BITCOIN_MAINNET]["contracts"] = serde_json::json!([{"bitcoin_template": "warrant-htlc-tr-v1"}]);
         assert!(validate_policy(&doc.to_string(), &p).is_err(), "template version 1");
+        // A proxy pin needs parseable admin and implementation addresses and the implementation code hash.
+        let proxy = |admin: &str| serde_json::json!([{"evm": {"address": HTLC_EVM, "code_hash": crate::to_hex(&[0xc0; 32]), "proxy": {"admin": admin, "implementation": crate::to_hex(&[7; 20]), "implementation_code_hash": crate::to_hex(&[9; 32])}}}]);
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = proxy(&crate::to_hex(&[8; 20]));
+        assert!(validate_policy(&doc.to_string(), &p).is_ok(), "a well-formed proxy pin");
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = proxy("0x08");
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "malformed proxy admin");
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"]["admin"] = Value::String(crate::to_hex(&[8; 20]));
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"].as_object_mut().unwrap().remove("implementation_code_hash");
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "proxy pin without the implementation code hash");
         // A profile that misses an obligatory item makes every policy naming the chain invalid.
         let mut broken = reference::ethereum();
         broken.refund = crate::profile::RefundMethod::None;

@@ -9,7 +9,7 @@ use rb::hashes::Hash as _;
 use warrant_swap_core::authorize::{authorize, AcceptEvidence, Env, IdentityCredential, Observations, Outcome, Request};
 use warrant_swap_core::caip::{AccountId, AssetId, ChainId};
 use warrant_swap_core::checks::{code, AssetFacts, ContractObservation, LockFacts, Payee, ReceiverFacts, Runtime};
-use warrant_swap_core::dsl::{validate_policy, CompiledPolicy};
+use warrant_swap_core::dsl::{validate_policy, CompiledPolicy, ContractPinSpec};
 use warrant_swap_core::evm::{self, ContractFacts, Eip1559Tx, LockCall};
 use warrant_swap_core::facts::{EvidenceMethod, Observed, PriceReport, Report, TransferFee};
 use warrant_swap_core::ledger::LedgerState;
@@ -242,7 +242,18 @@ fn usdc_receiver(payee: [u8; 20]) -> ReceiverFacts {
 }
 
 fn htlc_contract() -> ContractObservation {
-    ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], proxy_implementation: None, proxy_admin: None })
+    ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], slots: no_proxy_slots(), loupe: evm::Loupe::Reverted, implementation_code: None })
+}
+
+/// A storage word that holds the address `[a; 20]`.
+fn address_word(a: u8) -> Hash32 {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(&[a; 20]);
+    w
+}
+
+fn no_proxy_slots() -> evm::ProxySlots {
+    evm::ProxySlots { eip1967_implementation: [0; 32], eip1967_admin: [0; 32], eip1967_beacon: [0; 32], zos_implementation: [0; 32], zos_admin: [0; 32], eip1822_proxiable: [0; 32] }
 }
 
 struct World {
@@ -558,10 +569,40 @@ fn fault_6_fake_token_proxy_and_permanent_delegate() {
     f.asset = AssetId::parse("eip155:1/erc20:0xdead000000000000000000000000000000000000").unwrap();
     w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, f));
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S9);
-    // A proxy HTLC.
+    // A proxy HTLC of each pattern: EIP-1967, beacon, legacy slots, diamond.
+    type Mutation = fn(&mut ContractFacts);
+    let patterns: [(&str, Mutation); 5] = [
+        ("eip-1967", |f| {
+            f.slots.eip1967_implementation = address_word(1);
+            f.slots.eip1967_admin = address_word(2);
+            f.implementation_code = Some(([1; 20], [0xc1; 32]));
+        }),
+        ("beacon", |f| f.slots.eip1967_beacon = address_word(3)),
+        ("zeppelinos", |f| f.slots.zos_implementation = address_word(1)),
+        ("eip-1822", |f| f.slots.eip1822_proxiable = address_word(1)),
+        ("diamond", |f| f.loupe = evm::Loupe::Returned),
+    ];
+    for (name, mutate) in &patterns {
+        let mut w = initiator_reveal_world();
+        let ContractObservation::Evm(mut facts) = htlc_contract() else { unreachable!() };
+        mutate(&mut facts);
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts)));
+        let o = w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET));
+        assert_eq!(o.reasons(), [code::S7], "{name}");
+        assert_denied(&o, code::S7);
+    }
+    // An EIP-1967 proxy HTLC passes S7 when the policy pins its admin, implementation
+    // and implementation code. A beacon beside it fails S7 with the same pin.
     let mut w = initiator_reveal_world();
-    let proxy = ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], proxy_implementation: Some([1; 20]), proxy_admin: Some([2; 20]) });
-    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, proxy));
+    let eth = ChainId::parse(ETH_CHAIN).unwrap();
+    let ContractPinSpec::Evm(pin) = &mut w.policy.policy.chains.get_mut(&eth).unwrap().contracts[0] else { unreachable!() };
+    pin.proxy = Some(evm::ProxyPin { admin: warrant_swap_core::to_hex(&[2; 20]), implementation: warrant_swap_core::to_hex(&[1; 20]), implementation_code_hash: [0xc1; 32] });
+    let ContractObservation::Evm(mut facts) = htlc_contract() else { unreachable!() };
+    (patterns[0].1)(&mut facts);
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts.clone())));
+    assert_allow(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)));
+    facts.slots.eip1967_beacon = address_word(3);
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts)));
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S7);
     // An asset whose issuer can seize it is outside the allowed flags: policy Deny.
     let mut w = World::new(Role::Initiator);
@@ -1449,6 +1490,52 @@ fn evm_same_chain_world(role: Role) -> World {
         Role::Responder => vec![eth("bb")],
     };
     w
+}
+
+/// G20: a pinned EIP-1967 proxy HTLC, from the policy text through S7. A claim
+/// halts when the proxy was upgraded during the swap (structural S7 on the exit).
+#[test]
+fn a_pinned_proxy_htlc_from_the_policy_text() {
+    let t = evm_same_chain_terms();
+    let mut w = evm_same_chain_world(Role::Responder);
+    let e = w.profiles.get(&t.leg_b.chain).unwrap().clone();
+    let doc = serde_json::json!({
+        "version": 3, "ref_ccy": "USD", "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": { (ETH_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&e.hash()), "contracts": [{"evm": {
+            "address": HTLC_EVM, "code_hash": warrant_swap_core::to_hex(&[0xc0; 32]),
+            "proxy": { "admin": warrant_swap_core::to_hex(&[2; 20]), "implementation": warrant_swap_core::to_hex(&[1; 20]),
+                       "implementation_code_hash": warrant_swap_core::to_hex(&[0xc1; 32]) } }}] } },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 }, "quorum": 2, "margin_secs": 1800,
+        "rule": { "pair_in": [[ETH, USDC], [USDC, ETH]] }
+    });
+    w.policy = validate_policy(&doc.to_string(), &w.profiles).unwrap();
+    let ContractObservation::Evm(mut proxied) = htlc_contract() else { unreachable!() };
+    proxied.slots.eip1967_implementation = address_word(1);
+    proxied.slots.eip1967_admin = address_word(2);
+    proxied.implementation_code = Some(([1; 20], [0xc1; 32]));
+    let observe = |w: &mut World, facts: &ContractFacts| {
+        for leg in [LegName::A, LegName::B] {
+            w.obs.contracts.insert(leg, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts.clone())));
+        }
+    };
+    // The pinned proxy passes S7 at accept, at the responder's lock and at the claim.
+    observe(&mut w, &proxied);
+    assert_allow(&w.run(Action::Accept, t.clone(), None, None));
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, evm_lock_a_facts(&t)));
+    let lock = Some(responder_lock_txs(30_000_000_000, 30_000_000_000));
+    assert_allow(&w.run(Action::Lock, t.clone(), lock.clone(), None));
+    let claim = Some(evm_call(evm::claim_calldata(&t.leg_a.lock.lock_id, &SECRET)));
+    assert_allow(&w.run(Action::Claim, t.clone(), claim.clone(), Some(SECRET)));
+    // A plain contract at the address does not match the proxy pin.
+    let ContractObservation::Evm(plain) = htlc_contract() else { unreachable!() };
+    observe(&mut w, &plain);
+    assert_denied(&w.run(Action::Lock, t.clone(), lock, None), code::S7);
+    // The admin upgraded the implementation during the swap: the claim halts.
+    let mut upgraded = proxied.clone();
+    upgraded.slots.eip1967_implementation = address_word(3);
+    upgraded.implementation_code = Some(([3; 20], [0xc3; 32]));
+    observe(&mut w, &upgraded);
+    assert_halt(&w.run(Action::Claim, t, claim, Some(SECRET)), code::S7);
 }
 
 fn evm_lock_a_facts(t: &Terms) -> LockFacts {
