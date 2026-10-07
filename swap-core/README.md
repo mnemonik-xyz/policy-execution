@@ -33,7 +33,7 @@ flowchart LR
 | `evm` | RLP, EIP-1559, the reference HTLC ABI, exact calldata checks, contract and proxy pins |
 | `solana` | Legacy and version 0 messages, lookup tables from chain facts, the allowed instruction set per mode, reference HTLC accounts and privileges, PDAs, program pins |
 | `tx` | Intent from the terms per family and action; the transaction binding (S24) |
-| `checks` | S1 to S25 with fixed reason codes |
+| `checks` | S1 to S25 and S27 with fixed reason codes |
 | `dsl` | The JSON mini-DSL and `validate_policy` |
 | `warrant` | `SwapWarrant`, `DecisionRecord`, payload and hash, the S20 binding check |
 | `authorize` | The pipeline: entry actions through the evaluator, exit actions never |
@@ -57,6 +57,16 @@ flowchart LR
 - On Bitcoin the leaf keys decide who can spend. S5 and S6 require the claim key
   of the counterparty leg and the refund key of the own leg to be own keys
   (`OwnAccounts::bitcoin_keys`).
+- S11 adds `D_refund(B)`, the time for the leg B refund to become final after
+  `T_B`, because a claim stays valid until then. A profile sets it to 0 only
+  with `claim_closes_at_timelock`, which a Bitcoin profile can never set. The
+  profile states the failure probability of its clock bounds, and a Bitcoin
+  profile has at least six settle blocks for time locks.
+- S27 runs before `lock` for the own receiver on the counterparty leg and the
+  own `refund_to` on the own leg, and again before `reveal`. An EVM token must
+  block neither the payee nor the HTLC and must not be paused. A Solana payee
+  needs its associated token account for the leg mint, initialized, not frozen
+  and without required memos. Bitcoin and native coins need no facts.
 - A signed Bitcoin transaction never waits. A lock or a claim has an
   `nLockTime` that is final now (0, or a height at or below the observed tip)
   and no relative lock on any input (bit 31 of `nSequence` set). An absolute

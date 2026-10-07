@@ -5,7 +5,7 @@
 //! only; the evaluator is never called (S18); a failure halts the signer.
 
 use crate::caip::{AssetId, ChainId, Family};
-use crate::checks::{self, code, AssetFacts, ContractObservation, LockFacts, Runtime, Violation};
+use crate::checks::{self, code, AssetFacts, ContractObservation, LockFacts, Payee, ReceiverFacts, Runtime, Violation};
 use crate::dsl::CompiledPolicy;
 use crate::facts::{self, EvidenceMethod, FactRecord, Observed, PriceReport, Provenance};
 use crate::ledger::LedgerState;
@@ -74,6 +74,8 @@ pub struct Observations {
     /// Solana address lookup tables that the proposed message uses: table address
     /// and its addresses in order, read from the leg chain.
     pub lookup_tables: BTreeMap<Hash32, Observed<Vec<Hash32>>>,
+    /// Whether each own payee can receive the leg asset now (S27).
+    pub receivers: BTreeMap<(LegName, Payee), Observed<ReceiverFacts>>,
 }
 
 /// What the agent proposes. Nothing here is a fact: terms must hash to the
@@ -209,6 +211,18 @@ fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
         let env = c.env;
         ctx.token_program = c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program);
     }
+}
+
+/// S27 for one own payee, from the receiver facts that the signer observed.
+fn receivable(c: &mut Collected, leg_name: LegName, leg: &Leg, payee: Payee, asset: Option<&AssetFacts>) -> Result<(), Violation> {
+    let env = c.env;
+    let needs_facts = leg.chain.family() != Some(Family::Bitcoin) && !leg.asset.is_native();
+    let facts = if needs_facts {
+        c.resolve(&format!("receiver:{leg_name:?}:{payee:?}"), env.obs.receivers.get(&(leg_name, payee)))
+    } else {
+        None
+    };
+    checks::s27(leg, payee, facts.as_ref(), asset.and_then(|a| a.token_program))
 }
 
 /// The observed tip height of a Bitcoin leg chain, for the `nLockTime` checks.
@@ -426,6 +440,10 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 ta = Some(facts.timelock);
                 counterparty_lock = Some(LockObs { chain: terms.leg_a.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             }
+            // S27: the own receiver on the counterparty leg and the own refund account
+            // can both receive the asset now.
+            receivable(c, their_name, their_leg, Payee::Receiver, their_asset.as_ref())?;
+            receivable(c, own_name, own_leg, Payee::RefundTo, own_asset.as_ref())?;
             let fee = match (&own_asset, own_leg.asset.is_native()) {
                 (Some(a), _) => a.transfer_fee,
                 (None, true) => None,
@@ -455,6 +473,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             let Some(preimage) = preimage else {
                 return Err(checks::violation(code::S2, "the secret does not open the hashlock"));
             };
+            // S27 again: the own receiver on leg B can still receive the asset.
+            receivable(c, LegName::B, &terms.leg_b, Payee::Receiver, their_asset.as_ref())?;
             counterparty_lock = Some(LockObs { chain: terms.leg_b.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             let mut ctx = BindContext {
                 preimage: Some(preimage),
@@ -476,10 +496,10 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             let now_a = c.chain_now(&terms.leg_a.chain, ta);
             let now_b = c.chain_now(&terms.leg_b.chain, tb);
             let gap = now_a.zip(now_b).map(|(na, nb)| verified::timeout_gap(ta, na, pa.clock, tb, nb, pb.clock));
-            let window = now_b.map(|nb| verified::reveal_window(tb, nb, pb.clock, pb.d_confirm_secs));
+            let window = now_b.map(|nb| verified::reveal_window(tb, nb, pb.clock, pb.d_confirm_secs, margin));
             (gap, window)
         }
-        (None, Some(tb)) => (None, c.chain_now(&terms.leg_b.chain, tb).map(|nb| verified::reveal_window(tb, nb, pb.clock, pb.d_confirm_secs))),
+        (None, Some(tb)) => (None, c.chain_now(&terms.leg_b.chain, tb).map(|nb| verified::reveal_window(tb, nb, pb.clock, pb.d_confirm_secs, margin))),
         _ => (None, None),
     };
 

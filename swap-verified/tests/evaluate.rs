@@ -155,20 +155,44 @@ fn empty_combinators() {
     assert_eq!(decide(&SwapRule::Any(vec![]), &facts()), Decision::Deny);
 }
 
-const BTC: ClockBounds = ClockBounds { min_block_secs: 60, max_block_secs: 3_600, max_lead_secs: 7_200, max_lag_secs: 3_600 };
-const EVM: ClockBounds = ClockBounds { min_block_secs: 12, max_block_secs: 12, max_lead_secs: 15, max_lag_secs: 15 };
+// Reference bounds, not measured. Bitcoin: the real time of n blocks lies in
+// [400 n - 20 000, 900 n + 20 000] seconds; a time lock waits for six blocks.
+const BTC: ClockBounds = ClockBounds {
+    fast_block_secs: 400,
+    fast_slack_secs: 20_000,
+    slow_block_secs: 900,
+    slow_slack_secs: 20_000,
+    max_lead_secs: 7_200,
+    max_lag_secs: 3_600,
+    time_settle_blocks: 6,
+};
+const EVM: ClockBounds = ClockBounds {
+    fast_block_secs: 12,
+    fast_slack_secs: 0,
+    slow_block_secs: 12,
+    slow_slack_secs: 0,
+    max_lead_secs: 15,
+    max_lag_secs: 15,
+    time_settle_blocks: 1,
+};
 
 #[test]
 fn clock_bounds() {
     let now = ChainNow { tip_height: 100, now_real: 1_000_000 };
+    // Ten blocks: the lower bound is below the slack, so it is 0.
     let t = Timelock::Height(110);
     assert!(pending_exec(t, now, BTC));
-    assert_eq!(earliest_exec(t, now, BTC), 1_000_000 + 9 * 60);
-    assert_eq!(latest_exec(t, now, BTC), 1_000_000 + 10 * 3_600);
+    assert_eq!(earliest_exec(t, now, BTC), 1_000_000);
+    assert_eq!(latest_exec(t, now, BTC), 1_000_000 + 10 * 900 + 20_000);
+    // 144 blocks: 144 * 400 - 20 000.
+    let t = Timelock::Height(244);
+    assert_eq!(earliest_exec(t, now, BTC), 1_000_000 + 144 * 400 - 20_000);
+    // A time lock: two hours of lead; one hour of lag plus six slow blocks.
     let t = Timelock::Time(1_010_000);
     assert!(pending_exec(t, now, BTC));
     assert_eq!(earliest_exec(t, now, BTC), 1_010_000 - 7_200);
-    assert_eq!(latest_exec(t, now, BTC), 1_010_000 + 3_600);
+    assert_eq!(latest_exec(t, now, BTC), 1_010_000 + 3_600 + 6 * 900 + 20_000);
+    assert_eq!(latest_exec(t, now, ClockBounds { time_settle_blocks: 0, ..BTC }), 1_010_000 + 3_600);
     assert!(!pending_exec(Timelock::Height(100), now, BTC));
     assert!(!pending_exec(Timelock::Time(1_007_200), now, BTC));
 }
@@ -180,30 +204,47 @@ fn s11_gap_and_s12_deadline() {
     let now_b = ChainNow { tip_height: 0, now_real: 1_700_000_000 };
     let ta = Timelock::Height(800_144);
     let tb = Timelock::Time(1_700_000_000 + 4 * 3_600);
-    // Earliest A: 143 blocks of 60 s = 8_580 s; latest B: 14_400 + 15 s. Gap is negative.
-    assert_eq!(timeout_gap(ta, now_a, BTC, tb, now_b, EVM), 0);
-    assert!(!s11_holds(ta, now_a, BTC, tb, now_b, EVM, 600, 3_600, 600));
-    // With a 9-minute floor on the Bitcoin block interval, the gap is wide enough.
-    let btc = ClockBounds { min_block_secs: 540, ..BTC };
-    let gap = timeout_gap(ta, now_a, btc, tb, now_b, EVM);
-    assert_eq!(gap, 143 * 540 - (4 * 3_600 + 15));
-    assert!(s11_holds(ta, now_a, btc, tb, now_b, EVM, 600, 3_600, 600));
-    assert!(!s11_holds(ta, now_a, btc, tb, now_b, EVM, 600, 3_600, gap));
+    // Earliest A: 144 * 400 - 20 000 = 37 600 s; latest B: 14 400 + 15 + 12 s.
+    let gap = timeout_gap(ta, now_a, BTC, tb, now_b, EVM);
+    assert_eq!(gap, 37_600 - (4 * 3_600 + 15 + 12));
+    assert!(s11_holds(ta, now_a, BTC, tb, now_b, EVM, 0, 600, 3_600, 600));
+    assert!(!s11_holds(ta, now_a, BTC, tb, now_b, EVM, 0, 600, 3_600, gap));
+    // The refund time of leg B counts: a claim that stays valid after T_B.
+    let need = gap - 600 - 3_600 - 600;
+    assert!(s11_holds(ta, now_a, BTC, tb, now_b, EVM, need, 600, 3_600, 600));
+    assert!(!s11_holds(ta, now_a, BTC, tb, now_b, EVM, need + 1, 600, 3_600, 600));
+    // A faster worst case for Bitcoin blocks closes the gap.
+    let fast = ClockBounds { fast_block_secs: 100, ..BTC };
+    assert_eq!(timeout_gap(ta, now_a, fast, tb, now_b, EVM), 0);
+    assert!(!s11_holds(ta, now_a, fast, tb, now_b, EVM, 0, 600, 3_600, 600));
     // S12 on leg B: the claim needs 15 minutes plus a 10-minute margin.
     assert!(s12_holds(tb, now_b, EVM, 900, 600));
     let late = ChainNow { tip_height: 0, now_real: 1_700_000_000 + 4 * 3_600 - 1_500 };
     assert!(!s12_holds(tb, late, EVM, 900, 600));
-    // Earliest refund of B is T - 15; window = (T - 15) - (T - 1_500) - 900.
-    assert_eq!(reveal_window(tb, late, EVM, 900), 1_500 - 15 - 900);
+    // Earliest refund of B is T - 15; window = (T - 15) - (T - 1 500) - 900 - margin.
+    assert_eq!(reveal_window(tb, late, EVM, 900, 0), 1_500 - 15 - 900);
+    assert_eq!(reveal_window(tb, late, EVM, 900, 500), 1_500 - 15 - 900 - 500);
+    assert_eq!(reveal_window(tb, late, EVM, 900, 600), 0);
 }
 
 #[test]
 fn arithmetic_at_the_limits() {
     let now = ChainNow { tip_height: 0, now_real: u64::MAX };
-    let wide = ClockBounds { min_block_secs: u64::MAX, max_block_secs: u64::MAX, max_lead_secs: 0, max_lag_secs: u64::MAX };
+    let wide = ClockBounds {
+        fast_block_secs: u64::MAX,
+        fast_slack_secs: 0,
+        slow_block_secs: u64::MAX,
+        slow_slack_secs: u64::MAX,
+        max_lead_secs: 0,
+        max_lag_secs: u64::MAX,
+        time_settle_blocks: u32::MAX,
+    };
     let t = Timelock::Height(u64::MAX);
-    assert!(latest_exec(t, now, wide) > u64::MAX as u128);
+    assert_eq!(latest_exec(t, now, wide), u128::MAX);
     assert_eq!(timeout_gap(t, now, wide, Timelock::Height(1), ChainNow { tip_height: 0, now_real: 0 }, EVM), u64::MAX);
+    let at_zero = ChainNow { tip_height: 0, now_real: 0 };
+    let expected = 2 * (u64::MAX as u128) + (u32::MAX as u128) * (u64::MAX as u128) + u64::MAX as u128;
+    assert_eq!(latest_exec(Timelock::Time(u64::MAX), at_zero, wide), expected);
 }
 
 #[test]

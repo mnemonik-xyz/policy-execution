@@ -752,16 +752,26 @@ pub fn decide(rule: &SwapRule, f3: &SwapFacts3) -> (result: Decision)
 // Timeout arithmetic (spec 7.3: S11 and S12)
 // ---------------------------------------------------------------------------
 
-/// Conservative clock bounds of one chain profile.
+/// Conservative clock bounds of one chain profile, at the profile's stated failure
+/// probability (spec 7.3). Blocks arrive at random: no fixed fastest or slowest
+/// block interval exists. Instead, the real time of the next `n` blocks from now
+/// is at least `n * fast_block_secs - fast_slack_secs` (and at least 0) and at
+/// most `n * slow_block_secs + slow_slack_secs`.
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize))]
 pub struct ClockBounds {
-    pub min_block_secs: u64,
-    pub max_block_secs: u64,
+    pub fast_block_secs: u64,
+    pub fast_slack_secs: u64,
+    pub slow_block_secs: u64,
+    pub slow_slack_secs: u64,
     /// How far the chain clock can run ahead of real time.
     pub max_lead_secs: u64,
-    /// How far the chain clock can lag behind real time.
+    /// How far a block timestamp can lag behind real time (timestamp drift and,
+    /// on an L2, the sequencer window).
     pub max_lag_secs: u64,
+    /// New blocks that a time lock needs after the chain clock passes `T`: the
+    /// median time past (BIP 113) needs about six on Bitcoin. 0 when none.
+    pub time_settle_blocks: u32,
 }
 
 /// An absolute timelock: the first height, or the first chain time, at which the
@@ -782,6 +792,25 @@ pub struct ChainNow {
     pub now_real: u64,
 }
 
+/// The least real time that `n` new blocks take, at the failure probability.
+pub open spec fn blocks_lo(n: int, b: ClockBounds) -> int {
+    if n * b.fast_block_secs as int >= b.fast_slack_secs as int {
+        n * b.fast_block_secs as int - b.fast_slack_secs as int
+    } else {
+        0
+    }
+}
+
+/// The most real time that `n` new blocks take, at the failure probability.
+pub open spec fn blocks_hi(n: int, b: ClockBounds) -> int {
+    n * b.slow_block_secs as int + b.slow_slack_secs as int
+}
+
+/// The slow-arrival time of the blocks that a time lock needs after `T`.
+pub open spec fn settle_secs(b: ClockBounds) -> int {
+    if b.time_settle_blocks == 0 { 0 } else { blocks_hi(b.time_settle_blocks as int, b) }
+}
+
 /// The refund is certainly not valid yet.
 pub open spec fn pending(t: Timelock, now: ChainNow, b: ClockBounds) -> bool {
     match t {
@@ -792,17 +821,15 @@ pub open spec fn pending(t: Timelock, now: ChainNow, b: ClockBounds) -> bool {
 
 pub open spec fn earliest_real(t: Timelock, now: ChainNow, b: ClockBounds) -> int {
     match t {
-        Timelock::Height(h) => now.now_real as int
-            + (h as int - now.tip_height as int - 1) * b.min_block_secs as int,
+        Timelock::Height(h) => now.now_real as int + blocks_lo(h as int - now.tip_height as int, b),
         Timelock::Time(tt) => tt as int - b.max_lead_secs as int,
     }
 }
 
 pub open spec fn latest_real(t: Timelock, now: ChainNow, b: ClockBounds) -> int {
     match t {
-        Timelock::Height(h) => now.now_real as int
-            + (h as int - now.tip_height as int) * b.max_block_secs as int,
-        Timelock::Time(tt) => tt as int + b.max_lag_secs as int,
+        Timelock::Height(h) => now.now_real as int + blocks_hi(h as int - now.tip_height as int, b),
+        Timelock::Time(tt) => tt as int + b.max_lag_secs as int + settle_secs(b),
     }
 }
 
@@ -810,15 +837,17 @@ pub open spec fn clamp_u64(x: int) -> int {
     if x < 0 { 0 } else if x > u64::MAX as int { u64::MAX as int } else { x }
 }
 
+/// S11. `d_refund` is the time for the responder's refund of leg B to become
+/// final after `T_B`; 0 only when the lock rejects a claim after `T_B`.
 pub open spec fn s11_spec(
     ta: Timelock, now_a: ChainNow, ba: ClockBounds,
     tb: Timelock, now_b: ChainNow, bb: ClockBounds,
-    d_observe: u64, d_confirm: u64, d_margin: u64,
+    d_refund: u64, d_observe: u64, d_confirm: u64, d_margin: u64,
 ) -> bool {
     &&& pending(ta, now_a, ba)
     &&& pending(tb, now_b, bb)
     &&& earliest_real(ta, now_a, ba) - latest_real(tb, now_b, bb)
-        >= d_observe as int + d_confirm as int + d_margin as int
+        >= d_refund as int + d_observe as int + d_confirm as int + d_margin as int
 }
 
 pub open spec fn s12_spec(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64, d_margin: u64) -> bool {
@@ -834,9 +863,9 @@ pub open spec fn gap_spec(ta: Timelock, now_a: ChainNow, ba: ClockBounds, tb: Ti
     }
 }
 
-pub open spec fn window_spec(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64) -> int {
+pub open spec fn window_spec(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64, d_margin: u64) -> int {
     if pending(tb, now_b, bb) {
-        clamp_u64(earliest_real(tb, now_b, bb) - now_b.now_real as int - d_confirm as int)
+        clamp_u64(earliest_real(tb, now_b, bb) - now_b.now_real as int - d_confirm as int - d_margin as int)
     } else {
         0
     }
@@ -861,6 +890,49 @@ proof fn lemma_mul_bound(x: u64, y: u64)
         requires x as int >= 0, y as int >= 0;
 }
 
+proof fn lemma_mul_bound_u32(x: u32, y: u64)
+    ensures (x as int) * (y as int) <= (u32::MAX as int) * (u64::MAX as int),
+            (x as int) * (y as int) >= 0,
+{
+    assert((x as int) * (y as int) <= (u32::MAX as int) * (u64::MAX as int)) by (nonlinear_arith)
+        requires x as int <= u32::MAX as int, y as int <= u64::MAX as int, x as int >= 0, y as int >= 0;
+    assert((x as int) * (y as int) >= 0) by (nonlinear_arith)
+        requires x as int >= 0, y as int >= 0;
+}
+
+/// Never overflows: `n * fast` is below 2^128. The explicit branch keeps the
+/// Verus mutation target; `saturating_sub` would compute the same value.
+#[allow(clippy::implicit_saturating_sub)]
+fn blocks_lo_exec(n: u64, b: ClockBounds) -> (result: u128)
+    ensures result as int == blocks_lo(n as int, b),
+            result as int <= (u64::MAX as int) * (u64::MAX as int),
+{
+    proof { lemma_mul_bound(n, b.fast_block_secs); }
+    let p = (n as u128) * (b.fast_block_secs as u128);
+    if p >= b.fast_slack_secs as u128 { p - b.fast_slack_secs as u128 } else { 0 }
+}
+
+/// Never overflows: `n * slow + slack` is at most `(2^64 - 1)^2 + 2^64 - 1`.
+fn blocks_hi_exec(n: u64, b: ClockBounds) -> (result: u128)
+    ensures result as int == blocks_hi(n as int, b),
+            result as int <= (u64::MAX as int) * (u64::MAX as int) + u64::MAX as int,
+{
+    proof { lemma_mul_bound(n, b.slow_block_secs); }
+    (n as u128) * (b.slow_block_secs as u128) + (b.slow_slack_secs as u128)
+}
+
+fn settle_exec(b: ClockBounds) -> (result: u128)
+    ensures result as int == settle_secs(b),
+            result as int <= (u32::MAX as int) * (u64::MAX as int) + u64::MAX as int,
+{
+    if b.time_settle_blocks == 0 {
+        0
+    } else {
+        proof { lemma_mul_bound_u32(b.time_settle_blocks, b.slow_block_secs); }
+        (b.time_settle_blocks as u128) * (b.slow_block_secs as u128) + (b.slow_slack_secs as u128)
+    }
+}
+
 /// Requires a pending timelock. Never overflows: every term is below 2^128.
 pub fn earliest_exec(t: Timelock, now: ChainNow, b: ClockBounds) -> (result: u128)
     requires pending(t, now, b),
@@ -868,9 +940,9 @@ pub fn earliest_exec(t: Timelock, now: ChainNow, b: ClockBounds) -> (result: u12
 {
     match t {
         Timelock::Height(h) => {
-            let blocks = h - now.tip_height - 1;
-            proof { lemma_mul_bound(blocks, b.min_block_secs); }
-            (now.now_real as u128) + (blocks as u128) * (b.min_block_secs as u128)
+            let lo = blocks_lo_exec(h - now.tip_height, b);
+            assert((u64::MAX as int) * (u64::MAX as int) + u64::MAX as int <= u128::MAX as int) by (compute_only);
+            (now.now_real as u128) + lo
         },
         Timelock::Time(tt) => (tt - b.max_lead_secs) as u128,
     }
@@ -882,11 +954,15 @@ pub fn latest_exec(t: Timelock, now: ChainNow, b: ClockBounds) -> (result: u128)
 {
     match t {
         Timelock::Height(h) => {
-            let blocks = h - now.tip_height;
-            proof { lemma_mul_bound(blocks, b.max_block_secs); }
-            (now.now_real as u128) + (blocks as u128) * (b.max_block_secs as u128)
+            let hi = blocks_hi_exec(h - now.tip_height, b);
+            assert((u64::MAX as int) * (u64::MAX as int) + 2 * (u64::MAX as int) <= u128::MAX as int) by (compute_only);
+            (now.now_real as u128) + hi
         },
-        Timelock::Time(tt) => (tt as u128) + (b.max_lag_secs as u128),
+        Timelock::Time(tt) => {
+            let settle = settle_exec(b);
+            assert((u32::MAX as int) * (u64::MAX as int) + 3 * (u64::MAX as int) <= u128::MAX as int) by (compute_only);
+            (tt as u128) + (b.max_lag_secs as u128) + settle
+        },
     }
 }
 
@@ -915,13 +991,13 @@ pub fn timeout_gap(ta: Timelock, now_a: ChainNow, ba: ClockBounds, tb: Timelock,
     }
 }
 
-/// Fact `reveal_window`: time left before the reveal deadline of S12, without
-/// the policy margin; 0 when the timelock is not pending.
-pub fn reveal_window(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64) -> (result: u64)
-    ensures result as int == window_spec(tb, now_b, bb, d_confirm),
+/// Fact `reveal_window`: time left before the reveal deadline of S12, after the
+/// confirmation time and the policy margin; 0 when the timelock is not pending.
+pub fn reveal_window(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64, d_margin: u64) -> (result: u64)
+    ensures result as int == window_spec(tb, now_b, bb, d_confirm, d_margin),
 {
     if pending_exec(tb, now_b, bb) {
-        clamp_exec((now_b.now_real as u128) + (d_confirm as u128), earliest_exec(tb, now_b, bb))
+        clamp_exec((now_b.now_real as u128) + (d_confirm as u128) + (d_margin as u128), earliest_exec(tb, now_b, bb))
     } else {
         0
     }
@@ -931,14 +1007,14 @@ pub fn reveal_window(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: 
 pub fn s11_holds(
     ta: Timelock, now_a: ChainNow, ba: ClockBounds,
     tb: Timelock, now_b: ChainNow, bb: ClockBounds,
-    d_observe: u64, d_confirm: u64, d_margin: u64,
+    d_refund: u64, d_observe: u64, d_confirm: u64, d_margin: u64,
 ) -> (result: bool)
-    ensures result == s11_spec(ta, now_a, ba, tb, now_b, bb, d_observe, d_confirm, d_margin),
+    ensures result == s11_spec(ta, now_a, ba, tb, now_b, bb, d_refund, d_observe, d_confirm, d_margin),
 {
     if !(pending_exec(ta, now_a, ba) && pending_exec(tb, now_b, bb)) {
         return false;
     }
-    let need = (d_observe as u128) + (d_confirm as u128) + (d_margin as u128);
+    let need = (d_refund as u128) + (d_observe as u128) + (d_confirm as u128) + (d_margin as u128);
     let earliest_a = earliest_exec(ta, now_a, ba);
     let latest_b = latest_exec(tb, now_b, bb);
     earliest_a >= latest_b && earliest_a - latest_b >= need
@@ -958,16 +1034,19 @@ pub fn s12_holds(tb: Timelock, now_b: ChainNow, bb: ClockBounds, d_confirm: u64,
 // Clock model: the bounds are conservative
 // ---------------------------------------------------------------------------
 
-/// `bt(k)` is the real time of the k-th block after the observed tip.
+/// `bt(n)` is the real time of the n-th block after the observed tip. The model
+/// holds at the profile's failure probability: the real time of the next `n`
+/// blocks lies within the profile's bounds. No per-block interval is assumed.
 pub open spec fn block_times_ok(bt: spec_fn(int) -> int, now: ChainNow, b: ClockBounds) -> bool {
-    &&& 0 <= bt(1) - now.now_real as int <= b.max_block_secs as int
-    &&& forall|k: int| k >= 1 ==> b.min_block_secs as int <= #[trigger] bt(k + 1) - bt(k)
-        && bt(k + 1) - bt(k) <= b.max_block_secs as int
+    forall|n: int| n >= 1 ==> now.now_real as int + blocks_lo(n, b) <= #[trigger] bt(n)
+        && bt(n) <= now.now_real as int + blocks_hi(n, b)
 }
 
-/// `c(r)` is the chain clock (for Bitcoin, the median time past) at real time `r`.
+/// `c(r)` is the chain clock that a time lock reads at real time `r` (for
+/// Bitcoin, the median time past). It leads real time by at most `max_lead_secs`
+/// and lags it by at most `max_lag_secs` plus the slow arrival of the settle blocks.
 pub open spec fn chain_clock_ok(c: spec_fn(int) -> int, b: ClockBounds) -> bool {
-    forall|r: int| r - b.max_lag_secs as int <= #[trigger] c(r) && c(r) <= r + b.max_lead_secs as int
+    forall|r: int| r - b.max_lag_secs as int - settle_secs(b) <= #[trigger] c(r) && c(r) <= r + b.max_lead_secs as int
 }
 
 pub open spec fn model_ok(now: ChainNow, b: ClockBounds, bt: spec_fn(int) -> int, c: spec_fn(int) -> int) -> bool {
@@ -982,42 +1061,26 @@ pub open spec fn refund_valid(t: Timelock, now: ChainNow, bt: spec_fn(int) -> in
     }
 }
 
-pub proof fn lemma_block_time_bounds(bt: spec_fn(int) -> int, now: ChainNow, b: ClockBounds, n: int)
-    requires
-        block_times_ok(bt, now, b),
-        n >= 1,
-    ensures
-        now.now_real as int + (n - 1) * b.min_block_secs as int <= bt(n),
-        bt(n) <= now.now_real as int + n * b.max_block_secs as int,
-    decreases n,
-{
-    if n > 1 {
-        lemma_block_time_bounds(bt, now, b, n - 1);
-        let k = n - 1;
-        assert(b.min_block_secs as int <= bt(k + 1) - bt(k) && bt(k + 1) - bt(k) <= b.max_block_secs as int);
-        assert((n - 1) * b.min_block_secs as int == (n - 2) * b.min_block_secs as int + b.min_block_secs as int)
-            by (nonlinear_arith);
-        assert(n * b.max_block_secs as int == (n - 1) * b.max_block_secs as int + b.max_block_secs as int)
-            by (nonlinear_arith);
-    } else {
-        assert((n - 1) * b.min_block_secs as int == 0) by (nonlinear_arith) requires n == 1;
-        assert(n * b.max_block_secs as int == b.max_block_secs as int) by (nonlinear_arith) requires n == 1;
-    }
-}
-
 /// The model is not vacuous: for consistent bounds, a chain that meets them exists.
 pub proof fn model_is_satisfiable(now: ChainNow, b: ClockBounds)
-    requires b.min_block_secs <= b.max_block_secs,
+    requires b.fast_block_secs <= b.slow_block_secs,
     ensures exists|bt: spec_fn(int) -> int, c: spec_fn(int) -> int| model_ok(now, b, bt, c),
 {
-    let m = b.max_block_secs as int;
-    let bt = |k: int| now.now_real as int + k * m;
+    let m = b.slow_block_secs as int;
+    let bt = |n: int| now.now_real as int + n * m;
     let c = |r: int| r;
-    assert forall|k: int| k >= 1 implies b.min_block_secs as int <= #[trigger] bt(k + 1) - bt(k)
-        && bt(k + 1) - bt(k) <= m by {
-        assert((k + 1) * m == k * m + m) by (nonlinear_arith);
+    assert forall|n: int| n >= 1 implies now.now_real as int + blocks_lo(n, b) <= #[trigger] bt(n)
+        && bt(n) <= now.now_real as int + blocks_hi(n, b) by {
+        assert(n * (b.fast_block_secs as int) <= n * m) by (nonlinear_arith)
+            requires n >= 1, b.fast_block_secs as int <= m;
+        assert(n * m >= 0) by (nonlinear_arith) requires n >= 1, m >= 0;
     }
-    assert(1 * m == m);
+    assert(settle_secs(b) >= 0) by {
+        if b.time_settle_blocks != 0 {
+            assert((b.time_settle_blocks as int) * m >= 0) by (nonlinear_arith)
+                requires b.time_settle_blocks as int >= 0, m >= 0;
+        }
+    }
     assert(model_ok(now, b, bt, c));
 }
 
@@ -1033,7 +1096,8 @@ pub proof fn earliest_is_conservative(
 {
     match t {
         Timelock::Height(h) => {
-            lemma_block_time_bounds(bt, now, b, h as int - now.tip_height as int);
+            let n = h as int - now.tip_height as int;
+            assert(now.now_real as int + blocks_lo(n, b) <= bt(n));
         },
         Timelock::Time(tt) => {
             assert(c(r) <= r + b.max_lead_secs as int);
@@ -1053,32 +1117,35 @@ pub proof fn latest_is_conservative(
 {
     match t {
         Timelock::Height(h) => {
-            lemma_block_time_bounds(bt, now, b, h as int - now.tip_height as int);
+            let n = h as int - now.tip_height as int;
+            assert(bt(n) <= now.now_real as int + blocks_hi(n, b));
         },
         Timelock::Time(tt) => {
-            assert(r - b.max_lag_secs as int <= c(r));
+            assert(r - b.max_lag_secs as int - settle_secs(b) <= c(r));
         },
     }
 }
 
 /// S11 soundness: whenever leg A is refundable, leg B has been refundable for at
-/// least `d_observe + d_confirm + d_margin` seconds.
+/// least `d_refund + d_observe + d_confirm + d_margin` seconds. The responder's
+/// refund of leg B is then final before the initiator can refund leg A.
 pub proof fn s11_sound(
     ta: Timelock, now_a: ChainNow, ba: ClockBounds, bt_a: spec_fn(int) -> int, c_a: spec_fn(int) -> int,
     tb: Timelock, now_b: ChainNow, bb: ClockBounds, bt_b: spec_fn(int) -> int, c_b: spec_fn(int) -> int,
-    d_observe: u64, d_confirm: u64, d_margin: u64, ra: int,
+    d_refund: u64, d_observe: u64, d_confirm: u64, d_margin: u64, ra: int,
 )
     requires
-        s11_spec(ta, now_a, ba, tb, now_b, bb, d_observe, d_confirm, d_margin),
+        s11_spec(ta, now_a, ba, tb, now_b, bb, d_refund, d_observe, d_confirm, d_margin),
         model_ok(now_a, ba, bt_a, c_a),
         model_ok(now_b, bb, bt_b, c_b),
         refund_valid(ta, now_a, bt_a, c_a, ra),
     ensures
-        refund_valid(tb, now_b, bt_b, c_b, ra - d_observe as int - d_confirm as int - d_margin as int),
+        refund_valid(tb, now_b, bt_b, c_b,
+            ra - d_refund as int - d_observe as int - d_confirm as int - d_margin as int),
 {
     earliest_is_conservative(ta, now_a, ba, bt_a, c_a, ra);
     latest_is_conservative(tb, now_b, bb, bt_b, c_b,
-        ra - d_observe as int - d_confirm as int - d_margin as int);
+        ra - d_refund as int - d_observe as int - d_confirm as int - d_margin as int);
 }
 
 /// S12 soundness: leg B is not refundable before the claim has had
@@ -1097,3 +1164,4 @@ pub proof fn s12_sound(
 }
 
 } // verus!
+
