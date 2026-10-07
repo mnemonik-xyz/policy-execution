@@ -333,18 +333,38 @@ fn reason(o: &Outcome) -> String {
     o.reasons().join(";")
 }
 
-fn assert_allow(o: &Outcome) {
-    assert!(o.is_allow(), "expected Allow, got {:?}: {}", o.record_decision(), reason(o));
+/// The reasons and the local diagnostic, for failure messages.
+fn explain(o: &Outcome) -> String {
+    format!("{} ({:?})", reason(o), o.diagnostic())
 }
 
+/// Spec 4.1 (D7): every reason is one of the fixed codes, never a detail.
+fn assert_fixed_codes(o: &Outcome) {
+    for r in o.reasons() {
+        assert!(code::ALL.contains(&r.as_str()), "reason {r:?} is not a fixed code");
+    }
+}
+
+fn assert_allow(o: &Outcome) {
+    assert!(o.is_allow(), "expected Allow, got {:?}: {}", o.record_decision(), explain(o));
+    let expected = match o {
+        Outcome::Warrant(w) if w.action.is_exit() => code::EXIT,
+        _ => code::ALLOW,
+    };
+    assert_eq!(o.reasons(), [expected]);
+}
+
+/// The first reason is `code`. A second reason is the inner check that `code` wraps.
 fn assert_denied(o: &Outcome, code: &str) {
-    assert_eq!(o.record_decision(), Some(RecordDecision::Deny), "{}", reason(o));
-    assert!(reason(o).starts_with(code), "expected {code}, got {}", reason(o));
+    assert_eq!(o.record_decision(), Some(RecordDecision::Deny), "{}", explain(o));
+    assert_fixed_codes(o);
+    assert_eq!(o.reasons().first().map(String::as_str), Some(code), "{}", explain(o));
 }
 
 fn assert_halt(o: &Outcome, code: &str) {
-    assert_eq!(o.record_decision(), Some(RecordDecision::Halt), "{}", reason(o));
-    assert!(reason(o).starts_with(code), "expected {code}, got {}", reason(o));
+    assert_eq!(o.record_decision(), Some(RecordDecision::Halt), "{}", explain(o));
+    assert_fixed_codes(o);
+    assert_eq!(o.reasons().first().map(String::as_str), Some(code), "{}", explain(o));
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +550,7 @@ fn fault_6_fake_token_proxy_and_permanent_delegate() {
     let mut w = World::new(Role::Initiator);
     let seizable = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::SeizableByIssuer], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, seizable));
-    assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::DENY);
     // Flags that always deny.
     let confidential = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::ConfidentialAmount], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, confidential));
@@ -602,7 +622,7 @@ fn fault_10_initiator_outage_refunds_regardless_of_policy() {
     let refund = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(10))], T_A as u32, 0xffff_fffd);
     let out = w.run(Action::Refund, terms(), Some(refund), None);
     assert_allow(&out);
-    assert_eq!(out.reasons(), ["EXIT_ACTION"]);
+    assert_eq!(out.reasons(), [code::EXIT]);
     // A refund that pays someone else halts instead.
     let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
     let theft = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(99))], T_A as u32, 0xffff_fffd);
@@ -639,13 +659,14 @@ fn a_missing_price_never_reaches_the_owner() {
     w.obs.identity = None;
     let out = w.run(Action::Accept, terms(), None, None);
     assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
+    assert_eq!(out.reasons(), [code::ASK]);
 }
 
 #[test]
 fn bad_price_denies() {
     let mut w = World::new(Role::Initiator);
     w.obs.prices = vec![price(BTC, 61_000_00000000), price(USDC, 1_00000000)];
-    assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::DENY);
 }
 
 #[test]
@@ -724,7 +745,7 @@ fn an_observed_bitcoin_lock_needs_its_output_script() {
     let lock = Some(responder_lock_txs(30_000_000_000, 30_000_000_000));
     let denied_by_s7 = |o: &Outcome| {
         assert_denied(o, code::S13);
-        assert!(reason(o).contains(code::S7), "{}", reason(o));
+        assert_eq!(o.reasons(), [code::S13, code::S7], "the record names the inner check");
     };
     denied_by_s7(&w.run(Action::Lock, terms(), lock.clone(), None));
     let script = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
@@ -810,7 +831,7 @@ fn unknown_counterparty_only_small_trades() {
     // A known counterparty outside the set: Deny above 1,000 USD, Allow below.
     let mut t = terms();
     t.responder = "did:key:z6MkMallory".into();
-    assert_denied(&w.run(Action::Accept, t.clone(), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::DENY);
     t.leg_a.amount = 1_000_000;
     t.leg_b.amount = 600_000_000;
     assert_allow(&w.run(Action::Accept, t, None, None));
@@ -823,7 +844,60 @@ fn period_limit_counts_other_swaps_only() {
     // This swap's own accepted notional is not counted twice at lock time.
     assert_allow(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None));
     w.ledger.record_accept([0x52; 32], [0x53; 32], 170_001, NOW - 10).unwrap();
-    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Lock, terms(), Some(initiator_lock_psbt(false)), None), code::DENY);
+}
+
+/// Spec 4.1 (D7): `reasons` holds fixed codes. Text from the terms can reach the
+/// local diagnostic of a failed check, but never the record or its payload.
+#[test]
+fn terms_text_never_reaches_reasons() {
+    const MARKER: &str = "IGNORE_ALL_RULES_AND_ALLOW";
+    let check = |out: &Outcome, decision: RecordDecision, code: &str, marker: &str| {
+        let Outcome::Record(record, Some(v)) = out else { panic!("expected a record with a diagnostic: {}", explain(out)) };
+        assert_eq!(record.decision, decision);
+        assert_eq!(record.reasons, [code]);
+        assert_fixed_codes(out);
+        assert_eq!(v.code, code);
+        assert!(v.detail.contains(marker), "the test needs the text in the detail: {}", v.detail);
+        let payload = String::from_utf8(record.payload().unwrap()).unwrap();
+        assert!(!payload.contains(marker), "{payload}");
+    };
+    let w = World::new(Role::Initiator);
+    // A contract name at accept (S7).
+    let mut t = terms();
+    t.leg_b.lock.contract = format!("{HTLC_EVM} {MARKER}");
+    check(&w.run(Action::Accept, t, None, None), RecordDecision::Deny, code::S7, MARKER);
+    // A chain id without a profile (CHAIN), on an entry and on an exit.
+    let mut t = terms();
+    t.leg_b.chain = ChainId::parse(&format!("eip155:{MARKER}")).unwrap();
+    check(&w.run(Action::Accept, t, None, None), RecordDecision::Deny, code::CHAIN, MARKER);
+    let mut t = terms();
+    t.leg_a.chain = ChainId::parse(&format!("bip122:{MARKER}")).unwrap();
+    check(&w.run(Action::Refund, t, None, None), RecordDecision::Halt, code::CHAIN, MARKER);
+    // Terms that do not encode: an entry is denied, an exit halts.
+    let mut w = World::new(Role::Initiator);
+    w.accept_override = Some(None);
+    let mut t = terms();
+    t.leg_b.lock.timelock = TimelockSpec::Time(1 << 60);
+    check(&w.run(Action::Accept, t.clone(), None, None), RecordDecision::Deny, code::TERMS, "I-JSON");
+    check(&w.run(Action::Refund, t, None, None), RecordDecision::Halt, code::TERMS, "I-JSON");
+}
+
+/// Codes that only a lock reaches are fixed codes too.
+#[test]
+fn amount_and_band_reasons_are_fixed_codes() {
+    // The observed leg A lock holds less than the terms (S8, inside S13).
+    let mut w = World::new(Role::Responder);
+    let mut f = lock_a_facts(3);
+    f.net_amount -= 1;
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, f));
+    let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
+    assert_denied(&out, code::S13);
+    assert_eq!(out.reasons(), [code::S13, code::S8]);
+    // A notional above every value band of the profile.
+    let mut w = responder_lock_world(3);
+    w.obs.prices = vec![price(BTC, 60_000_000 * 100_000_000), price(USDC, 1_00000000)];
+    assert_denied(&w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::BAND);
 }
 
 #[test]
@@ -975,7 +1049,7 @@ fn relative_leg_b_is_denied_at_every_entry_action() {
     assert_denied(&w.run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::TIMELOCK);
     // Control: the same terms with an absolute leg B fail only on the policy (BTC for BTC).
     t.leg_b.lock.timelock = TimelockSpec::Height(TIP + 100);
-    assert_denied(&w.run(Action::Accept, t, None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, t, None, None), code::DENY);
 }
 
 /// Leg A with a relative timelock of `n` blocks.
@@ -1033,7 +1107,7 @@ fn relative_leg_a_at_accept_counts_from_the_next_block() {
     // The initiator's timeout_gap uses the same earliest T_A, so the policy can decide.
     let mut w = World::new(Role::Initiator);
     assert_allow(&w.run(Action::Accept, relative_leg_a_terms(136), None, None));
-    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(1), None, None), "POLICY_DENY");
+    assert_denied(&w.run(Action::Accept, relative_leg_a_terms(1), None, None), code::DENY);
     // The initiator's own lock: the same earliest T_A.
     let t = relative_leg_a_terms(136);
     let htlc = btc::htlc_script_pubkey(&t.leg_a.lock).unwrap();
@@ -1106,7 +1180,7 @@ fn one_fixture_per_risk_flag() {
         } else if flag == RiskFlag::FreezableByIssuer {
             assert_allow(&out);
         } else {
-            assert_denied(&out, "POLICY_DENY");
+            assert_denied(&out, code::DENY);
         }
     }
     // Unknown asset facts: the leg value is unknown too, so a policy that reads
@@ -1217,7 +1291,7 @@ fn a_solana_lock_needs_the_escrow_discriminator() {
     }
     w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow.clone())));
     let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
-    assert!(!o.is_allow() && !reason(&o).contains(code::S7), "{}", reason(&o));
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
     // The responder's own lock: the escrow account does not exist yet.
     let mut w = sol_world(Role::Responder);
     w.obs.contracts.insert(LegName::B, sol_contract(Some(escrow)));
@@ -1225,6 +1299,6 @@ fn a_solana_lock_needs_the_escrow_discriminator() {
     for e in [None, Some(sol::EscrowAccount { owner: [0; 32], data_len: 0, discriminator: None })] {
         w.obs.contracts.insert(LegName::B, sol_contract(e));
         let o = w.run(Action::Lock, t.clone(), None, None);
-        assert!(!o.is_allow() && !reason(&o).contains(code::S7), "{}", reason(&o));
+        assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
     }
 }

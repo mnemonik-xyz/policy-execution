@@ -83,6 +83,7 @@ pub struct SwapWarrant {
     pub policy_version: u64,
     pub evaluator_id: EvaluatorId,
     pub decision: String,
+    /// Fixed reason codes from `checks::code::ALL` only, never detail text (spec 4.1).
     pub reasons: Vec<String>,
     pub valid_after: u64,
     pub valid_until: u64,
@@ -113,6 +114,7 @@ pub struct DecisionRecord {
     #[serde(with = "enc::hex32")]
     pub terms_hash: Hash32,
     pub decision: RecordDecision,
+    /// Fixed reason codes from `checks::code::ALL` only, never detail text (spec 4.1).
     pub reasons: Vec<String>,
     pub facts: Vec<FactRecord>,
     #[serde(with = "enc::hex32")]

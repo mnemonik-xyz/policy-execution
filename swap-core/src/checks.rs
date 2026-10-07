@@ -14,22 +14,31 @@ use crate::verified::{self, ChainNow, Timelock};
 use crate::Hash32;
 use std::fmt;
 
+/// A failed check. `code`, and `cause` when a check wraps another one, are the
+/// fixed reason codes that a decision record carries. `detail` is a local
+/// diagnostic only: it can contain text from the proposed terms, so it never goes
+/// into `reasons` (spec 4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {
     pub code: &'static str,
+    /// The code of the inner check that failed, when `code` wraps it (S13).
+    pub cause: Option<&'static str>,
     pub detail: String,
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.detail)
+        match self.cause {
+            Some(cause) => write!(f, "{} ({cause}): {}", self.code, self.detail),
+            None => write!(f, "{}: {}", self.code, self.detail),
+        }
     }
 }
 
 pub type Check = Result<(), Violation>;
 
 pub fn violation(code: &'static str, detail: impl Into<String>) -> Violation {
-    Violation { code, detail: detail.into() }
+    Violation { code, cause: None, detail: detail.into() }
 }
 
 pub fn fail(code: &'static str, detail: impl Into<String>) -> Check {
@@ -71,6 +80,17 @@ pub mod code {
     pub const ACCEPT: &str = "ACCEPT_BINDING";
     pub const PRICE: &str = "PRICE_UNKNOWN";
     pub const S27: &str = "S27_RECEIVER";
+    pub const TERMS: &str = "TERMS_ENCODING";
+    pub const ALLOW: &str = "POLICY_ALLOW";
+    pub const ASK: &str = "POLICY_ASK";
+    pub const DENY: &str = "POLICY_DENY";
+    pub const EXIT: &str = "EXIT_ACTION";
+
+    /// Every fixed reason code. `reasons` holds values from this list only.
+    pub const ALL: &[&str] = &[
+        S1, S2, S3, S4, S5, S6, S7, S8, S8_FLAG, S9, S10, S11, S12, S13, S14, S15, S16, S17, S19, S21, S22, S23, S24, S27,
+        CHAIN, ROLE, TIMELOCK, BAND, ACCEPT, PRICE, TERMS, ALLOW, ASK, DENY, EXIT,
+    ];
 }
 
 /// A lock as read from its chain by the profile's observation adapter. On
@@ -172,7 +192,7 @@ pub fn profile_for<'a>(chain: &ChainId, policy: &CompiledPolicy, profiles: &'a P
     let profile = profiles.get(chain).filter(|p| p.missing_obligatory().is_empty());
     match (profile, policy.policy.chains.get(chain)) {
         (Some(p), Some(entry)) if p.hash() == entry.profile_hash => Ok(p),
-        _ => Err(Violation { code: code::CHAIN, detail: format!("{chain} has no pinned, complete profile") }),
+        _ => Err(violation(code::CHAIN, format!("{chain} has no pinned, complete profile"))),
     }
 }
 
@@ -444,8 +464,8 @@ pub fn s14(facts: &LockFacts, method: crate::facts::EvidenceMethod, band: &Value
 /// The value band for a notional; an unknown notional takes the strictest band.
 pub fn band(profile: &ChainProfile, notional: Option<u64>) -> Result<&ValueBand, Violation> {
     match notional {
-        Some(n) => profile.band(n).ok_or_else(|| Violation { code: code::BAND, detail: format!("notional {n} above every band") }),
-        None => profile.value_bands.last().ok_or_else(|| Violation { code: code::BAND, detail: "no band".into() }),
+        Some(n) => profile.band(n).ok_or_else(|| violation(code::BAND, format!("notional {n} above every band"))),
+        None => profile.value_bands.last().ok_or_else(|| violation(code::BAND, "no band")),
     }
 }
 
@@ -489,7 +509,7 @@ pub fn s21(ledger: &LedgerState, warrant_hash: &Hash32) -> Check {
 pub fn s22(ledger: &LedgerState, policy: &CompiledPolicy) -> Check {
     ledger
         .check_policy(policy.policy.version, &policy.policy_hash)
-        .map_err(|e| Violation { code: code::S22, detail: format!("{e:?}") })
+        .map_err(|e| violation(code::S22, format!("{e:?}")))
 }
 
 pub fn s23(policy: &CompiledPolicy, build: &Hash32) -> Check {
@@ -627,6 +647,29 @@ mod tests {
         let mut native = leg.clone();
         native.asset = crate::caip::AssetId::parse(&format!("{chain}/slip44:501")).unwrap();
         assert!(s27(&native, Payee::Receiver, None, None, true).is_ok());
+    }
+
+    /// Spec 4.1 (D7): `code::ALL` lists every code of `mod code`, each a fixed token
+    /// that cannot carry a detail.
+    #[test]
+    fn reason_codes_are_fixed_tokens() {
+        let source = include_str!("checks.rs");
+        let start = source.find("pub mod code {").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        let declared: Vec<&str> = source[start..end]
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const ")?.split_once(": &str = \"")?.1.strip_suffix("\";"))
+            .collect();
+        assert!(declared.len() >= 35, "{declared:?}");
+        let mut all = code::ALL.to_vec();
+        all.sort_unstable();
+        let mut sorted = declared.clone();
+        sorted.sort_unstable();
+        assert_eq!(all, sorted, "code::ALL must list every code");
+        for (i, c) in code::ALL.iter().enumerate() {
+            assert!(!c.is_empty() && c.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'), "{c}");
+            assert!(!code::ALL[..i].contains(c), "duplicate {c}");
+        }
     }
 
     /// Spec 7.3 (G2): a relative leg A timelock counts from the observed

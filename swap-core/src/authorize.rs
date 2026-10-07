@@ -110,7 +110,10 @@ pub struct Env<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Warrant(Box<SwapWarrant>),
-    Record(Box<DecisionRecord>),
+    /// A decision record, and the failed check when a check decided. The violation
+    /// is a local diagnostic: it is not part of the record, and its detail can
+    /// contain text from the proposed terms. Never sign, store or anchor it.
+    Record(Box<DecisionRecord>, Option<Violation>),
 }
 
 impl Outcome {
@@ -120,7 +123,15 @@ impl Outcome {
 
     pub fn record_decision(&self) -> Option<RecordDecision> {
         match self {
-            Outcome::Record(r) => Some(r.decision),
+            Outcome::Record(r, _) => Some(r.decision),
+            Outcome::Warrant(_) => None,
+        }
+    }
+
+    /// The failed check with its detail, for local logs only.
+    pub fn diagnostic(&self) -> Option<&Violation> {
+        match self {
+            Outcome::Record(_, v) => v.as_ref(),
             Outcome::Warrant(_) => None,
         }
     }
@@ -128,7 +139,7 @@ impl Outcome {
     pub fn reasons(&self) -> &[String] {
         match self {
             Outcome::Warrant(w) => &w.reasons,
-            Outcome::Record(r) => &r.reasons,
+            Outcome::Record(r, _) => &r.reasons,
         }
     }
 }
@@ -184,29 +195,31 @@ pub fn authorize(req: &Request, env: &Env) -> Outcome {
     let mut c = Collected { env, records: Vec::new(), weakest: None };
     let terms_hash = match req.terms.hash() {
         Ok(h) => h,
-        Err(e) => return record(req, env, [0; 32], RecordDecision::Deny, vec![format!("TERMS_ENCODING: {e}")], vec![]),
+        Err(e) => return rejected(req, env, [0; 32], halt_or_deny(req), checks::violation(code::TERMS, e.to_string()), vec![]),
     };
     // No warrant for terms that the signed ACCEPT does not cover.
     let inner_sig_hash = match accepted(env, &terms_hash) {
         Ok(h) => h,
-        Err(v) => {
-            let decision = if req.action.is_exit() { RecordDecision::Halt } else { RecordDecision::Deny };
-            return record(req, env, terms_hash, decision, vec![v.to_string()], vec![]);
-        }
+        Err(v) => return rejected(req, env, terms_hash, halt_or_deny(req), v, vec![]),
     };
     if req.action.is_exit() {
         match exit(req, env, &mut c) {
-            Ok(binding) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["EXIT_ACTION".into()], c.records),
-            Err(v) => record(req, env, terms_hash, RecordDecision::Halt, vec![v.to_string()], c.records),
+            Ok(binding) => warrant(req, env, terms_hash, inner_sig_hash, binding, &[code::EXIT], c.records),
+            Err(v) => rejected(req, env, terms_hash, RecordDecision::Halt, v, c.records),
         }
     } else {
         match entry(req, env, &mut c) {
-            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["POLICY_ALLOW".into()], c.records),
-            Ok((Decision::Ask, _)) => record(req, env, terms_hash, RecordDecision::Ask, vec!["POLICY_ASK".into()], c.records),
-            Ok((Decision::Deny, _)) => record(req, env, terms_hash, RecordDecision::Deny, vec!["POLICY_DENY".into()], c.records),
-            Err(v) => record(req, env, terms_hash, RecordDecision::Deny, vec![v.to_string()], c.records),
+            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, inner_sig_hash, binding, &[code::ALLOW], c.records),
+            Ok((Decision::Ask, _)) => record(req, env, terms_hash, RecordDecision::Ask, &[code::ASK], None, c.records),
+            Ok((Decision::Deny, _)) => record(req, env, terms_hash, RecordDecision::Deny, &[code::DENY], None, c.records),
+            Err(v) => rejected(req, env, terms_hash, RecordDecision::Deny, v, c.records),
         }
     }
+}
+
+/// A failed check before the action-specific checks: an exit halts, an entry is denied.
+fn halt_or_deny(req: &Request) -> RecordDecision {
+    if req.action.is_exit() { RecordDecision::Halt } else { RecordDecision::Deny }
 }
 
 /// Solana chain facts of a claim or reveal binding: the lookup tables and the
@@ -279,7 +292,7 @@ fn warrant(
     terms_hash: Hash32,
     inner_sig_hash: Hash32,
     binding: Option<TxBinding>,
-    reasons: Vec<String>,
+    reasons: &[&'static str],
     facts: Vec<FactRecord>,
 ) -> Outcome {
     let leg = req.action.leg(req.role).map(|l| req.terms.leg(l).clone());
@@ -296,7 +309,7 @@ fn warrant(
         policy_version: env.policy.policy.version,
         evaluator_id: EvaluatorId::Build(env.policy.policy.evaluator_id),
         decision: "allow".into(),
-        reasons,
+        reasons: codes(reasons),
         valid_after: env.now_real,
         valid_until: env.now_real.saturating_add(req.valid_for_secs),
         nonce: req.nonce,
@@ -304,14 +317,35 @@ fn warrant(
     }))
 }
 
-fn record(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision, reasons: Vec<String>, facts: Vec<FactRecord>) -> Outcome {
+/// `reasons` holds fixed codes only (spec 4.1): `&'static str` values from
+/// `checks::code`, never text built from the request.
+fn codes(reasons: &[&'static str]) -> Vec<String> {
+    reasons.iter().map(|r| (*r).to_owned()).collect()
+}
+
+/// A record for a failed check: its code (and the code of the inner check that it
+/// wraps) go into `reasons`, the detail stays in the local diagnostic.
+fn rejected(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision, v: Violation, facts: Vec<FactRecord>) -> Outcome {
+    let reasons: Vec<&'static str> = std::iter::once(v.code).chain(v.cause).collect();
+    record(req, env, terms_hash, decision, &reasons, Some(v), facts)
+}
+
+fn record(
+    req: &Request,
+    env: &Env,
+    terms_hash: Hash32,
+    decision: RecordDecision,
+    reasons: &[&'static str],
+    diagnostic: Option<Violation>,
+    facts: Vec<FactRecord>,
+) -> Outcome {
     Outcome::Record(Box::new(DecisionRecord {
         protocol: DECISION_PROTOCOL.into(),
         action: req.action,
         swap_id: req.terms.swap_id,
         terms_hash,
         decision,
-        reasons,
+        reasons: codes(reasons),
         facts,
         policy_hash: env.policy.policy_hash,
         policy_version: env.policy.policy.version,
@@ -319,15 +353,15 @@ fn record(req: &Request, env: &Env, terms_hash: Hash32, decision: RecordDecision
         at: env.now_real,
         nonce: req.nonce,
         prev_warrant: req.prev_warrant,
-    }))
+    }), diagnostic)
 }
 
 fn need_tx(req: &Request) -> Result<&ProposedTx, Violation> {
-    req.tx.as_ref().ok_or_else(|| Violation { code: code::S24, detail: "no transaction proposed".into() })
+    req.tx.as_ref().ok_or_else(|| checks::violation(code::S24, "no transaction proposed"))
 }
 
 fn s24(r: Result<TxBinding, String>) -> Result<TxBinding, Violation> {
-    r.map_err(|detail| Violation { code: code::S24, detail })
+    r.map_err(|detail| checks::violation(code::S24, detail))
 }
 
 /// Observed lock and contract identity of one leg (S5–S10, S7), and the height of
@@ -336,7 +370,7 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<(Lock
     let env = c.env;
     let (facts, seen_at) = c
         .resolve_at(&format!("lock:{leg_name:?}"), env.obs.locks.get(&leg_name))
-        .ok_or_else(|| Violation { code: code::S14, detail: format!("lock of leg {leg_name:?} not observed with agreeing evidence") })?;
+        .ok_or_else(|| checks::violation(code::S14, format!("lock of leg {leg_name:?} not observed with agreeing evidence")))?;
     let expected = leg.refund_valid_from();
     checks::observed_lock(leg, &facts, expected)?;
     let contract = if leg.chain.family() == Some(Family::Bitcoin) {
@@ -456,7 +490,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
             if role == Role::Responder {
                 // S13: the initiator lock is final and leaves room for T_B.
                 let (facts, seen_at) = observed_leg(c, LegName::A, &terms.leg_a)
-                    .map_err(|v| Violation { code: code::S13, detail: v.to_string() })?;
+                    .map_err(|v| Violation { code: code::S13, cause: Some(v.code), detail: v.detail })?;
                 let method = c.weakest.unwrap_or(EvidenceMethod::SingleRpc);
                 checks::s14(&facts, method, checks::band(pa, notional)?)?;
                 let Some(tb) = tb_terms else {
@@ -474,7 +508,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                     return Err(checks::violation(code::S13, "chain tip unknown"));
                 };
                 checks::s11(ta_lock, now_a, pa, tb, now_b, pb, margin)
-                    .map_err(|v| Violation { code: code::S13, detail: v.detail })?;
+                    .map_err(|v| Violation { code: code::S13, cause: Some(v.code), detail: v.detail })?;
                 ta = Some(ta_lock);
                 counterparty_lock = Some(LockObs { chain: terms.leg_a.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
             }
@@ -669,7 +703,7 @@ fn record_facts(c: &mut Collected, f: &SwapFacts3) {
 fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>, Violation> {
     let (terms, role, action) = (&req.terms, req.role, req.action);
     if !action.allowed_for(role) {
-        return Err(Violation { code: code::ROLE, detail: format!("{action:?} is not an action of the {role:?}") });
+        return Err(checks::violation(code::ROLE, format!("{action:?} is not an action of the {role:?}")));
     }
     checks::s1(terms)?;
     checks::s3(terms)?;
@@ -688,7 +722,7 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
             let (facts, _) = observed_leg(c, leg_name, leg)?;
             let preimage = req.preimage.filter(|p| preimage_opens(p, &leg.lock.hashlock));
             if preimage.is_none() {
-                return Err(Violation { code: code::S2, detail: "the observed preimage does not open the hashlock".into() });
+                return Err(checks::violation(code::S2, "the observed preimage does not open the hashlock"));
             }
             c.record("preimage_opens_hashlock", Value::Bool(true), None);
             ctx.preimage = preimage;
