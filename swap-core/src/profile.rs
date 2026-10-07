@@ -46,7 +46,10 @@ pub struct ValueBand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fees {
-    /// Worst-case fee of a claim and of a refund, in base units of the native coin.
+    /// Worst-case fee of a lock, a claim and a refund, in base units of the native
+    /// coin. On Bitcoin the decoder rejects a transaction that pays more.
+    #[serde(with = "crate::enc::amount")]
+    pub worst_lock: u128,
     #[serde(with = "crate::enc::amount")]
     pub worst_claim: u128,
     #[serde(with = "crate::enc::amount")]
@@ -159,7 +162,7 @@ pub mod reference {
                 ValueBand { max_notional: 100_000, confirmations: 3, finalized_tag: false, min_evidence: EvidenceMethod::LightClient },
                 ValueBand { max_notional: 1_000_000, confirmations: 6, finalized_tag: false, min_evidence: EvidenceMethod::OwnNode },
             ],
-            fees: Fees { worst_claim: 50_000, worst_refund: 50_000, raise: FeeRaise::RbfOrCpfp },
+            fees: Fees { worst_lock: 50_000, worst_claim: 50_000, worst_refund: 50_000, raise: FeeRaise::RbfOrCpfp },
             refund: RefundMethod::Prepared,
             swap_id_binding: true,
             template_enforces_len32: true,
@@ -179,7 +182,12 @@ pub mod reference {
                 ValueBand { max_notional: 1_000, confirmations: 3, finalized_tag: false, min_evidence: EvidenceMethod::RpcQuorum },
                 ValueBand { max_notional: 1_000_000, confirmations: 0, finalized_tag: true, min_evidence: EvidenceMethod::LightClient },
             ],
-            fees: Fees { worst_claim: 10_000_000_000_000_000, worst_refund: 10_000_000_000_000_000, raise: FeeRaise::SameNonceReplacement },
+            fees: Fees {
+                worst_lock: 10_000_000_000_000_000,
+                worst_claim: 10_000_000_000_000_000,
+                worst_refund: 10_000_000_000_000_000,
+                raise: FeeRaise::SameNonceReplacement,
+            },
             refund: RefundMethod::Permissionless,
             swap_id_binding: true,
             template_enforces_len32: true,
@@ -199,7 +207,7 @@ pub mod reference {
                 ValueBand { max_notional: 1_000, confirmations: 32, finalized_tag: false, min_evidence: EvidenceMethod::RpcQuorum },
                 ValueBand { max_notional: 1_000_000, confirmations: 0, finalized_tag: true, min_evidence: EvidenceMethod::OwnNode },
             ],
-            fees: Fees { worst_claim: 1_000_000, worst_refund: 1_000_000, raise: FeeRaise::Resubmit },
+            fees: Fees { worst_lock: 1_000_000, worst_claim: 1_000_000, worst_refund: 1_000_000, raise: FeeRaise::Resubmit },
             refund: RefundMethod::Permissionless,
             swap_id_binding: true,
             template_enforces_len32: true,

@@ -526,10 +526,32 @@ fn check_sighash_types(psbt: &Psbt) -> Result<Vec<u8>, BtcError> {
         .collect()
 }
 
+/// The fee is the input value minus the output value, at most `max_fee`. The input
+/// values come from the PSBT witness UTXOs; a wrong value does not help, because
+/// every BIP 341 sighash commits to the amounts of all inputs.
+fn check_fee(psbt: &Psbt, max_fee: u64) -> Result<(), BtcError> {
+    let mut inputs: u64 = 0;
+    for input in &psbt.inputs {
+        let utxo = input.witness_utxo.as_ref().ok_or(BtcError::Mismatch("input without witness UTXO".into()))?;
+        inputs = inputs.checked_add(utxo.value).ok_or(BtcError::Mismatch("input value overflow".into()))?;
+    }
+    let outputs = psbt
+        .tx
+        .outputs
+        .iter()
+        .try_fold(0u64, |sum, o| sum.checked_add(o.value))
+        .ok_or(BtcError::Mismatch("output value overflow".into()))?;
+    match inputs.checked_sub(outputs) {
+        None => Err(BtcError::Mismatch("outputs exceed inputs".into())),
+        Some(fee) if fee > max_fee => Err(BtcError::Mismatch(format!("fee {fee} exceeds the limit {max_fee}"))),
+        Some(_) => Ok(()),
+    }
+}
+
 /// A lock transaction: own Taproot coins in; exactly one HTLC output with the
 /// derived script and the leg amount; at most one change output to an own script;
-/// nothing else.
-pub fn check_lock_psbt(psbt: &Psbt, lock: &Lock, amount: u64, own_scripts: &[Vec<u8>]) -> Result<BtcBinding, BtcError> {
+/// a fee of at most `max_fee`; nothing else.
+pub fn check_lock_psbt(psbt: &Psbt, lock: &Lock, amount: u64, own_scripts: &[Vec<u8>], max_fee: u64) -> Result<BtcBinding, BtcError> {
     let types = check_sighash_types(psbt)?;
     let htlc = htlc_script_pubkey(lock)?;
     for input in &psbt.inputs {
@@ -555,6 +577,7 @@ pub fn check_lock_psbt(psbt: &Psbt, lock: &Lock, amount: u64, own_scripts: &[Vec
     if htlc_outputs != 1 || change_outputs > 1 {
         return Err(BtcError::Mismatch("expected one HTLC output and at most one change output".into()));
     }
+    check_fee(psbt, max_fee)?;
     let sighashes = (0..psbt.inputs.len())
         .map(|i| taproot_sighash(psbt, i, types[i], None))
         .collect::<Result<_, _>>()?;
@@ -567,14 +590,16 @@ pub enum Leaf {
     Refund,
 }
 
-/// A claim or refund: one input, the HTLC output; every output to an own script.
-/// A refund must satisfy its own timelock in the transaction fields.
+/// A claim or refund: one input, the HTLC output; every output to an own script;
+/// a fee of at most `max_fee`. A refund must satisfy its own timelock in the
+/// transaction fields.
 pub fn check_spend_psbt(
     psbt: &Psbt,
     lock: &Lock,
     htlc_outpoint: (&Hash32, u32),
     leaf: Leaf,
     own_scripts: &[Vec<u8>],
+    max_fee: u64,
 ) -> Result<BtcBinding, BtcError> {
     let types = check_sighash_types(psbt)?;
     let htlc = htlc_script_pubkey(lock)?;
@@ -593,6 +618,7 @@ pub fn check_spend_psbt(
     if tx.outputs.is_empty() || tx.outputs.iter().any(|o| !own_scripts.contains(&o.script_pubkey)) {
         return Err(BtcError::Mismatch("a spend pays own scripts only".into()));
     }
+    check_fee(psbt, max_fee)?;
     let (claim, refund) = htlc_leaves(lock)?;
     if leaf == Leaf::Refund {
         let ok = match lock.timelock {
@@ -618,6 +644,9 @@ pub fn check_spend_psbt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The test inputs hold 100 000 sat or more; this limit admits their fees.
+    const MAX_FEE: u64 = 150_000;
     use crate::types::{HashAlg, HtlcKeys};
     use ::bitcoin as rb;
     use rb::hashes::Hash as _;
@@ -741,14 +770,14 @@ mod tests {
         let psbt = rb_psbt(&[(1, 0, own[0].clone()), (2, 1, own[1].clone())], &[(50_000, htlc.clone()), (1_000, own[0].clone())], 0, 0xffff_fffd, None);
         let parsed = parse_psbt(&psbt.serialize()).unwrap();
         assert_eq!(parsed.tx.txid_hex(), psbt.unsigned_tx.compute_txid().to_string());
-        let binding = check_lock_psbt(&parsed, &l, 50_000, &own).unwrap();
+        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE).unwrap();
         for i in 0..2 {
             assert_eq!(binding.sighashes[i], rb_sighash(&psbt, i, None, rb::TapSighashType::Default));
         }
         // SIGHASH_ALL also commits to everything.
         let psbt_all = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, 0xffff_fffd, Some(1));
         let parsed = parse_psbt(&psbt_all.serialize()).unwrap();
-        let binding = check_lock_psbt(&parsed, &l, 50_000, &own).unwrap();
+        let binding = check_lock_psbt(&parsed, &l, 50_000, &own, MAX_FEE).unwrap();
         assert_eq!(binding.sighashes[0], rb_sighash(&psbt_all, 0, None, rb::TapSighashType::All));
     }
 
@@ -757,7 +786,7 @@ mod tests {
         let l = lock(TimelockSpec::Height(850_000));
         let htlc = htlc_script_pubkey(&l).unwrap();
         let own = vec![own_spk(3)];
-        let check = |p: rb::Psbt| check_lock_psbt(&parse_psbt(&p.serialize()).unwrap(), &l, 50_000, &own);
+        let check = |p: rb::Psbt| check_lock_psbt(&parse_psbt(&p.serialize()).unwrap(), &l, 50_000, &own, MAX_FEE);
         // Fault test 7: one extra output.
         let extra = rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (10, own_spk(9))], 0, 0, None);
         assert!(check(extra).is_err());
@@ -786,22 +815,40 @@ mod tests {
 
         let p = spend(0, 0xffff_ffff, own[0].clone());
         let parsed = parse_psbt(&p.serialize()).unwrap();
-        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Claim, &own).unwrap();
+        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Claim, &own, MAX_FEE).unwrap();
         assert_eq!(b.sighashes[0], rb_sighash(&p, 0, Some(&claim), rb::TapSighashType::Default));
 
         let p = spend(850_000, 0xffff_fffe, own[0].clone());
         let parsed = parse_psbt(&p.serialize()).unwrap();
-        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own).unwrap();
+        let b = check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE).unwrap();
         assert_eq!(b.sighashes[0], rb_sighash(&p, 0, Some(&refund), rb::TapSighashType::Default));
 
         // Refund before its timelock, refund with locktime disabled, and a foreign payee.
         for p in [spend(849_999, 0xffff_fffe, own[0].clone()), spend(850_000, 0xffff_ffff, own[0].clone()), spend(850_000, 0, own_spk(9))] {
             let parsed = parse_psbt(&p.serialize()).unwrap();
-            assert!(check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own).is_err());
+            assert!(check_spend_psbt(&parsed, &l, (&txid, 0), Leaf::Refund, &own, MAX_FEE).is_err());
         }
         // Wrong outpoint.
         let parsed = parse_psbt(&spend(0, 0, own[0].clone()).serialize()).unwrap();
-        assert!(check_spend_psbt(&parsed, &l, (&[7u8; 32], 0), Leaf::Claim, &own).is_err());
+        assert!(check_spend_psbt(&parsed, &l, (&[7u8; 32], 0), Leaf::Claim, &own, MAX_FEE).is_err());
+    }
+
+    #[test]
+    fn fee_limit() {
+        let l = lock(TimelockSpec::Height(850_000));
+        let htlc = htlc_script_pubkey(&l).unwrap();
+        let own = vec![own_spk(3)];
+        // One input of 100 000 sat into a 50 000 sat lock and no change: a 50 000 sat fee.
+        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone())], 0, 0, None).serialize()).unwrap();
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, 50_000).is_ok());
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, 49_999).is_err());
+        // Outputs above the inputs.
+        let p = parse_psbt(&rb_psbt(&[(1, 0, own[0].clone())], &[(50_000, htlc.clone()), (60_000, own[0].clone())], 0, 0, None).serialize()).unwrap();
+        assert!(check_lock_psbt(&p, &l, 50_000, &own, MAX_FEE).is_err());
+        // A claim that leaves most of the 100 000 sat HTLC output to the miners.
+        let p = parse_psbt(&rb_psbt(&[(6, 0, htlc.clone())], &[(1_000, own[0].clone())], 0, 0xffff_ffff, None).serialize()).unwrap();
+        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 50_000).is_err());
+        assert!(check_spend_psbt(&p, &l, (&[6u8; 32], 0), Leaf::Claim, &own, 99_000).is_ok());
     }
 
     #[test]

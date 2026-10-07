@@ -5,7 +5,7 @@
 
 use bitcoin as rb;
 use rb::hashes::Hash as _;
-use warrant_swap_core::authorize::{authorize, Env, IdentityCredential, Observations, Outcome, Request};
+use warrant_swap_core::authorize::{authorize, AcceptEvidence, Env, IdentityCredential, Observations, Outcome, Request};
 use warrant_swap_core::caip::{AccountId, AssetId, ChainId};
 use warrant_swap_core::checks::{code, AssetFacts, ContractObservation, LockFacts, Runtime};
 use warrant_swap_core::dsl::{validate_policy, CompiledPolicy};
@@ -221,6 +221,14 @@ struct World {
     build: Hash32,
     now: u64,
     role: Role,
+    /// `None`: a verified ACCEPT of exactly the terms that `run` gets.
+    accept_override: Option<Option<AcceptEvidence>>,
+}
+
+const ACCEPT_HASH: Hash32 = [0xac; 32];
+
+fn accept_of(terms: &Terms) -> AcceptEvidence {
+    AcceptEvidence { inner_sig_hash: ACCEPT_HASH, terms_hash: terms.hash().unwrap(), signature_ok: true }
 }
 
 impl World {
@@ -229,10 +237,10 @@ impl World {
         let mut obs = Observations::default();
         obs.tips.insert(t.leg_a.chain.clone(), chain_obs(EvidenceMethod::LightClient, TIP));
         obs.tips.insert(t.leg_b.chain.clone(), chain_obs(EvidenceMethod::LightClient, 20_000_000));
-        obs.assets.insert(t.leg_a.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 8, risk_flags: vec![], transfer_fee: None }));
+        obs.assets.insert(t.leg_a.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 8, risk_flags: vec![], transfer_fee: None, token_program: None }));
         obs.assets.insert(
             t.leg_b.asset.clone(),
-            chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::FreezableByIssuer], transfer_fee: None }),
+            chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::FreezableByIssuer], transfer_fee: None, token_program: None }),
         );
         obs.prices = vec![price(BTC, 60_000_00000000), price(USDC, 1_00000000)];
         let counterparty = match role {
@@ -265,14 +273,17 @@ impl World {
             build: BUILD,
             now: NOW,
             role,
+            accept_override: None,
         }
     }
 
     fn run(&self, action: Action, terms: Terms, tx: Option<ProposedTx>, preimage: Option<Hash32>) -> Outcome {
+        let mut obs = self.obs.clone();
+        obs.accept = self.accept_override.clone().unwrap_or_else(|| Some(accept_of(&terms)));
         let env = Env {
             policy: &self.policy,
             profiles: &self.profiles,
-            obs: &self.obs,
+            obs: &obs,
             ledger: &self.ledger,
             runtime: &self.runtime,
             own: &self.own,
@@ -283,7 +294,6 @@ impl World {
             action,
             role: self.role,
             terms,
-            inner_sig_hash: [0xac; 32],
             tx,
             preimage,
             nonce: [0x0f; 16],
@@ -493,11 +503,11 @@ fn fault_6_fake_token_proxy_and_permanent_delegate() {
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S7);
     // An asset whose issuer can seize it is outside the allowed flags: policy Deny.
     let mut w = World::new(Role::Initiator);
-    let seizable = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::SeizableByIssuer], transfer_fee: None };
+    let seizable = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::SeizableByIssuer], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, seizable));
     assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
     // Flags that always deny.
-    let confidential = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::ConfidentialAmount], transfer_fee: None };
+    let confidential = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::ConfidentialAmount], transfer_fee: None, token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, confidential));
     assert_denied(&w.run(Action::Accept, terms(), None, None), code::S8_FLAG);
 }
@@ -509,6 +519,19 @@ fn fault_7_extra_output_or_wrong_call() {
     let w = initiator_reveal_world();
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&[0; 32])), Some(SECRET)), code::S24);
     assert_denied(&w.run(Action::Reveal, terms(), None, Some(SECRET)), code::S24);
+}
+
+#[test]
+fn bitcoin_fees_stay_within_the_profile() {
+    let w = World::new(Role::Initiator);
+    // A 60 000 000 sat coin into the 50 000 000 sat lock without change burns 10 000 000 sat.
+    let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
+    let burn = psbt(&[([1; 32], 0, 60_000_000, p2tr(10))], &[(50_000_000, htlc.clone())], 0, 0xffff_fffd);
+    assert_denied(&w.run(Action::Lock, terms(), Some(burn), None), code::S24);
+    // A claim that leaves the HTLC amount to the miners halts.
+    let w = responder_lock_world(3);
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(1_000, p2tr(20))], 0, 0xffff_ffff);
+    assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some(SECRET)), code::S24);
 }
 
 #[test]
@@ -560,6 +583,48 @@ fn bad_price_denies() {
     let mut w = World::new(Role::Initiator);
     w.obs.prices = vec![price(BTC, 61_000_00000000), price(USDC, 1_00000000)];
     assert_denied(&w.run(Action::Accept, terms(), None, None), "POLICY_DENY");
+}
+
+#[test]
+fn one_missing_price_leaves_notional_unknown() {
+    let mut w = World::new(Role::Initiator);
+    // No deviation atom, so only the notional can stop a mispriced trade.
+    w.policy = policy_with(serde_json::json!({ "all": [
+        { "pair_in": [[BTC, USDC], [USDC, BTC]] },
+        { "notional_at_most": ["USD", 50000] }
+    ]}), 3);
+    assert_allow(&w.run(Action::Accept, terms(), None, None));
+    // Without the BTC price, the BTC leg can be the larger one: the notional is unknown.
+    w.obs.prices = vec![price(USDC, 1_00000000)];
+    let out = w.run(Action::Accept, terms(), None, None);
+    assert_eq!(out.record_decision(), Some(RecordDecision::Ask), "{}", reason(&out));
+}
+
+#[test]
+fn warrant_needs_a_verified_accept_of_the_terms() {
+    let mut w = World::new(Role::Initiator);
+    let out = w.run(Action::Accept, terms(), None, None);
+    let Outcome::Warrant(aw) = &out else { panic!("expected Allow: {}", reason(&out)) };
+    assert_eq!(aw.inner_sig_hash, ACCEPT_HASH);
+
+    // The agent proposes other terms than the counterparty signed.
+    let mut changed = terms();
+    changed.leg_b.amount -= 1;
+    w.accept_override = Some(Some(accept_of(&terms())));
+    assert_denied(&w.run(Action::Accept, changed.clone(), None, None), code::ACCEPT);
+    assert_denied(&w.run(Action::Lock, changed, Some(initiator_lock_psbt(false)), None), code::ACCEPT);
+    // No verified ACCEPT, or one whose signature fails.
+    w.accept_override = Some(None);
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::ACCEPT);
+    w.accept_override = Some(Some(AcceptEvidence { signature_ok: false, ..accept_of(&terms()) }));
+    assert_denied(&w.run(Action::Accept, terms(), None, None), code::ACCEPT);
+
+    // An exit for terms without a verified ACCEPT halts.
+    let mut w = responder_lock_world(3);
+    let htlc = btc::htlc_script_pubkey(&terms().leg_a.lock).unwrap();
+    let claim = psbt(&[([0x77; 32], 0, 50_000_000, htlc)], &[(49_990_000, p2tr(20))], 0, 0xffff_ffff);
+    w.accept_override = Some(None);
+    assert_halt(&w.run(Action::Claim, terms(), Some(claim), Some(SECRET)), code::ACCEPT);
 }
 
 #[test]
@@ -714,7 +779,7 @@ fn responder_waits_for_initiator_finality() {
 fn fee_token_lock_approves_the_exact_gross_debit() {
     let mut w = responder_lock_world(3);
     let fee = TransferFee { bps: 100, max_fee: None, round_up: false };
-    let usdc = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::FreezableByIssuer, RiskFlag::TransferFee], transfer_fee: Some(fee) };
+    let usdc = AssetFacts { decimals: 6, risk_flags: vec![RiskFlag::FreezableByIssuer, RiskFlag::TransferFee], transfer_fee: Some(fee), token_program: None };
     w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, usdc));
     w.policy = policy_with(
         {
@@ -754,7 +819,7 @@ fn one_fixture_per_risk_flag() {
     // The policy allows only `freezable_by_issuer`; two flags always deny.
     for flag in RiskFlag::ALL {
         let mut w = World::new(Role::Initiator);
-        let facts = AssetFacts { decimals: 6, risk_flags: vec![flag], transfer_fee: None };
+        let facts = AssetFacts { decimals: 6, risk_flags: vec![flag], transfer_fee: None, token_program: None };
         w.obs.assets.insert(AssetId::parse(USDC).unwrap(), chain_obs(EvidenceMethod::OwnNode, facts));
         let out = w.run(Action::Accept, terms(), None, None);
         if flag.always_denied() {

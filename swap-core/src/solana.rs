@@ -4,6 +4,7 @@
 //! transaction binding `blake3(message bytes)`.
 
 use crate::Hash32;
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
@@ -35,7 +36,7 @@ impl fmt::Display for SolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SolError::Decode(e) => write!(f, "message: {e}"),
-            SolError::LookupsUnresolved => f.write_str("address lookup tables need resolved addresses"),
+            SolError::LookupsUnresolved => f.write_str("an address lookup table or index is not in the observed tables"),
             SolError::Mismatch(e) => write!(f, "transaction does not match the intent: {e}"),
         }
     }
@@ -122,7 +123,13 @@ pub fn parse_message(bytes: &[u8]) -> Result<Message, SolError> {
     let header = [r.u8()?, r.u8()?, r.u8()?];
     let n_keys = r.compact()?;
     let account_keys = (0..n_keys).map(|_| r.key()).collect::<Result<Vec<_>, _>>()?;
-    if account_keys.is_empty() || header[0] == 0 || header[0] as usize > account_keys.len() {
+    // The fee payer is a writable signer; read-only counts stay inside their groups.
+    if account_keys.is_empty()
+        || header[0] == 0
+        || header[0] as usize > account_keys.len()
+        || header[1] >= header[0]
+        || header[2] as usize > account_keys.len() - header[0] as usize
+    {
         return Err(SolError::Decode("bad header"));
     }
     let recent_blockhash = r.key()?;
@@ -147,20 +154,63 @@ pub fn parse_message(bytes: &[u8]) -> Result<Message, SolError> {
     Ok(Message { version0, header, account_keys, recent_blockhash, instructions, lookups })
 }
 
+/// Address lookup tables as the signer read them from the chain: the table
+/// address and its addresses in order. Never taken from the proposal.
+pub type LookupTables = BTreeMap<Hash32, Vec<Hash32>>;
+
 impl Message {
     /// Static keys, then every writable lookup address, then every read-only one.
-    /// `resolved` lists the lookup addresses in that order, read from the chain.
-    pub fn all_keys(&self, resolved: Option<&[Hash32]>) -> Result<Vec<Hash32>, SolError> {
-        let lookup_count: usize = self.lookups.iter().map(|l| l.writable.len() + l.readonly.len()).sum();
+    /// The addresses come from `tables` by the table address and index in the
+    /// message. Entries of a table never change once written.
+    pub fn all_keys(&self, tables: &LookupTables) -> Result<Vec<Hash32>, SolError> {
         let mut keys = self.account_keys.clone();
-        if lookup_count > 0 {
-            let resolved = resolved.ok_or(SolError::LookupsUnresolved)?;
-            if resolved.len() != lookup_count {
-                return Err(SolError::LookupsUnresolved);
+        for writable in [true, false] {
+            for l in &self.lookups {
+                let table = tables.get(&l.key).ok_or(SolError::LookupsUnresolved)?;
+                let indexes = if writable { &l.writable } else { &l.readonly };
+                for i in indexes {
+                    keys.push(*table.get(*i as usize).ok_or(SolError::LookupsUnresolved)?);
+                }
             }
-            keys.extend_from_slice(resolved);
         }
         Ok(keys)
+    }
+
+    /// Privileges of the account at `index` of `all_keys`.
+    fn meta(&self, keys: &[Hash32], index: u8) -> Option<AccountMeta> {
+        let i = index as usize;
+        let key = *keys.get(i)?;
+        let (signers, ro_signed, ro_unsigned) = (self.header[0] as usize, self.header[1] as usize, self.header[2] as usize);
+        let n_static = self.account_keys.len();
+        let writable_lookups: usize = self.lookups.iter().map(|l| l.writable.len()).sum();
+        let writable = if i < signers {
+            i < signers - ro_signed
+        } else if i < n_static {
+            i < n_static - ro_unsigned
+        } else {
+            i - n_static < writable_lookups
+        };
+        Some(AccountMeta { key, signer: i < signers, writable })
+    }
+}
+
+/// An instruction account with its privileges in the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountMeta {
+    pub key: Hash32,
+    pub signer: bool,
+    pub writable: bool,
+}
+
+impl AccountMeta {
+    pub fn signer_writable(key: Hash32) -> Self {
+        AccountMeta { key, signer: true, writable: true }
+    }
+    pub fn writable(key: Hash32) -> Self {
+        AccountMeta { key, signer: false, writable: true }
+    }
+    pub fn readonly(key: Hash32) -> Self {
+        AccountMeta { key, signer: false, writable: false }
     }
 }
 
@@ -190,6 +240,8 @@ pub struct Ed25519Expect {
 pub struct SolanaIntent {
     pub htlc_program: Hash32,
     pub htlc_data: Vec<u8>,
+    /// The exact accounts of the HTLC instruction, in order, with their privileges.
+    pub htlc_accounts: Vec<AccountMeta>,
     pub fee_payer: Hash32,
     pub mode: SolanaMode,
 }
@@ -208,9 +260,9 @@ fn ed25519_ok(data: &[u8], expect: &Ed25519Expect) -> bool {
 
 /// S24 for Solana: every instruction is the HTLC call of the intent or an allowed
 /// helper for the mode; the fee payer is own. Returns the binding hash.
-pub fn check_message(bytes: &[u8], resolved_lookups: Option<&[Hash32]>, intent: &SolanaIntent) -> Result<Hash32, SolError> {
+pub fn check_message(bytes: &[u8], tables: &LookupTables, intent: &SolanaIntent) -> Result<Hash32, SolError> {
     let msg = parse_message(bytes)?;
-    let keys = msg.all_keys(resolved_lookups)?;
+    let keys = msg.all_keys(tables)?;
     let mismatch = |what: &str| Err(SolError::Mismatch(what.into()));
     if keys[0] != intent.fee_payer {
         return mismatch("fee payer");
@@ -223,6 +275,10 @@ pub fn check_message(bytes: &[u8], resolved_lookups: Option<&[Hash32]>, intent: 
         if program == intent.htlc_program {
             if ix.data != intent.htlc_data {
                 return mismatch("HTLC instruction data");
+            }
+            let metas: Option<Vec<AccountMeta>> = ix.accounts.iter().map(|i| msg.meta(&keys, *i)).collect();
+            if metas.as_ref() != Some(&intent.htlc_accounts) {
+                return mismatch("HTLC instruction accounts or privileges");
             }
             htlc_calls += 1;
         } else if program == key(COMPUTE_BUDGET_PROGRAM) {
@@ -315,6 +371,65 @@ pub fn refund_data(swap_id: &Hash32) -> Vec<u8> {
     d
 }
 
+/// A token leg's mint and the program that owns the mint (Token or Token-2022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenAccounts {
+    pub mint: Hash32,
+    pub token_program: Hash32,
+}
+
+/// The associated token account of `owner` for `mint`.
+pub fn associated_token_address(owner: &Hash32, token: &TokenAccounts) -> Option<Hash32> {
+    find_program_address(&[owner, &token.token_program, &token.mint], &key(ATA_PROGRAM)).map(|(a, _)| a)
+}
+
+/// A key that occurs twice has the same privileges at both places in a message.
+fn merge_duplicates(mut metas: Vec<AccountMeta>) -> Vec<AccountMeta> {
+    let all = metas.clone();
+    for m in &mut metas {
+        m.signer = all.iter().any(|o| o.key == m.key && o.signer);
+        m.writable = all.iter().any(|o| o.key == m.key && o.writable);
+    }
+    metas
+}
+
+/// Reference HTLC accounts of a lock (implementation spec 4.6): the sender (signer,
+/// writable), the escrow PDA (writable); for a token, the sender's and the escrow's
+/// associated token accounts (writable), the mint and the token program; then the
+/// System Program.
+pub fn lock_accounts(program: &Hash32, swap_id: &Hash32, sender: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, swap_id)?;
+    let mut v = vec![AccountMeta::signer_writable(*sender), AccountMeta::writable(escrow)];
+    if let Some(t) = token {
+        v.push(AccountMeta::writable(associated_token_address(sender, t)?));
+        v.push(AccountMeta::writable(associated_token_address(&escrow, t)?));
+        v.push(AccountMeta::readonly(t.mint));
+        v.push(AccountMeta::readonly(t.token_program));
+    }
+    v.push(AccountMeta::readonly(key(SYSTEM_PROGRAM)));
+    Some(merge_duplicates(v))
+}
+
+/// Reference HTLC accounts of a claim or a refund: the caller (signer, writable),
+/// the escrow PDA (writable), then the payee (the receiver for a claim, `refund_to`
+/// for a refund, writable). For a token, the payee's associated token account takes
+/// the payee's place, followed by the escrow's token account, the mint and the
+/// token program.
+pub fn spend_accounts(program: &Hash32, swap_id: &Hash32, caller: &Hash32, payee: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, swap_id)?;
+    let mut v = vec![AccountMeta::signer_writable(*caller), AccountMeta::writable(escrow)];
+    match token {
+        None => v.push(AccountMeta::writable(*payee)),
+        Some(t) => {
+            v.push(AccountMeta::writable(associated_token_address(payee, t)?));
+            v.push(AccountMeta::writable(associated_token_address(&escrow, t)?));
+            v.push(AccountMeta::readonly(t.mint));
+            v.push(AccountMeta::readonly(t.token_program));
+        }
+    }
+    Some(merge_duplicates(v))
+}
+
 // ---------------------------------------------------------------------------
 // Program and escrow identity (S7)
 // ---------------------------------------------------------------------------
@@ -389,7 +504,7 @@ impl ProgramPin {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn compact(n: usize, out: &mut Vec<u8>) {
@@ -447,7 +562,7 @@ mod tests {
     }
 
     fn intent(mode: SolanaMode) -> SolanaIntent {
-        SolanaIntent { htlc_program: HTLC, htlc_data: refund_data(&[7; 32]), fee_payer: PAYER, mode }
+        SolanaIntent { htlc_program: HTLC, htlc_data: refund_data(&[7; 32]), htlc_accounts: vec![AccountMeta::signer_writable(PAYER)], fee_payer: PAYER, mode }
     }
 
     fn ed_data(pubkey: &Hash32, message: &[u8]) -> Vec<u8> {
@@ -468,7 +583,7 @@ mod tests {
     #[test]
     fn plain_refund() {
         let m = encode(&base_keys(), &[(2, vec![], vec![3, 0x40, 0x0d, 3, 0, 0, 0, 0, 0]), (1, vec![0], refund_data(&[7; 32]))], None);
-        assert_eq!(check_message(&m, None, &intent(SolanaMode::default())).unwrap(), crate::blake3(&m));
+        assert_eq!(check_message(&m, &LookupTables::new(), &intent(SolanaMode::default())).unwrap(), crate::blake3(&m));
     }
 
     #[test]
@@ -486,13 +601,13 @@ mod tests {
         ];
         for (name, ixs) in cases {
             let m = encode(&base_keys(), &ixs, None);
-            assert!(check_message(&m, None, &intent(SolanaMode::default())).is_err(), "{name}");
+            assert!(check_message(&m, &LookupTables::new(), &intent(SolanaMode::default())).is_err(), "{name}");
         }
         // Foreign fee payer.
         let mut keys = base_keys();
         keys[0] = [9; 32];
         let m = encode(&keys, &[refund], None);
-        assert!(check_message(&m, None, &intent(SolanaMode::default())).is_err());
+        assert!(check_message(&m, &LookupTables::new(), &intent(SolanaMode::default())).is_err());
     }
 
     #[test]
@@ -503,13 +618,13 @@ mod tests {
         let advance = (3u8, vec![6u8, 8, 0], vec![4u8, 0, 0, 0]);
         let refund = (1u8, vec![0u8], refund_data(&[7; 32]));
         let ok = encode(&keys, &[advance.clone(), refund.clone()], None);
-        assert!(check_message(&ok, None, &intent(mode.clone())).is_ok());
+        assert!(check_message(&ok, &LookupTables::new(), &intent(mode.clone())).is_ok());
         let late = encode(&keys, &[refund.clone(), advance.clone()], None);
-        assert!(check_message(&late, None, &intent(mode.clone())).is_err(), "advance not first");
+        assert!(check_message(&late, &LookupTables::new(), &intent(mode.clone())).is_err(), "advance not first");
         let missing = encode(&keys, &[refund.clone()], None);
-        assert!(check_message(&missing, None, &intent(mode.clone())).is_err(), "no advance");
+        assert!(check_message(&missing, &LookupTables::new(), &intent(mode.clone())).is_err(), "no advance");
         let foreign = encode(&keys, &[(3, vec![7, 8, 0], vec![4, 0, 0, 0]), refund], None);
-        assert!(check_message(&foreign, None, &intent(mode)).is_err(), "other nonce account");
+        assert!(check_message(&foreign, &LookupTables::new(), &intent(mode)).is_err(), "other nonce account");
     }
 
     #[test]
@@ -517,25 +632,62 @@ mod tests {
         let mode = SolanaMode { durable_nonce: None, ed25519: Some(Ed25519Expect { pubkey: [5; 32], message: b"warrant".to_vec() }) };
         let refund = (1u8, vec![0u8], refund_data(&[7; 32]));
         let ok = encode(&base_keys(), &[(4, vec![], ed_data(&[5; 32], b"warrant")), refund.clone()], None);
-        assert!(check_message(&ok, None, &intent(mode.clone())).is_ok());
+        assert!(check_message(&ok, &LookupTables::new(), &intent(mode.clone())).is_ok());
         for bad in [ed_data(&[6; 32], b"warrant"), ed_data(&[5; 32], b"other")] {
             let m = encode(&base_keys(), &[(4, vec![], bad), refund.clone()], None);
-            assert!(check_message(&m, None, &intent(mode.clone())).is_err());
+            assert!(check_message(&m, &LookupTables::new(), &intent(mode.clone())).is_err());
         }
         let missing = encode(&base_keys(), &[refund], None);
-        assert!(check_message(&missing, None, &intent(mode)).is_err());
+        assert!(check_message(&missing, &LookupTables::new(), &intent(mode)).is_err());
     }
 
     #[test]
     fn version0_lookups() {
         // The HTLC program comes from a lookup table: index 9 is the first writable lookup.
         let keys = base_keys();
-        let m = encode(&keys, &[(9, vec![0], refund_data(&[7; 32]))], Some(&[([8; 32], vec![0], vec![])]));
+        let m = encode(&keys, &[(9, vec![0], refund_data(&[7; 32]))], Some(&[([8; 32], vec![1], vec![])]));
         assert!(parse_message(&m).unwrap().version0);
-        assert_eq!(check_message(&m, None, &intent(SolanaMode::default())), Err(SolError::LookupsUnresolved));
-        assert!(check_message(&m, Some(&[HTLC]), &intent(SolanaMode::default())).is_ok());
-        // A lookup that resolves to an unknown program.
-        assert!(check_message(&m, Some(&[[0xee; 32]]), &intent(SolanaMode::default())).is_err());
+        let tables = |entries: Vec<Hash32>| LookupTables::from([([8; 32], entries)]);
+        let none = LookupTables::new();
+        assert_eq!(check_message(&m, &none, &intent(SolanaMode::default())), Err(SolError::LookupsUnresolved));
+        assert!(check_message(&m, &tables(vec![[0xee; 32], HTLC]), &intent(SolanaMode::default())).is_ok());
+        // The observed table resolves the index to another program, or has no such index.
+        assert!(check_message(&m, &tables(vec![HTLC, [0xee; 32]]), &intent(SolanaMode::default())).is_err());
+        assert_eq!(check_message(&m, &tables(vec![HTLC]), &intent(SolanaMode::default())), Err(SolError::LookupsUnresolved));
+        // Another table than the message names.
+        let other = LookupTables::from([([0x0a; 32], vec![[0xee; 32], HTLC])]);
+        assert_eq!(check_message(&m, &other, &intent(SolanaMode::default())), Err(SolError::LookupsUnresolved));
+    }
+
+    #[test]
+    fn htlc_accounts_and_privileges() {
+        let escrow = escrow_address(&HTLC, &[7; 32]).unwrap();
+        let payee = [5u8; 32];
+        let mut intent = intent(SolanaMode::default());
+        intent.htlc_accounts = spend_accounts(&HTLC, &[7; 32], &PAYER, &payee, None).unwrap();
+        let keys = vec![PAYER, HTLC, escrow, payee, [0x0b; 32], key(SYSTEM_PROGRAM)];
+        let tables = LookupTables::new();
+        let ok = encode(&keys, &[(1, vec![0, 2, 3], refund_data(&[7; 32]))], None);
+        assert!(check_message(&ok, &tables, &intent).is_ok());
+        // Another payee, a missing account, an extra account.
+        for accounts in [vec![0, 2, 4], vec![0, 2], vec![0, 2, 3, 4]] {
+            let m = encode(&keys, &[(1, accounts, refund_data(&[7; 32]))], None);
+            assert!(check_message(&m, &tables, &intent).is_err());
+        }
+        // The same accounts, but the header makes the payee read-only.
+        let mut read_only = ok.clone();
+        read_only[2] = 3;
+        assert!(check_message(&read_only, &tables, &intent).is_err());
+        // A key that is caller and payee is a signer at both places.
+        assert_eq!(spend_accounts(&HTLC, &[7; 32], &PAYER, &PAYER, None).unwrap()[2], AccountMeta::signer_writable(PAYER));
+        // A token lock: sender, escrow, both token accounts, mint, token program, System Program.
+        let usdc = TokenAccounts { mint: [0x0c; 32], token_program: key(TOKEN_PROGRAM) };
+        let lock = lock_accounts(&HTLC, &[7; 32], &PAYER, Some(&usdc)).unwrap();
+        assert_eq!(lock.len(), 7);
+        assert_eq!(lock[3], AccountMeta::writable(associated_token_address(&escrow, &usdc).unwrap()));
+        assert_eq!(lock[6], AccountMeta::readonly(key(SYSTEM_PROGRAM)));
+        // Header counts outside their groups.
+        assert!(parse_message(&encode(&keys, &[], None).iter().enumerate().map(|(i, b)| if i == 1 { 1 } else { *b }).collect::<Vec<_>>()).is_err());
     }
 
     #[test]
@@ -562,6 +714,8 @@ mod tests {
         let (ours, our_bump) = find_program_address(&seeds, &key(ATA_PROGRAM)).unwrap();
         let (theirs, their_bump) = Pubkey::find_program_address(&seeds, &Pubkey::new_from_array(key(ATA_PROGRAM)));
         assert_eq!((ours, our_bump), (theirs.to_bytes(), their_bump));
+        let usdc = TokenAccounts { mint, token_program: key(TOKEN_PROGRAM) };
+        assert_eq!(associated_token_address(&wallet, &usdc), Some(ours));
         for id in [[7u8; 32], [8; 32], [0; 32]] {
             let (theirs, _) = Pubkey::find_program_address(&[ESCROW_SEED, &id], &Pubkey::new_from_array(HTLC));
             assert_eq!(escrow_address(&HTLC, &id), Some(theirs.to_bytes()));

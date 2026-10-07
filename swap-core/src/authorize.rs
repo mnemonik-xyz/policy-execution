@@ -4,13 +4,14 @@
 //! `Allow`, a decision record on `Deny` or `Ask`. Exit actions: structural checks
 //! only; the evaluator is never called (S18); a failure halts the signer.
 
-use crate::caip::{AssetId, ChainId};
+use crate::caip::{AssetId, ChainId, Family};
 use crate::checks::{self, code, AssetFacts, ContractObservation, LockFacts, Runtime, Violation};
 use crate::dsl::CompiledPolicy;
 use crate::facts::{self, EvidenceMethod, FactRecord, Observed, PriceReport, Provenance};
 use crate::ledger::LedgerState;
 use crate::profile::{ChainProfile, ProfileSet};
 use crate::secret::preimage_opens;
+use crate::solana::LookupTables;
 use crate::tx::{self, BindContext, OwnAccounts, ProposedTx};
 use crate::types::{Action, Leg, LegName, Role, Terms};
 use crate::verified::{self, ChainNow, Decision, ListCheck, LockObs, PeriodSpent, SwapFacts3, Timelock};
@@ -45,9 +46,22 @@ pub struct CollateralReport {
     pub signature_ok: bool,
 }
 
+/// The ACCEPT message as the signer runtime verified it (spec 3.5): the signer's
+/// own ACCEPT, or the counterparty's ACCEPT after the inner signature check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptEvidence {
+    /// `blake3` of the signed ACCEPT message.
+    pub inner_sig_hash: Hash32,
+    /// The `terms_hash` that the signed ACCEPT carries.
+    pub terms_hash: Hash32,
+    /// The inner signature verifies under the author's identity key.
+    pub signature_ok: bool,
+}
+
 /// Everything the signer observed, each with its provenance.
 #[derive(Clone, Debug, Default)]
 pub struct Observations {
+    pub accept: Option<AcceptEvidence>,
     pub tips: BTreeMap<ChainId, Observed<u64>>,
     pub locks: BTreeMap<LegName, Observed<LockFacts>>,
     pub contracts: BTreeMap<LegName, Observed<ContractObservation>>,
@@ -57,17 +71,19 @@ pub struct Observations {
     pub list: Option<ListSnapshot>,
     pub collateral: Option<CollateralReport>,
     pub fee_reserves: BTreeMap<ChainId, u128>,
+    /// Solana address lookup tables that the proposed message uses: table address
+    /// and its addresses in order, read from the leg chain.
+    pub lookup_tables: BTreeMap<Hash32, Observed<Vec<Hash32>>>,
 }
 
-/// What the agent proposes. Nothing here is a fact: terms are checked against the
-/// signed ACCEPT message hash and chain observations; the transaction is decoded.
+/// What the agent proposes. Nothing here is a fact: terms must hash to the
+/// `terms_hash` of the verified ACCEPT (`Observations::accept`) and are checked
+/// against chain observations; the transaction is decoded.
 #[derive(Clone, Debug)]
 pub struct Request {
     pub action: Action,
     pub role: Role,
     pub terms: Terms,
-    /// `blake3` of the signed ACCEPT message.
-    pub inner_sig_hash: Hash32,
     pub tx: Option<ProposedTx>,
     /// Reveal: from the signer's secret store. Claim: as observed on the chain.
     pub preimage: Option<Hash32>,
@@ -157,14 +173,22 @@ pub fn authorize(req: &Request, env: &Env) -> Outcome {
         Ok(h) => h,
         Err(e) => return record(req, env, [0; 32], RecordDecision::Deny, vec![format!("TERMS_ENCODING: {e}")], vec![]),
     };
+    // No warrant for terms that the signed ACCEPT does not cover.
+    let inner_sig_hash = match accepted(env, &terms_hash) {
+        Ok(h) => h,
+        Err(v) => {
+            let decision = if req.action.is_exit() { RecordDecision::Halt } else { RecordDecision::Deny };
+            return record(req, env, terms_hash, decision, vec![v.to_string()], vec![]);
+        }
+    };
     if req.action.is_exit() {
         match exit(req, env, &mut c) {
-            Ok(binding) => warrant(req, env, terms_hash, binding, vec!["EXIT_ACTION".into()], c.records),
+            Ok(binding) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["EXIT_ACTION".into()], c.records),
             Err(v) => record(req, env, terms_hash, RecordDecision::Halt, vec![v.to_string()], c.records),
         }
     } else {
         match entry(req, env, &mut c) {
-            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, binding, vec!["POLICY_ALLOW".into()], c.records),
+            Ok((Decision::Allow, binding)) => warrant(req, env, terms_hash, inner_sig_hash, binding, vec!["POLICY_ALLOW".into()], c.records),
             Ok((Decision::Ask, _)) => record(req, env, terms_hash, RecordDecision::Ask, vec!["POLICY_ASK".into()], c.records),
             Ok((Decision::Deny, _)) => record(req, env, terms_hash, RecordDecision::Deny, vec!["POLICY_DENY".into()], c.records),
             Err(v) => record(req, env, terms_hash, RecordDecision::Deny, vec![v.to_string()], c.records),
@@ -172,14 +196,60 @@ pub fn authorize(req: &Request, env: &Env) -> Outcome {
     }
 }
 
-fn warrant(req: &Request, env: &Env, terms_hash: Hash32, binding: Option<TxBinding>, reasons: Vec<String>, facts: Vec<FactRecord>) -> Outcome {
+/// Solana chain facts of a claim or reveal binding: the lookup tables and the
+/// token program of the leg asset. Nothing on other chains.
+fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
+    if leg.chain.family() != Some(Family::Solana) {
+        return;
+    }
+    ctx.lookup_tables = lookup_tables(c, leg);
+    if !leg.asset.is_native() {
+        let env = c.env;
+        ctx.token_program = c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program);
+    }
+}
+
+/// The observed lookup tables, for a Solana leg only.
+fn lookup_tables(c: &mut Collected, leg: &Leg) -> LookupTables {
+    let mut tables = LookupTables::new();
+    if leg.chain.family() != Some(Family::Solana) {
+        return tables;
+    }
+    let env = c.env;
+    for (table, obs) in &env.obs.lookup_tables {
+        if let Some(addresses) = c.resolve(&format!("lookup_table:{}", crate::to_hex(table)), Some(obs)) {
+            tables.insert(*table, addresses);
+        }
+    }
+    tables
+}
+
+/// The verified ACCEPT must exist and carry exactly these terms.
+fn accepted(env: &Env, terms_hash: &Hash32) -> Result<Hash32, Violation> {
+    match &env.obs.accept {
+        None => Err(checks::violation(code::ACCEPT, "no verified ACCEPT message")),
+        Some(a) if !a.signature_ok => Err(checks::violation(code::ACCEPT, "ACCEPT signature does not verify")),
+        Some(a) if &a.terms_hash != terms_hash => Err(checks::violation(code::ACCEPT, "terms differ from the signed ACCEPT")),
+        Some(a) => Ok(a.inner_sig_hash),
+    }
+}
+
+fn warrant(
+    req: &Request,
+    env: &Env,
+    terms_hash: Hash32,
+    inner_sig_hash: Hash32,
+    binding: Option<TxBinding>,
+    reasons: Vec<String>,
+    facts: Vec<FactRecord>,
+) -> Outcome {
     let leg = req.action.leg(req.role).map(|l| req.terms.leg(l).clone());
     Outcome::Warrant(Box::new(SwapWarrant {
         protocol: PROTOCOL.into(),
         action: req.action,
         swap_id: req.terms.swap_id,
         terms_hash,
-        inner_sig_hash: req.inner_sig_hash,
+        inner_sig_hash,
         leg,
         tx_binding: binding,
         facts,
@@ -286,10 +356,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
     let give_e8 = value_e8(own_leg, &own_asset);
     let take_e8 = value_e8(their_leg, &their_asset);
     let whole = |v: Option<u128>| v.and_then(|v| u64::try_from(v.div_ceil(100_000_000)).ok());
-    let notional = match (whole(give_e8), whole(take_e8)) {
-        (Some(g), Some(t)) => Some(g.max(t)),
-        (g, t) => g.or(t),
-    };
+    // Known only when both legs have a value: one unknown leg can be the larger one.
+    let notional = whole(give_e8).zip(whole(take_e8)).map(|(g, t)| g.max(t));
     let deviation = give_e8.zip(take_e8).and_then(|(g, t)| facts::deviation_bps(g, t));
 
     // Timelocks as agreed (absolute) or as observed.
@@ -346,7 +414,14 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 (None, true) => None,
                 (None, false) => return Err(checks::violation(code::S8, "own asset facts unknown")),
             };
-            let ctx = BindContext { transfer_fee: fee, solana_mode: env.runtime.solana_mode.clone(), ..Default::default() };
+            let ctx = BindContext {
+                transfer_fee: fee,
+                solana_mode: env.runtime.solana_mode.clone(),
+                max_fee: own_profile.fees.worst_lock,
+                lookup_tables: lookup_tables(c, own_leg),
+                token_program: own_asset.as_ref().and_then(|a| a.token_program),
+                ..Default::default()
+            };
             binding = Some(s24(tx::bind(action, own_leg, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Reveal => {
@@ -363,12 +438,14 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 return Err(checks::violation(code::S2, "the secret does not open the hashlock"));
             };
             counterparty_lock = Some(LockObs { chain: terms.leg_b.chain.id(), depth: Some(facts.confirmations), finalized: facts.finalized });
-            let ctx = BindContext {
+            let mut ctx = BindContext {
                 preimage: Some(preimage),
                 htlc_outpoint: facts.outpoint,
                 solana_mode: env.runtime.solana_mode.clone(),
+                max_fee: pb.fees.worst_claim,
                 ..Default::default()
             };
+            solana_facts(c, &terms.leg_b, &mut ctx);
             binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Claim | Action::Refund => unreachable!("exit actions take the exit path"),
@@ -504,7 +581,13 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     checks::s3(terms)?;
     let leg_name = action.leg(role).expect("exits touch a leg");
     let leg = terms.leg(leg_name);
-    let mut ctx = BindContext { solana_mode: env.runtime.solana_mode.clone(), ..Default::default() };
+    // The profile, not the policy, sets the fee limit: the policy never blocks an exit.
+    let Some(fees) = env.profiles.get(&leg.chain).map(|p| &p.fees) else {
+        return Err(checks::violation(code::CHAIN, format!("{} has no profile", leg.chain)));
+    };
+    let max_fee = if action == Action::Refund { fees.worst_refund } else { fees.worst_claim };
+    let mut ctx = BindContext { solana_mode: env.runtime.solana_mode.clone(), max_fee, ..Default::default() };
+    solana_facts(c, leg, &mut ctx);
     match action {
         Action::Claim => {
             let facts = observed_leg(c, leg_name, leg)?;

@@ -29,9 +29,9 @@ flowchart LR
 | `profile` | Chain profiles, value bands, the obligatory-item check of spec 8.8, reference profiles |
 | `ledger` | Period spend, open swaps, consumed swap ids, hashlocks and warrants, policy version, the S25 counter |
 | `secret` | The swap secret: caller-supplied CSPRNG, no `Debug`, no `Serialize`, zeroized |
-| `bitcoin` | Taproot HTLC template, PSBT version 0, BIP 341 sighashes, lock and spend intent checks |
+| `bitcoin` | Taproot HTLC template, PSBT version 0, BIP 341 sighashes, lock and spend intent checks, fee limits |
 | `evm` | RLP, EIP-1559, the reference HTLC ABI, exact calldata checks, contract and proxy pins |
-| `solana` | Legacy and version 0 messages, the allowed instruction set per mode, PDAs, program pins |
+| `solana` | Legacy and version 0 messages, lookup tables from chain facts, the allowed instruction set per mode, reference HTLC accounts and privileges, PDAs, program pins |
 | `tx` | Intent from the terms per family and action; the transaction binding (S24) |
 | `checks` | S1 to S25 with fixed reason codes |
 | `dsl` | The JSON mini-DSL and `validate_policy` |
@@ -49,7 +49,20 @@ flowchart LR
   at an unknown future confirmation, and S11 could not bound it.
 - On Bitcoin, the observation adapter reports the HTLC output. S7 re-derives
   the output script from the terms, which proves `H`, both keys and `T`.
-- An unknown notional takes the strictest value band for S14.
+- The notional is known only when both legs have a value. An unknown notional
+  takes the strictest value band for S14.
+- `authorize` issues no warrant unless the signer runtime supplies a verified
+  ACCEPT (`Observations::accept`) whose `terms_hash` equals the hash of the
+  proposed terms. The warrant takes `inner_sig_hash` from that evidence.
+- A Bitcoin transaction pays at most the profile's worst-case fee for its
+  action (`worst_lock`, `worst_claim`, `worst_refund`). The fee is the input
+  value minus the output value. The input values come from the PSBT, which is
+  safe because every BIP 341 sighash commits to all input amounts.
+- A Solana message takes its lookup-table addresses from chain facts
+  (`Observations::lookup_tables`), never from the proposal. The HTLC
+  instruction must have exactly the reference accounts, in order, with their
+  signer and writable flags. A token leg needs the observed token program of
+  the mint (`AssetFacts::token_program`).
 - Warrant validity windows use the signer's real time in W2.
 - A credential for an identity other than the counterparty of the terms is not
   a fact: the counterparty stays unknown.

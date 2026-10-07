@@ -68,6 +68,7 @@ pub mod code {
     pub const ROLE: &str = "ACTION_NOT_FOR_ROLE";
     pub const TIMELOCK: &str = "TIMELOCK_FORM";
     pub const BAND: &str = "VALUE_BAND_EXCEEDED";
+    pub const ACCEPT: &str = "ACCEPT_BINDING";
 }
 
 /// A lock as read from its chain by the profile's observation adapter. On
@@ -102,6 +103,8 @@ pub struct AssetFacts {
     pub decimals: u8,
     pub risk_flags: Vec<RiskFlag>,
     pub transfer_fee: Option<TransferFee>,
+    /// Solana: the program that owns the mint. `None` on other chains.
+    pub token_program: Option<Hash32>,
 }
 
 impl AssetFacts {
