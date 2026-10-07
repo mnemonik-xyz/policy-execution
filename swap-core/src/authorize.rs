@@ -229,10 +229,17 @@ fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
         return;
     }
     ctx.lookup_tables = lookup_tables(c, leg);
-    if !leg.asset.is_native() {
-        let env = c.env;
-        ctx.token_program = c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program);
+    ctx.token_program = solana_token_program(c, leg);
+}
+
+/// The program that owns the mint of a Solana token leg, read from the chain (S9).
+/// `None` on other chains and for the native coin.
+fn solana_token_program(c: &mut Collected, leg: &Leg) -> Option<Hash32> {
+    if leg.chain.family() != Some(Family::Solana) || leg.asset.is_native() {
+        return None;
     }
+    let env = c.env;
+    c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program)
 }
 
 /// S27 for one own payee, from the receiver facts that the signer observed.
@@ -383,7 +390,8 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<(Lock
     } else {
         c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
-    checks::s7(leg, env.policy, contract.as_ref(), true)?;
+    let token_program = solana_token_program(c, leg);
+    checks::s7(leg, env.policy, contract.as_ref(), token_program, true)?;
     Ok((facts, seen_at))
 }
 
@@ -478,7 +486,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
         Action::Lock => {
             let own_contract = c.resolve(&format!("contract:{own_name:?}"), env.obs.contracts.get(&own_name));
             // The own lock does not exist yet: on Solana its escrow address holds no account, or only lamports.
-            checks::s7(own_leg, policy, own_contract.as_ref(), false)?;
+            let own_token_program = solana_token_program(c, own_leg);
+            checks::s7(own_leg, policy, own_contract.as_ref(), own_token_program, false)?;
             checks::s15(&env.obs.fee_reserves, own_profile, their_profile)?;
             checks::s16(env.runtime)?;
             checks::s17(own_profile, env.runtime)?;

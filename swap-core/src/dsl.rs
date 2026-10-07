@@ -304,10 +304,17 @@ pub fn validate_policy(text: &str, profiles: &ProfileSet) -> Result<CompiledPoli
             let ok = match c {
                 ContractPinSpec::BitcoinTemplate(t) => t == crate::bitcoin::TEMPLATE_ID,
                 ContractPinSpec::Evm(p) => p.well_formed(),
-                ContractPinSpec::Solana(p) => crate::solana::parse_key(&p.program).is_some(),
+                ContractPinSpec::Solana(p) => p.well_formed(),
             };
             if !ok {
                 return err(format!("{chain}: malformed contract pin"));
+            }
+        }
+        // S7 uses the first pin of a contract (`pin_for`): a second pin of the same
+        // contract, for example with another code hash, would never apply.
+        for (i, c) in entry.contracts.iter().enumerate() {
+            if entry.contracts[..i].iter().any(|d| d.contract_id().eq_ignore_ascii_case(&c.contract_id())) {
+                return err(format!("{chain}: contract pinned twice"));
             }
         }
     }
@@ -432,6 +439,51 @@ pub(crate) mod tests {
         doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"]["admin"] = Value::String(crate::to_hex(&[8; 20]));
         doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"].as_object_mut().unwrap().remove("implementation_code_hash");
         assert!(validate_policy(&doc.to_string(), &p).is_err(), "proxy pin without the implementation code hash");
+        // Spec 8.4 Solana (G21): a program pin carries the code hash and a well-formed
+        // upgrade authority.
+        let ps = ProfileSet::new(vec![reference::bitcoin(reference::BITCOIN_MAINNET), reference::ethereum(), reference::solana()]);
+        let program = bs58::encode([2u8; 32]).into_string();
+        let solana = |pin: Value| {
+            let mut doc = policy_json(example_rule());
+            doc["chains"][reference::SOLANA_MAINNET] = serde_json::json!({
+                "profile_hash": crate::to_hex(&reference::solana().hash()), "contracts": [{"solana": pin}]
+            });
+            validate_policy(&doc.to_string(), &ps)
+        };
+        let code_hash = crate::to_hex(&[0xc5; 32]);
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash})).is_ok());
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "upgrade_authority": bs58::encode([3u8; 32]).into_string()})).is_ok());
+        assert!(solana(serde_json::json!({"program": program})).is_err(), "no code hash");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": "c5"})).is_err(), "short code hash");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "upgrade_authority": "0OIl"})).is_err(), "malformed authority");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "loader": "BPFLoader2111111111111111111111111111111111"})).is_err(), "unknown field");
+        // One pin per contract: a second pin of the same program or address is rejected.
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::SOLANA_MAINNET] = serde_json::json!({
+            "profile_hash": crate::to_hex(&reference::solana().hash()),
+            "contracts": [{"solana": {"program": program, "code_hash": code_hash}}, {"solana": {"program": program, "code_hash": crate::to_hex(&[0xc6; 32])}}]
+        });
+        let twice = |doc: &Value| format!("{:?}", validate_policy(&doc.to_string(), &ps).unwrap_err()).contains("pinned twice");
+        assert!(twice(&doc), "program pinned twice");
+        // `pin_for` compares ids without case, so two program ids that differ only in
+        // case are one pin too.
+        let alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let other_case = (0..program.len())
+            .find_map(|i| {
+                let c = program.as_bytes()[i] as char;
+                let swapped = if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+                let candidate = format!("{}{swapped}{}", &program[..i], &program[i + 1..]);
+                (swapped != c && alphabet.contains(swapped) && crate::solana::parse_key(&candidate).is_some()).then_some(candidate)
+            })
+            .unwrap();
+        doc["chains"][reference::SOLANA_MAINNET]["contracts"][1]["solana"]["program"] = Value::String(other_case);
+        assert!(twice(&doc), "program pinned twice, in another case");
+        let mut doc = policy_json(example_rule());
+        let evm = doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0].clone();
+        let mut upper = evm.clone();
+        upper["evm"]["address"] = Value::String(upper["evm"]["address"].as_str().unwrap().to_uppercase().replacen("0X", "0x", 1));
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = serde_json::json!([evm, upper]);
+        assert!(twice(&doc), "address pinned twice, in another case");
         // A profile that misses an obligatory item makes every policy naming the chain invalid.
         let mut broken = reference::ethereum();
         broken.refund = crate::profile::RefundMethod::None;

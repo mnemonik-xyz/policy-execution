@@ -1330,10 +1330,26 @@ fn sol_terms() -> Terms {
     with_lock_ids(t)
 }
 
+/// The program bytes of the test Solana HTLC, with the zero padding of its ProgramData account.
+const HTLC_SOL_CODE: &[u8] = b"\x7fELF\x02\x01\x01\x00test htlc\x00\x00\x00\x00";
+
+/// An immutable program under the upgradeable loader whose code is `HTLC_SOL_CODE`,
+/// with the escrow of the lock that `key` names.
+fn sol_program_facts(key: &Hash32, escrow: Option<sol::EscrowAccount>) -> sol::ProgramFacts {
+    let loader = sol::key(sol::BPF_LOADER_UPGRADEABLE);
+    sol::ProgramFacts {
+        executable: true,
+        loader,
+        programdata_address: sol::programdata_address(&HTLC_SOL),
+        programdata: Some(sol::ProgramDataAccount { owner: loader, upgrade_authority: None, code_hash: sol::code_hash(HTLC_SOL_CODE) }),
+        escrow_address: sol::escrow_address(&HTLC_SOL, key).unwrap(),
+        escrow,
+        escrow_token: None,
+    }
+}
+
 fn sol_contract(escrow: Option<sol::EscrowAccount>) -> Observed<ContractObservation> {
-    let escrow_address = sol::escrow_address(&HTLC_SOL, &sol_terms().leg_b.lock.lock_id).unwrap();
-    let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address, escrow };
-    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts))
+    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(sol_program_facts(&sol_terms().leg_b.lock.lock_id, escrow)))
 }
 
 fn sol_world(role: Role) -> World {
@@ -1346,12 +1362,12 @@ fn sol_world(role: Role) -> World {
         "evaluator_id": warrant_swap_core::to_hex(&BUILD),
         "chains": {
             (BTC_CHAIN): { "profile_hash": profile_hash(BTC_CHAIN), "contracts": [{"bitcoin_template": btc::TEMPLATE_ID}] },
-            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract}}] }
+            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract, "code_hash": warrant_swap_core::to_hex(&sol::code_hash(HTLC_SOL_CODE))}}] }
         },
         "oracle": { "max_age_secs": 60, "max_conf_bps": 50 },
         "quorum": 2,
         "margin_secs": 1800,
-        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC]] }
+        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC], [BTC, SOL_USDC], [SOL_USDC, BTC]] }
     });
     let mut w = World::new(role);
     w.policy = validate_policy(&doc.to_string(), &profiles).unwrap();
@@ -1637,7 +1653,7 @@ fn sol_same_chain_world(role: Role, (a, b): (Option<sol::EscrowAccount>, Option<
     let sol = w.profiles.get(&t.leg_b.chain).unwrap().clone();
     let doc = serde_json::json!({
         "version": 3, "ref_ccy": "USD", "evaluator_id": warrant_swap_core::to_hex(&BUILD),
-        "chains": { (SOL_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&sol.hash()), "contracts": [{"solana": {"program": t.leg_b.lock.contract}}] } },
+        "chains": { (SOL_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&sol.hash()), "contracts": [{"solana": {"program": t.leg_b.lock.contract, "code_hash": warrant_swap_core::to_hex(&sol::code_hash(HTLC_SOL_CODE))}}] } },
         "authorities": { "oracle": ["pyth"] },
         "oracle": { "max_age_secs": 60, "max_conf_bps": 50 }, "quorum": 2, "margin_secs": 1800,
         "rule": { "pair_in": [[SOL, SOL]] }
@@ -1646,8 +1662,7 @@ fn sol_same_chain_world(role: Role, (a, b): (Option<sol::EscrowAccount>, Option<
     w.obs.prices.push(price(SOL, 150_00000000));
     // The adapter reads the escrow of each lock at the PDA of its lock_id.
     for (name, leg, escrow) in [(LegName::A, &t.leg_a, a), (LegName::B, &t.leg_b, b)] {
-        let escrow_address = sol::escrow_address(&HTLC_SOL, &leg.lock.lock_id).unwrap();
-        let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address, escrow };
+        let facts = sol_program_facts(&leg.lock.lock_id, escrow);
         w.obs.contracts.insert(name, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
         let lock = LockFacts { contract: leg.lock.contract.clone(), lock_id: leg.lock.lock_id, timelock: leg.refund_valid_from().unwrap(), receiver: leg.receiver.clone(), refund_to: leg.refund_to.clone(), asset: leg.asset.clone(), net_amount: leg.amount, ..lock_b_facts() };
         w.obs.locks.insert(name, chain_obs(EvidenceMethod::LightClient, lock));
@@ -1681,7 +1696,7 @@ fn same_chain_solana_swap_uses_two_escrows() {
     assert_denied(&w.run(Action::Lock, t.clone(), Some(sol_message(&[[0xbb; 32], escrow_b, HTLC_SOL, system], 2, 2, &[0, 1, 3], leg_a_byte)), None), code::S24);
     // An adapter that reads leg B at leg A's escrow sees an existing lock: S7.
     let mut shared = w;
-    let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address: escrow_a, escrow: Some(escrow.clone()) };
+    let facts = sol_program_facts(&id_a, Some(escrow.clone()));
     shared.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
     assert_denied(&shared.run(Action::Lock, t.clone(), None, None), code::S7);
     // The initiator reveals on leg B's escrow by id_b; the responder claims leg A by id_a.
@@ -1691,7 +1706,103 @@ fn same_chain_solana_swap_uses_two_escrows() {
     assert_denied(&w.run(Action::Reveal, t.clone(), Some(claim([0xaa; 32], escrow_a, &id_a)), Some(SECRET)), code::S24);
     // Leg B's escrow with leg A's key in the data: the program would claim another lock.
     assert_denied(&w.run(Action::Reveal, t.clone(), Some(claim([0xaa; 32], escrow_b, &id_a)), Some(SECRET)), code::S24);
-    let w = sol_same_chain_world(Role::Responder, (Some(escrow.clone()), Some(escrow)));
+    let mut w = sol_same_chain_world(Role::Responder, (Some(escrow.clone()), Some(escrow.clone())));
     assert_allow(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_a, &id_a)), Some(SECRET)));
-    assert_halt(&w.run(Action::Claim, t, Some(claim([0xbb; 32], escrow_b, &id_b)), Some(SECRET)), code::S24);
+    assert_halt(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_b, &id_b)), Some(SECRET)), code::S24);
+    // G21: the program code changed during the swap (an upgrade, another loader): the
+    // claim halts on S7 as a structural check.
+    let good = sol_program_facts(&id_a, Some(escrow));
+    let data = good.programdata.clone().unwrap();
+    let changed = [
+        sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { code_hash: [9; 32], ..data }), ..good.clone() },
+        sol::ProgramFacts { loader: sol::key("BPFLoader2111111111111111111111111111111111"), ..good },
+    ];
+    for facts in changed {
+        w.obs.contracts.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
+        assert_halt(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_a, &id_a)), Some(SECRET)), code::S7);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solana leg B: the program identity and the escrow token account (spec 8.4, G21)
+// ---------------------------------------------------------------------------
+
+const SOL_USDC: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+fn sol_lock_b(t: &Terms) -> LockFacts {
+    LockFacts { contract: t.leg_b.lock.contract.clone(), lock_id: t.leg_b.lock.lock_id, receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() }
+}
+
+#[test]
+fn a_solana_program_needs_the_upgradeable_loader_and_the_pinned_code() {
+    let t = sol_terms();
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    let mut w = sol_world(Role::Initiator);
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, sol_lock_b(&t)));
+    let good = sol_program_facts(&t.leg_b.lock.lock_id, Some(escrow));
+    let data = good.programdata.clone().unwrap();
+    let bad = [
+        ("BPF loader 2", sol::ProgramFacts { loader: sol::key("BPFLoader2111111111111111111111111111111111"), ..good.clone() }),
+        ("not a Program state", sol::ProgramFacts { programdata_address: None, ..good.clone() }),
+        ("no ProgramData account", sol::ProgramFacts { programdata: None, ..good.clone() }),
+        ("other code", sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { code_hash: sol::code_hash(b"\x7fELF other"), ..data.clone() }), ..good.clone() }),
+        ("upgradeable", sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { upgrade_authority: Some([9; 32]), ..data }), ..good.clone() }),
+    ];
+    for (name, f) in bad.clone() {
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(f)));
+        let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+        assert!(reason(&o) == code::S7, "{name}: {}", explain(&o));
+    }
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(good)));
+    let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
+    // The own lock: the program checks apply before the escrow exists.
+    let mut w = sol_world(Role::Responder);
+    for (name, f) in bad {
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(sol::ProgramFacts { escrow: None, ..f })));
+        let o = w.run(Action::Lock, t.clone(), None, None);
+        assert!(reason(&o) == code::S7, "{name}: {}", explain(&o));
+    }
+}
+
+/// The swap of `sol_terms()` with leg B as SPL USDC.
+fn sol_token_world(role: Role) -> (World, Terms, sol::TokenAccounts) {
+    let mut t = sol_terms();
+    t.leg_b.asset = AssetId::parse(SOL_USDC).unwrap();
+    t.leg_b.amount = 30_000_000_000;
+    let mut w = sol_world(role);
+    let usdc = sol::TokenAccounts { mint: t.leg_b.asset.spl_mint().unwrap(), token_program: sol::key(sol::TOKEN_PROGRAM) };
+    let facts = AssetFacts { decimals: 6, risk_flags: vec![], transfer_fee: None, token_program: Some(usdc.token_program) };
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, facts));
+    w.obs.prices.push(price(SOL_USDC, 1_00000000));
+    (w, t, usdc)
+}
+
+#[test]
+fn a_solana_token_lock_needs_its_escrow_token_account() {
+    let (mut w, t, usdc) = sol_token_world(Role::Initiator);
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::OwnNode, sol_lock_b(&t)));
+    let key = t.leg_b.lock.lock_id;
+    let escrow = sol::escrow_address(&HTLC_SOL, &key).unwrap();
+    let account = sol::TokenAccount { address: sol::escrow_token_address(&HTLC_SOL, &key, &usdc).unwrap(), program: usdc.token_program, mint: usdc.mint, owner: escrow, initialized: true };
+    let locked = |token: Option<sol::TokenAccount>| {
+        let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+        let f = sol::ProgramFacts { escrow_token: token, ..sol_program_facts(&key, Some(escrow)) };
+        chain_obs(EvidenceMethod::OwnNode, ContractObservation::Solana(f))
+    };
+    for token in [None, Some(sol::TokenAccount { owner: [9; 32], ..account.clone() }), Some(sol::TokenAccount { mint: [9; 32], ..account.clone() })] {
+        w.obs.contracts.insert(LegName::B, locked(token));
+        assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    }
+    // With the escrow token account, S7 passes; S27 then needs the receiver facts.
+    w.obs.contracts.insert(LegName::B, locked(Some(account)));
+    assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S27);
+    // Without the token program of the mint, S7 cannot tell the escrow token account.
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 6, risk_flags: vec![], transfer_fee: None, token_program: None }));
+    assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    // The responder's own lock: no escrow token account is needed yet.
+    let (mut w, t, _) = sol_token_world(Role::Responder);
+    w.obs.contracts.insert(LegName::B, sol_contract(None));
+    let o = w.run(Action::Lock, t.clone(), None, None);
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
 }
