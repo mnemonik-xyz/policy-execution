@@ -103,6 +103,7 @@ class Cloud:
         if schema is None:
             raise PilotError("Required tool is missing from io.net discovery")
         # Do not follow schema-supplied remote references or expose validation values.
+
         def refs(value):
             if isinstance(value, dict):
                 for k, v in value.items():
@@ -152,8 +153,8 @@ async def connected(operation):
 
 def validate_deployment(arguments):
     no_credentials(arguments)
-    if arguments.get("billing_model") != "duration":
-        raise PilotError("Pilot deployments require explicit duration billing")
+    if arguments.get("billing_model") not in ("duration", "payg"):
+        raise PilotError("Pilot deployments require explicit duration or payg billing")
     for field in ("duration_hours", "gpus_per_container", "replica_count"):
         value = arguments.get(field)
         if type(value) is not int or value < 1:

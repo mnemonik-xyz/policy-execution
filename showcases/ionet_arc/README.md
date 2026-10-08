@@ -115,9 +115,9 @@ not raw account responses.
 
 ## First live deployment
 
-The first pilot allows exactly one GPU, one replica, one hour, and explicit
-`billing_model: "duration"`. PayG is rejected: its required duration field does
-not bound lifetime, and the documented price estimator is for duration billing.
+The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
+or `"payg"`. Note that PayG does not bound container lifetime on the provider side: destroy
+promptly after testing to prevent ongoing metered billing.
 
 1. Select an integer CaaS hardware ID and one integer location ID from live
    discovery and availability. Regional string hardware IDs are unsuitable

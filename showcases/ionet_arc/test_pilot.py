@@ -84,14 +84,19 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             await self.launch()
         self.assertEqual(read_json(self.state)["phase"], "submission_unknown")
 
-    async def test_payg_and_unbounded_capacity_rejected_before_call(self):
-        for change in ({"billing_model": "payg"}, {"duration_hours": 2}, {"replica_count": 2},
+    async def test_invalid_billing_and_unbounded_capacity_rejected_before_call(self):
+        for change in ({"billing_model": "invalid"}, {"duration_hours": 2}, {"replica_count": 2},
                        {"hardware_id": "gpu_1x_a6000"}, {"node_pool_id": "private"},
                        {"location_ids": []}, {"gpus_per_container": True}, {"duration_hours": -1}):
             with self.subTest(change=change), self.assertRaises(PilotError):
                 await self.launch(args=dict(ARGS, **change))
         self.cloud.call.assert_not_awaited()
         self.assertFalse(self.state.exists())
+
+    async def test_payg_billing_model_allowed(self):
+        result = await self.launch(args=dict(ARGS, billing_model="payg"))
+        self.assertEqual(result["phase"], "deployed")
+        self.assertEqual(result["deployment_id"], DEPLOYMENT_ID)
 
     async def test_stale_mismatched_overbudget_estimates_rejected(self):
         for kind in ("stale", "changed", "expensive", "negative", "nan", "missing"):
