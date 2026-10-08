@@ -8,10 +8,10 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from showcases.ionet_arc.adapter import (PilotError, READ_TOOLS, connected, deploy,
+from showcases.ionet_arc.adapter import (PilotError, READ_TOOLS, connected, deploy,  # noqa: E402
                                          destroy, read_json, save)
-from showcases.ionet_arc.arc import preflight
-from showcases.ionet_arc.funding import payment_plan
+from showcases.ionet_arc.arc import preflight  # noqa: E402
+from showcases.ionet_arc.funding import payment_plan  # noqa: E402
 
 
 def main():
@@ -71,13 +71,26 @@ def main():
         print(json.dumps({k: result[k] for k in ("phase", "deployment_id") if k in result}))
 
 
+def unwrap_error(exc):
+    if isinstance(exc, (PilotError, FileExistsError)):
+        return exc
+    if hasattr(exc, "exceptions"):
+        for sub in exc.exceptions:
+            found = unwrap_error(sub)
+            if found:
+                return found
+    return None
+
+
 if __name__ == "__main__":
     try:
         main()
-    except (PilotError, FileExistsError) as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
-    except Exception:
+    except Exception as exc:
+        pilot = unwrap_error(exc)
+        if pilot:
+            print(str(pilot), file=sys.stderr)
+            sys.exit(1)
         # Transport/SDK exceptions may contain authorization headers or tool inputs.
-        print("Operation failed. If a write was submitted, inspect saved state and io.net before retrying.", file=sys.stderr)
+        print("Operation failed. If a write was submitted, inspect saved state and io.net before retrying.",
+              file=sys.stderr)
         sys.exit(1)
