@@ -40,6 +40,16 @@ impl ContractPinSpec {
             ContractPinSpec::Solana(p) => p.program.clone(),
         }
     }
+
+    /// Whether this pin covers the `Lock.contract` value `contract`. An EVM address
+    /// is hex, so its case does not matter. A Solana program id is base58 and a
+    /// Bitcoin template id is a name: their case matters.
+    pub fn covers(&self, contract: &str) -> bool {
+        match self {
+            ContractPinSpec::Evm(_) => self.contract_id().eq_ignore_ascii_case(contract),
+            _ => self.contract_id() == contract,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +108,7 @@ impl CompiledPolicy {
     }
 
     pub fn pin_for(&self, chain: &ChainId, contract: &str) -> Option<&ContractPinSpec> {
-        self.pins(chain).iter().find(|p| p.contract_id().eq_ignore_ascii_case(contract))
+        self.pins(chain).iter().find(|p| p.covers(contract))
     }
 }
 
@@ -303,11 +313,18 @@ pub fn validate_policy(text: &str, profiles: &ProfileSet) -> Result<CompiledPoli
         for c in &entry.contracts {
             let ok = match c {
                 ContractPinSpec::BitcoinTemplate(t) => t == crate::bitcoin::TEMPLATE_ID,
-                ContractPinSpec::Evm(p) => p.address_bytes().is_some(),
-                ContractPinSpec::Solana(p) => crate::solana::parse_key(&p.program).is_some(),
+                ContractPinSpec::Evm(p) => p.well_formed(),
+                ContractPinSpec::Solana(p) => p.well_formed(),
             };
             if !ok {
                 return err(format!("{chain}: malformed contract pin"));
+            }
+        }
+        // S7 uses the first pin of a contract (`pin_for`): a second pin of the same
+        // contract, for example with another code hash, would never apply.
+        for (i, c) in entry.contracts.iter().enumerate() {
+            if entry.contracts[..i].iter().any(|d| d.covers(&c.contract_id())) {
+                return err(format!("{chain}: contract pinned twice"));
             }
         }
     }
@@ -334,6 +351,21 @@ pub(crate) mod tests {
     pub(crate) const USDC: &str = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
     pub(crate) const HTLC_EVM: &str = "0x3333333333333333333333333333333333333333";
 
+    /// `pin_for` ignores the case of an EVM address (hex) only.
+    #[test]
+    fn pin_for_ignores_the_case_of_hex_only() {
+        let address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["address"] = Value::String(address.into());
+        let compiled = validate_policy(&doc.to_string(), &profiles()).unwrap();
+        let eth = ChainId::parse(reference::ETHEREUM_MAINNET).unwrap();
+        assert!(compiled.pin_for(&eth, address).is_some());
+        assert!(compiled.pin_for(&eth, &format!("0x{}", address[2..].to_uppercase())).is_some(), "a checksummed address");
+        let btc = ChainId::parse(reference::BITCOIN_MAINNET).unwrap();
+        assert!(compiled.pin_for(&btc, crate::bitcoin::TEMPLATE_ID).is_some());
+        assert!(compiled.pin_for(&btc, &crate::bitcoin::TEMPLATE_ID.to_uppercase()).is_none(), "a template name in another case");
+    }
+
     pub(crate) fn profiles() -> ProfileSet {
         ProfileSet::new(vec![reference::bitcoin(reference::BITCOIN_MAINNET), reference::ethereum(), reference::solana()])
     }
@@ -347,7 +379,7 @@ pub(crate) mod tests {
             "ref_ccy": "USD",
             "evaluator_id": crate::to_hex(&[0xee; 32]),
             "chains": {
-                (reference::BITCOIN_MAINNET): { "profile_hash": crate::to_hex(&btc.hash()), "contracts": [{"bitcoin_template": "warrant-htlc-tr-v1"}] },
+                (reference::BITCOIN_MAINNET): { "profile_hash": crate::to_hex(&btc.hash()), "contracts": [{"bitcoin_template": crate::bitcoin::TEMPLATE_ID}] },
                 (reference::ETHEREUM_MAINNET): { "profile_hash": crate::to_hex(&eth.hash()), "contracts": [{"evm": {"address": HTLC_EVM, "code_hash": crate::to_hex(&[0xc0; 32])}}] }
             },
             "authorities": { "oracle": ["pyth"], "identity": ["mnemonik"], "list": ["ofac-mirror"] },
@@ -419,6 +451,71 @@ pub(crate) mod tests {
         let mut doc = policy_json(example_rule());
         doc["chains"][reference::BITCOIN_MAINNET]["contracts"] = serde_json::json!([{"bitcoin_template": "other"}]);
         assert!(validate_policy(&doc.to_string(), &p).is_err(), "unknown template");
+        // Version 1 of the template has no lock_id in the claim leaf (G4).
+        doc["chains"][reference::BITCOIN_MAINNET]["contracts"] = serde_json::json!([{"bitcoin_template": "warrant-htlc-tr-v1"}]);
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "template version 1");
+        // A proxy pin needs parseable admin and implementation addresses and the implementation code hash.
+        let proxy = |admin: &str| serde_json::json!([{"evm": {"address": HTLC_EVM, "code_hash": crate::to_hex(&[0xc0; 32]), "proxy": {"admin": admin, "implementation": crate::to_hex(&[7; 20]), "implementation_code_hash": crate::to_hex(&[9; 32])}}}]);
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = proxy(&crate::to_hex(&[8; 20]));
+        assert!(validate_policy(&doc.to_string(), &p).is_ok(), "a well-formed proxy pin");
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = proxy("0x08");
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "malformed proxy admin");
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"]["admin"] = Value::String(crate::to_hex(&[8; 20]));
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["proxy"].as_object_mut().unwrap().remove("implementation_code_hash");
+        assert!(validate_policy(&doc.to_string(), &p).is_err(), "proxy pin without the implementation code hash");
+        // Spec 8.4 Solana (G21): a program pin carries the code hash and a well-formed
+        // upgrade authority.
+        let ps = ProfileSet::new(vec![reference::bitcoin(reference::BITCOIN_MAINNET), reference::ethereum(), reference::solana()]);
+        let program = bs58::encode([2u8; 32]).into_string();
+        let solana = |pin: Value| {
+            let mut doc = policy_json(example_rule());
+            doc["chains"][reference::SOLANA_MAINNET] = serde_json::json!({
+                "profile_hash": crate::to_hex(&reference::solana().hash()), "contracts": [{"solana": pin}]
+            });
+            validate_policy(&doc.to_string(), &ps)
+        };
+        let code_hash = crate::to_hex(&[0xc5; 32]);
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash})).is_ok());
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "upgrade_authority": bs58::encode([3u8; 32]).into_string()})).is_ok());
+        assert!(solana(serde_json::json!({"program": program})).is_err(), "no code hash");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": "c5"})).is_err(), "short code hash");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "upgrade_authority": "0OIl"})).is_err(), "malformed authority");
+        assert!(solana(serde_json::json!({"program": program, "code_hash": code_hash, "loader": "BPFLoader2111111111111111111111111111111111"})).is_err(), "unknown field");
+        // One pin per contract: a second pin of the same program or address is rejected.
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::SOLANA_MAINNET] = serde_json::json!({
+            "profile_hash": crate::to_hex(&reference::solana().hash()),
+            "contracts": [{"solana": {"program": program, "code_hash": code_hash}}, {"solana": {"program": program, "code_hash": crate::to_hex(&[0xc6; 32])}}]
+        });
+        let twice = |doc: &Value| format!("{:?}", validate_policy(&doc.to_string(), &ps).unwrap_err()).contains("pinned twice");
+        assert!(twice(&doc), "program pinned twice");
+        // Base58 is case-sensitive: two program ids that differ only in case are two
+        // programs, two pins, and `pin_for` finds each by its exact id.
+        let alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let other_case = (0..program.len())
+            .find_map(|i| {
+                let c = program.as_bytes()[i] as char;
+                let swapped = if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() };
+                let candidate = format!("{}{swapped}{}", &program[..i], &program[i + 1..]);
+                (swapped != c && alphabet.contains(swapped) && crate::solana::parse_key(&candidate).is_some()).then_some(candidate)
+            })
+            .unwrap();
+        doc["chains"][reference::SOLANA_MAINNET]["contracts"][1]["solana"]["program"] = Value::String(other_case.clone());
+        let compiled = validate_policy(&doc.to_string(), &ps).unwrap();
+        let sol = ChainId::parse(reference::SOLANA_MAINNET).unwrap();
+        let program_of = |id: &str| match compiled.pin_for(&sol, id) {
+            Some(ContractPinSpec::Solana(p)) => Some((p.program.clone(), p.code_hash)),
+            _ => None,
+        };
+        assert_eq!(program_of(&program), Some((program.clone(), [0xc5; 32])));
+        assert_eq!(program_of(&other_case), Some((other_case.clone(), [0xc6; 32])));
+        let mut doc = policy_json(example_rule());
+        let evm = doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0].clone();
+        let mut upper = evm.clone();
+        upper["evm"]["address"] = Value::String(upper["evm"]["address"].as_str().unwrap().to_uppercase().replacen("0X", "0x", 1));
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"] = serde_json::json!([evm, upper]);
+        assert!(twice(&doc), "address pinned twice, in another case");
         // A profile that misses an obligatory item makes every policy naming the chain invalid.
         let mut broken = reference::ethereum();
         broken.refund = crate::profile::RefundMethod::None;

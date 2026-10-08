@@ -13,8 +13,15 @@ pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const ED25519_PROGRAM: &str = "Ed25519SigVerify111111111111111111111111111";
+/// The upgradeable BPF loader (loader v3). S7 accepts a program under this loader only.
+pub const BPF_LOADER_UPGRADEABLE: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
 
-/// PDA seed prefix of the reference HTLC escrow: `[b"htlc", swap_id]`.
+/// `UpgradeableLoaderState::size_of_programdata_metadata()`: the enum tag (4 bytes),
+/// the deployment slot (8) and the upgrade authority as `Option<Pubkey>` (1 + 32).
+/// The program bytes start after it.
+pub const PROGRAMDATA_HEADER_LEN: usize = 45;
+
+/// PDA seed prefix of the reference HTLC escrow: `[b"htlc", lock_id]` (spec 8.2).
 pub const ESCROW_SEED: &[u8] = b"htlc";
 
 /// The first 8 data bytes of a reference HTLC escrow account:
@@ -337,9 +344,12 @@ pub fn check_message(bytes: &[u8], tables: &LookupTables, intent: &SolanaIntent)
 // ---------------------------------------------------------------------------
 
 /// `mint` is all zero for native SOL. For a Token-2022 mint with a transfer fee,
-/// `amount` is the gross debit.
+/// `amount` is the gross debit. The data carries `swap_id` and the leg: the program
+/// derives `lock_id = sha256(swap_id ‖ leg ‖ sender)` from them and the signing
+/// sender, and requires the escrow account at `[b"htlc", lock_id]`.
 pub struct LockData {
     pub swap_id: Hash32,
+    pub leg: crate::types::LegName,
     pub receiver: Hash32,
     pub refund_to: Hash32,
     pub mint: Hash32,
@@ -352,6 +362,7 @@ impl LockData {
     pub fn encode(&self) -> Vec<u8> {
         let mut d = vec![0u8];
         d.extend(self.swap_id);
+        d.push(self.leg.lock_byte());
         d.extend(self.receiver);
         d.extend(self.refund_to);
         d.extend(self.mint);
@@ -362,16 +373,16 @@ impl LockData {
     }
 }
 
-pub fn claim_data(swap_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
+pub fn claim_data(lock_id: &Hash32, preimage: &Hash32) -> Vec<u8> {
     let mut d = vec![1u8];
-    d.extend(swap_id);
+    d.extend(lock_id);
     d.extend(preimage);
     d
 }
 
-pub fn refund_data(swap_id: &Hash32) -> Vec<u8> {
+pub fn refund_data(lock_id: &Hash32) -> Vec<u8> {
     let mut d = vec![2u8];
-    d.extend(swap_id);
+    d.extend(lock_id);
     d
 }
 
@@ -406,8 +417,8 @@ fn merge_duplicates(mut metas: Vec<AccountMeta>) -> Vec<AccountMeta> {
 /// writable), the escrow PDA (writable); for a token, the sender's and the escrow's
 /// associated token accounts (writable), the mint and the token program; then the
 /// System Program.
-pub fn lock_accounts(program: &Hash32, swap_id: &Hash32, sender: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
-    let escrow = escrow_address(program, swap_id)?;
+pub fn lock_accounts(program: &Hash32, lock_id: &Hash32, sender: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, lock_id)?;
     let mut v = vec![AccountMeta::signer_writable(*sender), AccountMeta::writable(escrow)];
     if let Some(t) = token {
         v.push(AccountMeta::writable(associated_token_address(sender, t)?));
@@ -424,8 +435,8 @@ pub fn lock_accounts(program: &Hash32, swap_id: &Hash32, sender: &Hash32, token:
 /// for a refund, writable). For a token, the payee's associated token account takes
 /// the payee's place, followed by the escrow's token account, the mint and the
 /// token program.
-pub fn spend_accounts(program: &Hash32, swap_id: &Hash32, caller: &Hash32, payee: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
-    let escrow = escrow_address(program, swap_id)?;
+pub fn spend_accounts(program: &Hash32, lock_id: &Hash32, caller: &Hash32, payee: &Hash32, token: Option<&TokenAccounts>) -> Option<Vec<AccountMeta>> {
+    let escrow = escrow_address(program, lock_id)?;
     let mut v = vec![AccountMeta::signer_writable(*caller), AccountMeta::writable(escrow)];
     match token {
         None => v.push(AccountMeta::writable(*payee)),
@@ -469,8 +480,59 @@ pub fn find_program_address(seeds: &[&[u8]], program: &Hash32) -> Option<(Hash32
     })
 }
 
-pub fn escrow_address(program: &Hash32, swap_id: &Hash32) -> Option<Hash32> {
-    find_program_address(&[ESCROW_SEED, swap_id], program).map(|(a, _)| a)
+/// The escrow PDA of the lock with key `lock_id`: seeds `[b"htlc", lock_id]`.
+pub fn escrow_address(program: &Hash32, lock_id: &Hash32) -> Option<Hash32> {
+    find_program_address(&[ESCROW_SEED, lock_id], program).map(|(a, _)| a)
+}
+
+/// The escrow token account of a token lock: the associated token account of the
+/// escrow PDA for the leg mint (implementation spec 4.6).
+pub fn escrow_token_address(program: &Hash32, lock_id: &Hash32, token: &TokenAccounts) -> Option<Hash32> {
+    escrow_address(program, lock_id).and_then(|e| associated_token_address(&e, token))
+}
+
+/// The ProgramData address of an upgradeable program: the loader PDA of the seed
+/// `[program]`.
+pub fn programdata_address(program: &Hash32) -> Option<Hash32> {
+    find_program_address(&[program], &key(BPF_LOADER_UPGRADEABLE)).map(|(a, _)| a)
+}
+
+/// The ProgramData address in the data of an upgradeable program account: the
+/// bincode `UpgradeableLoaderState::Program { programdata_address }`, tag 2 as a
+/// little-endian u32 and then 32 bytes. Bytes after them are ignored, as the loader
+/// ignores them. `None` for any other state.
+pub fn decode_program_account(data: &[u8]) -> Option<Hash32> {
+    if data.get(..4)? != [2, 0, 0, 0] {
+        return None;
+    }
+    data.get(4..36)?.try_into().ok()
+}
+
+/// The upgrade authority and the code hash of a ProgramData account: the bincode
+/// `UpgradeableLoaderState::ProgramData { slot, upgrade_authority_address }`, tag 3,
+/// the slot, then the option byte (0 none, 1 some) and the 32-byte key, then the
+/// program bytes from `PROGRAMDATA_HEADER_LEN`. After a 0 option byte the 32 key
+/// bytes can still hold an old authority; they are ignored. `None` for any other
+/// state or an option byte other than 0 or 1.
+pub fn decode_programdata(data: &[u8]) -> Option<(Option<Hash32>, Hash32)> {
+    if data.len() < PROGRAMDATA_HEADER_LEN || data[..4] != [3, 0, 0, 0] {
+        return None;
+    }
+    let authority = match data[12] {
+        0 => None,
+        1 => Some(data[13..PROGRAMDATA_HEADER_LEN].try_into().ok()?),
+        _ => return None,
+    };
+    Some((authority, code_hash(&data[PROGRAMDATA_HEADER_LEN..])))
+}
+
+/// The code hash of program bytes (spec 8.4): SHA-256 of the bytes without their
+/// trailing zero bytes. Over the bytes after the ProgramData header it is the value
+/// of `solana-verify get-program-hash`; over a built `.so` file, the value of
+/// `solana-verify get-executable-hash`.
+pub fn code_hash(program_bytes: &[u8]) -> Hash32 {
+    let end = program_bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    crate::sha256(&program_bytes[..end])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -478,6 +540,10 @@ pub fn escrow_address(program: &Hash32, swap_id: &Hash32) -> Option<Hash32> {
 pub struct ProgramPin {
     /// Base58 program id.
     pub program: String,
+    /// `code_hash` of the program bytes in its ProgramData account: the value of
+    /// `solana-verify get-program-hash`, as hex.
+    #[serde(with = "crate::enc::hex32")]
+    pub code_hash: Hash32,
     /// `None`: the program must be immutable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_authority: Option<String>,
@@ -493,15 +559,61 @@ pub struct EscrowAccount {
     pub discriminator: Option<[u8; 8]>,
 }
 
+/// The ProgramData account of an upgradeable program, as read from the chain and
+/// decoded by `decode_programdata`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramDataAccount {
+    /// The owner of the account (the loader).
+    pub owner: Hash32,
+    pub upgrade_authority: Option<Hash32>,
+    /// `code_hash` of the bytes after the header.
+    pub code_hash: Hash32,
+}
+
+/// A token account as read from the chain: the base layout that SPL Token and
+/// Token-2022 share.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenAccount {
+    /// The address that the account was read from.
+    pub address: Hash32,
+    /// The owner of the account (the token program).
+    pub program: Hash32,
+    pub mint: Hash32,
+    /// The owner field of the token account.
+    pub owner: Hash32,
+    /// The state is `Initialized` or `Frozen`. S27 reads whether it is frozen.
+    pub initialized: bool,
+}
+
+/// What a Solana escrow holds: native SOL in the escrow PDA, or a token in the
+/// escrow token account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscrowAsset {
+    Native,
+    /// The leg mint and the program that owns it, read from the chain (S9).
+    Token(TokenAccounts),
+}
+
 /// Observed facts about the program and the escrow account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramFacts {
     pub executable: bool,
-    pub upgrade_authority: Option<Hash32>,
+    /// The owner of the program account: the loader that runs the program.
+    pub loader: Hash32,
+    /// The ProgramData address in the program account data
+    /// (`decode_program_account`). `None`: the data is not a `Program` state.
+    pub programdata_address: Option<Hash32>,
+    /// The account at `programdata_address`. `None`: no account exists there, or its
+    /// data is not a `ProgramData` state (`decode_programdata`).
+    pub programdata: Option<ProgramDataAccount>,
     /// The address that the escrow account was read from.
     pub escrow_address: Hash32,
     /// The account at `escrow_address`. `None`: no account exists there.
     pub escrow: Option<EscrowAccount>,
+    /// A token leg: the account at `escrow_token_address`. `None`: no account exists
+    /// there, or it is not a token account of SPL Token or Token-2022. Not read for
+    /// a native leg.
+    pub escrow_token: Option<TokenAccount>,
 }
 
 impl ProgramFacts {
@@ -518,28 +630,65 @@ impl ProgramFacts {
             (None, true) => false,
         }
     }
+
+    /// The escrow token account of a token leg is in the state that the action
+    /// needs. Once the lock exists (`locked`), the account at `escrow_token_address`
+    /// is a token account of the leg's token program, with the leg mint and the
+    /// escrow PDA as owner. Before the own lock nothing is required: the lock
+    /// instruction creates or takes the account, and S24 binds its address. A native
+    /// leg has no escrow token account.
+    pub fn escrow_token_ready(&self, program: &Hash32, lock_id: &Hash32, asset: &EscrowAsset, locked: bool) -> bool {
+        let EscrowAsset::Token(token) = asset else {
+            return true;
+        };
+        if !locked {
+            return true;
+        }
+        let (Some(escrow), Some(t)) = (escrow_address(program, lock_id), &self.escrow_token) else {
+            return false;
+        };
+        escrow_token_address(program, lock_id, token) == Some(t.address)
+            && t.program == token.token_program
+            && t.mint == token.mint
+            && t.owner == escrow
+            && t.initialized
+    }
 }
 
 impl ProgramPin {
-    /// S7 for Solana: the program is pinned and executable, its upgrade authority
-    /// is none or the pinned account, and the escrow address is the expected PDA.
-    /// `locked`: the lock exists now; see `ProgramFacts::escrow_ready` for the
-    /// escrow account before and after the lock.
-    pub fn matches(&self, program: &Hash32, swap_id: &Hash32, facts: &ProgramFacts, locked: bool) -> bool {
+    /// The program id and the upgrade authority, if any, are base58 keys.
+    pub fn well_formed(&self) -> bool {
+        parse_key(&self.program).is_some() && self.upgrade_authority.as_deref().is_none_or(|a| parse_key(a).is_some())
+    }
+
+    /// S7 for Solana (spec 8.4): the program is pinned and executable under the
+    /// upgradeable loader. Its program account names the ProgramData PDA, which the
+    /// loader owns; the upgrade authority there is none or the pinned account, and
+    /// the code hash is the pinned hash. The escrow address is the expected PDA,
+    /// and the escrow account (`ProgramFacts::escrow_ready`) and, for a token leg,
+    /// the escrow token account (`ProgramFacts::escrow_token_ready`) are in the state
+    /// that the action needs. `locked`: the lock exists now.
+    pub fn matches(&self, program: &Hash32, lock_id: &Hash32, asset: &EscrowAsset, facts: &ProgramFacts, locked: bool) -> bool {
         let Some(pinned) = parse_key(&self.program) else {
             return false;
         };
-        let authority_ok = match (&self.upgrade_authority, facts.upgrade_authority) {
-            (_, None) => true,
-            (Some(a), Some(actual)) => parse_key(a) == Some(actual),
-            (None, Some(_)) => false,
-        };
-        let escrow_ok = facts.escrow_ready(program, locked);
+        let loader = key(BPF_LOADER_UPGRADEABLE);
+        let programdata_ok = facts.programdata.as_ref().is_some_and(|d| {
+            let authority_ok = match (&self.upgrade_authority, d.upgrade_authority) {
+                (_, None) => true,
+                (Some(a), Some(actual)) => parse_key(a) == Some(actual),
+                (None, Some(_)) => false,
+            };
+            d.owner == loader && d.code_hash == self.code_hash && authority_ok
+        });
         &pinned == program
             && facts.executable
-            && authority_ok
-            && escrow_ok
-            && escrow_address(program, swap_id) == Some(facts.escrow_address)
+            && facts.loader == loader
+            && programdata_address(program).is_some_and(|a| facts.programdata_address == Some(a))
+            && programdata_ok
+            && facts.escrow_ready(program, locked)
+            && escrow_address(program, lock_id) == Some(facts.escrow_address)
+            && facts.escrow_token_ready(program, lock_id, asset, locked)
     }
 }
 
@@ -760,25 +909,134 @@ pub(crate) mod tests {
             let (theirs, _) = Pubkey::find_program_address(&[ESCROW_SEED, &id], &Pubkey::new_from_array(HTLC));
             assert_eq!(escrow_address(&HTLC, &id), Some(theirs.to_bytes()));
         }
+        // The ProgramData PDA of the upgradeable loader.
+        let loader = Pubkey::new_from_array(key(BPF_LOADER_UPGRADEABLE));
+        assert_eq!(loader.to_string(), BPF_LOADER_UPGRADEABLE);
+        for program in [HTLC, wallet] {
+            let (theirs, _) = Pubkey::find_program_address(&[&program], &loader);
+            assert_eq!(programdata_address(&program), Some(theirs.to_bytes()));
+        }
+    }
+
+    /// Program bytes of a test HTLC: an ELF prefix and trailing zero bytes, as in a
+    /// ProgramData account with spare room.
+    pub(crate) const HTLC_CODE: &[u8] = b"\x7fELF\x02\x01\x01\x00reference htlc\x00\x00\x00";
+
+    pub(crate) fn htlc_pin(program: &Hash32) -> ProgramPin {
+        ProgramPin { program: bs58::encode(program).into_string(), code_hash: code_hash(HTLC_CODE), upgrade_authority: None }
+    }
+
+    /// Facts of an immutable program under the upgradeable loader with `HTLC_CODE`.
+    pub(crate) fn htlc_facts(program: &Hash32, lock_id: &Hash32, escrow: Option<EscrowAccount>) -> ProgramFacts {
+        let loader = key(BPF_LOADER_UPGRADEABLE);
+        ProgramFacts {
+            executable: true,
+            loader,
+            programdata_address: programdata_address(program),
+            programdata: Some(ProgramDataAccount { owner: loader, upgrade_authority: None, code_hash: code_hash(HTLC_CODE) }),
+            escrow_address: escrow_address(program, lock_id).unwrap(),
+            escrow,
+            escrow_token: None,
+        }
+    }
+
+    pub(crate) fn locked_escrow(program: &Hash32) -> EscrowAccount {
+        EscrowAccount { owner: *program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) }
+    }
+
+    /// Spec 3.2 and 8.2: the reference lock data carries `swap_id` and the leg byte
+    /// after the tag, in the order of the EVM ABI; claim and refund carry `lock_id`.
+    #[test]
+    fn htlc_data_layout() {
+        use crate::types::LegName;
+        let d = LockData { swap_id: [1; 32], leg: LegName::A, receiver: [2; 32], refund_to: [3; 32], mint: [0; 32], amount: 5, hashlock: [4; 32], timelock: 6 }.encode();
+        assert_eq!(d.len(), 1 + 32 + 1 + 32 * 3 + 8 + 32 + 8);
+        assert_eq!((d[0], &d[1..33], d[33], &d[34..66]), (0, &[1u8; 32][..], 0x41, &[2u8; 32][..]));
+        assert_eq!(&claim_data(&[7; 32], &[8; 32])[1..33], &[7; 32]);
+        assert_eq!(refund_data(&[7; 32]), [&[2u8][..], &[7; 32]].concat());
     }
 
     #[test]
     fn program_pins() {
-        let program = key(TOKEN_PROGRAM);
-        let pin = ProgramPin { program: TOKEN_PROGRAM.into(), upgrade_authority: None };
-        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
-        let facts = ProgramFacts {
-            executable: true,
-            upgrade_authority: None,
-            escrow_address: escrow_address(&program, &[7; 32]).unwrap(),
-            escrow: Some(escrow.clone()),
-        };
-        assert!(pin.matches(&program, &[7; 32], &facts, true));
-        assert!(!pin.matches(&program, &[8; 32], &facts, true), "escrow of another swap");
-        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { upgrade_authority: Some([1; 32]), ..facts.clone() }, true), "upgradeable");
-        let foreign = EscrowAccount { owner: [3; 32], ..escrow.clone() };
-        assert!(!pin.matches(&program, &[7; 32], &ProgramFacts { escrow: Some(foreign), ..facts.clone() }, true), "foreign owner");
-        assert!(!pin.matches(&key(ATA_PROGRAM), &[7; 32], &facts, true), "other program");
+        let program = HTLC;
+        let pin = htlc_pin(&program);
+        let facts = htlc_facts(&program, &[7; 32], Some(locked_escrow(&program)));
+        let native = EscrowAsset::Native;
+        let ok = |f: &ProgramFacts| pin.matches(&program, &[7; 32], &native, f, true);
+        assert!(ok(&facts));
+        assert!(!pin.matches(&program, &[8; 32], &native, &facts, true), "escrow of another swap");
+        assert!(!pin.matches(&[3; 32], &[7; 32], &native, &facts, true), "other program");
+        let foreign = EscrowAccount { owner: [3; 32], ..locked_escrow(&program) };
+        assert!(!ok(&ProgramFacts { escrow: Some(foreign), ..facts.clone() }), "foreign escrow owner");
+        assert!(!ok(&ProgramFacts { executable: false, ..facts.clone() }), "not executable");
+        let data = facts.programdata.clone().unwrap();
+        let with_data = |d: ProgramDataAccount| ProgramFacts { programdata: Some(d), ..facts.clone() };
+        assert!(!ok(&with_data(ProgramDataAccount { upgrade_authority: Some([1; 32]), ..data.clone() })), "upgradeable");
+        assert!(!ok(&with_data(ProgramDataAccount { code_hash: code_hash(b"\x7fELF other"), ..data.clone() })), "other code");
+        assert!(!ok(&with_data(ProgramDataAccount { owner: [3; 32], ..data.clone() })), "ProgramData of another owner");
+        assert!(!ok(&ProgramFacts { programdata: None, ..facts.clone() }), "no ProgramData account");
+        // The pinned authority may upgrade; an immutable program also passes that pin.
+        let pinned = ProgramPin { upgrade_authority: Some(bs58::encode([1u8; 32]).into_string()), ..pin.clone() };
+        let upgradeable = with_data(ProgramDataAccount { upgrade_authority: Some([1; 32]), ..data.clone() });
+        assert!(pinned.matches(&program, &[7; 32], &native, &upgradeable, true));
+        assert!(pinned.matches(&program, &[7; 32], &native, &facts, true));
+        let other = with_data(ProgramDataAccount { upgrade_authority: Some([4; 32]), ..data });
+        assert!(!pinned.matches(&program, &[7; 32], &native, &other, true), "another authority");
+    }
+
+    /// Spec 8.4 Solana (G21): only the upgradeable loader, with the program account
+    /// naming the ProgramData PDA of the program.
+    #[test]
+    fn program_loader() {
+        let program = HTLC;
+        let pin = htlc_pin(&program);
+        let facts = htlc_facts(&program, &[7; 32], Some(locked_escrow(&program)));
+        let ok = |f: &ProgramFacts| pin.matches(&program, &[7; 32], &EscrowAsset::Native, f, true);
+        assert!(ok(&facts));
+        for loader in ["BPFLoader2111111111111111111111111111111111", "BPFLoader1111111111111111111111111111111111", "LoaderV411111111111111111111111111111111111", "NativeLoader1111111111111111111111111111111"] {
+            assert!(!ok(&ProgramFacts { loader: key(loader), ..facts.clone() }), "{loader}");
+        }
+        assert!(!ok(&ProgramFacts { programdata_address: None, ..facts.clone() }), "program account is not a Program state");
+        let other = programdata_address(&[3; 32]);
+        assert!(!ok(&ProgramFacts { programdata_address: other, ..facts.clone() }), "ProgramData of another program");
+    }
+
+    /// Spec 8.4 Solana (G21): once a token lock exists, the escrow token account is
+    /// the escrow PDA's account for the leg mint under the leg's token program.
+    #[test]
+    fn escrow_token_account() {
+        let program = HTLC;
+        let pin = htlc_pin(&program);
+        let usdc = TokenAccounts { mint: [0x0c; 32], token_program: key(TOKEN_PROGRAM) };
+        let token = EscrowAsset::Token(usdc);
+        let escrow = escrow_address(&program, &[7; 32]).unwrap();
+        let account = TokenAccount { address: escrow_token_address(&program, &[7; 32], &usdc).unwrap(), program: usdc.token_program, mint: usdc.mint, owner: escrow, initialized: true };
+        assert_eq!(account.address, associated_token_address(&escrow, &usdc).unwrap());
+        let facts = |t: Option<TokenAccount>| ProgramFacts { escrow_token: t, ..htlc_facts(&program, &[7; 32], Some(locked_escrow(&program))) };
+        assert!(pin.matches(&program, &[7; 32], &token, &facts(Some(account.clone())), true));
+        let t22 = TokenAccounts { token_program: key(TOKEN_2022_PROGRAM), ..usdc };
+        let bad = [
+            ("no account", None),
+            ("other address", Some(TokenAccount { address: associated_token_address(&[9; 32], &usdc).unwrap(), ..account.clone() })),
+            ("other token program", Some(TokenAccount { program: key(TOKEN_2022_PROGRAM), ..account.clone() })),
+            ("account of the other token program", Some(TokenAccount { address: associated_token_address(&escrow, &t22).unwrap(), program: t22.token_program, ..account.clone() })),
+            ("other mint", Some(TokenAccount { mint: [0x0d; 32], ..account.clone() })),
+            ("other owner", Some(TokenAccount { owner: [9; 32], ..account.clone() })),
+            ("uninitialized", Some(TokenAccount { initialized: false, ..account.clone() })),
+        ];
+        for (name, t) in bad {
+            assert!(!pin.matches(&program, &[7; 32], &token, &facts(t), true), "{name}");
+        }
+        // A Token-2022 mint: the escrow account for that mint under Token-2022 passes.
+        let t22_account = TokenAccount { address: escrow_token_address(&program, &[7; 32], &t22).unwrap(), program: t22.token_program, ..account.clone() };
+        assert!(pin.matches(&program, &[7; 32], &EscrowAsset::Token(t22), &facts(Some(t22_account)), true));
+        // The escrow of another swap has another token account.
+        assert!(!facts(Some(account.clone())).escrow_token_ready(&program, &[8; 32], &token, true), "another swap");
+        // A native leg has none; before the own lock nothing is read.
+        assert!(pin.matches(&program, &[7; 32], &EscrowAsset::Native, &facts(None), true));
+        let before = |t: Option<TokenAccount>| ProgramFacts { escrow: None, ..facts(t) };
+        assert!(pin.matches(&program, &[7; 32], &token, &before(None), false));
+        assert!(pin.matches(&program, &[7; 32], &token, &before(Some(TokenAccount { owner: [9; 32], ..account })), false));
     }
 
     /// Spec 8.4 Solana (D3): a lock that exists has a program-owned escrow with the
@@ -786,38 +1044,114 @@ pub(crate) mod tests {
     /// or only lamports.
     #[test]
     fn escrow_account_state() {
-        let program = key(TOKEN_PROGRAM);
-        let pin = ProgramPin { program: TOKEN_PROGRAM.into(), upgrade_authority: None };
-        let escrow = EscrowAccount { owner: program, data_len: 113, discriminator: Some(ESCROW_DISCRIMINATOR) };
-        let facts = ProgramFacts {
-            executable: true,
-            upgrade_authority: None,
-            escrow_address: escrow_address(&program, &[7; 32]).unwrap(),
-            escrow: Some(escrow.clone()),
-        };
+        let program = HTLC;
+        let pin = htlc_pin(&program);
+        let escrow = locked_escrow(&program);
+        let facts = htlc_facts(&program, &[7; 32], Some(escrow.clone()));
         let with = |e: Option<EscrowAccount>| ProgramFacts { escrow: e, ..facts.clone() };
+        let m = |swap_id: &Hash32, f: &ProgramFacts, locked: bool| pin.matches(&program, swap_id, &EscrowAsset::Native, f, locked);
         // A lock that exists.
-        assert!(pin.matches(&program, &[7; 32], &facts, true));
+        assert!(m(&[7; 32], &facts, true));
         let other = EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(other)), true), "another account type");
+        assert!(!m(&[7; 32], &with(Some(other)), true), "another account type");
         let closed = EscrowAccount { discriminator: Some([0xff; 8]), ..escrow.clone() };
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(closed)), true), "closed account");
+        assert!(!m(&[7; 32], &with(Some(closed)), true), "closed account");
         let short = EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(short)), true), "data shorter than 8 bytes");
-        assert!(!pin.matches(&program, &[7; 32], &with(None), true), "no escrow account");
+        assert!(!m(&[7; 32], &with(Some(short)), true), "data shorter than 8 bytes");
+        assert!(!m(&[7; 32], &with(None), true), "no escrow account");
         // Before the own lock.
-        assert!(pin.matches(&program, &[7; 32], &with(None), false));
-        assert!(!pin.matches(&program, &[7; 32], &facts, false), "escrow exists before the lock");
+        assert!(m(&[7; 32], &with(None), false));
+        assert!(!m(&[7; 32], &facts, false), "escrow exists before the lock");
         let funded = EscrowAccount { owner: key(SYSTEM_PROGRAM), data_len: 0, discriminator: None };
-        assert!(pin.matches(&program, &[7; 32], &with(Some(funded.clone())), false), "lamports only: the lock can take it");
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(funded.clone())), true), "lamports only is not a lock");
+        assert!(m(&[7; 32], &with(Some(funded.clone())), false), "lamports only: the lock can take it");
+        assert!(!m(&[7; 32], &with(Some(funded.clone())), true), "lamports only is not a lock");
         let allocated = EscrowAccount { data_len: 1, ..funded.clone() };
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(allocated)), false), "System-owned account with data");
+        assert!(!m(&[7; 32], &with(Some(allocated)), false), "System-owned account with data");
         let foreign = EscrowAccount { owner: [3; 32], ..funded };
-        assert!(!pin.matches(&program, &[7; 32], &with(Some(foreign)), false), "account of another owner");
-        assert!(!pin.matches(&program, &[8; 32], &with(None), false), "address of another swap");
-        let upgradeable = ProgramFacts { upgrade_authority: Some([1; 32]), ..with(None) };
-        assert!(!pin.matches(&program, &[7; 32], &upgradeable, false), "program checks still apply");
+        assert!(!m(&[7; 32], &with(Some(foreign)), false), "account of another owner");
+        assert!(!m(&[8; 32], &with(None), false), "address of another swap");
+        let mut upgradeable = with(None);
+        upgradeable.programdata.as_mut().unwrap().upgrade_authority = Some([1; 32]);
+        assert!(!m(&[7; 32], &upgradeable, false), "program checks still apply");
+        assert!(!m(&[7; 32], &ProgramFacts { loader: [3; 32], ..with(None) }, false), "loader checks still apply");
+    }
+
+    /// Spec 8.4 Solana (G21): the loader account layouts and the code hash, which
+    /// `solana-verify` computes as SHA-256 of the program bytes without trailing zeros.
+    #[test]
+    fn upgradeable_loader_decoders() {
+        // sha256("abc"), FIPS 180-2.
+        let abc = crate::from_hex_array::<32>("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap();
+        assert_eq!(code_hash(b"abc"), abc);
+        assert_eq!(code_hash(b"abc\0\0\0"), abc, "trailing zeros are padding");
+        assert_ne!(code_hash(b"a\0bc"), code_hash(b"abc"), "inner zeros count");
+        assert_eq!(code_hash(&[0; 9]), crate::sha256(b""));
+        // Program account: tag 2 and the ProgramData address.
+        let mut program_account = vec![2, 0, 0, 0];
+        program_account.extend([5u8; 32]);
+        assert_eq!(decode_program_account(&program_account), Some([5; 32]));
+        let mut longer = program_account.clone();
+        longer.push(0);
+        assert_eq!(decode_program_account(&longer), Some([5; 32]), "bytes after the state are ignored");
+        assert_eq!(decode_program_account(&program_account[..35]), None);
+        for tag in [[0, 0, 0, 0], [1, 0, 0, 0], [3, 0, 0, 0], [2, 0, 0, 1]] {
+            let mut d = program_account.clone();
+            d[..4].copy_from_slice(&tag);
+            assert_eq!(decode_program_account(&d), None, "{tag:?}");
+        }
+        // ProgramData: tag 3, slot, authority option, program bytes from offset 45.
+        let header = |option: u8, key: [u8; 32]| {
+            let mut d = vec![3, 0, 0, 0];
+            d.extend(300_000_000u64.to_le_bytes());
+            d.push(option);
+            d.extend(key);
+            d
+        };
+        let with_code = |mut d: Vec<u8>| {
+            d.extend(HTLC_CODE);
+            d.extend([0u8; 64]);
+            d
+        };
+        assert_eq!(header(0, [0; 32]).len(), PROGRAMDATA_HEADER_LEN);
+        assert_eq!(decode_programdata(&with_code(header(1, [6; 32]))), Some((Some([6; 32]), code_hash(HTLC_CODE))));
+        assert_eq!(decode_programdata(&with_code(header(0, [6; 32]))), Some((None, code_hash(HTLC_CODE))), "stale key after none");
+        assert_eq!(decode_programdata(&header(0, [0; 32])), Some((None, crate::sha256(b""))));
+        assert_eq!(decode_programdata(&with_code(header(2, [6; 32]))), None, "bad option byte");
+        assert_eq!(decode_programdata(&header(1, [6; 32])[..44]), None, "short header");
+        // The tag is a 4-byte little-endian u32: every byte counts.
+        for i in 1..4 {
+            let mut tagged = with_code(header(1, [6; 32]));
+            tagged[i] = 1;
+            assert_eq!(decode_programdata(&tagged), None, "tag byte {i}");
+        }
+        let mut buffer = with_code(header(1, [6; 32]));
+        buffer[0] = 1;
+        assert_eq!(decode_programdata(&buffer), None, "a Buffer state");
+        assert_eq!(decode_programdata(&program_account), None);
+    }
+
+    /// Cross-check of the loader layouts against the Solana SDK (bincode
+    /// `UpgradeableLoaderState`).
+    #[test]
+    fn upgradeable_loader_matches_solana_sdk() {
+        use solana_loader_v3_interface::state::UpgradeableLoaderState;
+        use solana_pubkey::Pubkey;
+        assert_eq!(UpgradeableLoaderState::size_of_programdata_metadata(), PROGRAMDATA_HEADER_LEN);
+        assert_eq!(solana_sdk_ids::bpf_loader_upgradeable::id().to_bytes(), key(BPF_LOADER_UPGRADEABLE));
+        let program = UpgradeableLoaderState::Program { programdata_address: Pubkey::new_from_array([5; 32]) };
+        assert_eq!(decode_program_account(&bincode::serialize(&program).unwrap()), Some([5; 32]));
+        for authority in [None, Some(Pubkey::new_from_array([6; 32]))] {
+            let state = UpgradeableLoaderState::ProgramData { slot: 300_000_000, upgrade_authority_address: authority };
+            let mut data = vec![0u8; PROGRAMDATA_HEADER_LEN];
+            bincode::serialize_into(&mut data[..], &state).unwrap();
+            data.extend(HTLC_CODE);
+            assert_eq!(decode_programdata(&data), Some((authority.map(|a| a.to_bytes()), code_hash(HTLC_CODE))));
+        }
+        let buffer = UpgradeableLoaderState::Buffer { authority_address: Some(Pubkey::new_from_array([6; 32])) };
+        let mut data = vec![0u8; PROGRAMDATA_HEADER_LEN];
+        bincode::serialize_into(&mut data[..], &buffer).unwrap();
+        assert_eq!(decode_programdata(&data), None);
+        assert_eq!(decode_program_account(&data), None);
     }
 
     #[test]

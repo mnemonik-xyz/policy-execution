@@ -2743,6 +2743,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2916,6 +2926,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-instruction"
+version = "2.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bab5682934bd1f65f8d2c16f21cb532526fcc1a09f796e2cacdb091eee5774ad"
+dependencies = [
+ "getrandom 0.2.17",
+ "js-sys",
+ "num-traits",
+ "solana-define-syscall",
+ "solana-pubkey",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "solana-loader-v3-interface"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f7162a05b8b0773156b443bccd674ea78bb9aa406325b467ea78c06c99a63a2"
+dependencies = [
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "solana-instruction",
+ "solana-pubkey",
+ "solana-sdk-ids",
+]
+
+[[package]]
 name = "solana-pubkey"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2927,6 +2965,8 @@ dependencies = [
  "getrandom 0.2.17",
  "js-sys",
  "num-traits",
+ "serde",
+ "serde_derive",
  "solana-atomic-u64",
  "solana-decode-error",
  "solana-define-syscall",
@@ -2940,6 +2980,15 @@ name = "solana-sanitize"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61f1bc1357b8188d9c4a3af3fc55276e56987265eb7ad073ae6f8180ee54cecf"
+
+[[package]]
+name = "solana-sdk-ids"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c5d8b9cc68d5c88b062a33e23a6466722467dde0035152d8fb1afbcdf350a5f"
+dependencies = [
+ "solana-pubkey",
+]
 
 [[package]]
 name = "solana-sha256-hasher"
@@ -3475,6 +3524,7 @@ dependencies = [
 name = "warrant-swap-core"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "bitcoin",
  "blake3",
  "bs58",
@@ -3485,7 +3535,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "solana-loader-v3-interface",
  "solana-pubkey",
+ "solana-sdk-ids",
  "warrant-swap-verified",
  "zeroize",
 ]

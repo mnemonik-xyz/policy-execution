@@ -7,7 +7,7 @@ use crate::caip::Family;
 use crate::evm::{self, EvmIntent, LockCall};
 use crate::facts::TransferFee;
 use crate::solana::{self, LockData, LookupTables, SolanaIntent, SolanaMode, TokenAccounts};
-use crate::types::{Action, Leg, TimelockSpec};
+use crate::types::{Action, Leg, LegName, TimelockSpec};
 use crate::warrant::TxBinding;
 use crate::Hash32;
 
@@ -26,7 +26,9 @@ pub enum ProposedTx {
 /// The signer's own accounts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnAccounts {
-    /// CAIP-10 accounts that receive claims and refunds (S5, S6).
+    /// CAIP-10 accounts that receive claims and refunds (S5, S6). On EVM and Solana
+    /// the own leg's `sender`, which funds the own lock and so keys it (S10), is one
+    /// of them.
     pub accounts: Vec<crate::caip::AccountId>,
     /// Own Taproot `scriptPubKey`s: inputs and change on Bitcoin.
     pub bitcoin_scripts: Vec<Vec<u8>>,
@@ -81,8 +83,11 @@ pub fn gross_debit(leg: &Leg, fee: Option<&TransferFee>) -> Result<u128, String>
     }
 }
 
-/// Check `tx` against the intent of `action` on `leg` and return the binding.
-pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: &BindContext) -> Result<TxBinding, String> {
+/// Check `tx` against the intent of `action` on `leg`, which is leg `which` of the
+/// terms, and return the binding. A lock names its leg (the contract derives
+/// `lock_id` from `swap_id`, the leg and the sender); a claim or a refund names the
+/// lock by `lock_id`.
+pub fn bind(action: Action, which: LegName, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: &BindContext) -> Result<TxBinding, String> {
     let family = leg.chain.family().ok_or("unsupported chain")?;
     let lock = &leg.lock;
     let preimage = || ctx.preimage.ok_or_else(|| "a claim needs the preimage".to_string());
@@ -124,6 +129,7 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                     };
                     let call = LockCall {
                         swap_id: lock.swap_id,
+                        leg: which,
                         receiver: evm_addr(&leg.receiver)?,
                         refund_to: evm_addr(&leg.refund_to)?,
                         token,
@@ -134,9 +140,9 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                     intents.push(EvmIntent { chain_id, to: htlc, value, data: call.calldata() });
                 }
                 Action::Reveal | Action::Claim => {
-                    intents.push(EvmIntent { chain_id, to: htlc, value: 0, data: evm::claim_calldata(&lock.swap_id, &preimage()?) })
+                    intents.push(EvmIntent { chain_id, to: htlc, value: 0, data: evm::claim_calldata(&lock.lock_id, &preimage()?) })
                 }
-                Action::Refund => intents.push(EvmIntent { chain_id, to: htlc, value: 0, data: evm::refund_calldata(&lock.swap_id) }),
+                Action::Refund => intents.push(EvmIntent { chain_id, to: htlc, value: 0, data: evm::refund_calldata(&lock.lock_id) }),
                 Action::Accept => return Err("accept has no transaction".into()),
             }
             if txs.len() != intents.len() {
@@ -147,7 +153,9 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                 .zip(&intents)
                 .map(|(tx, intent)| evm::check_tx(tx, intent).map_err(|e| e.to_string()))
                 .collect::<Result<_, _>>()?;
-            Ok(TxBinding::Evm { signing_hashes })
+            // The contract keys a lock by `msg.sender`: the leg's sender must sign it.
+            let signer = if action == Action::Lock { Some(evm_addr(&leg.sender)?) } else { None };
+            Ok(TxBinding::Evm { signing_hashes, signer })
         }
         (Family::Solana, ProposedTx::Solana { message }) => {
             let program = solana::parse_key(&lock.contract).ok_or("bad HTLC program id")?;
@@ -163,9 +171,9 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                 Some(TokenAccounts { mint, token_program })
             };
             let accounts = match action {
-                Action::Lock => solana::lock_accounts(&program, &lock.swap_id, &sol_key(&leg.sender)?, token.as_ref()),
-                Action::Reveal | Action::Claim => solana::spend_accounts(&program, &lock.swap_id, &fee_payer, &sol_key(&leg.receiver)?, token.as_ref()),
-                Action::Refund => solana::spend_accounts(&program, &lock.swap_id, &fee_payer, &sol_key(&leg.refund_to)?, token.as_ref()),
+                Action::Lock => solana::lock_accounts(&program, &lock.lock_id, &sol_key(&leg.sender)?, token.as_ref()),
+                Action::Reveal | Action::Claim => solana::spend_accounts(&program, &lock.lock_id, &fee_payer, &sol_key(&leg.receiver)?, token.as_ref()),
+                Action::Refund => solana::spend_accounts(&program, &lock.lock_id, &fee_payer, &sol_key(&leg.refund_to)?, token.as_ref()),
                 Action::Accept => return Err("accept has no transaction".into()),
             }
             .ok_or("no escrow or token account address")?;
@@ -175,6 +183,7 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                     let mint = token.map_or([0; 32], |t| t.mint);
                     LockData {
                         swap_id: lock.swap_id,
+                        leg: which,
                         receiver: sol_key(&leg.receiver)?,
                         refund_to: sol_key(&leg.refund_to)?,
                         mint,
@@ -184,8 +193,8 @@ pub fn bind(action: Action, leg: &Leg, tx: &ProposedTx, own: &OwnAccounts, ctx: 
                     }
                     .encode()
                 }
-                Action::Reveal | Action::Claim => solana::claim_data(&lock.swap_id, &preimage()?),
-                Action::Refund => solana::refund_data(&lock.swap_id),
+                Action::Reveal | Action::Claim => solana::claim_data(&lock.lock_id, &preimage()?),
+                Action::Refund => solana::refund_data(&lock.lock_id),
                 Action::Accept => return Err("accept has no transaction".into()),
             };
             let intent = SolanaIntent { htlc_program: program, htlc_data, htlc_accounts: accounts, fee_payer, mode: ctx.solana_mode.clone() };
@@ -211,6 +220,10 @@ mod tests {
     const SENDER: Hash32 = [3; 32];
     const RECEIVER: Hash32 = [4; 32];
     const SWAP: Hash32 = [7; 32];
+    /// The `lock_id` of the test leg: a leg B whose sender is `SENDER`.
+    fn lock_key() -> Hash32 {
+        crate::types::lock_id(&SWAP, LegName::B, &SENDER)
+    }
 
     fn b58(k: &Hash32) -> String {
         bs58::encode(k).into_string()
@@ -232,7 +245,9 @@ mod tests {
                 preimage_len: 32,
                 timelock: TimelockSpec::Time(1_900_000_000),
                 swap_id: SWAP,
-                keys: None,
+                lock_id: lock_key(),
+                claim_key: None,
+                refund_key: None,
             },
         }
     }
@@ -250,30 +265,35 @@ mod tests {
 
     #[test]
     fn solana_refund_pays_refund_to_only() {
-        let escrow = solana::escrow_address(&PROGRAM, &SWAP).unwrap();
+        let escrow = solana::escrow_address(&PROGRAM, &lock_key()).unwrap();
         let keys = [PAYER, PROGRAM, escrow, SENDER, RECEIVER, solana::key(solana::SYSTEM_PROGRAM)];
         let ctx = BindContext::default();
+        let refund = message(&keys, vec![0, 2, 3], solana::refund_data(&lock_key()), 1);
+        assert!(bind(Action::Refund, LegName::B, &leg(SOL), &refund, &own(), &ctx).is_ok());
+        let theft = message(&keys, vec![0, 2, 4], solana::refund_data(&lock_key()), 1);
+        assert!(bind(Action::Refund, LegName::B, &leg(SOL), &theft, &own(), &ctx).is_err());
+        // A refund keyed by swap_id names another escrow and other data: version 0.2.
+        let old = solana::escrow_address(&PROGRAM, &SWAP).unwrap();
+        let keys = [PAYER, PROGRAM, old, SENDER, RECEIVER, solana::key(solana::SYSTEM_PROGRAM)];
         let refund = message(&keys, vec![0, 2, 3], solana::refund_data(&SWAP), 1);
-        assert!(bind(Action::Refund, &leg(SOL), &refund, &own(), &ctx).is_ok());
-        let theft = message(&keys, vec![0, 2, 4], solana::refund_data(&SWAP), 1);
-        assert!(bind(Action::Refund, &leg(SOL), &theft, &own(), &ctx).is_err());
+        assert!(bind(Action::Refund, LegName::B, &leg(SOL), &refund, &own(), &ctx).is_err());
     }
 
     #[test]
     fn solana_token_claim_needs_the_observed_token_program() {
         let token = TokenAccounts { mint: AssetId::parse(USDC).unwrap().spl_mint().unwrap(), token_program: solana::key(solana::TOKEN_PROGRAM) };
-        let escrow = solana::escrow_address(&PROGRAM, &SWAP).unwrap();
+        let escrow = solana::escrow_address(&PROGRAM, &lock_key()).unwrap();
         let ata = |owner: &Hash32| solana::associated_token_address(owner, &token).unwrap();
         let keys = [PAYER, PROGRAM, escrow, ata(&RECEIVER), ata(&escrow), token.mint, token.token_program];
         let preimage = [0x22; 32];
-        let claim = message(&keys, vec![0, 2, 3, 4, 5, 6], solana::claim_data(&SWAP, &preimage), 2);
+        let claim = message(&keys, vec![0, 2, 3, 4, 5, 6], solana::claim_data(&lock_key(), &preimage), 2);
         let mut ctx = BindContext { preimage: Some(preimage), ..Default::default() };
-        assert!(bind(Action::Claim, &leg(USDC), &claim, &own(), &ctx).is_err(), "token program not observed");
+        assert!(bind(Action::Claim, LegName::B, &leg(USDC), &claim, &own(), &ctx).is_err(), "token program not observed");
         ctx.token_program = Some(token.token_program);
-        assert!(bind(Action::Claim, &leg(USDC), &claim, &own(), &ctx).is_ok());
+        assert!(bind(Action::Claim, LegName::B, &leg(USDC), &claim, &own(), &ctx).is_ok());
         ctx.token_program = Some(solana::key(solana::TOKEN_2022_PROGRAM));
-        assert!(bind(Action::Claim, &leg(USDC), &claim, &own(), &ctx).is_err(), "accounts of another token program");
+        assert!(bind(Action::Claim, LegName::B, &leg(USDC), &claim, &own(), &ctx).is_err(), "accounts of another token program");
         ctx.token_program = Some([0x0e; 32]);
-        assert!(bind(Action::Claim, &leg(USDC), &claim, &own(), &ctx).is_err(), "not a token program");
+        assert!(bind(Action::Claim, LegName::B, &leg(USDC), &claim, &own(), &ctx).is_err(), "not a token program");
     }
 }

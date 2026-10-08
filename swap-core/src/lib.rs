@@ -117,6 +117,24 @@ pub mod enc {
         }
     }
 
+    pub mod hex20_opt {
+        use super::*;
+        pub fn serialize<S: Serializer>(v: &Option<[u8; 20]>, s: S) -> Result<S::Ok, S::Error> {
+            match v {
+                Some(v) => s.serialize_str(&crate::to_hex(v)),
+                None => s.serialize_none(),
+            }
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 20]>, D::Error> {
+            match Option::<String>::deserialize(d)? {
+                Some(text) => crate::from_hex_array(&text)
+                    .map(Some)
+                    .ok_or_else(|| D::Error::custom("expected 20 bytes of hex")),
+                None => Ok(None),
+            }
+        }
+    }
+
     pub mod hex32_vec {
         use super::*;
         use serde::ser::SerializeSeq;

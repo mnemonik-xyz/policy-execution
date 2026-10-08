@@ -229,10 +229,17 @@ fn solana_facts(c: &mut Collected, leg: &Leg, ctx: &mut BindContext) {
         return;
     }
     ctx.lookup_tables = lookup_tables(c, leg);
-    if !leg.asset.is_native() {
-        let env = c.env;
-        ctx.token_program = c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program);
+    ctx.token_program = solana_token_program(c, leg);
+}
+
+/// The program that owns the mint of a Solana token leg, read from the chain (S9).
+/// `None` on other chains and for the native coin.
+fn solana_token_program(c: &mut Collected, leg: &Leg) -> Option<Hash32> {
+    if leg.chain.family() != Some(Family::Solana) || leg.asset.is_native() {
+        return None;
     }
+    let env = c.env;
+    c.resolve(&format!("asset:{}", leg.asset), env.obs.assets.get(&leg.asset)).and_then(|a| a.token_program)
 }
 
 /// S27 for one own payee, from the receiver facts that the signer observed.
@@ -383,7 +390,8 @@ fn observed_leg(c: &mut Collected, leg_name: LegName, leg: &Leg) -> Result<(Lock
     } else {
         c.resolve(&format!("contract:{leg_name:?}"), env.obs.contracts.get(&leg_name))
     };
-    checks::s7(leg, env.policy, contract.as_ref(), true)?;
+    let token_program = solana_token_program(c, leg);
+    checks::s7(leg, env.policy, contract.as_ref(), token_program, true)?;
     Ok((facts, seen_at))
 }
 
@@ -414,6 +422,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
         checks::s4(terms, env.ledger)?;
     }
     checks::s5_s6_terms(terms, role, &env.own.accounts, &env.own.bitcoin_keys)?;
+    checks::s10_lock_id(terms)?;
+    checks::s10_lock_binding(terms, role, &env.own.accounts, pa, pb)?;
     checks::timelock_form(&terms.leg_a)?;
     checks::timelock_form(&terms.leg_b)?;
     checks::leg_b_absolute(terms)?;
@@ -476,7 +486,8 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
         Action::Lock => {
             let own_contract = c.resolve(&format!("contract:{own_name:?}"), env.obs.contracts.get(&own_name));
             // The own lock does not exist yet: on Solana its escrow address holds no account, or only lamports.
-            checks::s7(own_leg, policy, own_contract.as_ref(), false)?;
+            let own_token_program = solana_token_program(c, own_leg);
+            checks::s7(own_leg, policy, own_contract.as_ref(), own_token_program, false)?;
             checks::s15(&env.obs.fee_reserves, own_profile, their_profile)?;
             checks::s16(env.runtime)?;
             checks::s17(own_profile, env.runtime)?;
@@ -531,7 +542,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 token_program: own_asset.as_ref().and_then(|a| a.token_program),
                 ..Default::default()
             };
-            binding = Some(s24(tx::bind(action, own_leg, need_tx(req)?, env.own, &ctx))?);
+            binding = Some(s24(tx::bind(action, own_name, own_leg, need_tx(req)?, env.own, &ctx))?);
         }
         Action::Reveal => {
             let (facts, _) = observed_leg(c, LegName::B, &terms.leg_b)?;
@@ -558,7 +569,7 @@ fn entry(req: &Request, env: &Env, c: &mut Collected) -> Result<(Decision, Optio
                 ..Default::default()
             };
             solana_facts(c, &terms.leg_b, &mut ctx);
-            binding = Some(s24(tx::bind(action, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
+            binding = Some(s24(tx::bind(action, LegName::B, &terms.leg_b, need_tx(req)?, env.own, &ctx))?);
             if terms.leg_a.lock.timelock.is_relative() {
                 // The own leg A lock exists now: a relative T_A counts from its observed
                 // confirmation (spec 7.3), never from the adapter's value. Only an
@@ -717,6 +728,8 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
     }
     checks::s1(terms)?;
     checks::s3(terms)?;
+    // The claim or refund names the lock by lock_id: it must be this lock's key.
+    checks::s10_lock_id(terms)?;
     let leg_name = action.leg(role).expect("exits touch a leg");
     let leg = terms.leg(leg_name);
     // The profile, not the policy, sets the fee limit: the policy never blocks an exit.
@@ -746,6 +759,6 @@ fn exit(req: &Request, env: &Env, c: &mut Collected) -> Result<Option<TxBinding>
         }
         _ => unreachable!(),
     }
-    let binding = s24(tx::bind(action, leg, need_tx(req)?, env.own, &ctx))?;
+    let binding = s24(tx::bind(action, leg_name, leg, need_tx(req)?, env.own, &ctx))?;
     Ok(Some(binding))
 }

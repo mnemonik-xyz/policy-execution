@@ -9,13 +9,13 @@ use rb::hashes::Hash as _;
 use warrant_swap_core::authorize::{authorize, AcceptEvidence, Env, IdentityCredential, Observations, Outcome, Request};
 use warrant_swap_core::caip::{AccountId, AssetId, ChainId};
 use warrant_swap_core::checks::{code, AssetFacts, ContractObservation, LockFacts, Payee, ReceiverFacts, Runtime};
-use warrant_swap_core::dsl::{validate_policy, CompiledPolicy};
+use warrant_swap_core::dsl::{validate_policy, CompiledPolicy, ContractPinSpec};
 use warrant_swap_core::evm::{self, ContractFacts, Eip1559Tx, LockCall};
 use warrant_swap_core::facts::{EvidenceMethod, Observed, PriceReport, Report, TransferFee};
 use warrant_swap_core::ledger::LedgerState;
 use warrant_swap_core::profile::{reference, ProfileSet};
 use warrant_swap_core::tx::{OwnAccounts, ProposedTx};
-use warrant_swap_core::types::{Action, HashAlg, HtlcKeys, Leg, LegName, Lock, RiskFlag, Role, Terms, TimelockSpec};
+use warrant_swap_core::types::{Action, HashAlg, Leg, LegName, Lock, RiskFlag, Role, Terms, TimelockSpec};
 use warrant_swap_core::verified::Timelock;
 use warrant_swap_core::warrant::{RecordDecision, TxBinding};
 use warrant_swap_core::{bitcoin as btc, solana as sol, Hash32};
@@ -60,9 +60,21 @@ fn eth(byte: &str) -> AccountId {
     acct(&format!("{ETH_CHAIN}:0x{}", byte.repeat(20)))
 }
 
+/// Each lock carries `sha256(swap_id ‖ leg ‖ sender)` (spec 3.2), as honest terms do.
+fn with_lock_ids(mut t: Terms) -> Terms {
+    for which in [LegName::A, LegName::B] {
+        let id = t.leg(which).derived_lock_id(which).expect("sender bytes");
+        match which {
+            LegName::A => t.leg_a.lock.lock_id = id,
+            LegName::B => t.leg_b.lock.lock_id = id,
+        }
+    }
+    t
+}
+
 fn terms() -> Terms {
     let h = sha256(&SECRET);
-    Terms {
+    with_lock_ids(Terms {
         swap_id: SWAP_ID,
         initiator: INITIATOR.into(),
         responder: RESPONDER.into(),
@@ -80,7 +92,9 @@ fn terms() -> Terms {
                 preimage_len: 32,
                 timelock: TimelockSpec::Height(T_A),
                 swap_id: SWAP_ID,
-                keys: Some(HtlcKeys { receiver: xonly(20), refund: xonly(10) }),
+                lock_id: [0; 32],
+                claim_key: Some(xonly(20)),
+                refund_key: Some(xonly(10)),
             },
         },
         leg_b: Leg {
@@ -97,10 +111,12 @@ fn terms() -> Terms {
                 preimage_len: 32,
                 timelock: TimelockSpec::Time(T_B),
                 swap_id: SWAP_ID,
-                keys: None,
+                lock_id: [0; 32],
+                claim_key: None,
+                refund_key: None,
             },
         },
-    }
+    })
 }
 
 fn profiles() -> ProfileSet {
@@ -165,7 +181,7 @@ fn lock_a_facts(confirmations: u64) -> LockFacts {
     let t = terms();
     LockFacts {
         contract: btc::TEMPLATE_ID.into(),
-        swap_id: SWAP_ID,
+        lock_id: t.leg_a.lock.lock_id,
         hash_alg: HashAlg::Sha256,
         hashlock: t.leg_a.lock.hashlock,
         preimage_len_enforced: true,
@@ -186,7 +202,7 @@ fn lock_b_facts() -> LockFacts {
     let t = terms();
     LockFacts {
         contract: HTLC_EVM.into(),
-        swap_id: SWAP_ID,
+        lock_id: t.leg_b.lock.lock_id,
         hash_alg: HashAlg::Sha256,
         hashlock: t.leg_b.lock.hashlock,
         preimage_len_enforced: true,
@@ -226,7 +242,18 @@ fn usdc_receiver(payee: [u8; 20]) -> ReceiverFacts {
 }
 
 fn htlc_contract() -> ContractObservation {
-    ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], proxy_implementation: None, proxy_admin: None })
+    ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], slots: no_proxy_slots(), loupe: evm::Loupe::Reverted, implementation_code: None })
+}
+
+/// A storage word that holds the address `[a; 20]`.
+fn address_word(a: u8) -> Hash32 {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(&[a; 20]);
+    w
+}
+
+fn no_proxy_slots() -> evm::ProxySlots {
+    evm::ProxySlots { eip1967_implementation: [0; 32], eip1967_admin: [0; 32], eip1967_beacon: [0; 32], zos_implementation: [0; 32], zos_admin: [0; 32], eip1822_proxiable: [0; 32] }
 }
 
 struct World {
@@ -426,6 +453,7 @@ fn responder_lock_txs(approve: u128, lock_amount: u128) -> ProposedTx {
     let token = t.leg_b.asset.erc20_address().unwrap();
     let call = LockCall {
         swap_id: SWAP_ID,
+        leg: LegName::B,
         receiver: t.leg_b.receiver.evm_address().unwrap(),
         refund_to: t.leg_b.refund_to.evm_address().unwrap(),
         token,
@@ -438,7 +466,7 @@ fn responder_lock_txs(approve: u128, lock_amount: u128) -> ProposedTx {
 }
 
 fn reveal_tx(preimage: &Hash32) -> ProposedTx {
-    ProposedTx::Evm(vec![evm_tx(HTLC_EVM, 0, evm::claim_calldata(&SWAP_ID, preimage))])
+    ProposedTx::Evm(vec![evm_tx(HTLC_EVM, 0, evm::claim_calldata(&terms().leg_b.lock.lock_id, preimage))])
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +498,7 @@ fn initiator_happy_path() {
     let reveal = w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET));
     assert_allow(&reveal);
     let Outcome::Warrant(rw) = &reveal else { unreachable!() };
-    assert!(matches!(&rw.tx_binding, Some(TxBinding::Evm { signing_hashes }) if signing_hashes.len() == 1));
+    assert!(matches!(&rw.tx_binding, Some(TxBinding::Evm { signing_hashes, signer: None }) if signing_hashes.len() == 1));
     // The payload is canonical and the hash chain can link to it.
     assert_eq!(rw.hash().unwrap(), warrant_swap_core::blake3(&rw.payload().unwrap()));
 }
@@ -541,10 +569,40 @@ fn fault_6_fake_token_proxy_and_permanent_delegate() {
     f.asset = AssetId::parse("eip155:1/erc20:0xdead000000000000000000000000000000000000").unwrap();
     w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, f));
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S9);
-    // A proxy HTLC.
+    // A proxy HTLC of each pattern: EIP-1967, beacon, legacy slots, diamond.
+    type Mutation = fn(&mut ContractFacts);
+    let patterns: [(&str, Mutation); 5] = [
+        ("eip-1967", |f| {
+            f.slots.eip1967_implementation = address_word(1);
+            f.slots.eip1967_admin = address_word(2);
+            f.implementation_code = Some(([1; 20], [0xc1; 32]));
+        }),
+        ("beacon", |f| f.slots.eip1967_beacon = address_word(3)),
+        ("zeppelinos", |f| f.slots.zos_implementation = address_word(1)),
+        ("eip-1822", |f| f.slots.eip1822_proxiable = address_word(1)),
+        ("diamond", |f| f.loupe = evm::Loupe::Returned),
+    ];
+    for (name, mutate) in &patterns {
+        let mut w = initiator_reveal_world();
+        let ContractObservation::Evm(mut facts) = htlc_contract() else { unreachable!() };
+        mutate(&mut facts);
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts)));
+        let o = w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET));
+        assert_eq!(o.reasons(), [code::S7], "{name}");
+        assert_denied(&o, code::S7);
+    }
+    // An EIP-1967 proxy HTLC passes S7 when the policy pins its admin, implementation
+    // and implementation code. A beacon beside it fails S7 with the same pin.
     let mut w = initiator_reveal_world();
-    let proxy = ContractObservation::Evm(ContractFacts { code_hash: [0xc0; 32], proxy_implementation: Some([1; 20]), proxy_admin: Some([2; 20]) });
-    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, proxy));
+    let eth = ChainId::parse(ETH_CHAIN).unwrap();
+    let ContractPinSpec::Evm(pin) = &mut w.policy.policy.chains.get_mut(&eth).unwrap().contracts[0] else { unreachable!() };
+    pin.proxy = Some(evm::ProxyPin { admin: warrant_swap_core::to_hex(&[2; 20]), implementation: warrant_swap_core::to_hex(&[1; 20]), implementation_code_hash: [0xc1; 32] });
+    let ContractObservation::Evm(mut facts) = htlc_contract() else { unreachable!() };
+    (patterns[0].1)(&mut facts);
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts.clone())));
+    assert_allow(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)));
+    facts.slots.eip1967_beacon = address_word(3);
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts)));
     assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S7);
     // An asset whose issuer can seize it is outside the allowed flags: policy Deny.
     let mut w = World::new(Role::Initiator);
@@ -716,19 +774,20 @@ fn bitcoin_leaf_keys_are_own_keys() {
     // Leg A names the responder's address, but its claim key is the initiator's: the
     // initiator could claim both legs. The responder must not accept or lock.
     let mut stolen = terms();
-    stolen.leg_a.lock.keys = Some(HtlcKeys { receiver: xonly(10), refund: xonly(10) });
+    stolen.leg_a.lock.claim_key = Some(xonly(10));
     let w = responder_lock_world(3);
     assert_denied(&w.run(Action::Accept, stolen.clone(), None, None), code::S5);
     assert_denied(&w.run(Action::Lock, stolen, Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S5);
     // The initiator's own refund key must be its own, or it cannot refund leg A.
     let mut lost = terms();
-    lost.leg_a.lock.keys = Some(HtlcKeys { receiver: xonly(20), refund: xonly(20) });
+    lost.leg_a.lock.refund_key = Some(xonly(20));
+    let lost = with_lock_ids(lost);
     let w = World::new(Role::Initiator);
     assert_denied(&w.run(Action::Accept, lost.clone(), None, None), code::S6);
     assert_denied(&w.run(Action::Lock, lost, Some(initiator_lock_psbt(false)), None), code::S6);
     // A Bitcoin leg without leaf keys has no claim key and no refund key.
     let mut keyless = terms();
-    keyless.leg_a.lock.keys = None;
+    (keyless.leg_a.lock.claim_key, keyless.leg_a.lock.refund_key) = (None, None);
     assert_denied(&responder_lock_world(3).run(Action::Accept, keyless.clone(), None, None), code::S5);
     assert_denied(&World::new(Role::Initiator).run(Action::Accept, keyless, None, None), code::S6);
 }
@@ -953,7 +1012,7 @@ fn obligatory_checks_on_lock() {
     // A Bitcoin key that is not a curve point would make the claim unspendable.
     let w = World::new(Role::Initiator);
     let mut t = terms();
-    t.leg_a.lock.keys.as_mut().unwrap().receiver = [0xff; 32];
+    t.leg_a.lock.claim_key = Some([0xff; 32]);
     assert_denied(&w.run(Action::Lock, t, Some(initiator_lock_psbt(false)), None), code::S7);
 }
 
@@ -986,7 +1045,9 @@ fn responder_happy_path() {
     let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
     assert_allow(&out);
     let Outcome::Warrant(lw) = &out else { unreachable!() };
-    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signing_hashes }) if signing_hashes.len() == 2));
+    // A token lock binds approve and lock, and both must be signed by the leg's sender.
+    let sender = terms().leg_b.sender.evm_address();
+    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signing_hashes, signer }) if signing_hashes.len() == 2 && *signer == sender && sender.is_some()));
     assert!(lw.facts.iter().any(|f| f.name == "counterparty_lock" && f.value["depth"] == 3));
 }
 
@@ -1033,10 +1094,10 @@ fn relative_leg_b_terms(n: u64) -> Terms {
         sender: a.receiver.clone(),
         receiver: a.refund_to.clone(),
         refund_to: a.receiver.clone(),
-        lock: Lock { timelock: TimelockSpec::RelativeBlocks(n), keys: Some(HtlcKeys { receiver: xonly(10), refund: xonly(20) }), ..a.lock.clone() },
+        lock: Lock { timelock: TimelockSpec::RelativeBlocks(n), claim_key: Some(xonly(10)), refund_key: Some(xonly(20)), ..a.lock.clone() },
         ..a
     };
-    t
+    with_lock_ids(t)
 }
 
 #[test]
@@ -1233,7 +1294,7 @@ fn d8_window_uses_the_signer_real_time() {
     let Outcome::Warrant(aw) = &accept else { panic!("expected Allow") };
     assert_eq!((aw.valid_after, aw.valid_until), (NOW, NOW + 600));
     let at = |now_real, skew_secs| {
-        check_binding(aw, &Expected { action: Action::Accept, swap_id: &SWAP_ID, chain: None, contract: None, now_real, skew_secs })
+        check_binding(aw, &Expected { action: Action::Accept, swap_id: &SWAP_ID, chain: None, contract: None, lock_id: None, now_real, skew_secs })
     };
     // A verifier clock 30 seconds behind the policy signer needs a stated skew.
     assert_eq!(at(NOW - 30, 0), Err("outside the validity window"));
@@ -1268,13 +1329,29 @@ fn sol_terms() -> Terms {
         refund_to: sol_account([0xbb; 32]),
         lock,
     };
-    t
+    with_lock_ids(t)
+}
+
+/// The program bytes of the test Solana HTLC, with the zero padding of its ProgramData account.
+const HTLC_SOL_CODE: &[u8] = b"\x7fELF\x02\x01\x01\x00test htlc\x00\x00\x00\x00";
+
+/// An immutable program under the upgradeable loader whose code is `HTLC_SOL_CODE`,
+/// with the escrow of the lock that `key` names.
+fn sol_program_facts(key: &Hash32, escrow: Option<sol::EscrowAccount>) -> sol::ProgramFacts {
+    let loader = sol::key(sol::BPF_LOADER_UPGRADEABLE);
+    sol::ProgramFacts {
+        executable: true,
+        loader,
+        programdata_address: sol::programdata_address(&HTLC_SOL),
+        programdata: Some(sol::ProgramDataAccount { owner: loader, upgrade_authority: None, code_hash: sol::code_hash(HTLC_SOL_CODE) }),
+        escrow_address: sol::escrow_address(&HTLC_SOL, key).unwrap(),
+        escrow,
+        escrow_token: None,
+    }
 }
 
 fn sol_contract(escrow: Option<sol::EscrowAccount>) -> Observed<ContractObservation> {
-    let escrow_address = sol::escrow_address(&HTLC_SOL, &SWAP_ID).unwrap();
-    let facts = sol::ProgramFacts { executable: true, upgrade_authority: None, escrow_address, escrow };
-    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts))
+    chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(sol_program_facts(&sol_terms().leg_b.lock.lock_id, escrow)))
 }
 
 fn sol_world(role: Role) -> World {
@@ -1287,12 +1364,12 @@ fn sol_world(role: Role) -> World {
         "evaluator_id": warrant_swap_core::to_hex(&BUILD),
         "chains": {
             (BTC_CHAIN): { "profile_hash": profile_hash(BTC_CHAIN), "contracts": [{"bitcoin_template": btc::TEMPLATE_ID}] },
-            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract}}] }
+            (SOL_CHAIN): { "profile_hash": profile_hash(SOL_CHAIN), "contracts": [{"solana": {"program": t.leg_b.lock.contract, "code_hash": warrant_swap_core::to_hex(&sol::code_hash(HTLC_SOL_CODE))}}] }
         },
         "oracle": { "max_age_secs": 60, "max_conf_bps": 50 },
         "quorum": 2,
         "margin_secs": 1800,
-        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC]] }
+        "rule": { "pair_in": [[BTC, SOL], [SOL, BTC], [BTC, SOL_USDC], [SOL_USDC, BTC]] }
     });
     let mut w = World::new(role);
     w.policy = validate_policy(&doc.to_string(), &profiles).unwrap();
@@ -1314,7 +1391,7 @@ fn a_solana_lock_needs_the_escrow_discriminator() {
     let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
     // Reveal: the observed leg B lock needs its escrow account with the discriminator.
     let mut w = sol_world(Role::Initiator);
-    let lock_b = LockFacts { contract: t.leg_b.lock.contract.clone(), receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() };
+    let lock_b = LockFacts { contract: t.leg_b.lock.contract.clone(), lock_id: t.leg_b.lock.lock_id, receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() };
     w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, lock_b));
     let other = sol::EscrowAccount { discriminator: Some([0; 8]), ..escrow.clone() };
     let short = sol::EscrowAccount { data_len: 7, discriminator: None, ..escrow.clone() };
@@ -1334,4 +1411,434 @@ fn a_solana_lock_needs_the_escrow_discriminator() {
         let o = w.run(Action::Lock, t.clone(), None, None);
         assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lock keys (G4, spec 3.2, 8.2 and S10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_action_checks_the_lock_id() {
+    // Terms whose leg B lock is keyed by the swap id alone, or by the other leg's key.
+    let edits: [fn(&mut Terms); 2] = [|t| t.leg_b.lock.lock_id = SWAP_ID, |t| t.leg_b.lock.lock_id = t.leg_a.lock.lock_id];
+    for edit in edits {
+        let mut t = terms();
+        edit(&mut t);
+        assert_denied(&World::new(Role::Initiator).run(Action::Accept, t.clone(), None, None), code::S10_LOCK);
+        assert_denied(&World::new(Role::Responder).run(Action::Accept, t.clone(), None, None), code::S10_LOCK);
+        assert_denied(&initiator_reveal_world().run(Action::Reveal, t.clone(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S10_LOCK);
+        // An exit names the lock by this key: a wrong key halts.
+        let refund = ProposedTx::Evm(vec![evm_tx(HTLC_EVM, 0, evm::refund_calldata(&t.leg_b.lock.lock_id))]);
+        assert_halt(&responder_lock_world(3).run(Action::Refund, t, Some(refund), None), code::S10_LOCK);
+    }
+    // The observed leg B lock has another key: the adapter read another lock.
+    let mut w = initiator_reveal_world();
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, LockFacts { lock_id: terms().leg_a.lock.lock_id, ..lock_b_facts() }));
+    assert_denied(&w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET)), code::S10_LOCK);
+    // The responder's S13 names the inner check.
+    let mut w = World::new(Role::Responder);
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, LockFacts { lock_id: [0x99; 32], ..lock_a_facts(3) }));
+    let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
+    assert_eq!(out.reasons(), [code::S13, code::S10_LOCK], "{}", explain(&out));
+    // Bitcoin: an output whose claim leaf commits to another lock_id fails S7.
+    let mut other = terms();
+    other.swap_id = [0x52; 32];
+    other.leg_a.lock.swap_id = [0x52; 32];
+    let other = with_lock_ids(other);
+    let mut w = World::new(Role::Responder);
+    let script = btc::htlc_script_pubkey(&other.leg_a.lock).unwrap();
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, LockFacts { script_pubkey: Some(script), ..lock_a_facts(3) }));
+    let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
+    assert_eq!(out.reasons(), [code::S13, code::S7], "{}", explain(&out));
+}
+
+#[test]
+fn the_own_lock_is_funded_by_an_own_account() {
+    // The contract derives lock_id from the caller. Leg B funded from another account
+    // would carry another key than the terms: the initiator would find no lock.
+    let mut t = terms();
+    t.leg_b.sender = eth("dd");
+    let t = with_lock_ids(t);
+    let w = World::new(Role::Responder);
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::S10_LOCK);
+    let mut w = responder_lock_world(3);
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None), code::S10_LOCK);
+    w.own.accounts.push(eth("dd"));
+    assert_ne!(w.run(Action::Lock, t, Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None).reasons().first().map(String::as_str), Some(code::S10_LOCK));
+    // On Bitcoin the key derives from the refund_key (S6), not from the CAIP-10 sender.
+    let mut t = terms();
+    t.leg_a.sender = acct(&format!("{BTC_CHAIN}:bc1psomeoneelse"));
+    assert_allow(&World::new(Role::Initiator).run(Action::Accept, t, None, None));
+}
+
+const ETH: &str = "eip155:1/slip44:60";
+const T_A_EVM: u64 = NOW + 12 * 3_600;
+
+/// Both legs on Ethereum in one HTLC contract: ETH (leg A) for USDC (leg B).
+fn evm_same_chain_terms() -> Terms {
+    let mut t = terms();
+    t.leg_a = Leg {
+        chain: ChainId::parse(ETH_CHAIN).unwrap(),
+        asset: AssetId::parse(ETH).unwrap(),
+        amount: 10 * 10u128.pow(18),
+        sender: eth("aa"),
+        receiver: eth("bb"),
+        refund_to: eth("aa"),
+        lock: Lock { timelock: TimelockSpec::Time(T_A_EVM), ..t.leg_b.lock.clone() },
+    };
+    with_lock_ids(t)
+}
+
+fn evm_same_chain_world(role: Role) -> World {
+    let t = evm_same_chain_terms();
+    let mut w = World::new(role);
+    let e = w.profiles.get(&t.leg_b.chain).unwrap().clone();
+    let doc = serde_json::json!({
+        "version": 3, "ref_ccy": "USD", "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": { (ETH_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&e.hash()), "contracts": [{"evm": {"address": HTLC_EVM, "code_hash": warrant_swap_core::to_hex(&[0xc0; 32])}}] } },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 }, "quorum": 2, "margin_secs": 1800,
+        "rule": { "pair_in": [[ETH, USDC], [USDC, ETH]] }
+    });
+    w.policy = validate_policy(&doc.to_string(), &w.profiles).unwrap();
+    w.obs.assets.insert(t.leg_a.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 18, risk_flags: vec![], transfer_fee: None, token_program: None }));
+    w.obs.prices.push(price(ETH, 3_000 * 100_000_000));
+    w.obs.contracts.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, htlc_contract()));
+    w.own.accounts = match role {
+        Role::Initiator => vec![eth("aa")],
+        Role::Responder => vec![eth("bb")],
+    };
+    w
+}
+
+/// G20: a pinned EIP-1967 proxy HTLC, from the policy text through S7. A claim
+/// halts when the proxy was upgraded during the swap (structural S7 on the exit).
+#[test]
+fn a_pinned_proxy_htlc_from_the_policy_text() {
+    let t = evm_same_chain_terms();
+    let mut w = evm_same_chain_world(Role::Responder);
+    let e = w.profiles.get(&t.leg_b.chain).unwrap().clone();
+    let doc = serde_json::json!({
+        "version": 3, "ref_ccy": "USD", "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": { (ETH_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&e.hash()), "contracts": [{"evm": {
+            "address": HTLC_EVM, "code_hash": warrant_swap_core::to_hex(&[0xc0; 32]),
+            "proxy": { "admin": warrant_swap_core::to_hex(&[2; 20]), "implementation": warrant_swap_core::to_hex(&[1; 20]),
+                       "implementation_code_hash": warrant_swap_core::to_hex(&[0xc1; 32]) } }}] } },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 }, "quorum": 2, "margin_secs": 1800,
+        "rule": { "pair_in": [[ETH, USDC], [USDC, ETH]] }
+    });
+    w.policy = validate_policy(&doc.to_string(), &w.profiles).unwrap();
+    let ContractObservation::Evm(mut proxied) = htlc_contract() else { unreachable!() };
+    proxied.slots.eip1967_implementation = address_word(1);
+    proxied.slots.eip1967_admin = address_word(2);
+    proxied.implementation_code = Some(([1; 20], [0xc1; 32]));
+    let observe = |w: &mut World, facts: &ContractFacts| {
+        for leg in [LegName::A, LegName::B] {
+            w.obs.contracts.insert(leg, chain_obs(EvidenceMethod::LightClient, ContractObservation::Evm(facts.clone())));
+        }
+    };
+    // The pinned proxy passes S7 at accept, at the responder's lock and at the claim.
+    observe(&mut w, &proxied);
+    assert_allow(&w.run(Action::Accept, t.clone(), None, None));
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, evm_lock_a_facts(&t)));
+    let lock = Some(responder_lock_txs(30_000_000_000, 30_000_000_000));
+    assert_allow(&w.run(Action::Lock, t.clone(), lock.clone(), None));
+    let claim = Some(evm_call(evm::claim_calldata(&t.leg_a.lock.lock_id, &SECRET)));
+    assert_allow(&w.run(Action::Claim, t.clone(), claim.clone(), Some(SECRET)));
+    // A plain contract at the address does not match the proxy pin.
+    let ContractObservation::Evm(plain) = htlc_contract() else { unreachable!() };
+    observe(&mut w, &plain);
+    assert_denied(&w.run(Action::Lock, t.clone(), lock, None), code::S7);
+    // The admin upgraded the implementation during the swap: the claim halts.
+    let mut upgraded = proxied.clone();
+    upgraded.slots.eip1967_implementation = address_word(3);
+    upgraded.implementation_code = Some(([3; 20], [0xc3; 32]));
+    observe(&mut w, &upgraded);
+    assert_halt(&w.run(Action::Claim, t, claim, Some(SECRET)), code::S7);
+}
+
+fn evm_lock_a_facts(t: &Terms) -> LockFacts {
+    LockFacts {
+        contract: HTLC_EVM.into(),
+        lock_id: t.leg_a.lock.lock_id,
+        timelock: Timelock::Time(T_A_EVM),
+        receiver: t.leg_a.receiver.clone(),
+        refund_to: t.leg_a.refund_to.clone(),
+        asset: t.leg_a.asset.clone(),
+        net_amount: t.leg_a.amount,
+        ..lock_b_facts()
+    }
+}
+
+fn evm_call(data: Vec<u8>) -> ProposedTx {
+    ProposedTx::Evm(vec![evm_tx(HTLC_EVM, 0, data)])
+}
+
+/// G4: a same-chain swap. Keyed by swap_id, both legs were one lock: the second
+/// lock collided, and a claim of one leg was the claim of the other.
+#[test]
+fn same_chain_evm_swap_uses_two_lock_ids() {
+    let t = evm_same_chain_terms();
+    let (id_a, id_b) = (t.leg_a.lock.lock_id, t.leg_b.lock.lock_id);
+    assert_ne!(id_a, id_b);
+    // Accept and the initiator's lock: the call names swap_id and leg A; the contract derives id_a.
+    let w = evm_same_chain_world(Role::Initiator);
+    assert_allow(&w.run(Action::Accept, t.clone(), None, None));
+    let lock_a = LockCall {
+        swap_id: SWAP_ID,
+        leg: LegName::A,
+        receiver: t.leg_a.receiver.evm_address().unwrap(),
+        refund_to: t.leg_a.refund_to.evm_address().unwrap(),
+        token: [0; 20],
+        amount: t.leg_a.amount,
+        hashlock: t.leg_a.lock.hashlock,
+        timelock: T_A_EVM,
+    };
+    let lock_tx = |call: &LockCall| ProposedTx::Evm(vec![evm_tx(HTLC_EVM, t.leg_a.amount, call.calldata())]);
+    let out = w.run(Action::Lock, t.clone(), Some(lock_tx(&lock_a)), None);
+    assert_allow(&out);
+    // The contract keys leg A's lock by msg.sender: the binding names leg A's sender.
+    let Outcome::Warrant(lw) = &out else { unreachable!() };
+    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signer: Some(s), .. }) if Some(*s) == t.leg_a.sender.evm_address()));
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(lock_tx(&LockCall { leg: LegName::B, ..lock_a })), None), code::S24);
+    // The responder sees leg A under id_a and locks leg B, which the contract keys by id_b.
+    let mut w = evm_same_chain_world(Role::Responder);
+    assert_allow(&w.run(Action::Accept, t.clone(), None, None));
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, evm_lock_a_facts(&t)));
+    assert_allow(&w.run(Action::Lock, t.clone(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None));
+    // The responder claims leg A by id_a; the key of leg B would claim the responder's own lock.
+    assert_allow(&w.run(Action::Claim, t.clone(), Some(evm_call(evm::claim_calldata(&id_a, &SECRET))), Some(SECRET)));
+    assert_halt(&w.run(Action::Claim, t.clone(), Some(evm_call(evm::claim_calldata(&id_b, &SECRET))), Some(SECRET)), code::S24);
+    assert_allow(&w.run(Action::Refund, t.clone(), Some(evm_call(evm::refund_calldata(&id_b))), None));
+    assert_halt(&w.run(Action::Refund, t.clone(), Some(evm_call(evm::refund_calldata(&id_a))), None), code::S24);
+    // The initiator reveals on leg B by id_b, never by id_a; it refunds leg A by id_a.
+    let mut w = evm_same_chain_world(Role::Initiator);
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, lock_b_facts()));
+    w.obs.locks.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, evm_lock_a_facts(&t)));
+    assert_allow(&w.run(Action::Reveal, t.clone(), Some(evm_call(evm::claim_calldata(&id_b, &SECRET))), Some(SECRET)));
+    assert_denied(&w.run(Action::Reveal, t.clone(), Some(evm_call(evm::claim_calldata(&id_a, &SECRET))), Some(SECRET)), code::S24);
+    assert_allow(&w.run(Action::Refund, t.clone(), Some(evm_call(evm::refund_calldata(&id_a))), None));
+    // The adapter reports the leg A lock as the leg B lock: the keys differ.
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, LockFacts { lock_id: id_a, ..lock_b_facts() }));
+    assert_denied(&w.run(Action::Reveal, t, Some(evm_call(evm::claim_calldata(&id_b, &SECRET))), Some(SECRET)), code::S10_LOCK);
+}
+
+/// A legacy Solana message with one HTLC instruction; the first key is the only
+/// signer and pays the fee, the last `read_only` keys are read-only.
+fn sol_message(keys: &[Hash32], read_only: u8, program_index: u8, accounts: &[u8], data: Vec<u8>) -> ProposedTx {
+    let mut m = vec![1, 0, read_only, keys.len() as u8];
+    keys.iter().for_each(|k| m.extend(k));
+    m.extend([9u8; 32]);
+    m.extend([1, program_index, accounts.len() as u8]);
+    m.extend(accounts);
+    // Compact-u16 length: the lock data (178 bytes) needs two bytes.
+    match data.len() {
+        n @ 0..=0x7f => m.push(n as u8),
+        n => m.extend([(n & 0x7f) as u8 | 0x80, (n >> 7) as u8]),
+    }
+    m.extend(data);
+    ProposedTx::Solana { message: m }
+}
+
+/// Both legs on Solana in one HTLC program: 1 SOL for 1 SOL, leg A until `T_A_EVM`.
+fn sol_same_chain_terms() -> Terms {
+    let mut t = sol_terms();
+    t.leg_b.amount = 1_000_000_000;
+    t.leg_a = Leg {
+        sender: sol_account([0xaa; 32]),
+        receiver: sol_account([0xbb; 32]),
+        refund_to: sol_account([0xaa; 32]),
+        lock: Lock { timelock: TimelockSpec::Time(T_A_EVM), ..t.leg_b.lock.clone() },
+        ..t.leg_b.clone()
+    };
+    with_lock_ids(t)
+}
+
+/// G4: the program derives `lock_id` from the key that signs the lock, so the own
+/// Solana sender must be an own account.
+#[test]
+fn a_solana_own_lock_is_funded_by_an_own_account() {
+    let mut t = sol_same_chain_terms();
+    t.leg_b.sender = sol_account([0xcc; 32]);
+    let t = with_lock_ids(t);
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    let mut w = sol_same_chain_world(Role::Responder, (Some(escrow), None));
+    assert_denied(&w.run(Action::Accept, t.clone(), None, None), code::S10_LOCK);
+    w.own.accounts.push(sol_account([0xcc; 32]));
+    assert_allow(&w.run(Action::Accept, t, None, None));
+}
+
+/// G4: the initiator's Solana lock of leg A carries the leg byte 0x41 and uses the
+/// escrow of leg A's key.
+#[test]
+fn a_solana_leg_a_lock_names_leg_a() {
+    let t = sol_same_chain_terms();
+    let escrow_a = sol::escrow_address(&HTLC_SOL, &t.leg_a.lock.lock_id).unwrap();
+    let escrow_b = sol::escrow_address(&HTLC_SOL, &t.leg_b.lock.lock_id).unwrap();
+    let system = sol::key(sol::SYSTEM_PROGRAM);
+    let w = sol_same_chain_world(Role::Initiator, (None, None));
+    let data = sol::LockData { swap_id: SWAP_ID, leg: LegName::A, receiver: [0xbb; 32], refund_to: [0xaa; 32], mint: [0; 32], amount: t.leg_a.amount as u64, hashlock: t.leg_a.lock.hashlock, timelock: T_A_EVM as i64 };
+    let lock = |escrow: Hash32, data: &sol::LockData| sol_message(&[[0xaa; 32], escrow, HTLC_SOL, system], 2, 2, &[0, 1, 3], data.encode());
+    assert_allow(&w.run(Action::Lock, t.clone(), Some(lock(escrow_a, &data)), None));
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(lock(escrow_a, &sol::LockData { leg: LegName::B, ..data })), None), code::S24);
+    assert_denied(&w.run(Action::Lock, t, Some(lock(escrow_b, &data)), None), code::S24);
+}
+
+fn sol_same_chain_world(role: Role, (a, b): (Option<sol::EscrowAccount>, Option<sol::EscrowAccount>)) -> World {
+    let t = sol_same_chain_terms();
+    let mut w = sol_world(role);
+    let sol = w.profiles.get(&t.leg_b.chain).unwrap().clone();
+    let doc = serde_json::json!({
+        "version": 3, "ref_ccy": "USD", "evaluator_id": warrant_swap_core::to_hex(&BUILD),
+        "chains": { (SOL_CHAIN): { "profile_hash": warrant_swap_core::to_hex(&sol.hash()), "contracts": [{"solana": {"program": t.leg_b.lock.contract, "code_hash": warrant_swap_core::to_hex(&sol::code_hash(HTLC_SOL_CODE))}}] } },
+        "authorities": { "oracle": ["pyth"] },
+        "oracle": { "max_age_secs": 60, "max_conf_bps": 50 }, "quorum": 2, "margin_secs": 1800,
+        "rule": { "pair_in": [[SOL, SOL]] }
+    });
+    w.policy = validate_policy(&doc.to_string(), &w.profiles).unwrap();
+    w.obs.prices.push(price(SOL, 150_00000000));
+    // The adapter reads the escrow of each lock at the PDA of its lock_id.
+    for (name, leg, escrow) in [(LegName::A, &t.leg_a, a), (LegName::B, &t.leg_b, b)] {
+        let facts = sol_program_facts(&leg.lock.lock_id, escrow);
+        w.obs.contracts.insert(name, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
+        let lock = LockFacts { contract: leg.lock.contract.clone(), lock_id: leg.lock.lock_id, timelock: leg.refund_valid_from().unwrap(), receiver: leg.receiver.clone(), refund_to: leg.refund_to.clone(), asset: leg.asset.clone(), net_amount: leg.amount, ..lock_b_facts() };
+        w.obs.locks.insert(name, chain_obs(EvidenceMethod::LightClient, lock));
+    }
+    let payer = if role == Role::Initiator { [0xaa; 32] } else { [0xbb; 32] };
+    w.own.accounts = vec![sol_account(payer)];
+    w.own.solana_fee_payer = Some(payer);
+    w
+}
+
+/// G4: a same-chain Solana swap. Keyed by swap_id, both legs had one escrow PDA:
+/// leg A's escrow made the responder's lock fail S7, so the swap could not happen.
+#[test]
+fn same_chain_solana_swap_uses_two_escrows() {
+    let t = sol_same_chain_terms();
+    let (id_a, id_b) = (t.leg_a.lock.lock_id, t.leg_b.lock.lock_id);
+    let (escrow_a, escrow_b) = (sol::escrow_address(&HTLC_SOL, &id_a).unwrap(), sol::escrow_address(&HTLC_SOL, &id_b).unwrap());
+    assert_ne!(escrow_a, escrow_b);
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    let system = sol::key(sol::SYSTEM_PROGRAM);
+    // The responder: leg A's escrow exists; leg B's PDA is still free.
+    let w = sol_same_chain_world(Role::Responder, (Some(escrow.clone()), None));
+    assert_allow(&w.run(Action::Accept, t.clone(), None, None));
+    let data = sol::LockData { swap_id: SWAP_ID, leg: LegName::B, receiver: [0xaa; 32], refund_to: [0xbb; 32], mint: [0; 32], amount: t.leg_b.amount as u64, hashlock: t.leg_b.lock.hashlock, timelock: T_B as i64 };
+    let lock_b = sol_message(&[[0xbb; 32], escrow_b, HTLC_SOL, system], 2, 2, &[0, 1, 3], data.encode());
+    assert_allow(&w.run(Action::Lock, t.clone(), Some(lock_b), None));
+    // The same lock on leg A's escrow, or with leg A's byte, is another lock.
+    let on_a = sol_message(&[[0xbb; 32], escrow_a, HTLC_SOL, system], 2, 2, &[0, 1, 3], data.encode());
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(on_a), None), code::S24);
+    let leg_a_byte = sol::LockData { leg: LegName::A, ..data }.encode();
+    assert_denied(&w.run(Action::Lock, t.clone(), Some(sol_message(&[[0xbb; 32], escrow_b, HTLC_SOL, system], 2, 2, &[0, 1, 3], leg_a_byte)), None), code::S24);
+    // An adapter that reads leg B at leg A's escrow sees an existing lock: S7.
+    let mut shared = w;
+    let facts = sol_program_facts(&id_a, Some(escrow.clone()));
+    shared.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
+    assert_denied(&shared.run(Action::Lock, t.clone(), None, None), code::S7);
+    // The initiator reveals on leg B's escrow by id_b; the responder claims leg A by id_a.
+    let w = sol_same_chain_world(Role::Initiator, (Some(escrow.clone()), Some(escrow.clone())));
+    let claim = |payer: Hash32, escrow: Hash32, id: &Hash32| sol_message(&[payer, escrow, HTLC_SOL], 1, 2, &[0, 1, 0], sol::claim_data(id, &SECRET));
+    assert_allow(&w.run(Action::Reveal, t.clone(), Some(claim([0xaa; 32], escrow_b, &id_b)), Some(SECRET)));
+    assert_denied(&w.run(Action::Reveal, t.clone(), Some(claim([0xaa; 32], escrow_a, &id_a)), Some(SECRET)), code::S24);
+    // Leg B's escrow with leg A's key in the data: the program would claim another lock.
+    assert_denied(&w.run(Action::Reveal, t.clone(), Some(claim([0xaa; 32], escrow_b, &id_a)), Some(SECRET)), code::S24);
+    let mut w = sol_same_chain_world(Role::Responder, (Some(escrow.clone()), Some(escrow.clone())));
+    assert_allow(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_a, &id_a)), Some(SECRET)));
+    assert_halt(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_b, &id_b)), Some(SECRET)), code::S24);
+    // G21: the program code changed during the swap (an upgrade, another loader): the
+    // claim halts on S7 as a structural check.
+    let good = sol_program_facts(&id_a, Some(escrow));
+    let data = good.programdata.clone().unwrap();
+    let changed = [
+        sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { code_hash: [9; 32], ..data }), ..good.clone() },
+        sol::ProgramFacts { loader: sol::key("BPFLoader2111111111111111111111111111111111"), ..good },
+    ];
+    for facts in changed {
+        w.obs.contracts.insert(LegName::A, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(facts)));
+        assert_halt(&w.run(Action::Claim, t.clone(), Some(claim([0xbb; 32], escrow_a, &id_a)), Some(SECRET)), code::S7);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solana leg B: the program identity and the escrow token account (spec 8.4, G21)
+// ---------------------------------------------------------------------------
+
+const SOL_USDC: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+fn sol_lock_b(t: &Terms) -> LockFacts {
+    LockFacts { contract: t.leg_b.lock.contract.clone(), lock_id: t.leg_b.lock.lock_id, receiver: t.leg_b.receiver.clone(), refund_to: t.leg_b.refund_to.clone(), asset: t.leg_b.asset.clone(), net_amount: t.leg_b.amount, ..lock_b_facts() }
+}
+
+#[test]
+fn a_solana_program_needs_the_upgradeable_loader_and_the_pinned_code() {
+    let t = sol_terms();
+    let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+    let mut w = sol_world(Role::Initiator);
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, sol_lock_b(&t)));
+    let good = sol_program_facts(&t.leg_b.lock.lock_id, Some(escrow));
+    let data = good.programdata.clone().unwrap();
+    let bad = [
+        ("BPF loader 2", sol::ProgramFacts { loader: sol::key("BPFLoader2111111111111111111111111111111111"), ..good.clone() }),
+        ("not a Program state", sol::ProgramFacts { programdata_address: None, ..good.clone() }),
+        ("no ProgramData account", sol::ProgramFacts { programdata: None, ..good.clone() }),
+        ("other code", sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { code_hash: sol::code_hash(b"\x7fELF other"), ..data.clone() }), ..good.clone() }),
+        ("upgradeable", sol::ProgramFacts { programdata: Some(sol::ProgramDataAccount { upgrade_authority: Some([9; 32]), ..data }), ..good.clone() }),
+    ];
+    for (name, f) in bad.clone() {
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(f)));
+        let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+        assert!(reason(&o) == code::S7, "{name}: {}", explain(&o));
+    }
+    w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(good)));
+    let o = w.run(Action::Reveal, t.clone(), None, Some(SECRET));
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
+    // The own lock: the program checks apply before the escrow exists.
+    let mut w = sol_world(Role::Responder);
+    for (name, f) in bad {
+        w.obs.contracts.insert(LegName::B, chain_obs(EvidenceMethod::LightClient, ContractObservation::Solana(sol::ProgramFacts { escrow: None, ..f })));
+        let o = w.run(Action::Lock, t.clone(), None, None);
+        assert!(reason(&o) == code::S7, "{name}: {}", explain(&o));
+    }
+}
+
+/// The swap of `sol_terms()` with leg B as SPL USDC.
+fn sol_token_world(role: Role) -> (World, Terms, sol::TokenAccounts) {
+    let mut t = sol_terms();
+    t.leg_b.asset = AssetId::parse(SOL_USDC).unwrap();
+    t.leg_b.amount = 30_000_000_000;
+    let mut w = sol_world(role);
+    let usdc = sol::TokenAccounts { mint: t.leg_b.asset.spl_mint().unwrap(), token_program: sol::key(sol::TOKEN_PROGRAM) };
+    let facts = AssetFacts { decimals: 6, risk_flags: vec![], transfer_fee: None, token_program: Some(usdc.token_program) };
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, facts));
+    w.obs.prices.push(price(SOL_USDC, 1_00000000));
+    (w, t, usdc)
+}
+
+#[test]
+fn a_solana_token_lock_needs_its_escrow_token_account() {
+    let (mut w, t, usdc) = sol_token_world(Role::Initiator);
+    w.obs.locks.insert(LegName::B, chain_obs(EvidenceMethod::OwnNode, sol_lock_b(&t)));
+    let key = t.leg_b.lock.lock_id;
+    let escrow = sol::escrow_address(&HTLC_SOL, &key).unwrap();
+    let account = sol::TokenAccount { address: sol::escrow_token_address(&HTLC_SOL, &key, &usdc).unwrap(), program: usdc.token_program, mint: usdc.mint, owner: escrow, initialized: true };
+    let locked = |token: Option<sol::TokenAccount>| {
+        let escrow = sol::EscrowAccount { owner: HTLC_SOL, data_len: 113, discriminator: Some(sol::ESCROW_DISCRIMINATOR) };
+        let f = sol::ProgramFacts { escrow_token: token, ..sol_program_facts(&key, Some(escrow)) };
+        chain_obs(EvidenceMethod::OwnNode, ContractObservation::Solana(f))
+    };
+    for token in [None, Some(sol::TokenAccount { owner: [9; 32], ..account.clone() }), Some(sol::TokenAccount { mint: [9; 32], ..account.clone() })] {
+        w.obs.contracts.insert(LegName::B, locked(token));
+        assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    }
+    // With the escrow token account, S7 passes; S27 then needs the receiver facts.
+    w.obs.contracts.insert(LegName::B, locked(Some(account)));
+    assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S27);
+    // Without the token program of the mint, S7 cannot tell the escrow token account.
+    w.obs.assets.insert(t.leg_b.asset.clone(), chain_obs(EvidenceMethod::OwnNode, AssetFacts { decimals: 6, risk_flags: vec![], transfer_fee: None, token_program: None }));
+    assert_denied(&w.run(Action::Reveal, t.clone(), None, Some(SECRET)), code::S7);
+    // The responder's own lock: no escrow token account is needed yet.
+    let (mut w, t, _) = sol_token_world(Role::Responder);
+    w.obs.contracts.insert(LegName::B, sol_contract(None));
+    let o = w.run(Action::Lock, t.clone(), None, None);
+    assert!(!o.is_allow() && !o.reasons().iter().any(|r| r == code::S7), "{}", explain(&o));
 }

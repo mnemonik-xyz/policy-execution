@@ -45,16 +45,6 @@ impl TimelockSpec {
     }
 }
 
-/// X-only public keys of a Bitcoin Taproot HTLC.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HtlcKeys {
-    #[serde(with = "enc::hex32")]
-    pub receiver: Hash32,
-    #[serde(with = "enc::hex32")]
-    pub refund: Hash32,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lock {
@@ -67,9 +57,16 @@ pub struct Lock {
     pub timelock: TimelockSpec,
     #[serde(with = "enc::hex32")]
     pub swap_id: Hash32,
-    /// Required on Bitcoin, absent elsewhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keys: Option<HtlcKeys>,
+    /// The key of this lock on its chain: `sha256(swap_id ‖ leg ‖ sender)` (spec 3.2,
+    /// `lock_id`). S10 checks it against the derivation (`Leg::derived_lock_id`).
+    #[serde(with = "enc::hex32")]
+    pub lock_id: Hash32,
+    /// Bitcoin only: the 32-byte x-only key of the claim leaf (BIP 340).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "enc::hex32_opt")]
+    pub claim_key: Option<Hash32>,
+    /// Bitcoin only: the 32-byte x-only key of the refund leaf (BIP 340).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "enc::hex32_opt")]
+    pub refund_key: Option<Hash32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +83,35 @@ pub struct Leg {
     pub lock: Lock,
 }
 
+/// `lock_id = sha256(swap_id ‖ leg ‖ sender)` (spec 3.2). `leg` is one byte
+/// (`LegName::lock_byte`); `sender` is the chain-native bytes that the lock sees.
+pub fn lock_id(swap_id: &Hash32, leg: LegName, sender: &[u8]) -> Hash32 {
+    let mut data = Vec::with_capacity(33 + sender.len());
+    data.extend_from_slice(swap_id);
+    data.push(leg.lock_byte());
+    data.extend_from_slice(sender);
+    crate::sha256(&data)
+}
+
 impl Leg {
+    /// The funding sender as the lock sees it (spec 3.2; the byte form of each
+    /// profile, implementation spec 4.5). EVM: the 20-byte address that calls
+    /// `lock` (`msg.sender`). Solana: the 32-byte key that signs the lock
+    /// instruction. Bitcoin: the 32-byte x-only `refund_key`, the funder's key in the
+    /// lock; a Taproot output sees no sender. `None` when the leg lacks it.
+    pub fn sender_bytes(&self) -> Option<Vec<u8>> {
+        match self.chain.family()? {
+            crate::caip::Family::Evm => self.sender.evm_address().map(|a| a.to_vec()),
+            crate::caip::Family::Solana => self.sender.solana_key().map(|k| k.to_vec()),
+            crate::caip::Family::Bitcoin => self.lock.refund_key.map(|k| k.to_vec()),
+        }
+    }
+
+    /// The `lock_id` that the lock of this leg must carry, as leg `which`.
+    pub fn derived_lock_id(&self, which: LegName) -> Option<Hash32> {
+        Some(lock_id(&self.lock.swap_id, which, &self.sender_bytes()?))
+    }
+
     /// The first height or chain time at which the refund is valid: the input of
     /// the verified clock arithmetic. Bitcoin `OP_CHECKLOCKTIMEVERIFY` with operand
     /// `h` needs `nLockTime ≥ h`, and a transaction with `nLockTime = h` is final
@@ -149,6 +174,16 @@ impl Terms {
 pub enum LegName {
     A,
     B,
+}
+
+impl LegName {
+    /// The byte of the leg in `lock_id` (spec 3.2): `0x41` for leg A, `0x42` for leg B.
+    pub fn lock_byte(self) -> u8 {
+        match self {
+            LegName::A => 0x41,
+            LegName::B => 0x42,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +344,56 @@ mod tests {
         for other in ["keccak256", "sha3_256", "ripemd160", "SHA256"] {
             assert!(serde_json::from_str::<HashAlg>(&format!("\"{other}\"")).is_err(), "{other}");
         }
+    }
+
+    /// Spec 3.2: `lock_id`, `claim_key` and `refund_key` are Lock fields. The
+    /// version 0.2 `keys` object and a lock without `lock_id` do not parse.
+    #[test]
+    fn lock_fields_and_lock_id() {
+        let lock = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({ "contract": "c", "hash_alg": "sha256", "hashlock": "11".repeat(32), "preimage_len": 32,
+                                            "timelock": {"kind": "height", "value": 1}, "swap_id": "51".repeat(32) });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<Lock>(v)
+        };
+        let l = lock(serde_json::json!({ "lock_id": "77".repeat(32), "claim_key": "0a".repeat(32), "refund_key": "0b".repeat(32) })).unwrap();
+        assert_eq!((l.lock_id, l.claim_key, l.refund_key), ([0x77; 32], Some([0x0a; 32]), Some([0x0b; 32])));
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains(r#""claim_key":"0a0a"#) && text.contains(r#""refund_key":"0b0b"#), "{text}");
+        let plain = lock(serde_json::json!({ "lock_id": "77".repeat(32) })).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("_key"), "absent keys are not serialized");
+        assert!(lock(serde_json::json!({})).is_err(), "lock_id is required");
+        let old = serde_json::json!({ "lock_id": "77".repeat(32), "keys": { "receiver": "0a".repeat(32), "refund": "0b".repeat(32) } });
+        assert!(lock(old).is_err(), "the version 0.2 keys object");
+        // lock_id = sha256(swap_id ‖ leg ‖ sender), leg byte 0x41 or 0x42.
+        assert_eq!(
+            crate::to_hex(&lock_id(&[0x51; 32], LegName::B, &[0xaa; 20])),
+            "960cb8911e96f8420f9db1bf0851469a93442911d3620cd2da7e919324a5c6b8"
+        );
+        assert_eq!((LegName::A.lock_byte(), LegName::B.lock_byte()), (b'A', b'B'));
+        // The sender bytes of each family (Python hashlib vectors, swap_id 0x51 x 32).
+        let leg = |account: &str, refund_key: Option<Hash32>| -> Leg {
+            let chain = account.rsplit_once(':').unwrap().0;
+            serde_json::from_value(serde_json::json!({
+                "chain": chain, "asset": format!("{chain}/slip44:0"), "amount": "1",
+                "sender": account, "receiver": account, "refund_to": account,
+                "lock": { "contract": "c", "hash_alg": "sha256", "hashlock": "11".repeat(32), "preimage_len": 32,
+                          "timelock": {"kind": "time", "value": 1}, "swap_id": "51".repeat(32), "lock_id": "00".repeat(32),
+                          "refund_key": refund_key.map(|k| crate::to_hex(&k)) }
+            }))
+            .unwrap()
+        };
+        let hex = |h: Option<Hash32>| h.map(|h| crate::to_hex(&h));
+        let evm = leg(&format!("eip155:1:0x{}", "aa".repeat(20)), None);
+        assert_eq!(hex(evm.derived_lock_id(LegName::A)).as_deref(), Some("8566ed2b109335330d2ff5e10291adcf1c9f1624705a2b43e659a6671ea9665c"));
+        let sol = leg(&format!("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:{}", bs58::encode([0xbb; 32]).into_string()), None);
+        assert_eq!(hex(sol.derived_lock_id(LegName::B)).as_deref(), Some("31cc5ec933cbf8bde2056ef1a19d3f191f32d0ac5ea2a1de5bffefa385681533"));
+        // Bitcoin: the refund_key, never the CAIP-10 sender, which no output sees.
+        let btc = leg("bip122:000000000019d6689c085ae165831e93:bc1pa", Some([0x10; 32]));
+        assert_eq!(hex(btc.derived_lock_id(LegName::A)).as_deref(), Some("dfacec4245477865a290de7b6f73f45c21b91d3169ed0b005bfa33f733a47904"));
+        let other = leg("bip122:000000000019d6689c085ae165831e93:bc1pb", Some([0x10; 32]));
+        assert_eq!(other.derived_lock_id(LegName::A), btc.derived_lock_id(LegName::A));
+        assert_eq!(leg("bip122:000000000019d6689c085ae165831e93:bc1pa", None).derived_lock_id(LegName::A), None);
     }
 
     #[test]
