@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 from showcases.ionet_arc.adapter import (Cloud, DEPLOY, DESTROY, ENDPOINT, PilotError,
-    decode_result, deploy, destroy, estimate_cost, read_json, save, validate_deployment)
+                                         decode_result, deploy, destroy, read_json)
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
 from showcases.ionet_arc.worker import Worker, handler
@@ -36,7 +36,8 @@ def quote_state(network="mainnet"):
     caip, mint = SOLANA[network]
     return {"endpoint": ENDPOINT, "phase": "payment_required", "created_at": int(time.time()),
             "payment": {"x402Version": 2, "accepts": [{"scheme": "exact", "network": caip,
-                         "asset": mint, "payTo": SOLANA["testnet"][1], "maxAmountRequired": "3820000"}]}}
+                                                       "asset": mint, "payTo": SOLANA["testnet"][1],
+                                                       "maxAmountRequired": "3820000"}]}}
 
 
 class DeploymentTests(unittest.IsolatedAsyncioTestCase):
@@ -95,12 +96,18 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_mismatched_overbudget_estimates_rejected(self):
         for kind in ("stale", "changed", "expensive", "negative", "nan", "missing"):
             value = estimate()
-            if kind == "stale": value["observed_at"] -= 301
-            if kind == "changed": value["arguments"]["location_ids"] = [99]
-            if kind == "expensive": value["result"]["test_total_usd"] = "2.01"
-            if kind == "negative": value["result"]["test_total_usd"] = "-1"
-            if kind == "nan": value["result"]["test_total_usd"] = "NaN"
-            if kind == "missing": value["result"] = {}
+            if kind == "stale":
+                value["observed_at"] -= 301
+            if kind == "changed":
+                value["arguments"]["location_ids"] = [99]
+            if kind == "expensive":
+                value["result"]["test_total_usd"] = "2.01"
+            if kind == "negative":
+                value["result"]["test_total_usd"] = "-1"
+            if kind == "nan":
+                value["result"]["test_total_usd"] = "NaN"
+            if kind == "missing":
+                value["result"] = {}
             with self.subTest(kind=kind), self.assertRaises(PilotError):
                 await self.launch(estimate=value)
         self.cloud.call.assert_not_awaited()
@@ -151,15 +158,16 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
         server = uvicorn.Server(uvicorn.Config(mcp.streamable_http_app(), log_level="error",
-                                              timeout_graceful_shutdown=1))
+                                               timeout_graceful_shutdown=1))
         task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
             for _ in range(100):
-                if server.started or task.done(): break
+                if server.started or task.done():
+                    break
                 await asyncio.sleep(.01)
             self.assertTrue(server.started)
             with patch.object(adapter, "ENDPOINT", f"http://127.0.0.1:{port}/mcp"), \
-                 patch.dict(os.environ, {"IO_NET_API_KEY": "local-test-key"}):
+                    patch.dict(os.environ, {"IO_NET_API_KEY": "local-test-key"}):
                 result = await adapter.connected(lambda cloud: cloud.call("get_credit_status", {}))
             self.assertEqual(result, {"test_credit": "10.00"})
         finally:
@@ -239,6 +247,7 @@ class WorkerTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.calls = []
         self.done = threading.Event()
+
         def engine(audio, model_dir):
             self.calls.append(audio.read_bytes())
             self.done.set()
@@ -252,9 +261,12 @@ class WorkerTests(unittest.TestCase):
 
     def request(self, path, body=None, auth=True, checksum=None, extra_headers=None):
         headers = {}
-        if auth: headers["Authorization"] = "Bearer " + self.worker.token
-        if body is not None: headers["X-Audio-SHA256"] = checksum or hashlib.sha256(body).hexdigest()
-        if extra_headers: headers.update(extra_headers)
+        if auth:
+            headers["Authorization"] = "Bearer " + self.worker.token
+        if body is not None:
+            headers["X-Audio-SHA256"] = checksum or hashlib.sha256(body).hexdigest()
+        if extra_headers:
+            headers.update(extra_headers)
         request = urllib.request.Request(self.url + path, body, headers)
         try:
             response = urllib.request.urlopen(request, timeout=3)
@@ -275,7 +287,8 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(self.done.wait(2))
         for _ in range(100):
             code, job = self.request("/job")
-            if job["status"] == "complete": break
+            if job["status"] == "complete":
+                break
             time.sleep(.01)
         self.assertEqual(job["status"], "complete")
         data = json.dumps(job["result"], sort_keys=True, separators=(",", ":")).encode()
