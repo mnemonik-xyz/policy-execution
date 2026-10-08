@@ -40,6 +40,16 @@ impl ContractPinSpec {
             ContractPinSpec::Solana(p) => p.program.clone(),
         }
     }
+
+    /// Whether this pin covers the `Lock.contract` value `contract`. An EVM address
+    /// is hex, so its case does not matter. A Solana program id is base58 and a
+    /// Bitcoin template id is a name: their case matters.
+    pub fn covers(&self, contract: &str) -> bool {
+        match self {
+            ContractPinSpec::Evm(_) => self.contract_id().eq_ignore_ascii_case(contract),
+            _ => self.contract_id() == contract,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +108,7 @@ impl CompiledPolicy {
     }
 
     pub fn pin_for(&self, chain: &ChainId, contract: &str) -> Option<&ContractPinSpec> {
-        self.pins(chain).iter().find(|p| p.contract_id().eq_ignore_ascii_case(contract))
+        self.pins(chain).iter().find(|p| p.covers(contract))
     }
 }
 
@@ -313,7 +323,7 @@ pub fn validate_policy(text: &str, profiles: &ProfileSet) -> Result<CompiledPoli
         // S7 uses the first pin of a contract (`pin_for`): a second pin of the same
         // contract, for example with another code hash, would never apply.
         for (i, c) in entry.contracts.iter().enumerate() {
-            if entry.contracts[..i].iter().any(|d| d.contract_id().eq_ignore_ascii_case(&c.contract_id())) {
+            if entry.contracts[..i].iter().any(|d| d.covers(&c.contract_id())) {
                 return err(format!("{chain}: contract pinned twice"));
             }
         }
@@ -340,6 +350,21 @@ pub(crate) mod tests {
     pub(crate) const BTC: &str = "bip122:000000000019d6689c085ae165831e93/slip44:0";
     pub(crate) const USDC: &str = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
     pub(crate) const HTLC_EVM: &str = "0x3333333333333333333333333333333333333333";
+
+    /// `pin_for` ignores the case of an EVM address (hex) only.
+    #[test]
+    fn pin_for_ignores_the_case_of_hex_only() {
+        let address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let mut doc = policy_json(example_rule());
+        doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0]["evm"]["address"] = Value::String(address.into());
+        let compiled = validate_policy(&doc.to_string(), &profiles()).unwrap();
+        let eth = ChainId::parse(reference::ETHEREUM_MAINNET).unwrap();
+        assert!(compiled.pin_for(&eth, address).is_some());
+        assert!(compiled.pin_for(&eth, &format!("0x{}", address[2..].to_uppercase())).is_some(), "a checksummed address");
+        let btc = ChainId::parse(reference::BITCOIN_MAINNET).unwrap();
+        assert!(compiled.pin_for(&btc, crate::bitcoin::TEMPLATE_ID).is_some());
+        assert!(compiled.pin_for(&btc, &crate::bitcoin::TEMPLATE_ID.to_uppercase()).is_none(), "a template name in another case");
+    }
 
     pub(crate) fn profiles() -> ProfileSet {
         ProfileSet::new(vec![reference::bitcoin(reference::BITCOIN_MAINNET), reference::ethereum(), reference::solana()])
@@ -465,8 +490,8 @@ pub(crate) mod tests {
         });
         let twice = |doc: &Value| format!("{:?}", validate_policy(&doc.to_string(), &ps).unwrap_err()).contains("pinned twice");
         assert!(twice(&doc), "program pinned twice");
-        // `pin_for` compares ids without case, so two program ids that differ only in
-        // case are one pin too.
+        // Base58 is case-sensitive: two program ids that differ only in case are two
+        // programs, two pins, and `pin_for` finds each by its exact id.
         let alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
         let other_case = (0..program.len())
             .find_map(|i| {
@@ -476,8 +501,15 @@ pub(crate) mod tests {
                 (swapped != c && alphabet.contains(swapped) && crate::solana::parse_key(&candidate).is_some()).then_some(candidate)
             })
             .unwrap();
-        doc["chains"][reference::SOLANA_MAINNET]["contracts"][1]["solana"]["program"] = Value::String(other_case);
-        assert!(twice(&doc), "program pinned twice, in another case");
+        doc["chains"][reference::SOLANA_MAINNET]["contracts"][1]["solana"]["program"] = Value::String(other_case.clone());
+        let compiled = validate_policy(&doc.to_string(), &ps).unwrap();
+        let sol = ChainId::parse(reference::SOLANA_MAINNET).unwrap();
+        let program_of = |id: &str| match compiled.pin_for(&sol, id) {
+            Some(ContractPinSpec::Solana(p)) => Some((p.program.clone(), p.code_hash)),
+            _ => None,
+        };
+        assert_eq!(program_of(&program), Some((program.clone(), [0xc5; 32])));
+        assert_eq!(program_of(&other_case), Some((other_case.clone(), [0xc6; 32])));
         let mut doc = policy_json(example_rule());
         let evm = doc["chains"][reference::ETHEREUM_MAINNET]["contracts"][0].clone();
         let mut upper = evm.clone();
