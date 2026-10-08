@@ -15,8 +15,14 @@ use sha2::{Digest, Sha256};
 use warrant_verified_policy::{decide, Decision, Facts3, Rule};
 
 /// Changes whenever parsing or checking semantics change; bound into evidence.
-pub const CHECKER_VERSION: u32 = 2;
-const USDC_DECIMALS: u32 = 6;
+pub const CHECKER_VERSION: u32 = 3;
+/// Invoice currencies the checker can read, with their ISO 4217 minor units.
+/// Adding one changes the checker version and the guest image.
+pub const CURRENCIES: &[(&str, u32)] = &[("USD", 2), ("EUR", 2), ("AMD", 2)];
+/// One US cent is 10,000 USDC base units. A USD order must carry exactly this rate.
+pub const USD_RATE: (u64, u64) = (10_000, 1);
+/// Longest fraction the amount parser reads before it gives up on a value.
+const MAX_FRACTION_DIGITS: usize = 18;
 const MAX_LINES: usize = 256;
 const MAX_TERMS: usize = 256;
 
@@ -51,6 +57,8 @@ pub struct InvoicePolicy {
     /// Bounds on what a purchase order may authorise.
     pub max_po_total: u64,
     pub po_categories: Vec<u16>,
+    /// ISO 4217 codes a purchase order may name as its invoice currency.
+    pub currencies: Vec<String>,
     pub lexicon: Vec<LexiconEntry>,
     pub deny_terms: Vec<String>,
     pub rule: Rule,
@@ -83,8 +91,14 @@ pub struct PurchaseOrder {
     /// `reference_hash` of the order number the invoice must cite.
     pub po_id: Hash,
     pub vendor_tax_id: Hash,
-    /// Lifetime ceiling across every invoice paid against this order.
+    /// Lifetime ceiling across every invoice paid against this order, in USDC base units.
     pub max_total: u64,
+    /// ISO 4217 code of the invoices this order accepts.
+    pub currency: String,
+    /// The buyer's contract rate: `rate_num` USDC base units per `rate_den`
+    /// minor units of `currency`. The agent cannot choose it.
+    pub rate_num: u64,
+    pub rate_den: u64,
     pub lines: Vec<PoLine>,
     pub valid_after: u64,
     pub valid_until: u64,
@@ -262,7 +276,12 @@ pub fn sign_journal(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskReason {
     InvoiceAttestationMissing,
-    NotUsd,
+    /// The document currency is not in the checker's currency table.
+    UnsupportedCurrency,
+    /// An amount is not in the document currency, or the document is not in the order's.
+    CurrencyMismatch,
+    /// An amount has more decimals than the currency's minor units.
+    CurrencyPrecision,
     TotalsInconsistent,
     PayableUnknown,
     /// Invoice line indices whose label could not be admitted.
@@ -281,6 +300,7 @@ pub enum InvoiceOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceLine {
+    /// In minor units of the document currency.
     pub amount: Option<i128>,
     /// Item name and descriptions, decoded and joined with newlines. Spans index this.
     pub text: String,
@@ -294,15 +314,21 @@ pub struct InvoiceFacts {
     pub invoice_number: String,
     pub seller_tax_id: String,
     pub po_ref: Option<String>,
-    pub usd: bool,
-    /// In USDC base units; `None` when missing, negative or too precise.
-    pub payable: Option<u64>,
+    /// `DocumentCurrencyCode` exactly as written.
+    pub currency: String,
+    /// Every amount carries `currencyID` equal to `currency`.
+    pub currency_consistent: bool,
+    /// No amount has more decimals than the currency's minor units.
+    pub precise: bool,
+    /// In minor units of `currency`; `None` when missing, negative, too precise
+    /// or the currency is unsupported. `usdc_amount` converts it at the order's rate.
+    pub payable_minor: Option<u64>,
     pub totals_consistent: bool,
     pub lines: Vec<InvoiceLine>,
 }
 
 pub fn invoice_policy_hash(policy: &InvoicePolicy) -> Hash {
-    hash_tagged(b"warrant/invoice-policy/v2", policy)
+    hash_tagged(b"warrant/invoice-policy/v3", policy)
 }
 
 pub fn invoice_vendor_message(credential: &InvoiceVendorCredential) -> Vec<u8> {
@@ -369,6 +395,13 @@ pub fn validate_invoice_policy(policy: &InvoicePolicy) -> Result<(), Denial> {
         && !policy.po_categories.is_empty()
         && policy.po_categories.len() <= 64
         && !policy.po_categories.contains(&0)
+        && !policy.currencies.is_empty()
+        && policy.currencies.len() <= CURRENCIES.len()
+        && policy
+            .currencies
+            .iter()
+            .enumerate()
+            .all(|(i, c)| minor_units(c).is_some() && !policy.currencies[..i].contains(c))
         && policy.lexicon.len() <= 64
         && terms + policy.deny_terms.len() <= MAX_TERMS
         && policy
@@ -384,9 +417,37 @@ pub fn validate_invoice_policy(policy: &InvoicePolicy) -> Result<(), Denial> {
     }
 }
 
-/// Exact decimal to base units at `USDC_DECIMALS`. Exponents, signs other than a
-/// leading minus, and excess precision are not representable and yield `None`.
-fn parse_amount(raw: &str) -> Option<i128> {
+/// ISO 4217 minor units of a supported currency.
+pub fn minor_units(code: &str) -> Option<u32> {
+    CURRENCIES.iter().find(|(c, _)| *c == code).map(|(_, d)| *d)
+}
+
+/// The payable amount in USDC base units at the order's contract rate, rounded
+/// down so the vendor never receives more than the signed rate gives. `None`
+/// when the currencies differ, the amount is unknown, or the result is zero or
+/// does not fit a `u64`.
+pub fn usdc_amount(facts: &InvoiceFacts, po: &PurchaseOrder) -> Option<u64> {
+    if facts.currency != po.currency || po.rate_den == 0 {
+        return None;
+    }
+    let minor = u128::from(facts.payable_minor?);
+    let value = minor * u128::from(po.rate_num) / u128::from(po.rate_den);
+    u64::try_from(value).ok().filter(|v| *v > 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Amount {
+    /// In minor units.
+    Value(i128),
+    /// Well formed, but with more decimals than the currency allows.
+    TooPrecise,
+    Invalid,
+}
+
+/// Exact decimal to minor units of a currency with `decimals` minor units.
+/// Exponents, signs other than a leading minus and other forms are invalid.
+/// Trailing zeros count: EN 16931 allows at most the currency's decimals.
+fn parse_amount(raw: &str, decimals: u32) -> Amount {
     let raw = raw.trim();
     let (negative, digits) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -396,20 +457,23 @@ fn parse_amount(raw: &str) -> Option<i128> {
     if whole.is_empty()
         || whole.len() > 18
         || !whole.bytes().all(|b| b.is_ascii_digit())
-        || frac.len() > USDC_DECIMALS as usize
+        || frac.len() > MAX_FRACTION_DIGITS
         || (digits.contains('.') && frac.is_empty())
         || !frac.bytes().all(|b| b.is_ascii_digit())
     {
-        return None;
+        return Amount::Invalid;
     }
-    let mut value: i128 = whole.parse().ok()?;
-    let mut scale = 0;
+    if frac.len() > decimals as usize {
+        return Amount::TooPrecise;
+    }
+    let Ok(mut value) = whole.parse::<i128>() else {
+        return Amount::Invalid;
+    };
     for b in frac.bytes() {
         value = value * 10 + i128::from(b - b'0');
-        scale += 1;
     }
-    value *= 10i128.pow(USDC_DECIMALS - scale);
-    Some(if negative { -value } else { value })
+    value *= 10i128.pow(decimals - frac.len() as u32);
+    Amount::Value(if negative { -value } else { value })
 }
 
 fn text_of(el: &Element) -> String {
@@ -460,14 +524,24 @@ pub fn parse_invoice(document: &[u8]) -> Result<InvoiceFacts, Denial> {
         .flatten()
         .filter(|s| !s.is_empty());
 
-    // Every monetary amount must carry the document currency.
-    let mut usd = currency == "USD";
+    // Every monetary amount must carry the document currency and fit its minor
+    // units. An unsupported currency is reported by the caller before totals matter.
+    let decimals = minor_units(&currency).unwrap_or(2);
+    let mut currency_consistent = true;
+    let mut precise = true;
     let mut amount = |el: Option<&Element>| -> Option<i128> {
         let el = el?;
         if el.attr("currencyID") != Some(currency.as_str()) {
-            usd = false;
+            currency_consistent = false;
         }
-        parse_amount(&el.text)
+        match parse_amount(&el.text, decimals) {
+            Amount::Value(v) => Some(v),
+            Amount::TooPrecise => {
+                precise = false;
+                None
+            }
+            Amount::Invalid => None,
+        }
     };
 
     let total = cac(&root, "LegalMonetaryTotal")?.ok_or(Denial::InvalidDocument)?;
@@ -522,7 +596,7 @@ pub fn parse_invoice(document: &[u8]) -> Result<InvoiceFacts, Denial> {
             line.child(CBC, "LineExtensionAmount")
                 .map_err(|_| Denial::InvalidDocument)?,
         );
-        sum = sum.zip(line_amount).map(|(a, b)| a + b);
+        sum = sum.zip(line_amount).and_then(|(a, b)| a.checked_add(b));
         lines.push(InvoiceLine {
             amount: line_amount,
             text,
@@ -545,8 +619,8 @@ pub fn parse_invoice(document: &[u8]) -> Result<InvoiceFacts, Denial> {
         )
     })()
     .unwrap_or(false);
-    let payable = payable_raw
-        .filter(|v| *v > 0)
+    let payable_minor = payable_raw
+        .filter(|v| *v > 0 && minor_units(&currency).is_some())
         .and_then(|v| u64::try_from(v).ok());
 
     Ok(InvoiceFacts {
@@ -554,8 +628,10 @@ pub fn parse_invoice(document: &[u8]) -> Result<InvoiceFacts, Denial> {
         invoice_number,
         seller_tax_id,
         po_ref,
-        usd,
-        payable,
+        currency,
+        currency_consistent,
+        precise,
+        payable_minor,
         totals_consistent,
         lines,
     })
@@ -667,11 +743,16 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
         || po.valid_after > po.valid_until
         || po.max_total == 0
         || po.lines.len() > MAX_LINES
+        || po.rate_num == 0
+        || po.rate_den == 0
+        || minor_units(&po.currency).is_none()
+        || (po.currency == "USD" && (po.rate_num, po.rate_den) != USD_RATE)
     {
         return Err(Denial::InvalidEvidence);
     }
     // The buyer's key cannot exceed what the owner's policy lets an order authorise.
     if po.max_total > policy.max_po_total
+        || !policy.currencies.contains(&po.currency)
         || po
             .lines
             .iter()
@@ -726,14 +807,26 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
         _ => return Err(Denial::InvalidEvidence),
     };
 
+    // Currency first: totals and amounts mean nothing in a currency the checker
+    // cannot read, or at a rate the order does not give.
     let mut ask = Vec::new();
-    if !facts.usd {
-        ask.push(AskReason::NotUsd);
+    if minor_units(&facts.currency).is_none() {
+        ask.push(AskReason::UnsupportedCurrency);
+    } else {
+        if !facts.currency_consistent || facts.currency != po.currency {
+            ask.push(AskReason::CurrencyMismatch);
+        }
+        if !facts.precise {
+            ask.push(AskReason::CurrencyPrecision);
+        }
+    }
+    if !ask.is_empty() {
+        return Ok(InvoiceOutcome::Ask(ask));
     }
     if !facts.totals_consistent {
         ask.push(AskReason::TotalsInconsistent);
     }
-    let Some(amount) = facts.payable else {
+    let Some(amount) = usdc_amount(&facts, po) else {
         ask.push(AskReason::PayableUnknown);
         return Ok(InvoiceOutcome::Ask(ask));
     };

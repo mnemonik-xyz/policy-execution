@@ -35,9 +35,9 @@ class FakeRpc:
 def world(tmp_path, warrant_ids, invoice_xml):
     facts = Ids(warrant_ids).facts(invoice_xml)
     logs = [offered(facts["poId"], 5_000_000_000, block=10),
-            paid(facts["obligationId"], facts["payable"], facts["documentHash"], tx="0x02", block=11),
+            paid(facts["obligationId"], facts["payableMinor"] * 10_000, facts["documentHash"], tx="0x02", block=11),
             paid("0x" + "ab" * 32, 1_000_000, "0x" + "cd" * 32, authenticator=2, tx="0x03", block=11),
-            closed(5_000_000_000 - facts["payable"] - 1_000_000, tx="0x04", block=12)]
+            closed(5_000_000_000 - facts["payableMinor"] * 10_000 - 1_000_000, tx="0x04", block=12)]
     chain = Chain(rpc_url="", chain_id=5042002, escrow="0x" + "11" * 20, from_block=0, confirmations=2)
     store = Store(str(tmp_path / "events.sqlite"))
     return dict(facts=facts, logs=logs, chain=chain, store=store, ids=Ids(warrant_ids), xml=invoice_xml,
@@ -111,3 +111,23 @@ def test_export_writes_atomically(world):
     assert "Expenses:Warrant:AcmeLV" in text
     with pytest.raises(ValueError):
         bc.render(store, chain, world["cfg"], {"0x" + "44" * 20: "acme lv"})
+
+
+def test_usd_amount_difference_is_reported(world):
+    store, chain, facts = world["store"], world["chain"], world["facts"]
+    logs = [world["logs"][0], paid(facts["obligationId"], 1_000_000, facts["documentHash"], tx="0x05", block=11)]
+    sync(FakeRpc(logs, head=14), store, chain)
+    intake.record(store, world["ids"], [world["xml"]])
+    diffs = [i for i in report.exceptions(store, chain.chain_id, now=T0) if i["kind"] == "amount difference"]
+    assert diffs and diffs[0]["invoicePayable"] == 1_320_000_000
+
+
+def test_old_store_is_refused(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE invoices (document_hash TEXT)")
+    db.commit()
+    db.close()
+    with pytest.raises(RuntimeError, match="schema version"):
+        Store(str(path))

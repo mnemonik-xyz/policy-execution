@@ -33,8 +33,10 @@ fn facts_match_the_checker() {
     assert_eq!(f["obligationId"], hex32(&obligation_id(TAX_ID, "INV-1001")));
     assert_eq!(f["poId"], hex32(&reference_hash("PO-77")));
     assert_eq!(f["taxIdHash"], hex32(&tax_id_hash(TAX_ID)));
-    assert_eq!(f["payable"], 1320 * USDC);
-    assert_eq!(f["usd"], true);
+    assert_eq!(f["payableMinor"], 132_000);
+    assert_eq!(f["currency"], "USD");
+    assert_eq!(f["currencyConsistent"], true);
+    assert_eq!(f["precise"], true);
     assert_eq!(f["totalsConsistent"], true);
 }
 

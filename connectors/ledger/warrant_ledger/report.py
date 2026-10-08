@@ -4,6 +4,8 @@ import time
 from . import match as m
 
 DAY = 86400
+# One US cent in USDC base units: the only rate the checker fixes for every order.
+USD_CENT = 10_000
 
 
 def self_checks(store, chain_id):
@@ -39,8 +41,12 @@ def exceptions(store, chain_id, unpaid_after_days=30, expiring_days=7, now=None)
             paid_obligations.add(inv["obligation_id"])
         if status != m.MATCHED:
             out.append({**base, "kind": status})
-        if inv is not None and inv["payable"] is not None and inv["payable"] != d["amount"]:
-            out.append({**base, "kind": "amount difference", "invoicePayable": inv["payable"]})
+        # Other currencies convert at the order's signed rate, which the connector
+        # does not hold; their paid amount is checked by Warrant, not here.
+        if inv is not None and inv["currency"] == "USD" and inv["payable_minor"] is not None \
+                and inv["payable_minor"] * USD_CENT != d["amount"]:
+            out.append({**base, "kind": "amount difference",
+                        "invoicePayable": inv["payable_minor"] * USD_CENT})
         if d["authenticator"] == "BuyerApproval":
             out.append({**base, "kind": "buyer approval: the checker did not run on chain"})
     open_by_po = {}

@@ -39,11 +39,13 @@ def render(store, chain, cfg, vendors):
     accounts = {cfg.escrow_account, cfg.wallet_account}
     escrow_balance, end_of_day, closing_days = 0, {}, set()
     for seq, inv in enumerate(invoices):
-        payable = "unknown" if inv["payable"] is None else usdc(inv["payable"])
+        # Every currency the checker supports has 2 minor units (ISO 4217).
+        payable = "unknown" if inv["payable_minor"] is None else \
+            f'{inv["payable_minor"] // 100}.{inv["payable_minor"] % 100:02d} {inv["currency"]}'
         entries.append((day(inv["recorded_at"]), 0, seq,
             f'{day(inv["recorded_at"])} custom "warrant-invoice" {q(inv["document_hash"])}\n'
             f'  obligation: {q(inv["obligation_id"])}\n  invoice: {q(inv["invoice_number"])}\n'
-            f'  po: {q(inv["po_id"])}\n  usd: {q("yes" if inv["usd"] else "no")}\n  payable: {q(payable)}\n'))
+            f'  po: {q(inv["po_id"])}\n  payable: {q(payable)}\n'))
     for seq, e in enumerate(events):
         d, date = e["data"], day(e["block_time"])
         txid = f'{e["tx_hash"]}:{e["log_index"]}'

@@ -218,10 +218,120 @@ fn e10_seller_tax_id_must_match_credential_and_po() {
 }
 
 #[test]
-fn e11_non_usd_invoice_asks() {
+fn e11_eur_invoice_pays_at_the_signed_order_rate() {
     let mut d = doc();
     d.currency = "EUR";
-    assert_eq!(asked(&fixture(d.xml())), vec![AskReason::NotUsd]);
+    let mut input = fixture(d.xml());
+    set_order_currency(&mut input, "EUR", EUR_RATE);
+    // 1,320.00 EUR is 132,000 cents; at 1,085,000 base units per 100 cents.
+    assert_eq!(allowed(&input).authorization.request.amount, 1_432_200_000);
+}
+
+#[test]
+fn eur_invoice_against_a_usd_order_asks() {
+    let mut d = doc();
+    d.currency = "EUR";
+    assert_eq!(asked(&fixture(d.xml())), vec![AskReason::CurrencyMismatch]);
+}
+
+#[test]
+fn amd_invoice_pays_and_rounds_down() {
+    let mut d = doc();
+    d.currency = "AMD";
+    let mut input = fixture(d.xml());
+    set_order_currency(&mut input, "AMD", (1, 7));
+    // 132,000 minor units / 7 = 18,857.14…; the vendor never gets the fraction.
+    assert_eq!(allowed(&input).authorization.request.amount, 18_857);
+}
+
+#[test]
+fn usd_amount_is_unchanged_at_the_fixed_rate() {
+    assert_eq!(
+        allowed(&fixture(doc().xml())).authorization.request.amount,
+        1_320 * USDC
+    );
+}
+
+#[test]
+fn usd_order_with_another_rate_is_invalid() {
+    let mut input = fixture(doc().xml());
+    set_order_currency(&mut input, "USD", (10_001, 1));
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidEvidence));
+}
+
+#[test]
+fn zero_rate_is_invalid() {
+    for rate in [(0, 1), (1, 0)] {
+        let mut d = doc();
+        d.currency = "EUR";
+        let mut input = fixture(d.xml());
+        set_order_currency(&mut input, "EUR", rate);
+        assert_eq!(authorize_invoice(&input), Err(Denial::InvalidEvidence));
+    }
+}
+
+#[test]
+fn order_currency_must_be_allowed_by_the_policy() {
+    let mut d = doc();
+    d.currency = "AMD";
+    let mut input = fixture(d.xml());
+    input.policy.currencies = vec!["USD".into(), "EUR".into()];
+    set_order_currency(&mut input, "AMD", (2_564, 100));
+    assert_eq!(authorize_invoice(&input), Err(Denial::InvalidEvidence));
+}
+
+#[test]
+fn unsupported_currency_asks() {
+    let mut d = doc();
+    d.currency = "GBP";
+    assert_eq!(
+        asked(&fixture(d.xml())),
+        vec![AskReason::UnsupportedCurrency]
+    );
+}
+
+#[test]
+fn amounts_beyond_the_currency_minor_units_ask() {
+    // 1.005 USD and 6.000000 USD: EN 16931 allows at most 2 decimals.
+    let mut d = doc();
+    d.payable = "1320.005";
+    assert_eq!(asked(&fixture(d.xml())), vec![AskReason::CurrencyPrecision]);
+    let mut d = doc();
+    d.lines[0].amount = "1000.000000";
+    assert_eq!(asked(&fixture(d.xml())), vec![AskReason::CurrencyPrecision]);
+}
+
+#[test]
+fn amount_in_another_currency_asks() {
+    // A TaxTotal in a separate tax currency is skipped by design; a monetary
+    // total in another currency is not.
+    let xml = String::from_utf8(doc().xml()).unwrap().replacen(
+        "<cbc:PayableAmount currencyID=\"USD\">",
+        "<cbc:PayableAmount currencyID=\"EUR\">",
+        1,
+    );
+    assert_eq!(
+        asked(&fixture(xml.into_bytes())),
+        vec![AskReason::CurrencyMismatch]
+    );
+}
+
+#[test]
+fn conversion_overflow_asks() {
+    let mut d = doc();
+    d.currency = "EUR";
+    let mut input = fixture(d.xml());
+    set_order_currency(&mut input, "EUR", (u64::MAX, 1));
+    assert_eq!(asked(&input), vec![AskReason::PayableUnknown]);
+}
+
+#[test]
+fn policy_currencies_are_validated() {
+    for currencies in [vec![], vec!["GBP"], vec!["USD", "USD"]] {
+        let mut input = fixture(doc().xml());
+        input.policy.currencies = currencies.into_iter().map(String::from).collect();
+        assert_eq!(authorize_invoice(&input), Err(Denial::InvalidPolicy));
+    }
 }
 
 #[test]
@@ -483,10 +593,7 @@ fn invoice_attestation_window_bounds_authorization() {
 fn unrepresentable_payable_asks() {
     let mut d = doc();
     d.payable = "1320.0000001";
-    assert_eq!(
-        asked(&fixture(d.xml())),
-        vec![AskReason::TotalsInconsistent, AskReason::PayableUnknown]
-    );
+    assert_eq!(asked(&fixture(d.xml())), vec![AskReason::CurrencyPrecision]);
 }
 
 #[test]

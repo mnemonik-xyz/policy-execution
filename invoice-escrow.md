@@ -53,6 +53,11 @@ the policy commitment domain is `warrant/invoice-policy/v2`, and the journal
 appends customer as its fifteenth word. Rebuild the invoice guest and deploy a
 new escrow with its image ID. Old 14-word receipts are not compatible.
 
+The multi-currency revision (2026-10-08) is also breaking for the guest: new PO
+fields and policy domain `warrant/invoice-policy/v3` change the invoice image ID.
+The contract and the journal layout are unchanged, but a deployment pins the image
+ID, so the new image needs a new escrow. See [the evidence checker §4a](evidence-checker.md).
+
 ## Invoice-source authentication
 
 The buyer includes a compressed secp256k1 public key, `invoice_key`, in the

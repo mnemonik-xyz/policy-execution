@@ -1,5 +1,37 @@
 # Warrant implementation validation
 
+## Multi-currency invoices — 2026-10-08
+
+Checker version 3 ([specification](../multi-currency/spec.md),
+[evidence checker §4a](evidence-checker.md)). Measured on Linux x86-64 in a cloud
+session, without the RISC Zero toolchain.
+
+| Check | Result |
+|---|---|
+| `cargo test -p warrant-policy --locked` | 76 passed: 39 invoice (11 new), 17 policy, 17 solver, 3 unit |
+| `cargo test -p warrant-ids --locked` | 4 passed; test vectors regenerated |
+| `forge test` | 74 passed, using regenerated `invoice-journal.json` and `invoice-signature.json` |
+| `connectors/ledger` pytest | 14 passed |
+| `scripts/invoice-demo.py --signed-only --ledger` on Anvil | Signed and buyer-approved USD settlements, then the ledger; `bean-check` passed |
+
+New tests cover: an EUR invoice at the signed rate (E11, now `Allow`), an AMD
+invoice rounded down, the unchanged USD amount, a USD order with another rate, a
+zero rate, a currency outside the policy, an unsupported currency, `1.005` and
+`6.000000` USD, an amount in another currency, conversion overflow, and policy
+currency validation.
+
+Not done in this session:
+
+- The invoice guest was not rebuilt. `rzup` could not download the toolchain
+  through the session proxy. The new image ID is therefore not recorded.
+- No real proof and no Groth16 wrap for checker version 3. `invoice-proof.json`
+  belongs to the version-2 image.
+- The demo ran with `RISC0_SKIP_BUILD=1` and a stand-in image ID. That is
+  allowed only with `--signed-only`, whose paths never verify a proof.
+- No EUR or AMD settlement on chain. The unit tests cover the conversion; the
+  demo order is in USD.
+- Verus was not rerun. The evaluator source is unchanged.
+
 ## Invoice authentication and customer isolation — 2026-09-30
 
 This working revision changes invoice policy commitments and settlement encoding.

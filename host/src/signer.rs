@@ -14,7 +14,7 @@ use sha3::{Digest, Keccak256};
 use std::{fs, io::Write, path::Path};
 use warrant_policy::evidence::{
     authorize_invoice, invoice_policy_hash, obligation_id, parse_invoice, sign_journal,
-    validate_invoice_policy, InvoiceOutcome, InvoicePolicy, SignRequest,
+    usdc_amount, validate_invoice_policy, InvoiceOutcome, InvoicePolicy, SignRequest,
 };
 use warrant_policy::{Address, Hash};
 
@@ -242,6 +242,8 @@ pub fn sign(
     let facts = parse_invoice(&request.document)?;
     let obligation = obligation_id(&facts.seller_tax_id, &facts.invoice_number);
     let input = request.into_input(policy, po_spent);
+    // What the buyer would approve: the payable converted at the signed order rate.
+    let payable = usdc_amount(&facts, &input.po);
     match authorize_invoice(&input)? {
         InvoiceOutcome::Ask(reasons) => Ok(Signed {
             output: json!({
@@ -249,7 +251,9 @@ pub fn sign(
                 "orderId": hex(&id),
                 "obligationId": hex(&obligation),
                 "documentHash": hex(&facts.doc_hash),
-                "payable": facts.payable,
+                "payable": payable,
+                "currency": facts.currency,
+                "invoicePayableMinor": facts.payable_minor,
                 "chainId": scope.chain_id,
                 "escrow": hex(&scope.vault),
             }),

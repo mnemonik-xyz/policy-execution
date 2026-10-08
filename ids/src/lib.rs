@@ -61,8 +61,10 @@ pub fn facts(document: &[u8]) -> Result<Value> {
         "poRef": f.po_ref,
         "poId": po_id,
         "obligationId": hex32(&obligation_id(&f.seller_tax_id, &f.invoice_number)),
-        "usd": f.usd,
-        "payable": f.payable,
+        "currency": f.currency,
+        "currencyConsistent": f.currency_consistent,
+        "precise": f.precise,
+        "payableMinor": f.payable_minor,
         "totalsConsistent": f.totals_consistent,
     }))
 }

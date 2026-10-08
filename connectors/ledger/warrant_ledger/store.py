@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS orders (
   recipient TEXT, max_total INTEGER, settle_by INTEGER, state TEXT);
 CREATE TABLE IF NOT EXISTS invoices (
   document_hash TEXT PRIMARY KEY, obligation_id TEXT, invoice_number TEXT,
-  seller_tax_id TEXT, po_id TEXT, usd INTEGER, payable INTEGER,
+  seller_tax_id TEXT, po_id TEXT, currency TEXT, payable_minor INTEGER,
   totals_consistent INTEGER, source TEXT, recorded_at INTEGER);
 CREATE TABLE IF NOT EXISTS bookings (
   event_key TEXT, adapter TEXT, ledger_ref TEXT, status TEXT, reason TEXT,
@@ -30,11 +30,21 @@ def event_key(chain_id, tx_hash, log_index):
     return f"{chain_id}:{tx_hash.lower()}:{log_index}"
 
 
+# 2: intake records carry the invoice currency and the payable in its minor units.
+VERSION = 2
+
+
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        has_tables = self.db.execute("SELECT count(*) FROM sqlite_master WHERE name='invoices'").fetchone()[0]
+        if has_tables and version != VERSION:
+            raise RuntimeError(f"Event store {path} has schema version {version}, expected {VERSION}; "
+                               "move it aside and run intake and sync again")
         self.db.executescript(SCHEMA)
+        self.db.execute(f"PRAGMA user_version = {VERSION}")
 
     def close(self):
         self.db.close()
@@ -89,7 +99,7 @@ class Store:
         cur = self.db.execute(
             "INSERT OR IGNORE INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?)",
             (facts["documentHash"], facts["obligationId"], facts["invoiceNumber"], facts["sellerTaxId"],
-             facts["poId"], int(facts["usd"]), facts["payable"], int(facts["totalsConsistent"]),
+             facts["poId"], facts["currency"], facts["payableMinor"], int(facts["totalsConsistent"]),
              source, int(time.time())))
         return cur.rowcount == 1
 
