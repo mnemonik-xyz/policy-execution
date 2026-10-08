@@ -6,11 +6,20 @@ second), an undecided invoice by the buyer's own approval, and a third by real
 proof (prove, wrap for EVM, settle). Rejects replay and smuggled inputs.
 Uses only Anvil's public test accounts and keys. Never connects to a public network.
 """
-import argparse, json, os, pathlib, platform, socket, subprocess, time, urllib.request
+import argparse, json, os, pathlib, platform, shutil, socket, subprocess, sys, time, urllib.request
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--deploy-only", action="store_true", help="Exercise deployment, funding and acceptance without proving")
 parser.add_argument("--signed-only", action="store_true", help="Stop after the signed settlement; skip proving")
+parser.add_argument("--ledger", action="store_true", help="With --signed-only: book the settlements with connectors/ledger and check the beancount output")
 options = parser.parse_args()
+if options.ledger and not options.signed_only:
+    parser.error("--ledger requires --signed-only")
+# Hosts without the zkVM toolchain build the host with RISC0_SKIP_BUILD=1 and get a
+# zero image ID, which the deployment refuses. The signed and approved paths never
+# verify a proof, so they may run against a stand-in image ID; proving may not.
+DEMO_IMAGE_ID = os.environ.get("WARRANT_DEMO_IMAGE_ID")
+if DEMO_IMAGE_ID and not options.signed_only:
+    parser.error("WARRANT_DEMO_IMAGE_ID is only allowed with --signed-only")
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
 ENV = dict(os.environ, RISC0_BUILD_LOCKED='1', RAYON_NUM_THREADS='4', DOCKER_DEFAULT_PLATFORM='linux/amd64')
@@ -37,6 +46,31 @@ def deploy(name, *args):
 def number(text):
     return int(text.split()[0])
 
+def ledger_demo(out, escrow):
+    """Books the two settlements with the ledger connector and checks the result."""
+    run('cargo','build','-p','warrant-ids','--release','--locked')
+    for name, request in (('invoice-1001.xml', out/'request.json'), ('invoice-1003.xml', out/'ask/request.json')):
+        (out/name).write_bytes(bytes(json.loads(request.read_text())['document']))
+    (out/'ledger.toml').write_text(
+        f'[chain]\nrpc_url = "{URL}"\nchain_id = 31337\nescrow = "{escrow}"\nfrom_block = 0\nconfirmations = 0\n'
+        f'[tools]\nwarrant_ids = "{ROOT/'target/release/warrant-ids'}"\n[store]\npath = "{out/'ledger.sqlite'}"\n'
+        f'[beancount]\npath = "{out/'books.beancount'}"\n[vendors]\n"{VENDOR.lower()}" = "Vendor"\n')
+    ledger=lambda *a: run(sys.executable,'-m','warrant_ledger','--config',str(out/'ledger.toml'),*a,cwd=ROOT/'connectors/ledger')
+    ledger('intake',str(out/'invoice-1001.xml'),str(out/'invoice-1003.xml'))
+    ledger('sync')
+    ledger('export-beancount')
+    kinds=sorted(i['kind'] for i in json.loads(ledger('report','--json')))
+    assert kinds==['buyer approval: the checker did not run on chain'], kinds
+    books=(out/'books.beancount').read_text()
+    assert books.count('Expenses:Warrant:Vendor  ')==2 and 'match: "matched"' in books, books
+    if shutil.which('bean-check'):
+        ENV['PYTHONPATH']=str(ROOT/'connectors/ledger')  # the plugin lives in the connector package
+        run('bean-check',str(out/'books.beancount'))
+        checked='bean-check passed'
+    else:
+        checked='bean-check not installed; skipped'
+    print(f'Ledger: both settlements booked against their invoices; {checked}. File: {out/"books.beancount"}',flush=True)
+
 out = ROOT/'artifacts'/f'invoice-{time.time_ns()}'
 out.mkdir(parents=True)
 with socket.socket() as sock:
@@ -60,7 +94,7 @@ try:
     signer_key_file.write_text(SIGNER_KEY+'\n')
     run('cargo','build','-p','warrant-host','--release','--locked')
     run('forge','build',cwd=ROOT/'contracts')
-    image=run('target/release/warrant-host','invoice-image-id')
+    image=DEMO_IMAGE_ID or run('target/release/warrant-host','invoice-image-id')
     token=deploy('test/PolicyExecutionVault.t.sol:TestToken')
     ENV.update(WARRANT_TOKEN=token, WARRANT_IMAGE_ID=image)
     run('forge','script','script/DeployInvoice.s.sol:DeployInvoice','--broadcast','--slow','--unlocked','--sender',CUSTOMER,'--rpc-url',URL,cwd=ROOT/'contracts')
@@ -144,6 +178,8 @@ try:
     except (RuntimeError,AssertionError): pass
     else: raise AssertionError('Approval replay unexpectedly accepted')
     print('Undecided invoice settled by buyer approval; replay rejected; smuggled inputs and unnamed signers refused.',flush=True)
+    if options.ledger:
+        ledger_demo(out, escrow)
     if options.signed_only:
         (out/'result.json').write_text(json.dumps(dict(chainId=31337,token=token,escrow=escrow,signer=SIGNER,orderId=order,
             amount=amount,signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],

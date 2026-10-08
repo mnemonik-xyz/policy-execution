@@ -62,6 +62,19 @@ They do not touch the invoice `Rule`, so the invoice guest image id is unchanged
   checks S1 to S25 and S27, Bitcoin, EVM and Solana primitives, the policy DSL
   and warrant payloads (144 tests; every check caught when disabled).
 
+## Ledger connector (2026-10-08, in progress)
+
+Phase 0 and phase 1 of [the ledger integration](../ledger-integration/spec.md)
+([implementation plan](../ledger-integration/implementation.md)):
+
+- [`ids`](ids/): the `warrant-ids` binary. It prints the document hash, the
+  obligation ID, the PO hash and `orderId` with the library functions. It has no
+  zkVM dependency, and the guests do not link it, so the image IDs are unchanged.
+- [`connectors/ledger`](connectors/ledger/README.md): reads `InvoiceEscrow` logs,
+  matches each `Paid` event to the invoice that the agent submitted, and writes a
+  beancount ledger with a `bean-check` plugin. It holds no Warrant key.
+  `python3 scripts/invoice-demo.py --signed-only --ledger` runs it end to end.
+
 ## Invoice authentication and compatibility (2026-09-30)
 
 Invoice orders and replay state are now isolated by funding customer. The invoice
