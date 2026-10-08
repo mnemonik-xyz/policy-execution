@@ -14,16 +14,20 @@ import re
 import tempfile
 import threading
 import time
+import urllib.parse
 
 MODEL_ID = "Systran/faster-whisper-small"
 MODEL_REVISION = "536b0662742c02347bc0e980a01041f333bce120"
 MAX_AUDIO_BYTES = 64 * 1024 * 1024
 
 
-def transcribe(audio, model_dir):
+def transcribe(audio, model_dir, language=None):
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_dir, device="cuda", compute_type="float16", local_files_only=True)
-    segments, info = model.transcribe(str(audio), beam_size=5)
+    device = os.getenv("WARRANT_DEVICE", "cuda")
+    compute_type = os.getenv("WARRANT_COMPUTE_TYPE", "float16" if device == "cuda" else "default")
+    lang = language or os.getenv("WARRANT_LANGUAGE")
+    model = WhisperModel(model_dir, device=device, compute_type=compute_type, local_files_only=True)
+    segments, info = model.transcribe(str(audio), beam_size=5, language=lang)
     return {"language": info.language, "audio_seconds": info.duration,
             "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in segments]}
 
@@ -56,7 +60,7 @@ class Worker:
             if os.path.exists(name):
                 os.unlink(name)
 
-    def submit(self, body, expected_hash):
+    def submit(self, body, expected_hash, language=None):
         actual_hash = hashlib.sha256(body).hexdigest()
         if actual_hash != expected_hash:
             return 400, {"error": "audio hash mismatch"}
@@ -69,19 +73,28 @@ class Worker:
             audio.write_bytes(body)
             self.job = {"input_sha256": actual_hash, "status": "running",
                         "model": MODEL_ID, "model_revision": MODEL_REVISION}
+            if language:
+                self.job["requested_language"] = language
             self.persist()
-            threading.Thread(target=self.run, args=(audio,), daemon=True).start()
+            threading.Thread(target=self.run, args=(audio, language), daemon=True).start()
             return 202, self.job.copy()
 
-    def run(self, audio):
+    def run(self, audio, language=None):
         started = time.monotonic()
         try:
-            output = self.engine(audio, self.model_dir)
+            import inspect
+            sig = inspect.signature(self.engine)
+            if "language" in sig.parameters:
+                output = self.engine(audio, self.model_dir, language=language)
+            else:
+                output = self.engine(audio, self.model_dir)
             result_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             update = {"status": "complete", "result": output,
                       "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
                       "elapsed_seconds": time.monotonic() - started}
-        except Exception:
+        except Exception as exc:
+            import sys
+            print(f"Transcription error: {exc}", file=sys.stderr, flush=True)
             update = {"status": "failed", "error": "Transcription failed"}
         with self.lock:
             self.job.update(update)
@@ -113,20 +126,28 @@ def handler(worker):
             return True
 
         def do_GET(self):
-            if self.path == "/health":
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/health":
                 return self.reply(200, {"status": "ok"})
             if not self.authorized():
                 return
-            if self.path != "/job":
+            if parsed.path != "/job":
                 return self.reply(404, {"error": "not found"})
             with worker.lock:
                 self.reply(200, worker.job or {"status": "empty"})
 
         def do_POST(self):
+            parsed = urllib.parse.urlsplit(self.path)
             if not self.authorized():
                 return
-            if self.path != "/job":
+            if parsed.path != "/job":
                 return self.reply(404, {"error": "not found"})
+            query = urllib.parse.parse_qs(parsed.query)
+            language = query.get("language", [None])[0] or self.headers.get("X-Language")
+            if language:
+                language = language.strip().lower()
+                if not re.fullmatch(r"[a-z]{2,3}", language):
+                    return self.reply(400, {"error": "Language must be a 2 or 3 letter ISO code (e.g. en, es)"})
             size = self.headers.get("Content-Length", "")
             expected = self.headers.get("X-Audio-SHA256", "")
             if not re.fullmatch(r"[0-9]{1,9}", size) or not 0 < int(size) <= MAX_AUDIO_BYTES:
@@ -136,7 +157,7 @@ def handler(worker):
             body = self.rfile.read(int(size))
             if len(body) != int(size):
                 return self.reply(400, {"error": "incomplete upload"})
-            code, result = worker.submit(body, expected)
+            code, result = worker.submit(body, expected, language=language)
             self.reply(code, result)
     return Handler
 

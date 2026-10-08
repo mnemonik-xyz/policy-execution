@@ -250,10 +250,11 @@ class WorkerTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 
-    def request(self, path, body=None, auth=True, checksum=None):
+    def request(self, path, body=None, auth=True, checksum=None, extra_headers=None):
         headers = {}
         if auth: headers["Authorization"] = "Bearer " + self.worker.token
         if body is not None: headers["X-Audio-SHA256"] = checksum or hashlib.sha256(body).hexdigest()
+        if extra_headers: headers.update(extra_headers)
         request = urllib.request.Request(self.url + path, body, headers)
         try:
             response = urllib.request.urlopen(request, timeout=3)
@@ -261,6 +262,12 @@ class WorkerTests(unittest.TestCase):
             response = error
         with response:
             return response.status, json.load(response)
+
+    def test_language_argument_and_validation(self):
+        code, err = self.request("/job?language=invalid_lang", b"audio")
+        self.assertEqual(code, 400)
+        code, err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
+        self.assertEqual(code, 400)
 
     def test_upload_poll_duplicate_and_persistent_result(self):
         code, _ = self.request("/job", b"fake audio for unit test")
