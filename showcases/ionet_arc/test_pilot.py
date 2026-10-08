@@ -86,12 +86,24 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_billing_and_unbounded_capacity_rejected_before_call(self):
         for change in ({"billing_model": "invalid"}, {"duration_hours": 2}, {"replica_count": 2},
-                       {"hardware_id": "gpu_1x_a6000"}, {"node_pool_id": "private"},
+                       {"hardware_id": ""}, {"node_pool_id": "private"},
                        {"location_ids": []}, {"gpus_per_container": True}, {"duration_hours": -1}):
             with self.subTest(change=change), self.assertRaises(PilotError):
                 await self.launch(args=dict(ARGS, **change))
         self.cloud.call.assert_not_awaited()
         self.assertFalse(self.state.exists())
+
+    async def test_string_hardware_id_and_location_allowed(self):
+        for loc in ("US", ["US"]):
+            with self.subTest(loc=loc):
+                args = dict(ARGS, hardware_id="gpu_1x_l40", location_ids=loc)
+                est = estimate()
+                est["arguments"]["hardware_id"] = "gpu_1x_l40"
+                est["arguments"]["location_ids"] = loc
+                state_path = Path(self.tmp.name, f"test-deploy-{loc}.json")
+                result = await adapter.deploy(self.cloud, args, state_path, est, "/test_total_usd", "2")
+                self.assertEqual(result["phase"], "deployed")
+                self.assertEqual(result["deployment_id"], DEPLOYMENT_ID)
 
     async def test_payg_billing_model_allowed(self):
         result = await self.launch(args=dict(ARGS, billing_model="payg"))
