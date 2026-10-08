@@ -194,7 +194,9 @@ Request the estimate:
    CHECKSUM=$(shasum -a 256 "$AUDIO_FILE" | awk '{print $1}')
 
    curl -X POST "https://<PUBLIC_ENDPOINT>/job?language=en" \
+     -A "Mozilla/5.0" \
      -H "Authorization: Bearer $WORKER_TOKEN" \
+     -H "Content-Type: application/octet-stream" \
      -H "X-Audio-SHA256: $CHECKSUM" \
      --data-binary @"$AUDIO_FILE"
    ```

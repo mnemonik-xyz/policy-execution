@@ -55,8 +55,18 @@ def save(path, value, *, exclusive=False):
             os.unlink(tmp)
 
 
-def read_json(path):
-    return json.loads(Path(path).read_text())
+def read_json(path_or_str):
+    if isinstance(path_or_str, (str, Path)):
+        p = Path(path_or_str)
+        try:
+            if p.is_file():
+                return json.loads(p.read_text())
+        except OSError:
+            pass
+        s = str(path_or_str).strip()
+        if s.startswith(("{", "[")):
+            return json.loads(s)
+    return json.loads(Path(path_or_str).read_text())
 
 
 def no_credentials(value):

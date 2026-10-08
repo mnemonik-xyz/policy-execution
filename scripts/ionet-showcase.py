@@ -21,10 +21,10 @@ def main():
     discover.add_argument("--out", required=True, type=pathlib.Path)
     read = sub.add_parser("read")
     read.add_argument("tool", choices=sorted(READ_TOOLS))
-    read.add_argument("--args", type=pathlib.Path)
+    read.add_argument("--args")
     read.add_argument("--out", required=True, type=pathlib.Path)
     create = sub.add_parser("deploy")
-    create.add_argument("--args", required=True, type=pathlib.Path)
+    create.add_argument("--args", required=True)
     create.add_argument("--state", required=True, type=pathlib.Path)
     create.add_argument("--estimate", required=True, type=pathlib.Path)
     create.add_argument("--usd-pointer", required=True, help="JSON pointer to the provider's total USD price")
@@ -72,7 +72,7 @@ def main():
 
 
 def unwrap_error(exc):
-    if isinstance(exc, (PilotError, FileExistsError)):
+    if isinstance(exc, (PilotError, FileExistsError, FileNotFoundError, json.JSONDecodeError)):
         return exc
     if hasattr(exc, "exceptions"):
         for sub in exc.exceptions:

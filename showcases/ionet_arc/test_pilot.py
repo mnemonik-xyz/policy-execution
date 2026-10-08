@@ -257,6 +257,21 @@ class ArcAndPaymentTests(unittest.TestCase):
                 decode_result(result)
             self.assertNotIn("SECRET", str(ctx.exception))
 
+    def test_read_json_file_and_inline(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            f.write('{"test_key": "from_file"}')
+            path = f.name
+        try:
+            self.assertEqual(read_json(path), {"test_key": "from_file"})
+            self.assertEqual(read_json(Path(path)), {"test_key": "from_file"})
+            self.assertEqual(read_json('{"test_key": "inline"}'), {"test_key": "inline"})
+            with self.assertRaises(FileNotFoundError):
+                read_json("nonexistent_path_xyz.json")
+            with self.assertRaises(json.JSONDecodeError):
+                read_json('{"invalid": json')
+        finally:
+            os.unlink(path)
+
 
 class WorkerTests(unittest.TestCase):
     def setUp(self):
