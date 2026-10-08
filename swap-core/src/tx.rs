@@ -153,7 +153,9 @@ pub fn bind(action: Action, which: LegName, leg: &Leg, tx: &ProposedTx, own: &Ow
                 .zip(&intents)
                 .map(|(tx, intent)| evm::check_tx(tx, intent).map_err(|e| e.to_string()))
                 .collect::<Result<_, _>>()?;
-            Ok(TxBinding::Evm { signing_hashes })
+            // The contract keys a lock by `msg.sender`: the leg's sender must sign it.
+            let signer = if action == Action::Lock { Some(evm_addr(&leg.sender)?) } else { None };
+            Ok(TxBinding::Evm { signing_hashes, signer })
         }
         (Family::Solana, ProposedTx::Solana { message }) => {
             let program = solana::parse_key(&lock.contract).ok_or("bad HTLC program id")?;

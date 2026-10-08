@@ -83,6 +83,9 @@ flowchart LR
   lock call names the swap id and the leg byte; claim and refund name the
   `lock_id`. The Solana lock data names the swap id and the leg byte; claim and
   refund data and the escrow PDA seeds use `lock_id`. S20 binds the `lock_id`.
+  An EVM lock binding also names `signer`, the leg's sender: the EIP-1559
+  signing hash does not cover the sender, so the binding states the key that
+  must sign. S20 rejects an EVM lock warrant without it.
   The two legs of a same-chain swap therefore have two keys.
 - S11 adds `D_refund(B)`, the time for the leg B refund to become final after
   `T_B`, because a claim stays valid until then. A profile sets it to 0 only

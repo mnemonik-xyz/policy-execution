@@ -54,6 +54,12 @@ pub enum TxBinding {
     Evm {
         #[serde(with = "enc::hex32_vec")]
         signing_hashes: Vec<Hash32>,
+        /// For a lock: the address that must sign every hash, the leg's `sender`.
+        /// The contract keys the lock by `msg.sender` (G4), and an EIP-1559 signing
+        /// hash does not cover the sender. Absent for a claim or a refund, which
+        /// name the lock by `lock_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "enc::hex20_opt")]
+        signer: Option<[u8; 20]>,
     },
     Solana {
         #[serde(with = "enc::hex32")]
@@ -201,6 +207,13 @@ pub fn check_binding(w: &SwapWarrant, e: &Expected) -> Result<(), &'static str> 
             if &leg.lock.lock_id != lock_id {
                 return Err("other lock");
             }
+            // An EVM lock binds the key that signs it: the contract keys the lock by it.
+            if let Some(TxBinding::Evm { signer, .. }) = &w.tx_binding {
+                let expected = if w.action == Action::Lock { leg.sender.evm_address() } else { None };
+                if *signer != expected || (w.action == Action::Lock && expected.is_none()) {
+                    return Err("other signer");
+                }
+            }
         }
         _ => return Err("leg binding missing"),
     }
@@ -260,7 +273,7 @@ pub(crate) mod tests {
             terms_hash: [2; 32],
             inner_sig_hash: [3; 32],
             leg: Some(leg()),
-            tx_binding: Some(TxBinding::Evm { signing_hashes: vec![[5; 32]] }),
+            tx_binding: Some(TxBinding::Evm { signing_hashes: vec![[5; 32]], signer: leg().sender.evm_address() }),
             facts: vec![FactRecord::new("notional", serde_json::json!(40_000), None)],
             policy_hash: [6; 32],
             policy_version: 3,
@@ -281,7 +294,8 @@ pub(crate) mod tests {
         assert!(text.starts_with(r#"{"action":"lock","decision":"allow","evaluator_id":"0707"#), "{text}");
         assert!(text.contains(r#""amount":"1000000000000000000000000""#), "amounts are decimal strings");
         assert!(text.contains(r#""prev_warrant":null"#));
-        assert!(text.contains(r#""tx_binding":{"family":"evm","signing_hashes":["0505"#));
+        let signer = crate::to_hex(&leg().sender.evm_address().unwrap());
+        assert!(text.contains(&format!(r#""tx_binding":{{"family":"evm","signer":"{signer}","signing_hashes":["0505"#)), "{text}");
         assert!(text.contains(&format!(r#""lock_id":"{}""#, crate::to_hex(&LOCK_ID))), "the leg carries its lock_id");
         assert!(!text.contains("claim_key") && !text.contains("refund_key"), "Bitcoin keys only on Bitcoin");
         assert!(!text.contains(' '));
@@ -341,6 +355,27 @@ pub(crate) mod tests {
         w.valid_until = valid_until;
         let e = Expected { action: Action::Accept, swap_id: &[1; 32], chain: None, contract: None, lock_id: None, now_real, skew_secs };
         check_binding(&w, &e)
+    }
+
+    /// S20 (G4): an EVM lock binds the key that signs it, the leg's sender, because
+    /// the contract keys the lock by `msg.sender`. A claim or a refund binds none.
+    #[test]
+    fn evm_lock_binds_its_signer() {
+        let chain = ChainId::parse("eip155:1").unwrap();
+        let contract = format!("0x{}", "33".repeat(20));
+        let lock = Expected { action: Action::Lock, swap_id: &[1; 32], chain: Some(&chain), contract: Some(&contract), lock_id: Some(&LOCK_ID), now_real: 150, skew_secs: 0 };
+        let w = warrant();
+        assert_eq!(check_binding(&w, &lock), Ok(()));
+        let with_signer = |signer: Option<[u8; 20]>| SwapWarrant { tx_binding: Some(TxBinding::Evm { signing_hashes: vec![[5; 32]], signer }), ..w.clone() };
+        assert_eq!(check_binding(&with_signer(None), &lock), Err("other signer"));
+        assert_eq!(check_binding(&with_signer(Some([0x12; 20])), &lock), Err("other signer"));
+        // A claim names its lock by lock_id: any own key may send it.
+        let claim = Expected { action: Action::Claim, ..lock };
+        let claim_warrant = |signer| SwapWarrant { action: Action::Claim, ..with_signer(signer) };
+        assert_eq!(check_binding(&claim_warrant(None), &claim), Ok(()));
+        assert_eq!(check_binding(&claim_warrant(leg().sender.evm_address()), &claim), Err("other signer"));
+        let text = String::from_utf8(claim_warrant(None).payload().unwrap()).unwrap();
+        assert!(!text.contains("signer"), "absent signer is not serialized: {text}");
     }
 
     /// An accept warrant has no leg: a verifier that expects a lock never accepts it.

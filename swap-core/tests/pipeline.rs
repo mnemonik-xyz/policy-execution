@@ -498,7 +498,7 @@ fn initiator_happy_path() {
     let reveal = w.run(Action::Reveal, terms(), Some(reveal_tx(&SECRET)), Some(SECRET));
     assert_allow(&reveal);
     let Outcome::Warrant(rw) = &reveal else { unreachable!() };
-    assert!(matches!(&rw.tx_binding, Some(TxBinding::Evm { signing_hashes }) if signing_hashes.len() == 1));
+    assert!(matches!(&rw.tx_binding, Some(TxBinding::Evm { signing_hashes, signer: None }) if signing_hashes.len() == 1));
     // The payload is canonical and the hash chain can link to it.
     assert_eq!(rw.hash().unwrap(), warrant_swap_core::blake3(&rw.payload().unwrap()));
 }
@@ -1045,7 +1045,9 @@ fn responder_happy_path() {
     let out = w.run(Action::Lock, terms(), Some(responder_lock_txs(30_000_000_000, 30_000_000_000)), None);
     assert_allow(&out);
     let Outcome::Warrant(lw) = &out else { unreachable!() };
-    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signing_hashes }) if signing_hashes.len() == 2));
+    // A token lock binds approve and lock, and both must be signed by the leg's sender.
+    let sender = terms().leg_b.sender.evm_address();
+    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signing_hashes, signer }) if signing_hashes.len() == 2 && *signer == sender && sender.is_some()));
     assert!(lw.facts.iter().any(|f| f.name == "counterparty_lock" && f.value["depth"] == 3));
 }
 
@@ -1592,7 +1594,11 @@ fn same_chain_evm_swap_uses_two_lock_ids() {
         timelock: T_A_EVM,
     };
     let lock_tx = |call: &LockCall| ProposedTx::Evm(vec![evm_tx(HTLC_EVM, t.leg_a.amount, call.calldata())]);
-    assert_allow(&w.run(Action::Lock, t.clone(), Some(lock_tx(&lock_a)), None));
+    let out = w.run(Action::Lock, t.clone(), Some(lock_tx(&lock_a)), None);
+    assert_allow(&out);
+    // The contract keys leg A's lock by msg.sender: the binding names leg A's sender.
+    let Outcome::Warrant(lw) = &out else { unreachable!() };
+    assert!(matches!(&lw.tx_binding, Some(TxBinding::Evm { signer: Some(s), .. }) if Some(*s) == t.leg_a.sender.evm_address()));
     assert_denied(&w.run(Action::Lock, t.clone(), Some(lock_tx(&LockCall { leg: LegName::B, ..lock_a })), None), code::S24);
     // The responder sees leg A under id_a and locks leg B, which the contract keys by id_b.
     let mut w = evm_same_chain_world(Role::Responder);
