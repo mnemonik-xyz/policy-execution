@@ -202,14 +202,15 @@ cargo build -p warrant-swap-core --target wasm32-unknown-unknown
   requires a failing test. S1 is also enforced by the type (`HashAlg` has only
   `Sha256`).
 
-Results on 2026-10-08, after G4, G20 and G21: 93 unit tests and 49 pipeline
-tests passed; 23 of 23 disabled checks caught, with the new checks
+Results on 2026-10-08, after G4, G20 and G21 and the Codex review (the EVM lock
+signer, case-sensitive Solana ids): 95 unit tests and 49 pipeline tests passed; 23 of 23 disabled checks caught, with the new checks
 `s10_lock_id` and `s10_lock_binding`; the wasm32 build succeeds. Manual
 mutations each fail a test: 28 of the `lock_id` rules (derivation, leg byte,
 sender bytes, the claim leaf, EVM and Solana keying, S20, the entry and exit
 call sites), 15 of the EVM proxy rules, 29 of the Solana loader, ProgramData,
 code hash and escrow token account rules (Token-2022 included), the duplicate
-pin rule, and the Solana own sender.
+pin rule and the case of contract ids, the EVM lock signer, and the Solana own
+sender.
 
 Results on 2026-10-07, after D3, D7, D8, D9 and G2: 79 unit tests and 40
 pipeline tests passed; 21 of 21 disabled checks caught; the wasm32 build
