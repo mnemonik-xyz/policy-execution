@@ -62,6 +62,34 @@ They do not touch the invoice `Rule`, so the invoice guest image id is unchanged
   checks S1 to S25 and S27, Bitcoin, EVM and Solana primitives, the policy DSL
   and warrant payloads (144 tests; every check caught when disabled).
 
+## Multi-currency invoices (2026-10-08)
+
+Implements [multi-currency invoices](../multi-currency/spec.md). Invoices in USD,
+EUR and AMD are paid in USDC at the contract rate in the signed purchase order,
+rounded down. Amounts with more decimals than the currency allows ask instead of
+being accepted (`1.005 USD` used to pass). Details: [evidence checker §4a](evidence-checker.md).
+
+This is a breaking revision. `PurchaseOrder` gains `currency`, `rate_num` and
+`rate_den`; `InvoicePolicy` gains `currencies`; the policy domain is
+`warrant/invoice-policy/v3` and the checker version is 3. The 15-word journal, the
+contracts and the Verus proof are unchanged. The invoice guest image ID changes:
+rebuild it with `RISC0_USE_DOCKER=1`, prove into a new receipt directory, and deploy
+a new `InvoiceEscrow`. The image ID and real receipts for this revision are not
+recorded yet.
+
+## Ledger connector (2026-10-08, in progress)
+
+Phase 0 and phase 1 of [the ledger integration](../ledger-integration/spec.md)
+([implementation plan](../ledger-integration/implementation.md)):
+
+- [`ids`](ids/): the `warrant-ids` binary. It prints the document hash, the
+  obligation ID, the PO hash and `orderId` with the library functions. It has no
+  zkVM dependency, and the guests do not link it, so the image IDs are unchanged.
+- [`connectors/ledger`](connectors/ledger/README.md): reads `InvoiceEscrow` logs,
+  matches each `Paid` event to the invoice that the agent submitted, and writes a
+  beancount ledger with a `bean-check` plugin. It holds no Warrant key.
+  `python3 scripts/invoice-demo.py --signed-only --ledger` runs it end to end.
+
 ## Invoice authentication and compatibility (2026-09-30)
 
 Invoice orders and replay state are now isolated by funding customer. The invoice

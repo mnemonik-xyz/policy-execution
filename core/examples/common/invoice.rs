@@ -8,6 +8,8 @@ use warrant_policy::*;
 
 pub const USDC: u64 = 1_000_000;
 pub const TAX_ID: &str = "US-12-3456789";
+/// Synthetic EUR contract rate: 1.0850 USD per euro, as USDC base units per cent.
+pub const EUR_RATE: (u64, u64) = (1_085_000, 100);
 
 pub fn key(byte: u8) -> SigningKey {
     SigningKey::from_slice(&[byte; 32]).unwrap()
@@ -131,6 +133,7 @@ pub fn policy(rule: Rule, scope: Scope, base: u64) -> InvoicePolicy {
         acceptance_key: Some(public(&key(2))),
         max_po_total: 5_000 * USDC,
         po_categories: vec![7, 9],
+        currencies: vec!["USD".into(), "EUR".into(), "AMD".into()],
         lexicon: vec![
             LexiconEntry {
                 label: 7,
@@ -171,6 +174,9 @@ pub fn fixture_at(document: Vec<u8>, scope: Scope, base: u64) -> InvoiceInput {
         po_id: reference_hash("PO-77"),
         vendor_tax_id: tax_id_hash(TAX_ID),
         max_total: 3_000 * USDC,
+        currency: "USD".into(),
+        rate_num: USD_RATE.0,
+        rate_den: USD_RATE.1,
         lines: vec![
             PoLine {
                 item_id: reference_hash("SW-1"),
@@ -211,6 +217,13 @@ pub fn fixture_at(document: Vec<u8>, scope: Scope, base: u64) -> InvoiceInput {
     };
     resign(&mut input);
     input
+}
+
+/// Re-denominates the order and re-signs it; the document must match.
+pub fn set_order_currency(input: &mut InvoiceInput, currency: &str, rate: (u64, u64)) {
+    input.po.currency = currency.into();
+    (input.po.rate_num, input.po.rate_den) = rate;
+    resign(input);
 }
 
 pub fn resign(input: &mut InvoiceInput) {

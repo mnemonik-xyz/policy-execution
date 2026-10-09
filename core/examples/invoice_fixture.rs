@@ -2,7 +2,9 @@
 //! (for `warrant-host invoice-prove`), `policy.json` and `request.json` (what the
 //! signing service holds and what the agent sends it) and `terms.json` (for
 //! `InvoiceEscrow.offer`). With a trailing `ask` argument the second line has no
-//! order match and no claim, so the checker asks instead of allowing.
+//! order match and no claim, so the checker asks instead of allowing. With a
+//! trailing `eur` argument the invoice and the order are in euros at the
+//! synthetic contract rate `EUR_RATE`.
 //! Never use these public signing keys for real payments.
 #[path = "common/invoice.rs"]
 mod invoice;
@@ -28,15 +30,19 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     assert!(
         (8..=10).contains(&args.len()),
-        "invoice_fixture out_dir chain_id escrow token vendor customer base_timestamp [invoice_number] [ask]"
+        "invoice_fixture out_dir chain_id escrow token vendor customer base_timestamp [invoice_number] [ask|eur]"
     );
     let ask = args.get(9).map(String::as_str) == Some("ask");
+    let eur = args.get(9).map(String::as_str) == Some("eur");
     let scope = Scope {
         chain_id: args[2].parse().unwrap(),
         vault: bytes(&args[3]),
         token: bytes(&args[4]),
     };
     let mut document = doc();
+    if eur {
+        document.currency = "EUR";
+    }
     if let Some(number) = args.get(8) {
         document.number = number.clone().leak();
     }
@@ -59,6 +65,9 @@ fn main() {
     input.policy.customer = bytes(&args[6]);
     if ask {
         input.claims.truncate(1);
+    }
+    if eur {
+        set_order_currency(&mut input, "EUR", EUR_RATE);
     }
     resign(&mut input);
     let facts = parse_invoice(&input.document).unwrap();
@@ -103,7 +112,7 @@ fn main() {
                 "poId": hex(&input.po.po_id),
                 "recipient": hex(&input.vendor.recipient),
                 "maxTotal": input.po.max_total,
-                "amount": facts.payable,
+                "amount": usdc_amount(&facts, &input.po),
                 "taskId": hex(&obligation),
                 "documentHash": hex(&facts.doc_hash),
                 "ask": reasons.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>(),

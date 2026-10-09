@@ -3493,6 +3493,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrant-ids"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "k256",
+ "serde_json",
+ "sha3",
+ "warrant-policy",
+]
+
+[[package]]
 name = "warrant-methods"
 version = "0.1.0"
 dependencies = [

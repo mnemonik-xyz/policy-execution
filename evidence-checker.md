@@ -69,11 +69,34 @@ The agent, the LLM, and the delivery channel are untrusted. A buyer-approved
 invoice authority must independently establish invoice provenance and sign its
 exact bytes; the checker verifies that attestation before evaluating rules.
 
+## 4a. Currencies (checker version 3, 2026-10-08)
+
+Specification: [multi-currency](../multi-currency/spec.md).
+
+- **Table.** `USD`, `EUR` and `AMD`, each with 2 minor units (ISO 4217). Every
+  amount is parsed in minor units of the document currency. An amount with more
+  decimals, trailing zeros included, gives `Ask(CurrencyPrecision)`: EN 16931
+  allows at most 2. An unknown code gives `Ask(UnsupportedCurrency)`.
+- **Rate.** `PurchaseOrder` carries `currency`, `rate_num` and `rate_den`:
+  `rate_num` USDC base units per `rate_den` minor units. The amount is
+  `floor(payable × rate_num / rate_den)` in `u128`; zero or a result above
+  `u64::MAX` gives `Ask(PayableUnknown)`. A USD order must use exactly 10000/1.
+  A zero rate, or a currency outside `InvoicePolicy.currencies`, denies with
+  `InvalidEvidence`.
+- **Order of reasons.** Currency problems are reported alone
+  (`UnsupportedCurrency`, `CurrencyMismatch`, `CurrencyPrecision`), because
+  totals mean nothing in a currency the checker cannot read.
+- **Unchanged.** The 15-word journal (its amount is USDC base units), the
+  contracts and the Verus-proved evaluator. Changed: `CHECKER_VERSION` 3, policy
+  domain `warrant/invoice-policy/v3`, the PO message, and so the invoice image ID.
+
 ## 4. Tier 0 — facts derived from the document
 
 **Implemented format.** UBL 2.1 `Invoice` XML only. CII and Factur-X extraction
 remain proposals. Unsupported roots and malformed documents return
-`InvalidDocument`, not `Ask`; parsed non-USD invoices return `Ask(NotUsd)`.
+`InvalidDocument`, not `Ask`. Invoices in USD, EUR and AMD are paid in USDC at
+the rate in the signed purchase order (§4a); other currencies return
+`Ask(UnsupportedCurrency)`.
 Source: [UBL 2.1](https://docs.oasis-open.org/ubl/UBL-2.1.html).
 
 **Parser profile.** A fixed allowlist of element paths, rejecting any `DOCTYPE`,
@@ -89,8 +112,8 @@ Unknown elements are ignored, never interpreted.
 |---|---|---|
 | `seller_tax_id` | `AccountingSupplierParty/Party/PartyTaxScheme/CompanyID` | Must equal the vendor credential's tax ID, else `Deny` |
 | `invoice_number` | root `cbc:ID` | Feeds the obligation ID (§7) |
-| `currency` | `DocumentCurrencyCode` + every `currencyID` attribute | v1 pays only `USD` invoices in USDC; anything else → `Ask` |
-| `payable` | `LegalMonetaryTotal/PayableAmount` | Exact decimal → integer base units (6 decimals); more precision → `Unknown` |
+| `currency` | `DocumentCurrencyCode` + every `currencyID` attribute | Must be in the currency table (§4a) and equal the order currency, else `Ask` |
+| `payable` | `LegalMonetaryTotal/PayableAmount` | Exact decimal → integer minor units of the currency; more decimals than ISO 4217 allows → `Ask(CurrencyPrecision)` |
 | `lines[i].amount` | `InvoiceLine/LineExtensionAmount` | Signed integers: credit lines can be negative |
 | `lines[i].text` | `InvoiceLine/Item/Name`, `Item/Description` | Kept as **byte ranges** into the document, for Tier 1 spans |
 | `lines[i].item_id` | `Item/SellersItemIdentification/ID` | For PO-line evidence |
@@ -249,7 +272,7 @@ promising a proving time.
 | E8 | LLM claims a span outside the line, or a fabricated span | Claim rejected → `Unknown` |
 | E9 | Denied term present; LLM omits that line | Scan finds it → `Deny` |
 | E10 | Seller tax ID differs from the credential | `Deny` |
-| E11 | EUR invoice | `Ask` |
+| E11 | EUR invoice against a signed EUR order | `Allow` at the order's rate; against a USD order, `Ask(CurrencyMismatch)` |
 | E12 | XML with `DOCTYPE` / entity declaration | Parser rejects → no facts |
 | E13 | Homoglyph in a lexicon term | No match → `Unknown` → `Ask` |
 
@@ -310,8 +333,8 @@ credentials.
 
 - Where do real invoices come from during the window? Synthetic data is
   disqualified, so the fixtures prove behaviour but not traction.
-- Is USD-only acceptable for the demo, or is an FX (foreign exchange) fact source
-  needed for EUR invoices?
+- Answered 2026-10-08: EUR and AMD are paid at a buyer-signed contract rate in
+  the purchase order (§4a). A signed FX (foreign exchange) rate source is planned.
 - The policy hash is unsalted (README, "Proof flow and privacy"); add a salt if
   policy parameters must stay confidential.
 - Exact EN 16931 rounding rules for `totals_consistent` (§4 warning).
@@ -325,6 +348,9 @@ credentials.
 - **Original journal was 14 words**: the 12 base words, `poId`, `poMaxTotal`.
   The 2026-09-30 revision adds `customer` as word 15 and requires a new image and
   deployment; invoice policy commitments use `warrant/invoice-policy/v2`.
+- **Multi-currency revision (2026-10-08)**: checker version 3, policy domain
+  `warrant/invoice-policy/v3`, three new PO fields and `InvoicePolicy.currencies`
+  (§4a). The journal layout is unchanged; the invoice image changes.
 - **Spans index the decoded line text** (item name, then descriptions, joined
   with newlines), not raw document bytes; that text is a deterministic function
   of the hashed bytes.
