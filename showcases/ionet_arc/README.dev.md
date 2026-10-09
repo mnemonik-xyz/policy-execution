@@ -207,11 +207,15 @@ Request the estimate:
      --data-binary @"$AUDIO_FILE"
    ```
 
-4. Poll for transcription completion (`GET /job`):
+4. Copy `job_id` from the submission response, then poll for transcription completion
+   (`GET /job/<job_id>`):
    ```sh
    curl -H "Authorization: Bearer $WORKER_TOKEN" \
-     "https://<PUBLIC_ENDPOINT>/job"
+     "https://<PUBLIC_ENDPOINT>/job/<job_id>"
    ```
+
+   Submit additional audio with `POST /job` as needed. Each distinct upload has its own
+   `job_id`; `GET /jobs` returns all submitted jobs.
 
 ---
 

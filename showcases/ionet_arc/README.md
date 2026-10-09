@@ -180,15 +180,18 @@ arguments from discovery to find the assigned public HTTPS endpoint.
 | Request | Authentication | Result |
 | --- | --- | --- |
 | `GET /health` | None | Process health; no GPU-readiness claim |
-| `POST /job` | `Authorization: Bearer WORKER_TOKEN` | Upload raw audio, receive job status |
-| `GET /job` | Same token | Status, transcript, hashes, revision and timing |
+| `POST /job` | `Authorization: Bearer WORKER_TOKEN` | Upload raw audio, receive its job status and `job_id` |
+| `GET /job/<job_id>` | Same token | Status, transcript, hashes, revision and timing for one job |
+| `GET /jobs` | Same token | All submitted jobs |
 
 For uploads, supply `Content-Length` and `X-Audio-SHA256` (lowercase SHA-256 of the audio). An
 optional language code can be passed via `?language=<code>` or `X-Language: <code>`. Maximum
-size is 64 MiB. No caller-supplied URL is fetched. Repeated submission of the same input
-returns its existing job; another input receives 409 for this single-job worker. Collect the
-output outside the container before cleanup. A restart with preserved state reports unfinished
-work as `interrupted`.
+size is 64 MiB. No caller-supplied URL is fetched. The response `job_id` is the input SHA-256;
+use it to poll `GET /job/<job_id>`. Repeated submission of the same input returns its existing
+job, while different inputs create independent jobs. `GET /job` remains available only when
+there is zero or one job, for compatibility. Collect output outside the container before cleanup.
+Jobs transcribe one at a time to avoid GPU contention. A restart with preserved state reports
+unfinished work as `interrupted`.
 
 The worker uses CUDA/FP16 `faster-whisper`. Timing includes model loading and
 transcription. Hashes identify bytes, not correctness. Local tests use an

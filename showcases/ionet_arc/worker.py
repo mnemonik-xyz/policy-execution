@@ -1,4 +1,4 @@
-"""Single-job HTTP transcription worker for io.net CaaS.
+"""Multi-job HTTP transcription worker for io.net CaaS.
 
 Audio is uploaded directly: no server-side fetching of caller-supplied URLs.
 Only public/non-sensitive audio is intended for this pilot. Output provenance
@@ -40,22 +40,45 @@ class Worker:
         self.root.mkdir(parents=True, exist_ok=True)
         self.engine, self.model_dir = engine, model_dir
         self.lock = threading.Lock()
-        self.job = None
+        self.run_lock = threading.Lock()
+        self.jobs = self.load_jobs()
         # A restarted process must not silently rerun an already accepted job.
-        if (self.root / "job.json").exists():
-            self.job = json.loads((self.root / "job.json").read_text())
-            if self.job["status"] == "running":
-                self.job["status"] = "interrupted"
-                self.persist()
+        interrupted = False
+        for job in self.jobs.values():
+            if job["status"] in {"queued", "running"}:
+                job["status"] = "interrupted"
+                interrupted = True
+        if interrupted:
+            self.persist()
+
+    @property
+    def job(self):
+        """Compatibility view for callers of the original single-job worker."""
+        if len(self.jobs) == 1:
+            return next(iter(self.jobs.values()))
+        return None
+
+    def load_jobs(self):
+        state = self.root / "jobs.json"
+        if state.exists():
+            return json.loads(state.read_text())["jobs"]
+        # Upgrade state written by the original single-job pilot without rerunning it.
+        legacy = self.root / "job.json"
+        if not legacy.exists():
+            return {}
+        job = json.loads(legacy.read_text())
+        job_id = job["input_sha256"]
+        job["job_id"] = job_id
+        return {job_id: job}
 
     def persist(self):
         fd, name = tempfile.mkstemp(dir=self.root)
         try:
             with os.fdopen(fd, "w") as stream:
-                json.dump(self.job, stream, allow_nan=False)
+                json.dump({"jobs": self.jobs}, stream, allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(name, self.root / "job.json")
+            os.replace(name, self.root / "jobs.json")
         finally:
             if os.path.exists(name):
                 os.unlink(name)
@@ -65,40 +88,54 @@ class Worker:
         if actual_hash != expected_hash:
             return 400, {"error": "audio hash mismatch"}
         with self.lock:
-            if self.job:
-                if self.job["input_sha256"] != actual_hash:
-                    return 409, {"error": "This pilot worker accepts only one unique job"}
-                return 200, self.job.copy()
-            audio = self.root / "input.audio"
+            if actual_hash in self.jobs:
+                return 200, self.jobs[actual_hash].copy()
+            inputs = self.root / "inputs"
+            inputs.mkdir(exist_ok=True)
+            audio = inputs / f"{actual_hash}.audio"
             audio.write_bytes(body)
-            self.job = {"input_sha256": actual_hash, "status": "running",
-                        "model": MODEL_ID, "model_revision": MODEL_REVISION}
+            self.jobs[actual_hash] = {"job_id": actual_hash, "input_sha256": actual_hash,
+                                      "status": "queued", "model": MODEL_ID,
+                                      "model_revision": MODEL_REVISION}
             if language:
-                self.job["requested_language"] = language
+                self.jobs[actual_hash]["requested_language"] = language
             self.persist()
-            threading.Thread(target=self.run, args=(audio, language), daemon=True).start()
-            return 202, self.job.copy()
+            threading.Thread(target=self.run, args=(actual_hash, audio, language), daemon=True).start()
+            return 202, self.jobs[actual_hash].copy()
 
-    def run(self, audio, language=None):
-        started = time.monotonic()
-        try:
-            import inspect
-            sig = inspect.signature(self.engine)
-            if "language" in sig.parameters:
-                output = self.engine(audio, self.model_dir, language=language)
-            else:
-                output = self.engine(audio, self.model_dir)
-            result_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-            update = {"status": "complete", "result": output,
-                      "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
-                      "elapsed_seconds": time.monotonic() - started}
-        except Exception as exc:
-            import sys
-            print(f"Transcription error: {exc}", file=sys.stderr, flush=True)
-            update = {"status": "failed", "error": "Transcription failed"}
+    def run(self, job_id, audio, language=None):
+        with self.run_lock:
+            with self.lock:
+                self.jobs[job_id]["status"] = "running"
+                self.persist()
+            started = time.monotonic()
+            try:
+                import inspect
+                sig = inspect.signature(self.engine)
+                if "language" in sig.parameters:
+                    output = self.engine(audio, self.model_dir, language=language)
+                else:
+                    output = self.engine(audio, self.model_dir)
+                result_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                update = {"status": "complete", "result": output,
+                          "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+                          "elapsed_seconds": time.monotonic() - started}
+            except Exception as exc:
+                import sys
+                print(f"Transcription error: {exc}", file=sys.stderr, flush=True)
+                update = {"status": "failed", "error": "Transcription failed"}
+            with self.lock:
+                self.jobs[job_id].update(update)
+                self.persist()
+
+    def get(self, job_id):
         with self.lock:
-            self.job.update(update)
-            self.persist()
+            job = self.jobs.get(job_id)
+            return job.copy() if job else None
+
+    def list(self):
+        with self.lock:
+            return [self.jobs[job_id].copy() for job_id in sorted(self.jobs)]
 
 
 def _handle_get(request, worker):
@@ -107,10 +144,22 @@ def _handle_get(request, worker):
         return request.reply(200, {"status": "ok"})
     if not request.authorized():
         return
+    if parsed.path == "/jobs":
+        return request.reply(200, {"jobs": worker.list()})
+    if parsed.path.startswith("/job/"):
+        job_id = parsed.path.removeprefix("/job/")
+        if not re.fullmatch(r"[0-9a-f]{64}", job_id):
+            return request.reply(404, {"error": "not found"})
+        job = worker.get(job_id)
+        return request.reply(200, job) if job else request.reply(404, {"error": "not found"})
     if parsed.path != "/job":
         return request.reply(404, {"error": "not found"})
-    with worker.lock:
-        request.reply(200, worker.job or {"status": "empty"})
+    jobs = worker.list()
+    if not jobs:
+        return request.reply(200, {"status": "empty"})
+    if len(jobs) == 1:
+        return request.reply(200, jobs[0])
+    return request.reply(400, {"error": "job_id required; use GET /job/<job_id> or GET /jobs"})
 
 
 def _handle_post(request, worker):
