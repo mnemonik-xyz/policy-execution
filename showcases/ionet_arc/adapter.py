@@ -149,8 +149,10 @@ class Cloud:
                                               if name == DEPLOY else (schema, arguments))
         validator = validators.validator_for(schema_to_validate)
         validator.check_schema(schema_to_validate)
-        if not validator(schema_to_validate).is_valid(call_arguments):
-            raise PilotError("Arguments do not match the discovered tool inputSchema")
+        errors = list(validator(schema_to_validate).iter_errors(call_arguments))
+        if errors:
+            details = "; ".join(e.message for e in errors[:3])
+            raise PilotError(f"Arguments do not match {name} schema: {details}")
         result = await self.session.call_tool(name, arguments=call_arguments, read_timeout_seconds=60)
         return decode_result(result.model_dump(by_alias=True, exclude_none=True))
 

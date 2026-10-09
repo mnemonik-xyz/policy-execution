@@ -113,6 +113,9 @@ Captured responses have restrictive local file permissions but may contain
 account data or container environment variables. Publish reviewed evidence,
 not raw account responses.
 
+For running the standalone Streamable HTTP MCP server for external agents,
+see [README.mcp.md](README.mcp.md).
+
 ## First live deployment
 
 The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
