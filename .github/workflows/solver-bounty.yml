@@ -47,6 +47,8 @@ jobs:
           forge test --root contracts
       - name: Guest execution agrees with native checks
         run: cargo test --release --locked -p warrant-host --test solver_execution
+      - name: Canary script guard tests
+        run: python3 scripts/test_solver_canary.py
 
   solver-proof:
     if: >-

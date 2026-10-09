@@ -181,6 +181,44 @@ For a reproducible deployment image, build with `RISC0_USE_DOCKER=1`.
 Construct the policy only after the escrow address is known.
 No public deployment is included in the local demonstration.
 
+## Public-chain canary driver
+
+Status: available now. It has not run on any public chain yet.
+
+`scripts/solver-canary.py` runs one bounty on a public chain. It uses the same
+steps as the local demonstration. Each step is a separate command.
+
+```sh
+export WARRANT_CANARY_RPC=https://...        # never put the URL in arguments
+export RISC0_USE_DOCKER=1                    # reproducible image ID
+python3 scripts/solver-canary.py init --dir artifacts/canary-1 --amount 2000000 --max-cost 14 \
+  --instance solver-bounty/instance.json --deployer account:NAME --buyer account:NAME \
+  --seller account:NAME --relayer account:NAME
+python3 scripts/solver-canary.py check --dir artifacts/canary-1
+python3 scripts/solver-canary.py deploy --dir artifacts/canary-1 [--execute ...]
+```
+
+The order is: `init`, `check`, `deploy`, `quote`, `offer`, `accept`, `deliver`,
+`prove`, `settle`, `evidence`.
+
+Rules that the script enforces:
+
+- A step that spends is a dry run. It broadcasts only with `--execute`,
+  `--confirm-chain` and `--confirm-amount`. Both confirm values must match the state.
+- The bounty cannot exceed 10 USDC (10,000,000 units). Raising the limit needs a code change.
+- Keys stay in a Foundry keystore or a Ledger. The script never reads a private key.
+  Unlocked accounts work only on a chain other than Arc mainnet.
+- Mainnet needs four different signers.
+- The script saves each transaction intent before it broadcasts. It never retries.
+  A second attempt stops with an error until a person has checked the chain.
+- The `deploy` step needs `RISC0_USE_DOCKER=1`. The `prove` step rejects a proof
+  from any guest other than the deployed image ID.
+- The `settle` step first checks that a changed result fails in simulation.
+  After payment it checks the seller balance, the result event and that a replay fails.
+
+Run `python3 scripts/test_solver_canary.py` for the guard tests. They need no chain.
+The checker proves a modelled cost, not a cloud bill. Settlement starts no cloud run.
+
 ## Validation and trust limits
 
 ```sh
