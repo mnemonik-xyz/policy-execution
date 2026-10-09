@@ -113,6 +113,28 @@ Captured responses have restrictive local file permissions but may contain
 account data or container environment variables. Publish reviewed evidence,
 not raw account responses.
 
+## MCP server for external agents
+
+Run the standalone daemon exposing guarded tools over Streamable HTTP (`/mcp`):
+
+```sh
+.venv/bin/python scripts/ionet-mcp-server.py \
+  --host 0.0.0.0 --port 8000 \
+  --auth-user <USER> --auth-pass <PASS>
+```
+
+Configurable options (also via environment variables):
+- `--host` / `HOST`: Bind address (default: `0.0.0.0`).
+- `--port` / `PORT`: Port number (default: `8000`).
+- `--state-dir` / `IONET_STATE_DIR`: Persistent state directory (default: `artifacts/state`).
+- `--auth-user` / `MCP_AUTH_USER`: Optional HTTP Basic Auth username.
+- `--auth-pass` / `MCP_AUTH_PASS`: Optional HTTP Basic Auth password.
+
+Exposed tools:
+- `ionet_read`: Query allowlisted read tools (hardware, availability, containers, credits).
+- `ionet_deploy`: Budget-checked, atomically journaled container deployment.
+- `ionet_destroy`: Guarded termination of an active deployment by `deployment_id`.
+
 ## First live deployment
 
 The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
