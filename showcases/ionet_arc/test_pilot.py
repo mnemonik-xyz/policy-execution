@@ -17,7 +17,7 @@ from showcases.ionet_arc.adapter import (Cloud, DEPLOY, DESTROY, ENDPOINT, Pilot
                                          decode_result, deploy, destroy, read_json)
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
-from showcases.ionet_arc.worker import Worker, handler
+from showcases.ionet_arc.worker import Worker, gpu_metrics, handler
 from showcases.ionet_arc import adapter
 
 
@@ -313,23 +313,49 @@ class WorkerTests(unittest.TestCase):
         code, err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
         self.assertEqual(code, 400)
 
-    def test_upload_poll_duplicate_and_persistent_result(self):
-        code, _ = self.request("/job", b"fake audio for unit test")
+    @patch("showcases.ionet_arc.worker.subprocess.run")
+    def test_gpu_metrics_and_unavailable_fallback(self, run):
+        run.return_value.stdout = "0, 78, 1024, 24576, 65, 201.5\n"
+        self.assertEqual(gpu_metrics(), {"available": True, "gpus": [{
+            "index": "0", "utilization_percent": "78", "memory_used_mib": "1024",
+            "memory_total_mib": "24576", "temperature_celsius": "65", "power_watts": "201.5"}]})
+        run.side_effect = FileNotFoundError()
+        self.assertEqual(gpu_metrics(), {"available": False, "reason": "nvidia_smi_unavailable"})
+
+    def test_upload_poll_duplicate_and_persistent_results(self):
+        first_audio = b"fake audio for unit test"
+        code, first = self.request("/job", first_audio)
         self.assertEqual(code, 202)
         self.assertTrue(self.done.wait(2))
         for _ in range(100):
-            code, job = self.request("/job")
+            code, job = self.request(f"/job/{first['job_id']}")
             if job["status"] == "complete":
                 break
             time.sleep(.01)
         self.assertEqual(job["status"], "complete")
         data = json.dumps(job["result"], sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(job["result_sha256"], hashlib.sha256(data).hexdigest())
-        self.assertEqual(self.request("/job", b"fake audio for unit test")[0], 200)
-        self.assertEqual(self.request("/job", b"different audio")[0], 409)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.request("/job", first_audio)[0], 200)
+
+        second_audio = b"different audio"
+        code, second = self.request("/job", second_audio)
+        self.assertEqual(code, 202)
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        for _ in range(100):
+            code, second_result = self.request(f"/job/{second['job_id']}")
+            if second_result["status"] == "complete":
+                break
+            time.sleep(.01)
+        self.assertEqual(second_result["status"], "complete")
+        self.assertEqual(self.request("/job")[0], 400)
+        code, listing = self.request("/jobs")
+        self.assertEqual(code, 200)
+        self.assertEqual({job["job_id"] for job in listing["jobs"]},
+                         {first["job_id"], second["job_id"]})
+        self.assertEqual(len(self.calls), 2)
         restored = Worker(self.tmp.name, self.worker.token)
-        self.assertEqual(restored.job["status"], "complete")
+        self.assertEqual(restored.get(first["job_id"])["status"], "complete")
+        self.assertEqual(restored.get(second["job_id"])["status"], "complete")
 
     def test_auth_hash_and_health(self):
         self.assertEqual(self.request("/health", auth=False)[0], 200)
@@ -339,7 +365,8 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_restart_marks_incomplete_job_interrupted(self):
-        Path(self.tmp.name, "job.json").write_text(json.dumps({"status": "running", "input_sha256": "0" * 64}))
+        Path(self.tmp.name, "jobs.json").write_text(json.dumps({"jobs": {
+            "0" * 64: {"status": "running", "input_sha256": "0" * 64, "job_id": "0" * 64}}}))
         restored = Worker(self.tmp.name, self.worker.token)
         self.assertEqual(restored.job["status"], "interrupted")
 

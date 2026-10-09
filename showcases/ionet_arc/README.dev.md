@@ -74,9 +74,15 @@ Verify tests pass locally:
 
 ---
 
-### Step 2: Build and Push Worker Image (x86_64 / amd64)
+### Step 2: Build and Push Worker Image
 
-The worker container requires `linux/amd64` architecture for GPU execution on io.net:
+Run the **Build io.net Arc transcription image** workflow from GitHub Actions using `workflow_dispatch`.
+It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for `linux/amd64` with CUDA
+for GPU execution on io.net, plus the separate
+`ghcr.io/mnemonik-xyz/warrant-transcription:pilot-arm64` image for CPU inference on Apple
+Silicon Macs.
+
+To build and push only the GPU image manually instead:
 
 ```sh
 # Authenticate with GHCR (using a PAT with write:packages scope)
@@ -201,11 +207,21 @@ Request the estimate:
      --data-binary @"$AUDIO_FILE"
    ```
 
-4. Poll for transcription completion (`GET /job`):
+4. Copy `job_id` from the submission response, then poll for transcription completion
+   (`GET /job/<job_id>`):
    ```sh
    curl -H "Authorization: Bearer $WORKER_TOKEN" \
-     "https://<PUBLIC_ENDPOINT>/job"
+     "https://<PUBLIC_ENDPOINT>/job/<job_id>"
    ```
+
+   Submit additional audio with `POST /job` as needed. Each distinct upload has its own
+   `job_id`; `GET /jobs` returns all submitted jobs.
+
+5. Read the container logs to follow job lifecycle events and GPU utilization. The worker emits
+   JSON log records on startup, job start/end, and every 10 seconds while a job runs with
+   utilization, memory, temperature, and power snapshots when `nvidia-smi` is available. Set
+   `WARRANT_GPU_LOG_INTERVAL_SECONDS` to change the running-job cadence. It never writes the
+   worker token, audio, or transcript text to these logs.
 
 ---
 
