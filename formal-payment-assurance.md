@@ -91,12 +91,13 @@ FOUNDRY_PROFILE=formal /tmp/warrant-formal/bin/python scripts/run-halmos.py \
 checks it against the generated constant, and emits the ELF hash, guest name,
 checker version and journal schema. It rejects an absent/invalid guest ELF.
 
-`scripts/proof-release.py prepare` runs Verus, native tests, Solidity tests,
+`scripts/proof-release.py prepare` runs Verus, native and guest execution tests, Solidity tests,
 the complete enumerated symbolic suite, a Docker guest build, and a fresh local
 strict proof settlement. It rejects simulated proof/skip-build environment
 settings, zero/wrong guest identities, missing symbolic properties, failed
 properties, bounded loops, source changes during the run, wrong-image acceptance,
-journal tampering and replay. It records source hashes (including uncommitted
+journal tampering in every one of the 15 public words, deployed-code mismatches
+and replay. It records source hashes (including uncommitted
 additions), lockfiles, tool versions, host/guest identities, evidence hashes and
 contract artifact hashes in a candidate manifest. No manifest is produced if a
 required step fails.
@@ -121,8 +122,17 @@ RISC0_USE_DOCKER=1 python3 scripts/invoice-demo.py --proof-only
 ```
 
 The demo uses Anvil's public test keys, synthetic invoices and a real verifier.
-It checks deployed image/token/verifier/registry bindings and writes proof and
-settlement evidence. It is not a public-network or real-invoice acceptance test.
+It checks deployed image/token/verifier/registry bindings and compares the full
+runtime code of the verifier, factory and escrow against locally simulated
+constructors from the compiled artifacts, including immutable values. Those
+constructors do not depend on their own address, caller or timestamp. It writes
+the read-back, proof and settlement evidence. It is not a public-network or
+real-invoice acceptance test.
+
+The PR fast CI job runs the native and contract suites, guest execution,
+release-gate tests, pinned Verus/mutation checks and the complete Halmos suite.
+Fresh invoice proof generation remains an explicit local release-gate command;
+the optional solver proof job does not substitute for it.
 
 For a **new replay domain**, `DeployInvoice.s.sol` accepts
 `WARRANT_PROOF_ONLY=true` and creates a factory and its initial escrow. For an

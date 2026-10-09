@@ -6,7 +6,7 @@ second), an undecided invoice by the buyer's own approval, and a third by real
 proof (prove, wrap for EVM, settle). Rejects replay and smuggled inputs.
 Uses only Anvil's public test accounts and keys. Never connects to a public network.
 """
-import argparse, json, os, pathlib, platform, shutil, socket, subprocess, sys, time, urllib.request
+import argparse, hashlib, json, os, pathlib, platform, re, shutil, socket, subprocess, sys, time, urllib.request
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=pathlib.Path, help="New directory under artifacts for this run")
 parser.add_argument("--proof-only", action="store_true", help="Deploy strict escrow and settle only by real proof")
@@ -125,6 +125,32 @@ try:
         assert call(escrow,'proofOnly()(bool)')=='true'
         assert call(escrow,'replayRegistry()(address)').lower()==factory.lower()
         assert call(factory,'isEscrow(address)(bool)',escrow)=='true'
+        assert call(factory,'token()(address)').lower()==token.lower()
+        assert call(factory,'verifier()(address)').lower()==verifier.lower()
+    # Simulate each approved constructor and compare its entire returned runtime
+    # with deployed code, including immutable values. These constructors do not
+    # depend on their own address, caller, timestamp, or mutable chain state.
+    # This is a local read-back test, not a public deployment attestation.
+    control_source=(ROOT/'contracts/vendor/risc0/contracts/src/groth16/ControlID.sol').read_text()
+    control={name: '0x'+value for name,value in re.findall(
+        r'bytes32 public constant (\w+) = hex"([0-9a-f]{64})";',control_source)}
+    contracts=[('RiscZeroGroth16Verifier',verifier,'f(bytes32,bytes32)',
+                [control['CONTROL_ROOT'],control['BN254_CONTROL_ID']])]
+    if options.proof_only:
+        contracts.extend([
+            ('ProofInvoiceFactory',factory,'f(address,address)',[token,verifier]),
+            ('ProofInvoiceEscrow',escrow,'f(address,address,bytes32,address)',[token,verifier,image,factory])])
+    else:
+        contracts.append(('InvoiceEscrow',escrow,'f(address,address,bytes32)',[token,verifier,image]))
+    readback={}
+    for name,address,signature,args in contracts:
+        artifact=json.loads((ROOT/f'contracts/out/{name}.sol/{name}.json').read_text())
+        encoded=run('cast','abi-encode',signature,*args)
+        expected=rpc('eth_call',[{'from':CUSTOMER,'data':artifact['bytecode']['object']+encoded[2:]},'latest'])
+        actual=rpc('eth_getCode',[address,'latest'])
+        assert len(expected)>2 and actual.lower()==expected.lower(), f'{name} runtime mismatch'
+        readback[name]=dict(address=address,constructorArgs=args,runtimeCode=actual)
+    (out/'deployment-readback.json').write_text(json.dumps(readback,indent=2)+'\n')
     (out/'deployment.json').write_text(json.dumps(deployment,indent=2))
     (out/'verifier-code.hex').write_text(rpc('eth_getCode',[verifier,'latest'])+'\n')
     now=int(rpc('eth_getBlockByNumber',['latest',False])['timestamp'],16)
@@ -235,10 +261,17 @@ try:
     try: call(verifier,'verify(bytes,bytes32,bytes32)',proof['seal'],wrong_image,proof['journalDigest'])
     except RuntimeError: pass
     else: raise AssertionError('Wrong image unexpectedly accepted')
-    altered=bytearray.fromhex(proof['journal'][2:]); altered[191]^=1
-    try: call(escrow,'settle(bytes,bytes)',proof['seal'],'0x'+altered.hex())
-    except RuntimeError: pass
-    else: raise AssertionError('Altered journal unexpectedly accepted')
+    # Check all 15 words against the cryptographic verifier, so a rejection
+    # cannot be explained merely by an escrow domain or accounting constraint.
+    for word in range(15):
+        altered=bytearray.fromhex(proof['journal'][2:]); altered[word*32+31]^=1
+        digest='0x'+hashlib.sha256(altered).hexdigest()
+        try: call(verifier,'verify(bytes,bytes32,bytes32)',proof['seal'],image,digest)
+        except RuntimeError: pass
+        else: raise AssertionError(f'Altered journal word {word} unexpectedly verified')
+        try: call(escrow,'settle(bytes,bytes)',proof['seal'],'0x'+altered.hex())
+        except RuntimeError: pass
+        else: raise AssertionError(f'Altered journal word {word} unexpectedly settled')
     settled=send(RELAYER,escrow,'settle(bytes,bytes)',proof['seal'],proof['journal'])
     paid=amount if options.proof_only else 2*amount+ask['payable']
     assert number(call(token,'balanceOf(address)(uint256)',VENDOR))==paid
@@ -250,6 +283,7 @@ try:
     summary=dict(chainId=31337, token=token, verifier=verifier, escrow=escrow,
         imageId=image, orderId=order, recipient=VENDOR, amount=amount,
         proofOnly=options.proof_only, realProof=True, replayRejected=True, wrongImageRejected=True, journalTamperingRejected=True,
+        tamperedJournalWordsRejected=15, deploymentCodeMatched=True,
         provenTransaction=settled['transactionHash'], provenGasUsed=settled['gasUsed'],
         proveSeconds=round(prove_seconds,2), wrapSeconds=round(wrap_seconds,2))
     if options.proof_only:

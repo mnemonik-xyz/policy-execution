@@ -37,20 +37,19 @@ Verified `verified/src/lib.rs` SHA-256:
 Re-run after source changes. The historical real-proof fixture does not establish
 fresh settlement of the current guest.
 
-## Required continuation
+## Final validation and remaining scope
 
-1. Review the diff, particularly cross-escrow replay, the final payment constructor
-   integration and the release runner. Add missing adversarial tests as needed.
-2. Finish a **fresh** pinned Docker build and strict real-proof settlement. An
-   earlier Docker build completed locally, but subsequent conversion/pinning and
-   CLI argument-guard changes invalidate it as final evidence. Do not reuse its ID.
-3. Exercise `scripts/proof-release.py prepare` end to end, then `check`; fix failures
-   without weakening evidence gates. The runner and updated strict demo have not
-   yet completed together. In particular verify Forge's emitted factory creation
-   event parsing and whether the toolchain emits the expected guest ELF form.
-4. Add and exercise deployment read-back against the approved contract bytecode,
-   token, verifier, image ID and replay registry. Current `check` is local only.
-5. Preserve an explicit remaining-gaps list. Complete evidence-to-facts and journal
+1. Run `scripts/proof-release.py prepare` end to end, then `check` from an unchanged
+   checkout. It rebuilds the pinned guest, exercises native/guest agreement, checks
+   deployment bytecode and constructor bindings, generates a fresh real proof,
+   settles through the strict escrow, and rejects all 15 journal-word mutations.
+   Generated evidence lives in the printed candidate directory; the PR records
+   the final run result. Earlier guest IDs are not evidence for the current source.
+2. PR CI runs Verus/mutations, Halmos, native/contract/guest and release-gate tests.
+   Its optional solver proof job does not replace the invoice release command.
+3. `check` is local only. Deployment read-back runs against the demo's local Anvil;
+   target-chain read-back and acceptance remain separate production gates.
+4. Preserve an explicit remaining-gaps list. Complete evidence-to-facts and journal
    refinement proofs and inductive contract invariants before claiming whole-flow
    formal verification. Arrange independent review and target-chain validation
    separately; do not deploy production or move real funds from this handoff.

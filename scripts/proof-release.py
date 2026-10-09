@@ -57,6 +57,15 @@ def validate_identity(info):
         raise ValueError("Wrong guest, schema or zero image ID")
 
 
+def validate_settlement(result, info):
+    if (result.get("imageId") != info["imageId"]
+            or result.get("tamperedJournalWordsRejected") != 15
+            or not all(result.get(k) is True for k in (
+                "proofOnly", "realProof", "replayRejected", "wrongImageRejected",
+                "journalTamperingRejected", "deploymentCodeMatched"))):
+        raise ValueError("Real settlement did not validate the release guest and deployed code")
+
+
 def prepare(args):
     for key in ("RISC0_DEV_MODE", "RISC0_SKIP_BUILD", "WARRANT_DEMO_IMAGE_ID", "CARGO_TARGET_DIR"):
         if os.environ.get(key):
@@ -73,6 +82,7 @@ def prepare(args):
             subprocess.run(command, cwd=ROOT, env=dict(env, **(extra or {})),
                            stdout=log, stderr=subprocess.STDOUT, check=True)
 
+    run("release-tests", [sys.executable, "scripts/test_proof_release.py"])
     run("verus", [sys.executable, "verified/verify.py", "--verus", args.verus, "--mutations"])
     run("native-tests", ["cargo", "test", "--locked", "-p", "warrant-policy"])
     run("dependencies", ["npm", "ci", "--prefix", "contracts", "--ignore-scripts"])
@@ -83,14 +93,14 @@ def prepare(args):
                      "--json-output", str(folder / "symbolic.json")], {"FOUNDRY_PROFILE": "formal"})
     validate_symbolic(json.loads((folder / "symbolic.json").read_text()))
     run("build", ["cargo", "build", "--locked", "--release", "-p", "warrant-host"])
+    run("guest-tests", ["cargo", "test", "--locked", "--release", "-p", "warrant-host",
+                        "--test", "execution", "--test", "tooling", "--", "--test-threads=1"])
     info = json.loads(output(str(HOST), "invoice-build-info", env=env))
     validate_identity(info)
     run("real-settlement", [sys.executable, "scripts/invoice-demo.py", "--proof-only",
                             "--output", str(folder / "settlement")])
     result = json.loads((folder / "settlement/result.json").read_text())
-    if result["imageId"] != info["imageId"] or not all(result.get(k) is True for k in (
-            "proofOnly", "realProof", "replayRejected", "wrongImageRejected", "journalTamperingRejected")):
-        raise ValueError("Real settlement did not validate the release guest")
+    validate_settlement(result, info)
     if sources() != baseline:
         raise ValueError("Source changed during verification/build; rerun from a stable checkout")
     manifest = dict(schema=SCHEMA, sourceRevision=output("git", "rev-parse", "HEAD"),
@@ -132,6 +142,7 @@ def check(args):
         if not item.is_relative_to(ROOT / "contracts/out") or digest(item) != expected:
             raise ValueError(f"Contract build changed: {name}")
     validate_symbolic(json.loads((path.parent / "symbolic.json").read_text()))
+    validate_settlement(json.loads((path.parent / "settlement/result.json").read_text()), info)
     print("Candidate source, guest, proofs and contract artifacts match.")
     print("WARRANT_PROOF_ONLY=true")
     print("WARRANT_IMAGE_ID=" + info["imageId"])

@@ -10,6 +10,17 @@ spec.loader.exec_module(release)
 
 
 class ReleaseGateTests(unittest.TestCase):
+    def test_settlement_requires_real_proof_and_complete_readback(self):
+        info = {"imageId": "0x" + "01" * 32}
+        result = dict(info, proofOnly=True, realProof=True, replayRejected=True,
+                      wrongImageRejected=True, journalTamperingRejected=True,
+                      deploymentCodeMatched=True, tamperedJournalWordsRejected=15)
+        release.validate_settlement(result, info)
+        for key in result:
+            for value in (None, False, "true"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    release.validate_settlement(dict(result, **{key: value}), info)
+
     def report(self):
         return {"exitcode": 0, "test_results": {
             "test/ProofInvoiceEscrow.t.sol:ProofInvoiceEscrowTest": [
