@@ -101,6 +101,43 @@ class Worker:
             self.persist()
 
 
+def _handle_get(request, worker):
+    parsed = urllib.parse.urlsplit(request.path)
+    if parsed.path == "/health":
+        return request.reply(200, {"status": "ok"})
+    if not request.authorized():
+        return
+    if parsed.path != "/job":
+        return request.reply(404, {"error": "not found"})
+    with worker.lock:
+        request.reply(200, worker.job or {"status": "empty"})
+
+
+def _handle_post(request, worker):
+    parsed = urllib.parse.urlsplit(request.path)
+    if not request.authorized():
+        return
+    if parsed.path != "/job":
+        return request.reply(404, {"error": "not found"})
+    query = urllib.parse.parse_qs(parsed.query)
+    language = query.get("language", [None])[0] or request.headers.get("X-Language")
+    if language:
+        language = language.strip().lower()
+        if not re.fullmatch(r"[a-z]{2,3}", language):
+            return request.reply(400, {"error": "Language must be a 2 or 3 letter ISO code (e.g. en, es)"})
+    size = request.headers.get("Content-Length", "")
+    expected = request.headers.get("X-Audio-SHA256", "")
+    if not re.fullmatch(r"[0-9]{1,9}", size) or not 0 < int(size) <= MAX_AUDIO_BYTES:
+        return request.reply(413, {"error": "Audio must be between 1 byte and 64 MiB"})
+    if request.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return request.reply(400, {"error": "Need Content-Length and X-Audio-SHA256"})
+    body = request.rfile.read(int(size))
+    if len(body) != int(size):
+        return request.reply(400, {"error": "incomplete upload"})
+    code, result = worker.submit(body, expected, language=language)
+    request.reply(code, result)
+
+
 def handler(worker):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -126,39 +163,10 @@ def handler(worker):
             return True
 
         def do_GET(self):
-            parsed = urllib.parse.urlsplit(self.path)
-            if parsed.path == "/health":
-                return self.reply(200, {"status": "ok"})
-            if not self.authorized():
-                return
-            if parsed.path != "/job":
-                return self.reply(404, {"error": "not found"})
-            with worker.lock:
-                self.reply(200, worker.job or {"status": "empty"})
+            return _handle_get(self, worker)
 
         def do_POST(self):
-            parsed = urllib.parse.urlsplit(self.path)
-            if not self.authorized():
-                return
-            if parsed.path != "/job":
-                return self.reply(404, {"error": "not found"})
-            query = urllib.parse.parse_qs(parsed.query)
-            language = query.get("language", [None])[0] or self.headers.get("X-Language")
-            if language:
-                language = language.strip().lower()
-                if not re.fullmatch(r"[a-z]{2,3}", language):
-                    return self.reply(400, {"error": "Language must be a 2 or 3 letter ISO code (e.g. en, es)"})
-            size = self.headers.get("Content-Length", "")
-            expected = self.headers.get("X-Audio-SHA256", "")
-            if not re.fullmatch(r"[0-9]{1,9}", size) or not 0 < int(size) <= MAX_AUDIO_BYTES:
-                return self.reply(413, {"error": "Audio must be between 1 byte and 64 MiB"})
-            if self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9a-f]{64}", expected):
-                return self.reply(400, {"error": "Need Content-Length and X-Audio-SHA256"})
-            body = self.rfile.read(int(size))
-            if len(body) != int(size):
-                return self.reply(400, {"error": "incomplete upload"})
-            code, result = worker.submit(body, expected, language=language)
-            self.reply(code, result)
+            return _handle_post(self, worker)
     return Handler
 
 
