@@ -124,7 +124,8 @@ def confirmed(st, args):
 def step(d, st, name, args, simulate, execute):
     """Simulate first. Broadcast only with --execute. Save the intent first and never retry."""
     if name in st["tx"]:
-        raise CanaryError(f"{name} was already attempted: {st['tx'][name]}. Inspect the chain before any manual change.")
+        raise CanaryError(f"{name} was already attempted: {st['tx'][name]}. "
+                          "Inspect the chain before any manual change.")
     simulate()
     print(f"{name}: dry run passed", flush=True)
     if not confirmed(st, args):
@@ -214,8 +215,10 @@ def cmd_deploy(args):
     result = step(d, st, "deploy", args, lambda: run(*base, cwd=ROOT / "contracts"), broadcast)
     if result is None:
         return
-    broadcast = json.loads((ROOT / f"contracts/broadcast/DeploySolver.s.sol/{st['chain_id']}/run-latest.json").read_text())
-    found = {t["contractName"]: t["contractAddress"] for t in broadcast["transactions"] if t["transactionType"] == "CREATE"}
+    latest = ROOT / f"contracts/broadcast/DeploySolver.s.sol/{st['chain_id']}/run-latest.json"
+    broadcast = json.loads(latest.read_text())
+    found = {t["contractName"]: t["contractAddress"]
+             for t in broadcast["transactions"] if t["transactionType"] == "CREATE"}
     escrow, verifier = found["SolverBountyEscrow"], found["RiscZeroGroth16Verifier"]
     if call(escrow, "token()(address)").lower() != st["token"].lower() or call(escrow, "imageId()(bytes32)") != image:
         raise CanaryError("Deployed escrow does not hold the expected token and image ID")
@@ -285,12 +288,15 @@ def cmd_offer(args):
     if "approve" in st["tx"] and "hash" not in st["tx"]["approve"]:
         raise CanaryError("approve was started but not confirmed. Inspect the chain.")
     if "approve" not in st["tx"]:  # Approve exactly the bounty, never an unlimited allowance.
-        step(d, st, "approve", args, lambda: call(token, "approve(address,uint256)(bool)", escrow, amount, sender=buyer),
-             lambda: {"hash": send_tx(st, "buyer", token, "approve(address,uint256)", escrow, amount)["transactionHash"]})
+        step(d, st, "approve", args,
+             lambda: call(token, "approve(address,uint256)(bool)", escrow, amount, sender=buyer),
+             lambda: {"hash": send_tx(st, "buyer", token, "approve(address,uint256)", escrow,
+                                      amount)["transactionHash"]})
         if "approve" not in st["tx"]:
             print("Dry run only. Execute approve first; offer is simulated after it.")
             return
-    terms = [q["salt"], st["addresses"]["seller"], q["policy_hash"], "1", amount, str(q["accept_by"]), str(q["settle_by"])]
+    terms = [q["salt"], st["addresses"]["seller"], q["policy_hash"], "1", amount,
+             str(q["accept_by"]), str(q["settle_by"])]
     step(d, st, "offer", args, lambda: call(escrow, OFFER + "(bytes32)", *terms, sender=buyer),
          lambda: {"hash": send_tx(st, "buyer", escrow, OFFER, *terms)["transactionHash"]})
 
@@ -423,7 +429,8 @@ def cmd_evidence(args):
                    image_id=st.get("image_id"), code_hashes=st.get("code_hashes"), amount=st["amount"],
                    addresses=st["addresses"], quote=st.get("quote"), delivery=st.get("delivery"),
                    transactions=st["tx"], checks=st.get("checks", {}), realProof="proof" in st, mockVerifier=False,
-                   note="The checker proves a modelled cost, not a cloud bill. Settlement does not start any cloud run.")
+                   note="The checker proves a modelled cost, not a cloud bill. "
+                        "Settlement does not start any cloud run.")
     write_new(d / "result.json", summary)
     print(json.dumps(summary, indent=2))
 

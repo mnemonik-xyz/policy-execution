@@ -76,7 +76,8 @@ class StepTests(TempCase):
         for wrong in (dict(confirm_chain=1, confirm_amount=2_000_000), dict(confirm_chain=5042, confirm_amount=1)):
             with self.assertRaises(canary.CanaryError):
                 canary.confirmed(self.st, self.args(execute=True, **wrong))
-        self.assertTrue(canary.confirmed(self.st, self.args(execute=True, confirm_chain=5042, confirm_amount=2_000_000)))
+        right = self.args(execute=True, confirm_chain=5042, confirm_amount=2_000_000)
+        self.assertTrue(canary.confirmed(self.st, right))
 
     def test_dry_run_never_broadcasts(self):
         calls = []
@@ -100,11 +101,13 @@ class StepTests(TempCase):
     def test_settle_refuses_when_substituted_result_passes_simulation(self):
         directory = pathlib.Path(self.dir)
         (directory / "evm.json").write_text(json.dumps(dict(seal="0x01", journal="0x02")))
-        self.st.update(proof={}, escrow=A, quote={"task": "0x" + "9" * 64}, delivery=dict(result="0xaa00", result_hash="0x1"))
+        self.st.update(proof={}, escrow=A, quote={"task": "0x" + "9" * 64},
+                       delivery=dict(result="0xaa00", result_hash="0x1"))
         canary.save(self.dir, self.st)
         with patch.object(canary, "connect"), patch.object(canary, "call", return_value="ok"):
             with self.assertRaises(canary.CanaryError) as ctx:
-                canary.cmd_settle(argparse.Namespace(dir=self.dir, execute=False, confirm_chain=None, confirm_amount=None))
+                canary.cmd_settle(argparse.Namespace(dir=self.dir, execute=False, confirm_chain=None,
+                                                     confirm_amount=None))
         self.assertIn("substituted", str(ctx.exception))
 
 
@@ -119,7 +122,8 @@ class RunTests(unittest.TestCase):
     def test_errors_do_not_leak_the_rpc_url(self):
         secret = "https://rpc.example/KEY123"
         failed = subprocess.CompletedProcess([], 1, stdout="", stderr=f"cannot reach {secret}")
-        with patch.dict(os.environ, {canary.RPC_ENV: secret}), patch.object(canary.subprocess, "run", return_value=failed):
+        with patch.dict(os.environ, {canary.RPC_ENV: secret}), \
+                patch.object(canary.subprocess, "run", return_value=failed):
             with self.assertRaises(canary.CanaryError) as ctx:
                 canary.run("cast", "chain-id")
         self.assertNotIn("KEY123", str(ctx.exception))
