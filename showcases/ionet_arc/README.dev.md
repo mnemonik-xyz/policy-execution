@@ -74,9 +74,15 @@ Verify tests pass locally:
 
 ---
 
-### Step 2: Build and Push Worker Image (x86_64 / amd64)
+### Step 2: Build and Push Worker Image
 
-The worker container requires `linux/amd64` architecture for GPU execution on io.net:
+Run the **Build io.net Arc transcription image** workflow from GitHub Actions using `workflow_dispatch`.
+It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for `linux/amd64` with CUDA
+for GPU execution on io.net, plus the separate
+`ghcr.io/mnemonik-xyz/warrant-transcription:pilot-arm64` image for CPU inference on Apple
+Silicon Macs.
+
+To build and push only the GPU image manually instead:
 
 ```sh
 # Authenticate with GHCR (using a PAT with write:packages scope)
