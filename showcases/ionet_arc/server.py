@@ -1,11 +1,8 @@
 """Streamable HTTP MCP server for external agents driving io.net GPU compute."""
-import argparse
 import base64
 import json
-import os
 import pathlib
 import secrets
-import sys
 import time
 import uuid
 
@@ -232,7 +229,10 @@ def create_app(
     app = server.streamable_http_app(transport_security=sec)
 
     if auth_user and auth_pass:
+        print(f"HTTP Basic Auth enabled for user '{auth_user}'", file=sys.stderr)
         app = BasicAuthMiddleware(app, auth_user, auth_pass)
+    else:
+        print("WARNING: HTTP Basic Auth disabled (no --auth-user / --auth-pass provided)", file=sys.stderr)
 
     return app
 

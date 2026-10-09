@@ -178,6 +178,16 @@ Request the estimate:
      --state artifacts/io-deployment.json
    ```
 
+   or run manually with the following command
+   ```sh
+   docker run --rm \
+     --name warrant-transcription \
+     --gpus all \
+     -p 8080:8080 \
+     -e WARRANT_WORKER_TOKEN="$WORKER_TOKEN" \
+     ghcr.io/mnemonik-xyz/warrant-transcription:pilot
+   ```
+
 ---
 
 ### Step 6: Query Endpoint and Submit Transcription Job
