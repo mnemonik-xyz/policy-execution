@@ -15,8 +15,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host address to bind (default: 0.0.0.0)",
+        default=os.environ.get("HOST", "localhost"),
+        help="Host address to bind (default: localhost)",
     )
     parser.add_argument(
         "--port",

@@ -3,6 +3,7 @@ import base64
 import json
 import pathlib
 import secrets
+import sys
 import time
 import uuid
 
@@ -102,12 +103,41 @@ def create_server(state_dir: pathlib.Path) -> MCPServer:
     state_dir.mkdir(parents=True, exist_ok=True)
 
     @server.tool(
+        name="ionet_discover",
+        description="Inspect the discovered inputSchemas of all allowed tools on io.net.",
+    )
+    async def ionet_discover() -> dict:
+        async def op(cloud):
+            return {"inputSchemas": cloud.schemas}
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
         name="ionet_read",
         description=(
-            "Execute an allowlisted read query on io.net. "
-            "Available tools: caas_get_hardware_ids, caas_get_max_gpus_per_container, "
-            "caas_get_available_replicas, caas_get_price_estimate, caas_list_deployments, "
-            "caas_get_deployment, caas_get_deployment_containers, get_credit_status."
+            "Execute an allowlisted read query on io.net.\n\n"
+            "Supported tools and their required argument shapes:\n"
+            "1. Zero-argument tools (pass `{}` for arguments):\n"
+            "   - get_credit_status: `{}`\n"
+            "   - caas_get_hardware_ids: `{}`\n"
+            "   - caas_get_max_gpus_per_container: `{}`\n"
+            "   - caas_list_deployments: `{}` (optional: page, page_size, status)\n\n"
+            "2. Deployment inspection tools:\n"
+            "   - caas_get_deployment: `{\"deployment_id\": \"<uuid>\"}`\n"
+            "   - caas_get_deployment_containers: `{\"deployment_id\": \"<uuid>\"}`\n\n"
+            "3. Pricing estimate (all 5 fields are required!):\n"
+            "   - caas_get_price_estimate: {\n"
+            "       \"hardware_id\": \"gpu_1x_l40\",\n"
+            "       \"location_ids\": \"US\",\n"
+            "       \"duration_hours\": 1,\n"
+            "       \"gpus_per_container\": 1,\n"
+            "       \"replica_count\": 1\n"
+            "     }\n\n"
+            "Note: Use string hardware IDs (e.g. 'gpu_1x_l40'). To check replica availability, "
+            "inspect 'available_replica_count' in the caas_get_price_estimate response."
         ),
     )
     async def ionet_read(tool: str, arguments: dict = None) -> dict:
@@ -132,19 +162,174 @@ def create_server(state_dir: pathlib.Path) -> MCPServer:
             raise safe_tool_error(exc) from None
 
     @server.tool(
+        name="ionet_check_credits",
+        description="Check current io.net account credits and balance status.",
+    )
+    async def ionet_check_credits() -> dict:
+        async def op(cloud):
+            res = await cloud.call("get_credit_status", {})
+            return {
+                "tool": "get_credit_status",
+                "observed_at": int(time.time()),
+                "result": res,
+            }
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
+        name="ionet_list_hardware",
+        description="List available GPU hardware types, specifications, and cluster options on io.net.",
+    )
+    async def ionet_list_hardware(node_pool_id: str = None) -> dict:
+        arguments = {"node_pool_id": node_pool_id} if node_pool_id else {}
+
+        async def op(cloud):
+            res = await cloud.call("caas_get_hardware_ids", arguments)
+            return {
+                "tool": "caas_get_hardware_ids",
+                "observed_at": int(time.time()),
+                "result": res,
+            }
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
+        name="ionet_get_pricing",
+        description=(
+            "Get price estimate and replica availability for a GPU type.\n"
+            "Parameters:\n"
+            "- hardware_id: Regional GPU string ID (e.g. 'gpu_1x_l40', 'gpu_4x_h100')\n"
+            "- location_id: Region code string (default 'US', or 'FR', 'PL', etc.)\n"
+            "- duration_hours: Duration in hours (default 1, max 1 for pilot)"
+        ),
+    )
+    async def ionet_get_pricing(
+        hardware_id: str,
+        location_id: str = "US",
+        duration_hours: int = 1,
+    ) -> dict:
+        arguments = {
+            "hardware_id": hardware_id,
+            "location_ids": location_id,
+            "duration_hours": duration_hours,
+            "gpus_per_container": 1,
+            "replica_count": 1,
+        }
+
+        async def op(cloud):
+            res = await cloud.call("caas_get_price_estimate", arguments)
+            return {
+                "tool": "caas_get_price_estimate",
+                "arguments": arguments,
+                "observed_at": int(time.time()),
+                "result": res,
+            }
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
+        name="ionet_get_deployment_status",
+        description="Inspect an active deployment's health, ingress endpoint, public URL, and container events.",
+    )
+    async def ionet_get_deployment_status(deployment_id: str) -> dict:
+        if not deployment_id:
+            raise ToolError("deployment_id is required")
+
+        async def op(cloud):
+            containers = await cloud.call(
+                "caas_get_deployment_containers", {"deployment_id": deployment_id}
+            )
+            deployment = await cloud.call(
+                "caas_get_deployment", {"deployment_id": deployment_id}
+            )
+            return {
+                "deployment_id": deployment_id,
+                "observed_at": int(time.time()),
+                "deployment": deployment,
+                "containers": containers,
+            }
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
+        name="ionet_list_deployments",
+        description="List your CaaS deployments on io.net.",
+    )
+    async def ionet_list_deployments(
+        page: int = 1, page_size: int = 10, status: str = None
+    ) -> dict:
+        arguments = {"page": page, "page_size": page_size}
+        if status:
+            arguments["status"] = status
+
+        async def op(cloud):
+            res = await cloud.call("caas_list_deployments", arguments)
+            return {
+                "tool": "caas_list_deployments",
+                "observed_at": int(time.time()),
+                "result": res,
+            }
+
+        try:
+            return await connected(op)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
+
+    @server.tool(
         name="ionet_deploy",
         description=(
-            "Safely deploy a CaaS container on io.net under budget and replica limits. "
-            "The server automatically queries pricing, validates cost against max_cost_usd, "
-            "records the write intent to disk, launches the container, and returns the state."
+            "Safely deploy a CaaS container on io.net under budget and replica limits.\n"
+            "Automatically queries pricing, checks budget against max_cost_usd, journals write intent "
+            "to disk, launches the container, and returns the state record.\n\n"
+            "Parameters:\n"
+            "- max_cost_usd: Budget limit ceiling (e.g. '1.00')\n"
+            "- hardware_id: Regional GPU string ID (default 'gpu_1x_l40')\n"
+            "- location_id: Region code string (default 'US')\n"
+            "- image_url: Container registry image URL\n"
+            "- resource_name: Deployment name (default 'warrant-worker')\n"
+            "- traffic_port: Port to expose (default 8080)\n"
+            "- env_variables: Optional dict of container environment variables\n"
+            "- deploy_args: Optional full raw deployment dictionary"
         ),
     )
     async def ionet_deploy(
-        deploy_args: dict,
         max_cost_usd: str,
+        hardware_id: str = "gpu_1x_l40",
+        location_id: str = "US",
+        image_url: str = "",
+        resource_name: str = "warrant-worker",
+        traffic_port: int = 8080,
+        env_variables: dict = None,
+        billing_model: str = "duration",
         usd_pointer: str = "",
+        deploy_args: dict = None,
     ) -> dict:
         try:
+            if deploy_args is None:
+                deploy_args = {
+                    "billing_model": billing_model,
+                    "hardware_id": hardware_id,
+                    "location_ids": location_id,
+                    "duration_hours": 1,
+                    "gpus_per_container": 1,
+                    "replica_count": 1,
+                    "resource_private_name": resource_name,
+                    "image_url": image_url,
+                    "traffic_port": traffic_port,
+                    "env_variables": env_variables or {},
+                }
             validate_deployment(deploy_args)
             price_args = extract_price_args(deploy_args)
             run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -238,7 +423,7 @@ def create_app(
 
 
 def run_server(
-    host: str = "0.0.0.0",
+    host: str = "localhost",
     port: int = 8000,
     state_dir: pathlib.Path = pathlib.Path("artifacts/state"),
     auth_user: str | None = None,

@@ -26,11 +26,18 @@ upstream io.net.
 
 ## Exposed tools
 
-- `ionet_read`: Query allowlisted read tools (`caas_get_hardware_ids`,
-  `caas_get_available_replicas`, `caas_get_price_estimate`, `caas_list_deployments`,
-  `caas_get_deployment`, `caas_get_deployment_containers`, `get_credit_status`).
+Primary typed tools:
+- `ionet_check_credits`: Check account balance status.
+- `ionet_list_hardware`: List available GPU hardware and specifications.
+- `ionet_get_pricing`: Get price estimate and availability for a GPU and region.
 - `ionet_deploy`: Budget-checked, atomically journaled container deployment.
+- `ionet_get_deployment_status`: Inspect deployment health, ingress URL, and logs.
+- `ionet_list_deployments`: List CaaS deployments.
 - `ionet_destroy`: Guarded termination of an active deployment by `deployment_id`.
+
+Escape-hatch tools:
+- `ionet_discover`: Inspect raw JSON inputSchemas.
+- `ionet_read`: Execute raw allowlisted read tools (`caas_get_hardware_ids`, etc.).
 
 ## Testing locally with curl
 
