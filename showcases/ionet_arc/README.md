@@ -13,14 +13,18 @@ files do not claim live GPU execution or public-chain settlement. The existing
 
 ## Responsibilities and proof boundary
 
-| Component | Responsibility | Evidence / assumption |
-| --- | --- | --- |
-| Buyer and seller | Agree to jobs, resources, runtime estimates, prices and fee | Buyer-approved committed inputs |
-| Warrant on Arc | Pay for a schedule satisfying the committed constraints | Pinned solver guest and Groth16 verification |
-| io.net adapter | Discover, estimate, provision, inspect, terminate | Authenticated provider API |
-| Transcription worker | Run audio job, return transcript and timing | Cloud execution evidence; no correctness proof |
-| CCTP service (next milestone) | Fund a Solana operational wallet from Arc | Circle attestation and destination confirmation |
-| Provider payment service (next milestone) | Pay the current exact top-up request once | Solana transaction and provider credit confirmation |
+- **Buyer and seller**: Agree to jobs, resources, runtime estimates, prices and fees.
+  *Evidence*: Buyer-approved committed inputs.
+- **Warrant on Arc**: Pay for a schedule satisfying the committed constraints.
+  *Evidence*: Pinned solver guest and Groth16 verification.
+- **io.net adapter**: Discover, estimate, provision, inspect, terminate.
+  *Evidence*: Authenticated provider API.
+- **Transcription worker**: Run audio job, return transcript and timing.
+  *Evidence*: Cloud execution evidence; no correctness proof.
+- **CCTP service (next milestone)**: Fund a Solana operational wallet from Arc.
+  *Evidence*: Circle attestation and destination confirmation.
+- **Provider payment service (next milestone)**: Pay the current exact top-up request once.
+  *Evidence*: Solana transaction and provider credit confirmation.
 
 The bounty and infrastructure budgets are separate. Cross-chain funding stays
 outside the escrow and is not atomic with Warrant settlement. The schedule
@@ -116,7 +120,87 @@ not raw account responses.
 For running the standalone Streamable HTTP MCP server for external agents,
 see [README.mcp.md](README.mcp.md).
 
-## First live deployment
+## Deploying contracts and running on Arc Testnet
+
+The Warrant transcription showcase connects io.net container provisioning with on-chain
+`TaskEscrow` verification and settlement on Arc Testnet (chain ID `5042002`).
+
+### 1. Build host and obtain guest image ID
+
+From the repository root, build the Rust `warrant-host` binary to inspect the policy guest image ID:
+
+```sh
+RISC0_BUILD_LOCKED=1 cargo build -p warrant-host --release --locked
+IMAGE_ID=$(target/release/warrant-host image-id)
+echo "Warrant Guest Image ID: $IMAGE_ID"
+```
+
+### 2. Deploy contracts to Arc Testnet
+
+Deploy `TaskEscrow` and `RiscZeroGroth16Verifier` using Foundry from the `contracts/` directory:
+
+```sh
+cd contracts
+
+export WARRANT_RPC_URL=https://rpc.testnet.arc.io
+export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
+export WARRANT_IMAGE_ID="$IMAGE_ID"
+export WARRANT_DEPLOYER="<your-deployer-address>"
+
+# Simulation run:
+forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
+  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --slow
+
+# Broadcast transactions on Arc Testnet:
+forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
+  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
+```
+
+Record the deployed contract addresses from Foundry output:
+- `TaskEscrow` contract address
+- `RiscZeroGroth16Verifier` contract address
+- Arc Testnet USDC address: `0x3600000000000000000000000000000000000000`
+
+### 3. Run the Warrant transcription MCP server
+
+Start the MCP daemon configured with your Arc Testnet addresses and `IO_NET_API_KEY`:
+
+```sh
+.venv/bin/python scripts/ionet-mcp-server.py \
+  --host 0.0.0.0 --port 8000 \
+  --rpc-url https://rpc.testnet.arc.io \
+  --escrow-address <DEPLOYED_TASK_ESCROW> \
+  --token-address 0x3600000000000000000000000000000000000000 \
+  --verifier-address <DEPLOYED_VERIFIER> \
+  --server-account <SERVER_RECIPIENT_ADDRESS>
+```
+
+For offline dry runs without io.net API keys, add `--mock-ionet`. If `--rpc-url` points to
+a local Anvil instance (`http://127.0.0.1:8545`), the server automatically deploys local test
+escrow contracts.
+
+### 4. Run the autonomous client agent
+
+In a separate terminal, launch the autonomous client agent with an audio file (e.g. `./adv.mp3`):
+
+```sh
+.venv/bin/python scripts/warrant-transcription-client.py \
+  --mcp-url http://127.0.0.1:8000/mcp \
+  --rpc-url https://rpc.testnet.arc.io \
+  --audio ./adv.mp3
+```
+
+The client agent performs the end-to-end flow:
+1. Discovers suitable Whisper single GPUs on io.net (`list_suitable_hardware`).
+2. Requests an agreement proposal (`propose_deployment`).
+3. Verifies proposal against local Warrant policy constraints.
+4. Funds `TaskEscrow.offer()` on Arc Testnet using testnet USDC.
+5. Invokes `deploy_with_escrow`: server accepts on-chain, provisions the container on io.net
+   for 1-hour duration, and executes `TaskEscrow.settle()` with a 384-byte journal.
+6. Calls `transcribe_audio` through MCP to transcribe `./adv.mp3` and print output + segments.
+7. Inspects deployment health and settlement status via `get_deployment_status`.
+
+## First live deployment (legacy CLI)
 
 The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
 or `"payg"`. Note that PayG does not bound container lifetime on the provider side: destroy
@@ -183,7 +267,7 @@ arguments from discovery to find the assigned public HTTPS endpoint.
 | Request | Authentication | Result |
 | --- | --- | --- |
 | `GET /health` | None | Process health; no GPU-readiness claim |
-| `POST /job` | `Authorization: Bearer WORKER_TOKEN` | Upload raw audio, receive its job status and `job_id` |
+| `POST /job` | `Bearer WORKER_TOKEN` | Upload raw audio, receive job status & `job_id` |
 | `GET /job/<job_id>` | Same token | Status, transcript, hashes, revision and timing for one job |
 | `GET /jobs` | Same token | All submitted jobs |
 
@@ -268,7 +352,9 @@ those measurements support them.
 - [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc)
 - [Arc EVM differences](https://docs.arc.io/integrate/evm-differences)
 - [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses)
-- [CCTP supported chains and domains](https://developers.circle.com/cctp/concepts/supported-chains-and-domains)
+- [CCTP supported chains and domains][cctp-chains]
 - [Circle-issued USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses)
 - [App Kit Bridge / Bridge Kit](https://docs.arc.io/app-kit/bridge)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+
+[cctp-chains]: https://developers.circle.com/cctp/concepts/supported-chains-and-domains

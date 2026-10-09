@@ -268,6 +268,7 @@ def handler(worker):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
 
         def authorized(self):
             supplied = self.headers.get("Authorization", "")

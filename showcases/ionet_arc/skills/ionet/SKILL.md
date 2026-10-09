@@ -1,53 +1,79 @@
 ---
-name: ionet
-description: Guide and validated call formats for driving the io.net GPU compute MCP server.
+name: ionet-warrant-transcription
+description: Guide and verified call formats for the Warrant io.net transcription MCP server.
 ---
 
-# io.net CaaS Call-Format Skill
+# Warrant io.net Audio Transcription MCP Skill
 
-Guidelines and verified call formats for driving the io.net tools exposed by this repo's MCP
-server (`scripts/ionet-mcp-server.py`).
+Guidelines and verified call formats for driving the Warrant audio transcription MCP server
+(`scripts/ionet-mcp-server.py`).
 
-## Primary typed tools
+## Core Principles
 
-- `ionet_check_credits`: Check credit balance (no arguments needed).
-- `ionet_list_hardware`: List available GPU hardware and specifications.
-- `ionet_get_pricing`: Get price estimate and availability:
-  `{"hardware_id": "gpu_1x_l40", "location_id": "US", "duration_hours": 1}`.
-- `ionet_deploy`: Deploy a container under budget limits:
-  `{"max_cost_usd": "1.00", "hardware_id": "gpu_1x_l40", "image_url": "...", "traffic_port": 8080}`.
-- `ionet_get_deployment_status`: Inspect container ingress and logs:
-  `{"deployment_id": "<uuid>"}`.
-- `ionet_list_deployments`: List CaaS deployments (`{"page": 1, "page_size": 10}`).
-- `ionet_destroy`: Terminate container (`{"deployment_id": "<uuid>"}`).
-
----
-
-## Hardware ID classes
-
-- **Regional (string) IDs** (e.g. `"gpu_1x_l40"`, `"gpu_4x_h100"`):
-  - `location_id`: Region string (`"US"`, `"FR"`, `"PL"`, etc.)
-  - Price estimate works reliably.
-  - Recommended for all deployment workflows.
-- **Numeric IDs** (e.g. `224`, `12`):
-  - Numeric IDs are currently read-only; provider rejects price estimates for numeric IDs.
+- **No Destroy Tool**: Deployments use a 1-hour duration billing model (`billing_model: "duration"`)
+  and automatically terminate on io.net. Do not look for or call a destroy tool.
+- **Repeatable Inference**: While the 1-hour container session is active, `transcribe_audio` can be
+  called repeatedly for multiple audio files.
+- **Strict Prerequisites**: Tools must be called in order:
+  1. `list_suitable_hardware`
+  2. `propose_deployment`
+  3. Customer verifies policy & funds `TaskEscrow.offer()` on-chain
+  4. `deploy_with_escrow`
+  5. `transcribe_audio`
 
 ---
 
-## Recommended deployment workflow
+## Tool Reference
 
-1. Check balance: `ionet_check_credits()`.
-2. Find hardware: `ionet_list_hardware()`.
-3. Check pricing: `ionet_get_pricing(hardware_id="gpu_1x_l40", location_id="US")`.
-4. Deploy container:
-   `ionet_deploy(max_cost_usd="1.00", hardware_id="gpu_1x_l40", image_url="...")`.
-5. Check status: `ionet_get_deployment_status(deployment_id="<uuid>")`.
-6. Terminate: `ionet_destroy(deployment_id="<uuid>")`.
+### 1. `list_suitable_hardware`
+Discovers available single-GPU instances on io.net suitable for `faster-whisper-small` inference,
+sorted ascending by price per hour. Multi-GPU clusters and nodes with 0 available replicas are
+filtered out.
 
----
+- Arguments: none (`{}`).
+- Returns: Array of hardware items with `hardware_id`, `hardware_name`, `price_per_hour_usd`,
+  `available_replicas`, and `location`.
 
-## Escape-hatch generic tools
+### 2. `propose_deployment`
+Selects the cheapest suitable GPU and generates a binding deployment proposal.
 
-- `ionet_discover`: Inspect raw JSON schemas.
-- `ionet_read`: `{"tool": "<tool_name>", "arguments": {<args>}}`.
-  Zero-argument tools require `{}`. `caas_get_price_estimate` requires all 5 fields.
+- Arguments:
+  - `customer_address` (optional string): EVM address of payer. Defaults to first RPC account.
+- Returns:
+  - `task_id`: Deterministic task ID (`taskIdFor(customer, salt)`).
+  - `salt`: Random salt for on-chain offer.
+  - `hardware_id`, `hardware_name`, `price_per_hour_usd`.
+  - `amount`: Token cost in atomic units (e.g. 1,000,000 for 1.00 USDC).
+  - `amount_usd`: Human-readable cost (e.g. `"1.00"`).
+  - `duration_hours`: Exactly `1`.
+  - `policy_hash`: Hash of the `accepted-contractor-v1` Warrant policy.
+  - `escrow_address`: `TaskEscrow` contract address.
+  - `token_address`: Payment ERC-20 token address.
+
+### 3. On-Chain Funding (`TaskEscrow.offer`)
+Customer agent verifies the proposal against local Warrant policy (budget cap, category, duration).
+If approved, customer funds escrow on-chain:
+- `IERC20(token).approve(escrow, amount)`
+- `TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, acceptBy, settleBy)`
+
+### 4. `deploy_with_escrow`
+Verifies on-chain escrow funding, accepts the task, provisions the container on io.net, settles the
+escrow deliverable with a 384-byte authorization journal, and activates the transcription service.
+
+- Arguments: `task_id` (string).
+- Returns: `status` (`"deployed"`), `deployment_id`, `public_url`, `expires_at`,
+  `settlement_transaction`.
+
+### 5. `transcribe_audio`
+Transcribes an audio file using the active 1-hour Whisper deployment.
+
+- Arguments:
+  - `audio_path` (string, required): Local path to audio file (e.g. `adv.mp3`).
+  - `language` (string, optional): 2-letter ISO code (e.g. `"en"`).
+- Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`.
+
+### 6. `get_deployment_status`
+Inspects active deployment health and remaining duration in the 1-hour window.
+
+- Arguments: none (`{}`).
+- Returns: `active` (bool), `is_expired` (bool), `remaining_seconds`, `settlement_transaction`.

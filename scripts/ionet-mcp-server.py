@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the io.net GPU compute MCP server over Streamable HTTP."""
+"""Run the Warrant GPU transcription MCP server over Streamable HTTP."""
 import argparse
 import os
 import pathlib
@@ -40,6 +40,37 @@ def main():
         default=os.environ.get("MCP_AUTH_PASS"),
         help="HTTP Basic Auth password (or set MCP_AUTH_PASS)",
     )
+    parser.add_argument(
+        "--rpc-url",
+        default=os.environ.get("WARRANT_RPC_URL", "http://127.0.0.1:8545"),
+        help="Ethereum / Arc JSON-RPC URL (default: http://127.0.0.1:8545)",
+    )
+    parser.add_argument(
+        "--escrow-address",
+        default=os.environ.get("WARRANT_ESCROW"),
+        help="TaskEscrow contract address",
+    )
+    parser.add_argument(
+        "--token-address",
+        default=os.environ.get("WARRANT_TOKEN"),
+        help="Payment token contract address (e.g. USDC)",
+    )
+    parser.add_argument(
+        "--verifier-address",
+        default=os.environ.get("WARRANT_VERIFIER"),
+        help="zkVM / Journal verifier contract address",
+    )
+    parser.add_argument(
+        "--server-account",
+        default=os.environ.get("WARRANT_SERVER_ACCOUNT"),
+        help="Server recipient / agent account address",
+    )
+    parser.add_argument(
+        "--mock-ionet",
+        action="store_true",
+        default=os.environ.get("MOCK_IONET", "").lower() in ("1", "true"),
+        help="Run using local mock worker instead of live io.net CaaS",
+    )
     args = parser.parse_args()
 
     run_server(
@@ -48,6 +79,12 @@ def main():
         state_dir=args.state_dir,
         auth_user=args.auth_user,
         auth_pass=args.auth_pass,
+        rpc_url=args.rpc_url,
+        escrow_address=args.escrow_address,
+        token_address=args.token_address,
+        verifier_address=args.verifier_address,
+        server_account=args.server_account,
+        mock_ionet=args.mock_ionet,
     )
 
 
