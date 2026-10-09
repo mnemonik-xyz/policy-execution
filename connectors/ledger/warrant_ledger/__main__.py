@@ -45,7 +45,7 @@ def main(argv=None):
             print(beancount.export(store, cfg.chain, cfg.beancount, cfg.vendors))
         elif args.command == "report":
             days = cfg.beancount.unpaid_after_days if cfg.beancount else 30
-            items = report.exceptions(store, cfg.chain.chain_id, unpaid_after_days=days)
+            items = report.exceptions(store, cfg.chain.chain_id, unpaid_after_days=days, customer=cfg.chain.customer)
             if args.json:
                 print(json.dumps(items, indent=2, sort_keys=True))
             else:
@@ -53,7 +53,7 @@ def main(argv=None):
                     print(f"{item['kind']}: " + ", ".join(f"{k}={v}" for k, v in sorted(item.items()) if k != "kind"))
                 print(f"{len(items)} exceptions")
         elif args.command == "check":
-            problems = report.self_checks(store, cfg.chain.chain_id)
+            problems = report.self_checks(store, cfg.chain.chain_id, cfg.chain.customer)
             for p in problems:
                 print(f"{p['orderId']}: {p['detail']}")
             sys.exit(1 if problems else 0)

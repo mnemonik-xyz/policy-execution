@@ -8,6 +8,7 @@ class Chain:
     rpc_url: str
     chain_id: int
     escrow: str
+    customer: str
     from_block: int = 0
     confirmations: int = 12
     max_range: int = 2000
@@ -36,6 +37,7 @@ def load(path):
         raw = tomllib.load(f)
     chain = Chain(**raw["chain"])
     chain.escrow = chain.escrow.lower()
+    chain.customer = chain.customer.lower()
     bean = Beancount(**raw["beancount"]) if "beancount" in raw else None
     vendors = {k.lower(): v for k, v in raw.get("vendors", {}).items()}
     return Config(

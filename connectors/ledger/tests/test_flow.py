@@ -38,7 +38,7 @@ def world(tmp_path, warrant_ids, invoice_xml):
             paid(facts["obligationId"], facts["payableMinor"] * 10_000, facts["documentHash"], tx="0x02", block=11),
             paid("0x" + "ab" * 32, 1_000_000, "0x" + "cd" * 32, authenticator=2, tx="0x03", block=11),
             closed(5_000_000_000 - facts["payableMinor"] * 10_000 - 1_000_000, tx="0x04", block=12)]
-    chain = Chain(rpc_url="", chain_id=5042002, escrow="0x" + "11" * 20, from_block=0, confirmations=2)
+    chain = Chain(rpc_url="", chain_id=5042002, escrow="0x" + "11" * 20, customer="0x" + "22" * 20, from_block=0, confirmations=2)
     store = Store(str(tmp_path / "events.sqlite"))
     return dict(facts=facts, logs=logs, chain=chain, store=store, ids=Ids(warrant_ids), xml=invoice_xml,
                 cfg=Beancount(path=str(tmp_path / "books.beancount")))
@@ -73,7 +73,7 @@ def test_match_report_and_beancount(world):
     assert intake.record(store, world["ids"], [world["xml"]])[0][2] == "recorded"
     assert intake.record(store, world["ids"], [world["xml"]])[0][2] == "already recorded"
 
-    kinds = sorted(i["kind"] for i in report.exceptions(store, chain.chain_id, now=T0 + 5 * 86400))
+    kinds = sorted(i["kind"] for i in report.exceptions(store, chain.chain_id, now=T0 + 5 * 86400, customer=chain.customer))
     assert kinds == ["buyer approval: the checker did not run on chain", "payment without a bill"]
 
     text = bc.render(store, chain, world["cfg"], {})
@@ -92,7 +92,7 @@ def test_unpaid_bill_is_reported(world, tmp_path):
     store, chain = world["store"], world["chain"]
     intake.record(store, world["ids"], [world["xml"]])
     later = int(dt.datetime.now(dt.timezone.utc).timestamp()) + 40 * 86400
-    kinds = [i["kind"] for i in report.exceptions(store, chain.chain_id, now=later)]
+    kinds = [i["kind"] for i in report.exceptions(store, chain.chain_id, now=later, customer=chain.customer)]
     assert kinds == ["bill without a payment"]
 
 
@@ -100,7 +100,7 @@ def test_self_check_flags_overspend(world):
     store, chain = world["store"], world["chain"]
     logs = world["logs"][:1] + [paid("0x" + "01" * 32, 6_000_000_000, "0x" + "02" * 32, tx="0x09", block=11)]
     sync(FakeRpc(logs, head=14), store, chain)
-    assert any("exceeds maxTotal" in p["detail"] for p in report.self_checks(store, chain.chain_id))
+    assert any("exceeds maxTotal" in p["detail"] for p in report.self_checks(store, chain.chain_id, chain.customer))
 
 
 def test_export_writes_atomically(world):
@@ -118,7 +118,7 @@ def test_usd_amount_difference_is_reported(world):
     logs = [world["logs"][0], paid(facts["obligationId"], 1_000_000, facts["documentHash"], tx="0x05", block=11)]
     sync(FakeRpc(logs, head=14), store, chain)
     intake.record(store, world["ids"], [world["xml"]])
-    diffs = [i for i in report.exceptions(store, chain.chain_id, now=T0) if i["kind"] == "amount difference"]
+    diffs = [i for i in report.exceptions(store, chain.chain_id, now=T0, customer=chain.customer) if i["kind"] == "amount difference"]
     assert diffs and diffs[0]["invoicePayable"] == 1_320_000_000
 
 
@@ -131,3 +131,25 @@ def test_old_store_is_refused(tmp_path):
     db.close()
     with pytest.raises(RuntimeError, match="schema version"):
         Store(str(path))
+
+
+def test_other_customers_orders_are_not_booked(world):
+    store, chain = world["store"], world["chain"]
+    other = "0x" + "99" * 20
+    foreign = offered("0x" + "77" * 32, 9_000_000_000, tx="0x21", block=10)
+    foreign["topics"] = [foreign["topics"][0], "0x" + "88" * 32, "0x" + "00" * 12 + "99" * 20]
+    foreign_paid = paid("0x" + "ab" * 32, 2_000_000, "0x" + "cd" * 32, tx="0x22", block=11)
+    foreign_paid["topics"] = [foreign_paid["topics"][0], "0x" + "88" * 32] + foreign_paid["topics"][2:]
+    sync(FakeRpc(world["logs"] + [foreign, foreign_paid], head=14), store, chain)
+    assert store.order("0x" + "88" * 32)["customer"] == other
+    mine = bc.render(store, chain, world["cfg"], {})
+    assert "9000.000000" not in mine and "2.000000 USDC" not in mine
+    assert "0x" + "88" * 32 not in mine and ("0x" + "88" * 32)[:10] not in mine
+    assert all(i.get("orderId") != "0x" + "88" * 32 for i in report.exceptions(store, chain.chain_id, now=T0, customer=chain.customer))
+    chain.customer = other
+    theirs = bc.render(store, chain, world["cfg"], {})
+    assert "9000.000000 USDC" in theirs and "1320.000000" not in theirs
+
+
+def test_line_breaks_in_strings_are_escaped():
+    assert bc.q('a\nb\rc"d') == '"a\\nb\\rc\\"d"'

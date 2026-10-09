@@ -74,9 +74,13 @@ class Store:
             self.db.execute("UPDATE orders SET state=? WHERE order_id=?", (name, fields["orderId"]))
         return cur.rowcount == 1
 
-    def events(self, chain_id, names=None):
-        rows = self.db.execute("SELECT * FROM logs WHERE chain_id=? ORDER BY block_number, log_index",
-                               (chain_id,)).fetchall()
+    def events(self, chain_id, names=None, customer=None):
+        """Logs in chain order. With a customer, only logs of that customer's orders."""
+        query, args = "SELECT * FROM logs WHERE chain_id=?", [chain_id]
+        if customer is not None:
+            query += " AND order_id IN (SELECT order_id FROM orders WHERE customer=?)"
+            args.append(customer.lower())
+        rows = self.db.execute(query + " ORDER BY block_number, log_index", args).fetchall()
         out = []
         for r in rows:
             if names and r["event"] not in names:
@@ -91,8 +95,11 @@ class Store:
         r = self.db.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         return dict(r) if r else None
 
-    def orders(self):
-        return [dict(r) for r in self.db.execute("SELECT * FROM orders ORDER BY order_id")]
+    def orders(self, customer=None):
+        if customer is None:
+            return [dict(r) for r in self.db.execute("SELECT * FROM orders ORDER BY order_id")]
+        return [dict(r) for r in self.db.execute("SELECT * FROM orders WHERE customer=? ORDER BY order_id",
+                                                 (customer.lower(),))]
 
     # Intake ------------------------------------------------------------
     def add_invoice(self, facts, source):

@@ -8,16 +8,16 @@ DAY = 86400
 USD_CENT = 10_000
 
 
-def self_checks(store, chain_id):
+def self_checks(store, chain_id, customer=None):
     problems = []
     paid, refunded = {}, {}
-    for e in store.events(chain_id, ("Paid", "Closed")):
+    for e in store.events(chain_id, ("Paid", "Closed"), customer):
         o = e["data"]["orderId"]
         if e["event"] == "Paid":
             paid[o] = paid.get(o, 0) + e["data"]["amount"]
         else:
             refunded[o] = refunded.get(o, 0) + e["data"]["refunded"]
-    for order in store.orders():
+    for order in store.orders(customer):
         o, spent = order["order_id"], paid.get(order["order_id"], 0)
         if spent > order["max_total"]:
             problems.append({"kind": "self-check", "orderId": o,
@@ -28,10 +28,10 @@ def self_checks(store, chain_id):
     return problems
 
 
-def exceptions(store, chain_id, unpaid_after_days=30, expiring_days=7, now=None):
+def exceptions(store, chain_id, unpaid_after_days=30, expiring_days=7, now=None, customer=None):
     now = int(now if now is not None else time.time())
     out, paid_docs, paid_obligations = [], set(), set()
-    for e in store.events(chain_id, ("Paid",)):
+    for e in store.events(chain_id, ("Paid",), customer):
         d = e["data"]
         status, order, inv = m.match(store, e)
         base = {"event": e["key"], "orderId": d["orderId"], "obligationId": d["obligationId"],
@@ -57,9 +57,9 @@ def exceptions(store, chain_id, unpaid_after_days=30, expiring_days=7, now=None)
         if now - inv["recorded_at"] > unpaid_after_days * DAY:
             out.append({"kind": "bill without a payment", "documentHash": inv["document_hash"],
                         "obligationId": inv["obligation_id"], "invoiceNumber": inv["invoice_number"]})
-    for order in store.orders():
+    for order in store.orders(customer):
         if order["state"] == "Accepted" and open_by_po.get(order["po_id"]) and \
                 0 <= order["settle_by"] - now <= expiring_days * DAY:
             out.append({"kind": "order expiring with open bills", "orderId": order["order_id"],
                         "settleBy": order["settle_by"], "openBills": len(open_by_po[order["po_id"]])})
-    return out + self_checks(store, chain_id)
+    return out + self_checks(store, chain_id, customer)

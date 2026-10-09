@@ -33,8 +33,23 @@ cargo build -p warrant-ids --release --locked
 ```
 
 Write a configuration (see
-[implementation.md section 2.2](../../../ledger-integration/implementation.md)),
-then:
+[implementation.md section 2.2](../../../ledger-integration/implementation.md)).
+The `[chain]` section must name the buyer:
+
+```toml
+[chain]
+rpc_url = "http://127.0.0.1:8545"
+chain_id = 5042002
+escrow = "0x..."      # the InvoiceEscrow deployment
+customer = "0x..."    # the buyer address whose orders this ledger books
+```
+
+Many buyers can share one `InvoiceEscrow` deployment. The connector reads all
+logs of the deployment, but it books and reports only the orders that this
+`customer` offered. A payment for an order that the store holds no `Offered`
+log for is not booked. Set `from_block` at or before the first offer.
+
+Then run:
 
 ```sh
 cd connectors/ledger

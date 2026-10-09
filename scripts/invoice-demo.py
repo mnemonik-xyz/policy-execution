@@ -51,10 +51,12 @@ def ledger_demo(out, escrow):
     run('cargo','build','-p','warrant-ids','--release','--locked')
     for name, request in (('invoice-1001.xml', out/'request.json'), ('invoice-1003.xml', out/'ask/request.json')):
         (out/name).write_bytes(bytes(json.loads(request.read_text())['document']))
+    host_tool, db_path, books_path = ROOT/'target/release/warrant-ids', out/'ledger.sqlite', out/'books.beancount'
     (out/'ledger.toml').write_text(
-        f'[chain]\nrpc_url = "{URL}"\nchain_id = 31337\nescrow = "{escrow}"\nfrom_block = 0\nconfirmations = 0\n'
-        f'[tools]\nwarrant_ids = "{ROOT/'target/release/warrant-ids'}"\n[store]\npath = "{out/'ledger.sqlite'}"\n'
-        f'[beancount]\npath = "{out/'books.beancount'}"\n[vendors]\n"{VENDOR.lower()}" = "Vendor"\n')
+        f'[chain]\nrpc_url = "{URL}"\nchain_id = 31337\nescrow = "{escrow}"\ncustomer = "{CUSTOMER}"\n'
+        f'from_block = 0\nconfirmations = 0\n'
+        f'[tools]\nwarrant_ids = "{host_tool}"\n[store]\npath = "{db_path}"\n'
+        f'[beancount]\npath = "{books_path}"\n[vendors]\n"{VENDOR.lower()}" = "Vendor"\n')
     ledger=lambda *a: run(sys.executable,'-m','warrant_ledger','--config',str(out/'ledger.toml'),*a,cwd=ROOT/'connectors/ledger')
     ledger('intake',str(out/'invoice-1001.xml'),str(out/'invoice-1003.xml'))
     ledger('sync')
@@ -69,7 +71,7 @@ def ledger_demo(out, escrow):
         checked='bean-check passed'
     else:
         checked='bean-check not installed; skipped'
-    print(f'Ledger: both settlements booked against their invoices; {checked}. File: {out/"books.beancount"}',flush=True)
+    print(f'Ledger: both settlements booked against their invoices; {checked}. File: {books_path}',flush=True)
 
 out = ROOT/'artifacts'/f'invoice-{time.time_ns()}'
 out.mkdir(parents=True)

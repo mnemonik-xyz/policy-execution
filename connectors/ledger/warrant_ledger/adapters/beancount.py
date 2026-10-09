@@ -29,11 +29,12 @@ def vendor_account(cfg, vendors, recipient):
 
 
 def q(s):
-    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    s = str(s).replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + s.replace("\n", "\\n").replace("\r", "\\r") + '"'
 
 
 def render(store, chain, cfg, vendors):
-    events = store.events(chain.chain_id)
+    events = store.events(chain.chain_id, customer=chain.customer)
     invoices = store.invoices()
     entries = []  # (date, sequence, text)
     accounts = {cfg.escrow_account, cfg.wallet_account}
