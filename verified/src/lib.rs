@@ -495,4 +495,86 @@ pub fn decide(rule: &Rule, f3: &Facts3) -> (result: Decision)
     }
 }
 
+/// Final invoice payment fields constructed from the very facts that were evaluated.
+/// Authentication of those facts remains the evidence adapter's responsibility.
+pub struct PolicyPayment {
+    pub recipient: [u8; 20],
+    pub document: [u8; 32],
+    pub amount: u64,
+    pub valid_after: u64,
+    pub valid_until: u64,
+}
+
+/// Runtime constructor: no caller-supplied recipient/amount can be substituted
+/// after the policy decision. Empty windows and zero payments never authorize.
+pub fn authorize_payment(rule: &Rule, facts: &Facts3, after: u64, until: u64)
+    -> (result: Option<PolicyPayment>)
+    ensures
+        result is Some ==> {
+            let p = result->Some_0;
+            &&& p.amount == facts.amount
+            &&& p.amount > 0
+            &&& p.recipient@ == facts.recipient@
+            &&& p.document@ == facts.deliverable@
+            &&& p.valid_after == after
+            &&& p.valid_until == until
+            &&& after <= until
+            &&& kleene(rule, facts) == Some(true)
+            &&& forall|complete: Facts| completes(facts, &complete)
+                ==> #[trigger] satisfies(rule, &complete)
+        },
+        result is Some <==> (facts.amount > 0 && after <= until && kleene(rule, facts) == Some(true)),
+{
+    if facts.amount == 0 || after > until {
+        return None;
+    }
+    match decide(rule, facts) {
+        Decision::Allow => {
+            proof { decision_sound(rule, facts); }
+            Some(PolicyPayment {
+                recipient: facts.recipient,
+                document: facts.deliverable,
+                amount: facts.amount,
+                valid_after: after,
+                valid_until: until,
+            })
+        },
+        _ => None,
+    }
+}
+
+/// Exact intersection of two signed validity windows.
+pub open spec fn in_window(after: u64, until: u64, now: u64) -> bool {
+    after <= now && now <= until
+}
+
+pub fn intersect_window(a0: u64, a1: u64, b0: u64, b1: u64) -> (r: (u64, u64))
+    ensures
+        r.0 == if a0 >= b0 { a0 } else { b0 },
+        r.1 == if a1 <= b1 { a1 } else { b1 },
+        forall|now: u64| #[trigger] in_window(r.0, r.1, now)
+            <==> (a0 <= now && now <= a1 && b0 <= now && now <= b1),
+{
+    (if a0 >= b0 { a0 } else { b0 }, if a1 <= b1 { a1 } else { b1 })
+}
+
+/// Floor conversion from invoice minor units to token base units. Neither a zero
+/// result nor a value exceeding the journal's u64 amount can authorize payment.
+pub fn convert_amount(minor: u64, numerator: u64, denominator: u64) -> (r: Option<u64>)
+    ensures
+        r is Some ==> denominator > 0 && r->Some_0 > 0
+            && r->Some_0 as int == (minor as int * numerator as int) / denominator as int,
+        r is Some <==> (denominator > 0
+            && 0 < (minor as int * numerator as int) / denominator as int
+            && (minor as int * numerator as int) / denominator as int <= u64::MAX),
+{
+    if denominator == 0 { return None; }
+    assert((minor as int) * (numerator as int) <= u128::MAX) by(nonlinear_arith)
+        requires minor <= u64::MAX, numerator <= u64::MAX;
+    let product = (minor as u128) * (numerator as u128);
+    let amount = product / (denominator as u128);
+    if amount == 0 || amount > u64::MAX as u128 { None }
+    else { Some(amount as u64) }
+}
+
 } // verus!

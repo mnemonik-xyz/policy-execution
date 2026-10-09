@@ -12,7 +12,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use warrant_verified_policy::{decide, Decision, Facts3, Rule};
+use warrant_verified_policy::{
+    authorize_payment, convert_amount, decide, intersect_window, Decision, Facts3, Rule,
+};
 
 /// Changes whenever parsing or checking semantics change; bound into evidence.
 pub const CHECKER_VERSION: u32 = 3;
@@ -430,9 +432,7 @@ pub fn usdc_amount(facts: &InvoiceFacts, po: &PurchaseOrder) -> Option<u64> {
     if facts.currency != po.currency || po.rate_den == 0 {
         return None;
     }
-    let minor = u128::from(facts.payable_minor?);
-    let value = minor * u128::from(po.rate_num) / u128::from(po.rate_den);
-    u64::try_from(value).ok().filter(|v| *v > 0)
+    convert_amount(facts.payable_minor?, po.rate_num, po.rate_den)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -842,16 +842,20 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
         amount,
     };
 
-    let mut valid_after = policy
-        .valid_after
-        .max(vendor.valid_after)
-        .max(po.valid_after)
-        .max(attestation.valid_after);
-    let mut valid_until = policy
-        .valid_until
-        .min(vendor.valid_until)
-        .min(po.valid_until)
-        .min(attestation.valid_until);
+    let (valid_after, valid_until) = intersect_window(
+        policy.valid_after,
+        policy.valid_until,
+        vendor.valid_after,
+        vendor.valid_until,
+    );
+    let (valid_after, valid_until) =
+        intersect_window(valid_after, valid_until, po.valid_after, po.valid_until);
+    let (mut valid_after, mut valid_until) = intersect_window(
+        valid_after,
+        valid_until,
+        attestation.valid_after,
+        attestation.valid_until,
+    );
     let accepted = match (
         &policy.acceptance_key,
         &input.acceptance,
@@ -870,8 +874,12 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
                 return Err(Denial::RequestMismatch);
             }
             verify(key, &crate::acceptance_message(acceptance), signature)?;
-            valid_after = valid_after.max(acceptance.valid_after);
-            valid_until = valid_until.min(acceptance.valid_until);
+            (valid_after, valid_until) = intersect_window(
+                valid_after,
+                valid_until,
+                acceptance.valid_after,
+                acceptance.valid_until,
+            );
             Some(acceptance.accepted)
         }
         _ => return Err(Denial::InvalidEvidence),
@@ -908,33 +916,43 @@ pub fn authorize_invoice(input: &InvoiceInput) -> Result<InvoiceOutcome, Denial>
             }
             Ok(InvoiceOutcome::Ask(ask))
         }
-        Decision::Allow => Ok(InvoiceOutcome::Allow(Box::new(InvoiceAuthorization {
-            authorization: Authorization {
-                policy_hash: invoice_policy_hash(policy),
-                request,
-                policy_version: policy.version,
-                valid_after,
-                valid_until,
-                evidence_hash: hash_tagged(
-                    b"warrant/invoice-evidence/v1",
-                    &(
-                        CHECKER_VERSION,
-                        facts.doc_hash,
-                        &input.claims,
-                        vendor,
-                        &input.vendor_signature,
-                        po,
-                        &input.po_signature,
-                        attestation,
-                        &input.invoice_signature,
-                        &input.acceptance,
-                        &input.acceptance_signature,
+        Decision::Allow => {
+            let payment = authorize_payment(&policy.rule, &f3, valid_after, valid_until)
+                .ok_or(Denial::PolicyDenied)?;
+            Ok(InvoiceOutcome::Allow(Box::new(InvoiceAuthorization {
+                authorization: Authorization {
+                    policy_hash: invoice_policy_hash(policy),
+                    request: Request {
+                        scope: request.scope,
+                        task_id: request.task_id,
+                        recipient: payment.recipient,
+                        deliverable_hash: payment.document,
+                        amount: payment.amount,
+                    },
+                    policy_version: policy.version,
+                    valid_after: payment.valid_after,
+                    valid_until: payment.valid_until,
+                    evidence_hash: hash_tagged(
+                        b"warrant/invoice-evidence/v1",
+                        &(
+                            CHECKER_VERSION,
+                            facts.doc_hash,
+                            &input.claims,
+                            vendor,
+                            &input.vendor_signature,
+                            po,
+                            &input.po_signature,
+                            attestation,
+                            &input.invoice_signature,
+                            &input.acceptance,
+                            &input.acceptance_signature,
+                        ),
                     ),
-                ),
-            },
-            po_id: po.po_id,
-            po_max_total: po.max_total,
-            customer: policy.customer,
-        }))),
+                },
+                po_id: po.po_id,
+                po_max_total: po.max_total,
+                customer: policy.customer,
+            })))
+        }
     }
 }

@@ -139,7 +139,7 @@ contract InvoiceEscrow is ReentrancyGuard {
 
     /// @notice Reserves the full order ceiling immediately. The signer, its allowance
     /// and the proof threshold are the buyer's choice for this order alone.
-    function offer(Terms calldata t) external nonReentrant returns (bytes32 orderId) {
+    function offer(Terms calldata t) public virtual nonReentrant returns (bytes32 orderId) {
         orderId = orderIdFor(msg.sender, t.policyHash, t.poId);
         if (orders[orderId].state != State.Missing) revert InvalidState();
         if (
@@ -224,7 +224,7 @@ contract InvoiceEscrow is ReentrancyGuard {
     /// @notice Anyone can relay an authorization signed by the order's signer, below
     /// the order's proof threshold and within its signer allowance, unless the
     /// customer revoked signing.
-    function settleSigned(bytes calldata journal, bytes calldata signature) external nonReentrant {
+    function settleSigned(bytes calldata journal, bytes calldata signature) external virtual nonReentrant {
         (bytes32 orderId, Order storage o, PolicyExecutionVault.Authorization memory a) = _authorize(journal);
         if (o.signer == address(0) || a.amount >= o.proofThreshold) revert ProofRequired();
         if (o.signerRevoked) revert Unauthorized();
@@ -242,6 +242,7 @@ contract InvoiceEscrow is ReentrancyGuard {
     /// @param documentHash sha256 of the invoice bytes, for the record.
     function settleApproved(bytes32 orderId, bytes32 obligationId, uint64 amount, bytes32 documentHash)
         external
+        virtual
         nonReentrant
     {
         Order storage o = orders[orderId];
@@ -269,7 +270,8 @@ contract InvoiceEscrow is ReentrancyGuard {
         o = orders[orderId];
         if (o.state != State.Accepted || block.timestamp > o.settleBy) revert InvalidState();
         if (
-            a.policyVersion != o.policyVersion || a.chainId != block.chainid || a.vault != address(this)
+            a.policyHash != o.policyHash || customer != o.customer || a.policyVersion != o.policyVersion
+                || a.chainId != block.chainid || a.vault != address(this)
                 || a.token != address(token) || a.recipient != o.recipient || poMaxTotal != o.maxTotal || a.amount == 0
                 || a.taskId == bytes32(0) || a.deliverableHash == bytes32(0) || a.evidenceHash == bytes32(0)
                 || a.validAfter > a.validUntil || block.timestamp < a.validAfter || block.timestamp > a.validUntil
@@ -288,7 +290,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         Authenticator authenticator,
         bytes32 deliverableHash,
         bytes32 evidenceHash
-    ) internal {
+    ) internal virtual {
         consumed[o.customer][taskId] = true;
         o.spent += amount;
         totalReserved -= amount;

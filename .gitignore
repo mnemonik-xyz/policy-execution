@@ -6,9 +6,12 @@
 /contracts/node_modules/
 /contracts/out/
 /contracts/cache/
+/contracts/out-formal/
+/contracts/cache-formal/
 
 /contracts/broadcast/
 
 __pycache__/
 .venv/
 .env
+/error.log

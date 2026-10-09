@@ -12,3 +12,10 @@ fs_permissions = [{ access = "read", path = "../artifacts" }, { access = "read",
 
 [profile.default.fuzz]
 runs = 256
+
+# Halmos executes constructors itself; Foundry's dynamic deployCode linking is
+# not supported. Keep symbolic artifacts separate from ordinary test builds.
+[profile.formal]
+dynamic_test_linking = false
+out = "out-formal"
+cache_path = "cache-formal"
