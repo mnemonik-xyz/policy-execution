@@ -115,9 +115,9 @@ not raw account responses.
 
 ## First live deployment
 
-The first pilot allows exactly one GPU, one replica, one hour, and explicit
-`billing_model: "duration"`. PayG is rejected: its required duration field does
-not bound lifetime, and the documented price estimator is for duration billing.
+The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
+or `"payg"`. Note that PayG does not bound container lifetime on the provider side: destroy
+promptly after testing to prevent ongoing metered billing.
 
 1. Select an integer CaaS hardware ID and one integer location ID from live
    discovery and availability. Regional string hardware IDs are unsuitable
@@ -183,11 +183,12 @@ arguments from discovery to find the assigned public HTTPS endpoint.
 | `POST /job` | `Authorization: Bearer WORKER_TOKEN` | Upload raw audio, receive job status |
 | `GET /job` | Same token | Status, transcript, hashes, revision and timing |
 
-For uploads, supply `Content-Length` and `X-Audio-SHA256` (lowercase SHA-256 of
-the audio). Maximum size is 64 MiB. No caller-supplied URL is fetched. Repeated
-submission of the same input returns its existing job; another input receives
-409 for this single-job worker. Collect the output outside the container before
-cleanup. A restart with preserved state reports unfinished work as `interrupted`.
+For uploads, supply `Content-Length` and `X-Audio-SHA256` (lowercase SHA-256 of the audio). An
+optional language code can be passed via `?language=<code>` or `X-Language: <code>`. Maximum
+size is 64 MiB. No caller-supplied URL is fetched. Repeated submission of the same input
+returns its existing job; another input receives 409 for this single-job worker. Collect the
+output outside the container before cleanup. A restart with preserved state reports unfinished
+work as `interrupted`.
 
 The worker uses CUDA/FP16 `faster-whisper`. Timing includes model loading and
 transcription. Hashes identify bytes, not correctness. Local tests use an

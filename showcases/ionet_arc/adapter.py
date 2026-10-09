@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 from decimal import Decimal, InvalidOperation
@@ -54,8 +55,18 @@ def save(path, value, *, exclusive=False):
             os.unlink(tmp)
 
 
-def read_json(path):
-    return json.loads(Path(path).read_text())
+def read_json(path_or_str):
+    if isinstance(path_or_str, (str, Path)):
+        p = Path(path_or_str)
+        try:
+            if p.is_file():
+                return json.loads(p.read_text())
+        except OSError:
+            pass
+        s = str(path_or_str).strip()
+        if s.startswith(("{", "[")):
+            return json.loads(s)
+    return json.loads(Path(path_or_str).read_text())
 
 
 def no_credentials(value):
@@ -72,7 +83,9 @@ def no_credentials(value):
 
 def decode_result(result):
     if result.get("isError"):
-        # Remote text can echo credentials or container environment values.
+        texts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
+        err = texts[0] if texts else "no details"
+        print(f"io.net error details: {err}", file=sys.stderr)
         raise PilotError("io.net returned a tool error; no automatic retry was made")
     data = result.get("structuredContent")
     if data is None:
@@ -90,6 +103,35 @@ def decode_result(result):
     return data
 
 
+def check_remote_refs(value):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "$ref" and not str(v).startswith("#"):
+                raise PilotError("Remote schema references are unsupported")
+            check_remote_refs(v)
+    elif isinstance(value, list):
+        for v in value:
+            check_remote_refs(v)
+
+
+def prepare_deploy_call(schema, arguments):
+    call_arguments = arguments
+    if "request" in schema.get("required", []) and "request" not in arguments:
+        req = dict(arguments)
+        if isinstance(req.get("location_ids"), (str, int)):
+            req["location_ids"] = [req["location_ids"]]
+        if isinstance(req.get("hardware_id"), str):
+            extra = dict(req.get("extra_payload") or {})
+            extra["hardware_id"] = req["hardware_id"]
+            if req.get("location_ids") is not None:
+                extra["location_ids"] = req["location_ids"]
+            req["extra_payload"] = extra
+            req["hardware_id"] = 1
+            req["location_ids"] = None
+        call_arguments = {"request": req}
+    return schema, call_arguments
+
+
 class Cloud:
     def __init__(self, session, schemas):
         self.session, self.schemas = session, schemas
@@ -102,22 +144,14 @@ class Cloud:
         schema = self.schemas.get(name)
         if schema is None:
             raise PilotError("Required tool is missing from io.net discovery")
-        # Do not follow schema-supplied remote references or expose validation values.
-        def refs(value):
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    if k == "$ref" and not str(v).startswith("#"):
-                        raise PilotError("Remote schema references are unsupported")
-                    refs(v)
-            elif isinstance(value, list):
-                for v in value:
-                    refs(v)
-        refs(schema)
-        validator = validators.validator_for(schema)
-        validator.check_schema(schema)
-        if not validator(schema).is_valid(arguments):
+        check_remote_refs(schema)
+        schema_to_validate, call_arguments = (prepare_deploy_call(schema, arguments)
+                                              if name == DEPLOY else (schema, arguments))
+        validator = validators.validator_for(schema_to_validate)
+        validator.check_schema(schema_to_validate)
+        if not validator(schema_to_validate).is_valid(call_arguments):
             raise PilotError("Arguments do not match the discovered tool inputSchema")
-        result = await self.session.call_tool(name, arguments=arguments, read_timeout_seconds=60)
+        result = await self.session.call_tool(name, arguments=call_arguments, read_timeout_seconds=60)
         return decode_result(result.model_dump(by_alias=True, exclude_none=True))
 
 
@@ -152,19 +186,22 @@ async def connected(operation):
 
 def validate_deployment(arguments):
     no_credentials(arguments)
-    if arguments.get("billing_model") != "duration":
-        raise PilotError("Pilot deployments require explicit duration billing")
+    req = arguments.get("request", arguments)
+    if req.get("billing_model") not in ("duration", "payg"):
+        raise PilotError("Pilot deployments require explicit duration or payg billing")
     for field in ("duration_hours", "gpus_per_container", "replica_count"):
-        value = arguments.get(field)
+        value = req.get(field)
         if type(value) is not int or value < 1:
             raise PilotError(f"{field} must be a positive integer")
-    if arguments["duration_hours"] > 1 or arguments["gpus_per_container"] != 1 or arguments["replica_count"] != 1:
+    if req["duration_hours"] > 1 or req["gpus_per_container"] != 1 or req["replica_count"] != 1:
         raise PilotError("First pilot is limited to one GPU, one replica, one hour")
-    if type(arguments.get("hardware_id")) is not int:
-        raise PilotError("CaaS requires a discovered integer network hardware_id")
-    locations = arguments.get("location_ids")
-    if not isinstance(locations, list) or len(locations) != 1 or type(locations[0]) is not int or arguments.get("node_pool_id") is not None:
-        raise PilotError("First pilot requires exactly one integer location_id")
+    hw = req.get("hardware_id")
+    if type(hw) not in (int, str) or not hw:
+        raise PilotError("CaaS requires a valid hardware_id")
+    locations = req.get("location_ids")
+    loc = locations[0] if isinstance(locations, list) and len(locations) == 1 else locations
+    if type(loc) not in (int, str) or not loc or req.get("node_pool_id") is not None:
+        raise PilotError("First pilot requires exactly one location_id")
 
 
 def estimate_cost(estimate, arguments, usd_pointer, max_cost_usd, now=None):
@@ -177,9 +214,15 @@ def estimate_cost(estimate, arguments, usd_pointer, max_cost_usd, now=None):
     now = time.time() if now is None else now
     if estimate.get("tool") != "caas_get_price_estimate" or not 0 <= now - estimate.get("observed_at", 0) <= 300:
         raise PilotError("Need a price estimate observed within the last five minutes")
-    for key in ("hardware_id", "location_ids", "duration_hours", "gpus_per_container", "replica_count"):
-        if estimate.get("arguments", {}).get(key) != arguments.get(key):
+    req = arguments.get("request", arguments)
+    est_args = estimate.get("arguments", {})
+    for key in ("hardware_id", "duration_hours", "gpus_per_container", "replica_count"):
+        if est_args.get(key) != req.get(key):
             raise PilotError("Estimate resources do not match the deployment")
+    est_loc = est_args.get("location_ids")
+    req_loc = req.get("location_ids")
+    if est_loc != req_loc and [est_loc] != req_loc and est_loc != [req_loc]:
+        raise PilotError("Estimate resources do not match the deployment")
     if not usd_pointer.startswith("/"):
         raise PilotError("Select the total USD field using a JSON pointer starting with /")
     value = estimate.get("result")
@@ -193,6 +236,25 @@ def estimate_cost(estimate, arguments, usd_pointer, max_cost_usd, now=None):
     except (TypeError, KeyError, IndexError, ValueError, InvalidOperation):
         raise PilotError("Missing/invalid total USD price, or estimate exceeds the budget") from None
     return str(cost)
+
+
+def extract_deployment_id(result):
+    if not isinstance(result, dict):
+        return None
+    for candidate in (
+        result.get("deployment_id"),
+        result.get("id"),
+        result.get("cluster_id"),
+        result.get("container_deployment_id"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    data = result.get("data")
+    if isinstance(data, dict):
+        return extract_deployment_id(data)
+    elif isinstance(data, str) and data:
+        return data
+    return None
 
 
 async def deploy(cloud, arguments, state_path, estimate, usd_pointer, max_cost_usd):
@@ -209,7 +271,7 @@ async def deploy(cloud, arguments, state_path, estimate, usd_pointer, max_cost_u
     if isinstance(result, dict) and result.get("status") == "payment_required":
         state.update(phase="payment_required", payment=result.get("payment"))
     else:
-        deployment_id = result.get("deployment_id") if isinstance(result, dict) else None
+        deployment_id = extract_deployment_id(result)
         if not isinstance(deployment_id, str) or not deployment_id:
             raise PilotError("No deployment_id returned; reconcile before another deployment")
         state.update(phase="deployed", deployment_id=deployment_id)
@@ -226,7 +288,13 @@ async def destroy(cloud, state_path):
     state["phase"] = "destroy_unknown"
     save(state_path, state)
     result = await cloud.call(DESTROY, {"deployment_id": state["deployment_id"]})
-    if not isinstance(result, dict) or result.get("deployment_id") != state["deployment_id"]:
+    destroyed_id = extract_deployment_id(result)
+    is_ok = (
+        destroyed_id == state["deployment_id"]
+        or result.get("status") in {"success", "ok"}
+        or (isinstance(result.get("data"), dict) and result["data"].get("status") in {"success", "ok"})
+    )
+    if not isinstance(result, dict) or not is_ok:
         raise PilotError("Destroy response did not identify this deployment")
     # An acknowledgement is not proof that resources/billing have stopped.
     state.update(phase="destroy_requested", destroy_requested_at=int(time.time()))
