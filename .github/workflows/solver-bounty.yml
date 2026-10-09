@@ -1,21 +1,60 @@
 name: Solver bounty
 
+# The fast job runs on every pull request.
+# The proof job is slow. It runs only on manual dispatch,
+# or on a pull request that has the "run-proof" label.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  RISC0_BUILD_LOCKED: "1"
+  RAYON_NUM_THREADS: "4"
+  WARRANT_SEGMENT_PO2: "18"
+  RUSTUP_TOOLCHAIN: "1.98.1"
+
 jobs:
-  solver-deal:
+  solver-fast:
+    # Adding a label must not re-run the fast tests.
+    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust and prover
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          curl -fsSL https://risczero.com/install -o /tmp/rzup-install.sh
+          bash /tmp/rzup-install.sh
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust 1.88.0
+          "$HOME/.risc0/bin/rzup" install r0vm 3.0.5
+      - name: Install Foundry and contract dependencies
+        run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
+          curl -fsSL https://foundry.paradigm.xyz -o /tmp/foundry-install.sh
+          bash /tmp/foundry-install.sh
+          "$HOME/.foundry/bin/foundryup" --install v1.8.4
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          npm ci --prefix contracts --ignore-scripts
+      - name: Native and contract regression tests
+        run: |
+          cargo test --locked -p warrant-policy -p warrant-solver
+          forge test --root contracts
+      - name: Guest execution agrees with native checks
+        run: cargo test --release --locked -p warrant-host --test solver_execution
+
+  solver-proof:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-proof'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      RISC0_BUILD_LOCKED: "1"
-      RAYON_NUM_THREADS: "4"
-      WARRANT_SEGMENT_PO2: "18"
-      RUSTUP_TOOLCHAIN: "1.98.1"
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and prover
@@ -35,12 +74,6 @@ jobs:
           echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
           npm ci --prefix contracts --ignore-scripts
           docker info
-      - name: Native and contract regression tests
-        run: |
-          cargo test --locked -p warrant-policy -p warrant-solver
-          forge test --root contracts
-      - name: Guest execution agrees with native checks
-        run: cargo test --release --locked -p warrant-host --test solver_execution
       - name: Real proof, delivery, and payment
         run: python3 scripts/solver-demo.py
       - name: Real receipt rejects image and journal mutations
