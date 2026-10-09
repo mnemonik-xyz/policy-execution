@@ -217,6 +217,12 @@ Request the estimate:
    Submit additional audio with `POST /job` as needed. Each distinct upload has its own
    `job_id`; `GET /jobs` returns all submitted jobs.
 
+5. Read the container logs to follow job lifecycle events and GPU utilization. The worker emits
+   JSON log records on startup, job start/end, and every 10 seconds while a job runs with
+   utilization, memory, temperature, and power snapshots when `nvidia-smi` is available. Set
+   `WARRANT_GPU_LOG_INTERVAL_SECONDS` to change the running-job cadence. It never writes the
+   worker token, audio, or transcript text to these logs.
+
 ---
 
 ### Step 7: Teardown and Cleanup

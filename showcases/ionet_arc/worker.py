@@ -8,9 +8,11 @@ import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -19,6 +21,44 @@ import urllib.parse
 MODEL_ID = "Systran/faster-whisper-small"
 MODEL_REVISION = "536b0662742c02347bc0e980a01041f333bce120"
 MAX_AUDIO_BYTES = 64 * 1024 * 1024
+LOGGER = logging.getLogger(__name__)
+
+
+def gpu_metrics():
+    """Return a best-effort GPU utilization snapshot without failing a job."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total,"
+             "temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+            capture_output=True, check=True, text=True, timeout=2)
+    except FileNotFoundError:
+        return {"available": False, "reason": "nvidia_smi_unavailable"}
+    except OSError:
+        return {"available": False, "reason": "nvidia_smi_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "reason": "nvidia_smi_timed_out"}
+    except subprocess.CalledProcessError:
+        return {"available": False, "reason": "nvidia_smi_failed"}
+    metrics = []
+    for line in result.stdout.splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != 6:
+            continue
+        metrics.append({"index": values[0], "utilization_percent": values[1],
+                        "memory_used_mib": values[2], "memory_total_mib": values[3],
+                        "temperature_celsius": values[4], "power_watts": values[5]})
+    return {"available": True, "gpus": metrics}
+
+
+def log_event(event, **fields):
+    LOGGER.info("%s", json.dumps({"event": event, "observed_at": time.time(), **fields}, sort_keys=True))
+
+
+def gpu_log_interval():
+    try:
+        return max(float(os.getenv("WARRANT_GPU_LOG_INTERVAL_SECONDS", "10")), 1)
+    except ValueError:
+        return 10
 
 
 def transcribe(audio, model_dir, language=None):
@@ -50,6 +90,8 @@ class Worker:
                 interrupted = True
         if interrupted:
             self.persist()
+            log_event("jobs_interrupted_after_restart", count=sum(
+                job["status"] == "interrupted" for job in self.jobs.values()))
 
     @property
     def job(self):
@@ -89,7 +131,9 @@ class Worker:
             return 400, {"error": "audio hash mismatch"}
         with self.lock:
             if actual_hash in self.jobs:
-                return 200, self.jobs[actual_hash].copy()
+                job = self.jobs[actual_hash].copy()
+                log_event("job_duplicate", job_id=actual_hash, status=job["status"])
+                return 200, job
             inputs = self.root / "inputs"
             inputs.mkdir(exist_ok=True)
             audio = inputs / f"{actual_hash}.audio"
@@ -101,14 +145,23 @@ class Worker:
                 self.jobs[actual_hash]["requested_language"] = language
             self.persist()
             threading.Thread(target=self.run, args=(actual_hash, audio, language), daemon=True).start()
-            return 202, self.jobs[actual_hash].copy()
+            job = self.jobs[actual_hash].copy()
+            queue_depth = sum(item["status"] == "queued" for item in self.jobs.values())
+        log_event("job_accepted", job_id=actual_hash, audio_bytes=len(body),
+                  queue_depth=queue_depth, requested_language=language)
+        return 202, job
 
     def run(self, job_id, audio, language=None):
         with self.run_lock:
             with self.lock:
                 self.jobs[job_id]["status"] = "running"
                 self.persist()
+            log_event("job_started", job_id=job_id, gpu=gpu_metrics())
             started = time.monotonic()
+            telemetry_stop = threading.Event()
+            telemetry = threading.Thread(target=self.log_running_gpu_metrics,
+                                         args=(job_id, telemetry_stop), daemon=True)
+            telemetry.start()
             try:
                 import inspect
                 sig = inspect.signature(self.engine)
@@ -124,9 +177,21 @@ class Worker:
                 import sys
                 print(f"Transcription error: {exc}", file=sys.stderr, flush=True)
                 update = {"status": "failed", "error": "Transcription failed"}
+            finally:
+                telemetry_stop.set()
+                telemetry.join(timeout=3)
             with self.lock:
                 self.jobs[job_id].update(update)
                 self.persist()
+            if update["status"] == "complete":
+                log_event("job_completed", job_id=job_id,
+                          elapsed_seconds=update["elapsed_seconds"], gpu=gpu_metrics())
+            else:
+                log_event("job_failed", job_id=job_id, gpu=gpu_metrics())
+
+    def log_running_gpu_metrics(self, job_id, stop):
+        while not stop.wait(gpu_log_interval()):
+            log_event("job_running", job_id=job_id, gpu=gpu_metrics())
 
     def get(self, job_id):
         with self.lock:
@@ -220,8 +285,11 @@ def handler(worker):
 
 
 def main():
+    logging.basicConfig(level=getattr(logging, os.getenv("WARRANT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+                        format="%(message)s")
     worker = Worker(os.getenv("WARRANT_WORK_DIR", "/data"), os.environ.get("WARRANT_WORKER_TOKEN"),
                     model_dir=os.getenv("WARRANT_MODEL_DIR", "/model"))
+    log_event("worker_started", job_count=len(worker.jobs), gpu=gpu_metrics())
     ThreadingHTTPServer(("0.0.0.0", 8080), handler(worker)).serve_forever()
 
 

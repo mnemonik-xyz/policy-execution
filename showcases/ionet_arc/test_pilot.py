@@ -17,7 +17,7 @@ from showcases.ionet_arc.adapter import (Cloud, DEPLOY, DESTROY, ENDPOINT, Pilot
                                          decode_result, deploy, destroy, read_json)
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
-from showcases.ionet_arc.worker import Worker, handler
+from showcases.ionet_arc.worker import Worker, gpu_metrics, handler
 from showcases.ionet_arc import adapter
 
 
@@ -312,6 +312,15 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(code, 400)
         code, err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
         self.assertEqual(code, 400)
+
+    @patch("showcases.ionet_arc.worker.subprocess.run")
+    def test_gpu_metrics_and_unavailable_fallback(self, run):
+        run.return_value.stdout = "0, 78, 1024, 24576, 65, 201.5\n"
+        self.assertEqual(gpu_metrics(), {"available": True, "gpus": [{
+            "index": "0", "utilization_percent": "78", "memory_used_mib": "1024",
+            "memory_total_mib": "24576", "temperature_celsius": "65", "power_watts": "201.5"}]})
+        run.side_effect = FileNotFoundError()
+        self.assertEqual(gpu_metrics(), {"available": False, "reason": "nvidia_smi_unavailable"})
 
     def test_upload_poll_duplicate_and_persistent_results(self):
         first_audio = b"fake audio for unit test"

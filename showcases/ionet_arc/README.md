@@ -197,6 +197,19 @@ The worker uses CUDA/FP16 `faster-whisper`. Timing includes model loading and
 transcription. Hashes identify bytes, not correctness. Local tests use an
 explicit fake transcription engine and do not claim a GPU/model run.
 
+## Operational logs
+
+The worker writes structured JSON events to its standard output: `worker_started`,
+`job_accepted`, `job_started`, `job_completed`, `job_failed`, and restart interruption events.
+Job events contain only the job ID, byte count, queue depth, elapsed time, and requested
+language—not authorization values, audio bytes, or transcript text. Startup and job start/end
+events include a best-effort `nvidia-smi` snapshot for each GPU: utilization, memory used/total,
+temperature, and power draw. Long-running jobs emit `job_running` snapshots every 10 seconds;
+set `WARRANT_GPU_LOG_INTERVAL_SECONDS` (minimum: 1) to adjust that cadence. On CPU deployments
+or when telemetry is unavailable, the event contains an `available: false` reason and
+transcription continues normally. Set `WARRANT_LOG_LEVEL` to adjust the standard `INFO` logging
+level.
+
 ## Cleanup and recovery
 
 ```sh
