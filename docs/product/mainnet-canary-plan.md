@@ -35,6 +35,8 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 7. Bump pins in `warrant` and `tameion` after review.
 
 ## Risks to state in the showcase
+Scope: this is a developer showcase of verified settlement for an agent-sold schedule, plus a separate cloud run. It is not a product. There is no web app, hosted API or agent-facing interface (MCP or HTTP). The seller is a deterministic heuristic, not an LLM. The GPU run is started by hand after settlement. Do not describe it as autonomous agents or automated payment of cloud bills.
+
 Solver proof path never settled on a public chain before; modelled cost is not the bill; settlement does not trigger the GPU run; no independent audit (self-review only); canary amounts only.
 
 ## Verification
