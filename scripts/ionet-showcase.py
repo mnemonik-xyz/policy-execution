@@ -18,11 +18,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     discover = sub.add_parser("discover")
-    discover.add_argument("--out", required=True, type=pathlib.Path)
+    discover.add_argument("--out", type=pathlib.Path)
     read = sub.add_parser("read")
     read.add_argument("tool", choices=sorted(READ_TOOLS))
     read.add_argument("--args")
-    read.add_argument("--out", required=True, type=pathlib.Path)
+    read.add_argument("--out", type=pathlib.Path)
     create = sub.add_parser("deploy")
     create.add_argument("--args", required=True)
     create.add_argument("--state", required=True, type=pathlib.Path)
@@ -34,13 +34,13 @@ def main():
     arc = sub.add_parser("arc-check")
     arc.add_argument("--network", choices=("testnet", "mainnet"), default="testnet")
     arc.add_argument("--rpc")
-    arc.add_argument("--out", required=True, type=pathlib.Path)
+    arc.add_argument("--out", type=pathlib.Path)
     funding = sub.add_parser("payment-plan")
     funding.add_argument("--state", required=True, type=pathlib.Path)
     funding.add_argument("--network", choices=("testnet", "mainnet"), required=True)
     funding.add_argument("--solana-wallet", required=True)
     funding.add_argument("--max-payment-usdc", required=True)
-    funding.add_argument("--out", required=True, type=pathlib.Path)
+    funding.add_argument("--out", type=pathlib.Path)
     args = parser.parse_args()
 
     async def operation(cloud):
@@ -67,8 +67,10 @@ def main():
     if getattr(args, "out", None):
         save(args.out, result, exclusive=True)
         print(f"Saved {args.out}")
-    else:
+    elif args.command in ("deploy", "destroy"):
         print(json.dumps({k: result[k] for k in ("phase", "deployment_id") if k in result}))
+    else:
+        print(json.dumps(result, indent=2))
 
 
 def unwrap_error(exc):
