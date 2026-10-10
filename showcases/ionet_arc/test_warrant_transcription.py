@@ -11,6 +11,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
 from showcases.ionet_arc.seller_mcp_server import (
+    SellerServerConfig,
+    ServerConfig,
+    create_app,
     create_server,
     filter_suitable_gpus,
 )
@@ -455,6 +458,23 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": "0xnonexistent"})
         self.assertIn("No deployment session found for task '0xnonexistent'", str(ctx.exception))
+
+    def test_create_server_and_app_with_config(self):
+        config = ServerConfig(
+            state_dir=self.state_dir,
+            rpc_url="http://127.0.0.1:8545",
+            escrow_address="0x" + "11" * 20,
+            token_address="0x" + "22" * 20,
+            mock_ionet=True,
+            auth_user="testuser",
+            auth_pass="testpass",
+        )
+        self.assertIs(ServerConfig, SellerServerConfig)
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            server = create_server(config)
+            self.assertIsNotNone(server)
+            app = create_app(config)
+            self.assertIsNotNone(app)
 
 
 if __name__ == "__main__":

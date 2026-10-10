@@ -15,18 +15,17 @@ import json
 import os
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import httpx2  # noqa: E402
-from mcp import ClientSession  # noqa: E402
-from mcp.client.streamable_http import streamable_http_client  # noqa: E402
+import httpx2
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
-from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService  # noqa: E402
-from showcases.ionet_arc.escrow import EscrowClient, EthRpc  # noqa: E402
+from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService
+from showcases.ionet_arc.escrow import EscrowClient, EthRpc, should_trust_env
 
 
 def extract_result(res):
@@ -44,9 +43,7 @@ def extract_result(res):
 
 
 async def fund_via_buyer_mcp(buyer_mcp_url: str, proposal: dict) -> dict:
-    parsed = urllib.parse.urlsplit(buyer_mcp_url)
-    trust_env = parsed.hostname not in ("127.0.0.1", "localhost", "::1")
-    async with httpx2.AsyncClient(timeout=60, trust_env=trust_env) as http_client:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(buyer_mcp_url)) as http_client:
         async with streamable_http_client(buyer_mcp_url, http_client=http_client) as (r, w):
             async with ClientSession(r, w, read_timeout_seconds=60) as session:
                 await session.initialize()
@@ -80,9 +77,7 @@ async def run_client(
         creds = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {creds}"
 
-    parsed_mcp = urllib.parse.urlsplit(mcp_url)
-    trust_env = parsed_mcp.hostname not in ("127.0.0.1", "localhost", "::1")
-    async with httpx2.AsyncClient(headers=headers, timeout=60, trust_env=trust_env) as http_client:
+    async with httpx2.AsyncClient(headers=headers, timeout=60, trust_env=should_trust_env(mcp_url)) as http_client:
         async with streamable_http_client(mcp_url, http_client=http_client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=60) as session:
                 await session.initialize()

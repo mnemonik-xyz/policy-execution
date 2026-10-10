@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -33,6 +34,7 @@ __all__ = [
     "encode_journal",
     "ensure_policy_hash",
     "find_binary",
+    "should_trust_env",
     "to_addr_str",
 ]
 
@@ -41,6 +43,14 @@ DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 100
 MOCK_SEAL = "0xabcd"
 MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
+
+
+def should_trust_env(url_or_hostname: str | None) -> bool:
+    """Determine whether HTTP client should trust proxy environment variables."""
+    if not url_or_hostname:
+        return False
+    hostname = urllib.parse.urlsplit(url_or_hostname).hostname if "://" in url_or_hostname else url_or_hostname
+    return hostname not in ("127.0.0.1", "localhost", "::1")
 
 
 def bytes32(val) -> bytes:

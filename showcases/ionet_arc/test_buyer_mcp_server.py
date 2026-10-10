@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from showcases.ionet_arc.buyer_mcp_server import create_app, create_server
+from showcases.ionet_arc.buyer_mcp_server import BuyerServerConfig, ServerConfig, create_app, create_server
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, ensure_policy_hash
 
 
@@ -287,6 +287,23 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             state_dir=self.state_dir,
             escrow_client=self.mock_escrow,
         )
+        self.assertIsNotNone(app)
+
+    def test_create_server_and_app_with_config(self):
+        config = ServerConfig(
+            state_dir=self.state_dir,
+            escrow_address=self.mock_escrow.escrow,
+            token_address=self.mock_escrow.token,
+            buyer_account="0x" + "aa" * 20,
+            max_budget_usd=3.50,
+            max_duration_hours=2,
+            allowed_categories=[DEFAULT_CATEGORY],
+            escrow_client=self.mock_escrow,
+        )
+        self.assertIs(ServerConfig, BuyerServerConfig)
+        server = create_server(config)
+        self.assertIsNotNone(server)
+        app = create_app(config)
         self.assertIsNotNone(app)
 
 

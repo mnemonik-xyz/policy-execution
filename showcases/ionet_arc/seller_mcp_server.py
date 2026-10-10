@@ -13,8 +13,8 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from http.server import ThreadingHTTPServer
 
@@ -46,6 +46,7 @@ from showcases.ionet_arc.escrow import (
     EscrowClient,
     encode_journal,
     ensure_policy_hash,
+    should_trust_env,
 )
 from showcases.ionet_arc.worker import Worker, handler
 
@@ -86,6 +87,8 @@ def unwrap_error(exc: Exception) -> Exception | None:
 
 
 def safe_tool_error(exc: Exception) -> ToolError:
+    if isinstance(exc, ToolError):
+        return exc
     pilot = unwrap_error(exc)
     if pilot:
         return ToolError(str(pilot))
@@ -520,8 +523,7 @@ class WarrantTranscriptionService:
             # 3. Poll container health endpoint until ready
             target_url = (self.worker_url or f"http://{self.ssh_host}:8080").rstrip("/")
             health_url = f"{target_url}/health"
-            req_parsed = urllib.parse.urlsplit(target_url)
-            trust_env = req_parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+            trust_env = should_trust_env(target_url)
 
             ready = False
             for _ in range(30):
@@ -711,22 +713,36 @@ class WarrantTranscriptionService:
             "elapsed_seconds": job_status.get("elapsed_seconds"),
         }
 
-    async def _poll_transcription(self, client: httpx2.AsyncClient, poll_url: str, headers: dict, job_id: str) -> dict:
+    async def _poll_job_status(
+        self,
+        poll_fn,
+        job_id: str,
+        timeout_error: str = "Transcription timed out waiting for worker.",
+    ) -> dict:
         for _ in range(120):  # poll up to 60 seconds
             try:
-                resp = await client.get(poll_url, headers=headers, timeout=10.0)
-                if resp.status_code == 200:
-                    job_status = resp.json()
+                job_status = poll_fn()
+                if asyncio.iscoroutine(job_status):
+                    job_status = await job_status
+                if job_status:
                     st = job_status.get("status")
                     if st == "complete":
                         return self._transcription_result(job_id, job_status)
                     elif st in ("failed", "interrupted"):
-                        raise ToolError(f"Transcription job failed: {job_status.get('error', st)}")
+                        err_msg = job_status.get("error") or st
+                        raise ToolError(f"Transcription job failed: {err_msg}")
             except httpx2.HTTPError:
                 pass
             await asyncio.sleep(0.5)
 
-        raise ToolError("Transcription timed out waiting for worker.")
+        raise ToolError(timeout_error)
+
+    async def _poll_transcription(self, client: httpx2.AsyncClient, poll_url: str, headers: dict, job_id: str) -> dict:
+        async def fetch():
+            resp = await client.get(poll_url, headers=headers, timeout=10.0)
+            return resp.json() if resp.status_code == 200 else None
+
+        return await self._poll_job_status(fetch, job_id)
 
     def _find_latest_unexpired_session(self) -> dict | None:
         now = time.time()
@@ -746,27 +762,26 @@ class WarrantTranscriptionService:
         candidates.sort(key=lambda s: s.get("deployed_at", 0), reverse=True)
         return candidates[0]
 
-    def _active_session(self, task_id: str | None = None) -> dict:
+    def _lookup_session(self, task_id: str | None = None) -> dict | None:
         if task_id:
             session_file = self.state_dir / "sessions" / f"{task_id}.json"
-            if not session_file.exists():
-                raise ToolError(f"No deployment session found for task '{task_id}'.")
-            session = read_json(session_file)
-        else:
-            session_file = self.state_dir / "active_session.json"
-            session = None
-            if session_file.exists():
-                candidate = read_json(session_file)
-                if time.time() <= candidate.get("expires_at", 0):
-                    session = candidate
-            if session is None:
-                session = self._find_latest_unexpired_session()
+            return read_json(session_file) if session_file.exists() else None
+        session_file = self.state_dir / "active_session.json"
+        if session_file.exists():
+            candidate = read_json(session_file)
+            if time.time() <= candidate.get("expires_at", 0):
+                return candidate
+        return self._find_latest_unexpired_session()
 
-            if session is None:
-                raise ToolError(
-                    "No active deployment session found. "
-                    "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
-                )
+    def _active_session(self, task_id: str | None = None) -> dict:
+        session = self._lookup_session(task_id)
+        if session is None:
+            if task_id:
+                raise ToolError(f"No deployment session found for task '{task_id}'.")
+            raise ToolError(
+                "No active deployment session found. "
+                "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
+            )
 
         if time.time() > session.get("expires_at", 0):
             target = f"for task '{task_id}' " if task_id else ""
@@ -810,8 +825,7 @@ class WarrantTranscriptionService:
                 "Content-Length": str(len(audio_bytes)),
             }
 
-            req_parsed = urllib.parse.urlsplit(worker_base)
-            trust_env = req_parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+            trust_env = should_trust_env(worker_base)
 
             try:
                 async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
@@ -855,26 +869,20 @@ class WarrantTranscriptionService:
         if code not in (200, 202):
             raise ToolError(f"Local worker rejected job: {job_data}") from net_err
         job_id = job_data["job_id"]
-        for _ in range(120):
-            st_job = worker.get(job_id)
-            if st_job and st_job.get("status") == "complete":
-                return self._transcription_result(job_id, st_job)
-            if st_job and st_job.get("status") in ("failed", "interrupted"):
-                raise ToolError(f"Local worker job failed: {st_job.get('error')}") from net_err
-            await asyncio.sleep(0.5)
-        raise ToolError("Local worker job timed out.") from net_err
+        try:
+            return await self._poll_job_status(
+                lambda: worker.get(job_id),
+                job_id,
+                timeout_error="Local worker job timed out.",
+            )
+        except ToolError as exc:
+            raise ToolError(str(exc)) from net_err
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
-        if task_id:
-            session_file = self.state_dir / "sessions" / f"{task_id}.json"
-            if not session_file.exists():
-                return {"active": False, "message": f"No deployment session found for task '{task_id}'."}
-            session = read_json(session_file)
-        else:
-            session_file = self.state_dir / "active_session.json"
-            session = read_json(session_file) if session_file.exists() else self._find_latest_unexpired_session()
-            if not session:
-                return {"active": False, "message": "No deployment session active."}
+        session = self._lookup_session(task_id)
+        if not session:
+            msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
+            return {"active": False, "message": msg}
 
         now = time.time()
         remaining = max(0, int(session.get("expires_at", 0) - now))
@@ -891,38 +899,69 @@ class WarrantTranscriptionService:
         }
 
 
+@dataclass
+class ServerConfig:
+    state_dir: pathlib.Path = pathlib.Path("artifacts/state")
+    host: str = "localhost"
+    port: int = 8000
+    auth_user: str | None = None
+    auth_pass: str | None = None
+    rpc_url: str = "http://127.0.0.1:8545"
+    escrow_address: str | None = None
+    token_address: str | None = None
+    verifier_address: str | None = None
+    server_account: str | None = None
+    mock_ionet: bool = False
+    local_server: bool = False
+    ssh_host: str = "petertower"
+    worker_url: str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.state_dir, str):
+            self.state_dir = pathlib.Path(self.state_dir)
+
+
+SellerServerConfig = ServerConfig
+
+
+def _normalize_config(
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
+) -> ServerConfig:
+    if isinstance(config, ServerConfig):
+        if kwargs:
+            return ServerConfig(**{**config.__dict__, **kwargs})
+        return config
+    if isinstance(config, (pathlib.Path, str)):
+        kwargs["state_dir"] = pathlib.Path(config)
+    return ServerConfig(**kwargs)
+
+
 def create_server(
-    state_dir: pathlib.Path,
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    verifier_address: str | None = None,
-    server_account: str | None = None,
-    mock_ionet: bool = False,
-    local_server: bool = False,
-    ssh_host: str = "petertower",
-    worker_url: str | None = None,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ) -> MCPServer:
     """Create and configure the Warrant Transcription MCP server."""
+    cfg = _normalize_config(config, **kwargs)
     server = MCPServer("seller-mcp-server")
     has_ionet_key = bool(os.environ.get("IO_NET_API_KEY"))
-    use_mock_ionet = mock_ionet or not has_ionet_key
+    use_mock_ionet = cfg.mock_ionet or not has_ionet_key
 
     escrow_client = EscrowClient(
-        rpc_url=rpc_url,
-        escrow_address=escrow_address,
-        token_address=token_address,
-        verifier_address=verifier_address,
-        server_account=server_account,
+        rpc_url=cfg.rpc_url,
+        escrow_address=cfg.escrow_address,
+        token_address=cfg.token_address,
+        verifier_address=cfg.verifier_address,
+        server_account=cfg.server_account,
     )
 
     service = WarrantTranscriptionService(
-        state_dir=state_dir,
+        state_dir=cfg.state_dir,
         escrow_client=escrow_client,
         use_mock_ionet=use_mock_ionet,
-        local_server=local_server,
-        ssh_host=ssh_host,
-        worker_url=worker_url,
+        local_server=cfg.local_server,
+        ssh_host=cfg.ssh_host,
+        worker_url=cfg.worker_url,
     )
 
     server.tool(
@@ -973,73 +1012,29 @@ def create_server(
 
 
 def create_app(
-    state_dir: pathlib.Path,
-    auth_user: str | None = None,
-    auth_pass: str | None = None,
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    verifier_address: str | None = None,
-    server_account: str | None = None,
-    mock_ionet: bool = False,
-    local_server: bool = False,
-    ssh_host: str = "petertower",
-    worker_url: str | None = None,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ):
     """Build ASGI app with streamable HTTP transport and basic auth."""
-    server = create_server(
-        state_dir=state_dir,
-        rpc_url=rpc_url,
-        escrow_address=escrow_address,
-        token_address=token_address,
-        verifier_address=verifier_address,
-        server_account=server_account,
-        mock_ionet=mock_ionet,
-        local_server=local_server,
-        ssh_host=ssh_host,
-        worker_url=worker_url,
-    )
+    cfg = _normalize_config(config, **kwargs)
+    server = create_server(cfg)
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = server.streamable_http_app(transport_security=sec)
 
-    if auth_user and auth_pass:
-        print(f"HTTP Basic Auth enabled for user '{auth_user}'", file=sys.stderr)
-        app = BasicAuthMiddleware(app, auth_user, auth_pass)
+    if cfg.auth_user and cfg.auth_pass:
+        print(f"HTTP Basic Auth enabled for user '{cfg.auth_user}'", file=sys.stderr)
+        app = BasicAuthMiddleware(app, cfg.auth_user, cfg.auth_pass)
     return app
 
 
 def run_server(
-    host: str = "localhost",
-    port: int = 8000,
-    state_dir: pathlib.Path = pathlib.Path("artifacts/state"),
-    auth_user: str | None = None,
-    auth_pass: str | None = None,
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    verifier_address: str | None = None,
-    server_account: str | None = None,
-    mock_ionet: bool = False,
-    local_server: bool = False,
-    ssh_host: str = "petertower",
-    worker_url: str | None = None,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ):
     """Run MCP server with uvicorn."""
-    app = create_app(
-        state_dir=state_dir,
-        auth_user=auth_user,
-        auth_pass=auth_pass,
-        rpc_url=rpc_url,
-        escrow_address=escrow_address,
-        token_address=token_address,
-        verifier_address=verifier_address,
-        server_account=server_account,
-        mock_ionet=mock_ionet,
-        local_server=local_server,
-        ssh_host=ssh_host,
-        worker_url=worker_url,
-    )
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    cfg = _normalize_config(config, **kwargs)
+    app = create_app(cfg)
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
 
 
 def main():
@@ -1122,22 +1117,8 @@ def main():
     )
     args = parser.parse_args()
 
-    run_server(
-        host=args.host,
-        port=args.port,
-        state_dir=args.state_dir,
-        auth_user=args.auth_user,
-        auth_pass=args.auth_pass,
-        rpc_url=args.rpc_url,
-        escrow_address=args.escrow_address,
-        token_address=args.token_address,
-        verifier_address=args.verifier_address,
-        server_account=args.server_account,
-        mock_ionet=args.mock_ionet,
-        local_server=args.local_server,
-        ssh_host=args.ssh_host,
-        worker_url=args.worker_url,
-    )
+    config = ServerConfig(**vars(args))
+    run_server(config)
 
 
 if __name__ == "__main__":

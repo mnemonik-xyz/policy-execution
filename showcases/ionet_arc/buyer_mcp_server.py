@@ -15,6 +15,7 @@ import os
 import pathlib
 import sys
 import time
+from dataclasses import dataclass
 
 # Ensure repository root is on sys.path
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
@@ -328,37 +329,69 @@ class BuyerWarrantService:
             raise ToolError(f"Failed to query escrow status for task '{task_id}': {e}") from e
 
 
+@dataclass
+class ServerConfig:
+    state_dir: pathlib.Path = pathlib.Path("artifacts/buyer_state")
+    transport: str = "stdio"
+    host: str = "127.0.0.1"
+    port: int = 8001
+    rpc_url: str = "http://127.0.0.1:8545"
+    escrow_address: str | None = None
+    token_address: str | None = None
+    buyer_account: str | None = None
+    max_budget_usd: float = 2.00
+    max_duration_hours: int = 1
+    allowed_categories: list[int] | None = None
+    auto_mint: bool = True
+    escrow_client: EscrowClient | None = None
+
+    def __post_init__(self):
+        if isinstance(self.state_dir, str):
+            self.state_dir = pathlib.Path(self.state_dir)
+
+
+BuyerServerConfig = ServerConfig
+
+
+def _normalize_config(
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
+) -> ServerConfig:
+    if isinstance(config, ServerConfig):
+        if kwargs:
+            return ServerConfig(**{**config.__dict__, **kwargs})
+        return config
+    if isinstance(config, (pathlib.Path, str)):
+        kwargs["state_dir"] = pathlib.Path(config)
+    return ServerConfig(**kwargs)
+
+
 def create_server(
-    state_dir: pathlib.Path,
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    buyer_account: str | None = None,
-    max_budget_usd: float = 2.00,
-    max_duration_hours: int = 1,
-    allowed_categories: list[int] | None = None,
-    auto_mint: bool = True,
-    escrow_client: EscrowClient | None = None,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ) -> MCPServer:
     """Instantiate and configure the Buyer Warrant MCPServer."""
+    cfg = _normalize_config(config, **kwargs)
+
+    escrow_client = cfg.escrow_client
     if escrow_client is None:
         escrow_client = EscrowClient(
-            rpc_url=rpc_url,
-            escrow_address=escrow_address,
-            token_address=token_address,
-            server_account=buyer_account,
+            rpc_url=cfg.rpc_url,
+            escrow_address=cfg.escrow_address,
+            token_address=cfg.token_address,
+            server_account=cfg.buyer_account,
         )
 
     service = BuyerWarrantService(
-        state_dir=state_dir,
+        state_dir=cfg.state_dir,
         escrow_client=escrow_client,
-        max_budget_usd=max_budget_usd,
-        max_duration_hours=max_duration_hours,
-        allowed_categories=allowed_categories,
-        buyer_account=buyer_account,
-        pinned_escrow=escrow_address,
-        pinned_token=token_address,
-        auto_mint=auto_mint,
+        max_budget_usd=cfg.max_budget_usd,
+        max_duration_hours=cfg.max_duration_hours,
+        allowed_categories=cfg.allowed_categories,
+        buyer_account=cfg.buyer_account,
+        pinned_escrow=cfg.escrow_address,
+        pinned_token=cfg.token_address,
+        auto_mint=cfg.auto_mint,
     )
 
     server = MCPServer("buyer-warrant-mcp-server")
@@ -389,66 +422,28 @@ def create_server(
 
 
 def create_app(
-    state_dir: pathlib.Path,
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    buyer_account: str | None = None,
-    max_budget_usd: float = 2.00,
-    max_duration_hours: int = 1,
-    allowed_categories: list[int] | None = None,
-    auto_mint: bool = True,
-    escrow_client: EscrowClient | None = None,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ):
     """Build ASGI app for streamable HTTP transport."""
-    server = create_server(
-        state_dir=state_dir,
-        rpc_url=rpc_url,
-        escrow_address=escrow_address,
-        token_address=token_address,
-        buyer_account=buyer_account,
-        max_budget_usd=max_budget_usd,
-        max_duration_hours=max_duration_hours,
-        allowed_categories=allowed_categories,
-        auto_mint=auto_mint,
-        escrow_client=escrow_client,
-    )
+    cfg = _normalize_config(config, **kwargs)
+    server = create_server(cfg)
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     return server.streamable_http_app(transport_security=sec)
 
 
 def run_server(
-    transport: str = "stdio",
-    host: str = "127.0.0.1",
-    port: int = 8001,
-    state_dir: pathlib.Path = pathlib.Path("artifacts/buyer_state"),
-    rpc_url: str = "http://127.0.0.1:8545",
-    escrow_address: str | None = None,
-    token_address: str | None = None,
-    buyer_account: str | None = None,
-    max_budget_usd: float = 2.00,
-    max_duration_hours: int = 1,
-    allowed_categories: list[int] | None = None,
-    auto_mint: bool = True,
+    config: ServerConfig | pathlib.Path | str | None = None,
+    **kwargs,
 ):
     """Run MCP server over stdio or Streamable HTTP."""
-    server = create_server(
-        state_dir=state_dir,
-        rpc_url=rpc_url,
-        escrow_address=escrow_address,
-        token_address=token_address,
-        buyer_account=buyer_account,
-        max_budget_usd=max_budget_usd,
-        max_duration_hours=max_duration_hours,
-        allowed_categories=allowed_categories,
-        auto_mint=auto_mint,
-    )
-    if transport == "stdio":
+    cfg = _normalize_config(config, **kwargs)
+    if cfg.transport == "stdio":
+        server = create_server(cfg)
         server.run(transport="stdio")
     else:
-        sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        app = server.streamable_http_app(transport_security=sec)
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        app = create_app(cfg)
+        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
 
 
 def main():
@@ -526,7 +521,7 @@ def main():
     cat_list = [int(c.strip()) for c in args.allowed_categories.split(",") if c.strip()]
     transport = "http" if args.transport in ("http", "streamable-http") else "stdio"
 
-    run_server(
+    config = ServerConfig(
         transport=transport,
         host=args.host,
         port=args.port,
@@ -540,6 +535,7 @@ def main():
         allowed_categories=cat_list,
         auto_mint=not args.no_auto_mint,
     )
+    run_server(config)
 
 
 if __name__ == "__main__":

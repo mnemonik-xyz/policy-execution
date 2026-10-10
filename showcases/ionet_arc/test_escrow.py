@@ -9,6 +9,7 @@ from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 from showcases.ionet_arc.escrow import (
     EscrowClient,
     encode_journal,
+    should_trust_env,
 )
 
 
@@ -196,6 +197,18 @@ class EscrowClientTests(unittest.TestCase):
             self.assertEqual(args[1], self.escrow_addr)
             expected_selector = function_signature_to_4byte_selector("accept(bytes32)")
             self.assertEqual(args[2][:4], expected_selector)
+
+    def test_should_trust_env(self):
+        self.assertFalse(should_trust_env("http://127.0.0.1:8545"))
+        self.assertFalse(should_trust_env("http://localhost:8000"))
+        self.assertFalse(should_trust_env("http://[::1]:8080"))
+        self.assertFalse(should_trust_env("127.0.0.1"))
+        self.assertFalse(should_trust_env("localhost"))
+        self.assertFalse(should_trust_env(None))
+        self.assertFalse(should_trust_env(""))
+        self.assertTrue(should_trust_env("http://petertower:8080"))
+        self.assertTrue(should_trust_env("https://mcp.io.solutions/mcp"))
+        self.assertTrue(should_trust_env("remote.example.com"))
 
 
 if __name__ == "__main__":
