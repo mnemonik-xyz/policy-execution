@@ -1,4 +1,5 @@
 """Tests for Warrant io.net transcription MCP server."""
+
 import json
 import tempfile
 import unittest
@@ -124,12 +125,45 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["status"], "proposed")
         self.assertEqual(proposal["duration_hours"], 1)
         self.assertEqual(proposal["billing_model"], "duration")
-        self.assertEqual(proposal["amount"], 1_000_000)
+        self.assertEqual(proposal["amount"], 270_000)
+        self.assertEqual(proposal["amount_usd"], "0.27")
         self.assertEqual(proposal["category"], DEFAULT_CATEGORY)
         self.assertTrue(proposal["task_id"].startswith("0x"))
         self.assertTrue(proposal["salt"].startswith("0x"))
         self.assertTrue(proposal["policy_hash"].startswith("0x"))
         self.assertIn("TaskEscrow.offer", proposal["instructions"])
+
+    async def test_propose_deployment_calculates_real_hardware_pricing(self):
+        # Specific GPU: RTX 4090 ($0.30/hr)
+        p4090 = await self.call("propose_deployment", {"hardware_id": 12})
+        self.assertEqual(p4090["amount"], 300_000)
+        self.assertEqual(p4090["amount_usd"], "0.30")
+        self.assertEqual(p4090["duration_hours"], 1)
+
+        # Multi-hour duration: 2 hours on RTX 4090 ($0.60 total)
+        p2h = await self.call("propose_deployment", {"hardware_id": 12, "duration_hours": 2})
+        self.assertEqual(p2h["amount"], 600_000)
+        self.assertEqual(p2h["amount_usd"], "0.60")
+        self.assertEqual(p2h["duration_hours"], 2)
+
+    async def test_propose_deployment_enforces_budget_cap(self):
+        # Budget cap lower than cheapest available ($0.27)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"budget_cap_usd": "0.20"})
+        self.assertIn("exceeds budget cap", str(ctx.exception))
+
+        # Budget cap lower than selected GPU ($0.66 > $0.50)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "propose_deployment",
+                {"hardware_id": "gpu_1x_l40", "budget_cap_usd": "0.50"},
+            )
+        self.assertIn("exceeds budget cap", str(ctx.exception))
+
+        # Invalid duration
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"duration_hours": 0})
+        self.assertIn("duration_hours must be at least 1", str(ctx.exception))
 
     async def test_transcribe_audio_fails_without_prerequisite_deployment(self):
         audio_file = self.state_dir / "test.mp3"
@@ -157,6 +191,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         # 2. Simulate task Offered on-chain with matching terms
         import time
+
         self.mock_escrow.get_task.return_value = {
             "task_id": task_id,
             "state": "Offered",
@@ -299,8 +334,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ]
         mock_health_resp = MagicMock(status_code=200)
 
-        with patch("subprocess.run", side_effect=mock_run_results) as mock_subproc, \
-             patch("httpx2.AsyncClient.get", return_value=mock_health_resp):
+        with (
+            patch("subprocess.run", side_effect=mock_run_results) as mock_subproc,
+            patch("httpx2.AsyncClient.get", return_value=mock_health_resp),
+        ):
             dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
 
             self.assertEqual(dep_res["status"], "deployed")

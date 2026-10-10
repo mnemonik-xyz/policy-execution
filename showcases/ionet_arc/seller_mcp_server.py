@@ -1,4 +1,5 @@
 """Streamable HTTP MCP server for Warrant GPU transcription on io.net CaaS."""
+
 import argparse
 import asyncio
 import atexit
@@ -14,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from decimal import Decimal, InvalidOperation
 from http.server import ThreadingHTTPServer
 
 # Ensure repository root is on sys.path
@@ -55,9 +57,7 @@ class BasicAuthMiddleware:
 
     def __init__(self, app, username: str, password: str):
         self.app = app
-        self.expected_auth = "Basic " + base64.b64encode(
-            f"{username}:{password}".encode()
-        ).decode("ascii")
+        self.expected_auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
@@ -89,9 +89,7 @@ def safe_tool_error(exc: Exception) -> ToolError:
     pilot = unwrap_error(exc)
     if pilot:
         return ToolError(str(pilot))
-    return ToolError(
-        f"Operation failed: {exc!s}"
-    )
+    return ToolError(f"Operation failed: {exc!s}")
 
 
 DEFAULT_MOCK_HARDWARE = [
@@ -174,13 +172,15 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
         if not _is_whisper_friendly(hw_name, hw_id):
             continue
 
-        suitable.append({
-            "hardware_id": hw_id,
-            "hardware_name": item.get("hardware_name", str(hw_id)),
-            "price_per_hour_usd": float(price),
-            "available_replicas": int(available),
-            "location": item.get("location") or "US",
-        })
+        suitable.append(
+            {
+                "hardware_id": hw_id,
+                "hardware_name": item.get("hardware_name", str(hw_id)),
+                "price_per_hour_usd": float(price),
+                "available_replicas": int(available),
+                "location": item.get("location") or "US",
+            }
+        )
 
     suitable.sort(key=lambda x: x["price_per_hour_usd"])
     return suitable
@@ -270,6 +270,7 @@ class WarrantTranscriptionService:
             if self.use_mock_ionet:
                 raw_items = load_cached_hardware()
             else:
+
                 async def op(cloud):
                     res = await cloud.call("caas_get_hardware_ids", {})
                     data = res.get("data", {})
@@ -333,9 +334,13 @@ class WarrantTranscriptionService:
         hardware_id: str | int | None = None,
         customer_address: str | None = None,
         location_id: str = "US",
-        budget_cap_usd: str = "1.00",
+        duration_hours: int = 1,
+        budget_cap_usd: str | float | None = "1.00",
     ) -> dict:
         try:
+            if duration_hours <= 0:
+                raise ToolError(f"duration_hours must be at least 1, got {duration_hours}")
+
             candidates = await self.list_suitable_hardware()
             if not candidates:
                 raise ToolError("No available suitable GPUs found.")
@@ -355,8 +360,28 @@ class WarrantTranscriptionService:
                 self.state_dir,
             )
 
-            # 1 hour duration; amount in token units (USDC 6 decimals -> $1.00 = 1,000,000)
-            token_amount = 1_000_000
+            # Dynamic pricing based on real hardware cost and duration
+            price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
+            duration = Decimal(str(duration_hours))
+            cost_usd = price_per_hour * duration
+
+            if budget_cap_usd is not None:
+                try:
+                    cap = Decimal(str(budget_cap_usd))
+                    if cost_usd > cap:
+                        raise ToolError(
+                            f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
+                            f"exceeds budget cap of ${cap:.2f}."
+                        )
+                except (ValueError, InvalidOperation):
+                    raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}") from None
+
+            token_amount = int(cost_usd.quantize(Decimal("0.000001")) * Decimal(1_000_000))
+            amount_usd = (
+                f"{cost_usd:.2f}"
+                if cost_usd == cost_usd.quantize(Decimal("0.01"))
+                else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
+            )
 
             proposal = {
                 "status": "proposed",
@@ -372,12 +397,12 @@ class WarrantTranscriptionService:
                 "policy_version": 1,
                 "category": DEFAULT_CATEGORY,
                 "amount": token_amount,
-                "amount_usd": "1.00",
+                "amount_usd": amount_usd,
                 "hardware_id": selected_hw["hardware_id"],
                 "hardware_name": selected_hw["hardware_name"],
                 "price_per_hour_usd": selected_hw["price_per_hour_usd"],
                 "location_ids": location_id,
-                "duration_hours": 1,
+                "duration_hours": duration_hours,
                 "billing_model": "duration",
                 "image_url": PILOT_IMAGE,
                 "traffic_port": 8080,
@@ -450,11 +475,18 @@ class WarrantTranscriptionService:
             run_cmd = [
                 "ssh",
                 self.ssh_host,
-                "docker", "run", "-d", "--rm",
-                "--name", "warrant-transcription",
-                "--gpus", "all",
-                "-p", "8080:8080",
-                "-e", f"WARRANT_WORKER_TOKEN={worker_token}",
+                "docker",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "warrant-transcription",
+                "--gpus",
+                "all",
+                "-p",
+                "8080:8080",
+                "-e",
+                f"WARRANT_WORKER_TOKEN={worker_token}",
                 PILOT_IMAGE,
             ]
             run_res = await asyncio.to_thread(
@@ -501,11 +533,12 @@ class WarrantTranscriptionService:
             self.active_local_worker = LocalMockWorker(self.state_dir / "worker_data", worker_token)
             return self.active_local_worker.start()
 
+        duration = proposal.get("duration_hours", 1)
         deploy_args = {
             "billing_model": "duration",
             "hardware_id": proposal["hardware_id"],
             "location_ids": proposal["location_ids"],
-            "duration_hours": 1,
+            "duration_hours": duration,
             "gpus_per_container": 1,
             "replica_count": 1,
             "resource_private_name": f"warrant-whisper-{proposal['task_id'][-8:]}",
@@ -517,7 +550,7 @@ class WarrantTranscriptionService:
         price_args = {
             "hardware_id": deploy_args["hardware_id"],
             "location_ids": deploy_args["location_ids"],
-            "duration_hours": 1,
+            "duration_hours": duration,
             "gpus_per_container": 1,
             "replica_count": 1,
         }
@@ -578,7 +611,7 @@ class WarrantTranscriptionService:
                 "image_url": PILOT_IMAGE,
                 "traffic_port": 8080,
                 "hardware_id": proposal["hardware_id"],
-                "duration_hours": 1,
+                "duration_hours": proposal.get("duration_hours", 1),
                 "deployed_at": now,
             }
             deliverable_hash = "0x" + hashlib.sha256(canonical(deliverable_record)).hexdigest()
@@ -932,9 +965,7 @@ def run_server(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run the Warrant GPU transcription MCP server over Streamable HTTP."
-    )
+    parser = argparse.ArgumentParser(description="Run the Warrant GPU transcription MCP server over Streamable HTTP.")
     parser.add_argument(
         "--host",
         default=os.environ.get("HOST", "localhost"),

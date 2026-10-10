@@ -67,12 +67,14 @@ sorted ascending by price per hour. Multi-GPU clusters and 0-replica nodes are f
   `available_replicas`, and `location`.
 
 #### 2. `propose_deployment`
-Selects the cheapest suitable GPU (or requested hardware) and generates a binding proposal.
+Selects the cheapest suitable GPU (or requested hardware) and generates a binding proposal
+calculated from actual hardware hourly pricing and duration.
 - Arguments:
   - `customer_address` (optional string): EVM address of payer. Defaults to first RPC account.
   - `budget_cap_usd` (optional string): Maximum budget ceiling in USD (default: `"1.00"`).
   - `hardware_id` (optional string/int): Specific hardware ID to select.
-- Returns: `task_id`, `salt`, `recipient`, `amount`, `amount_usd`, `duration_hours` (`1`),
+  - `duration_hours` (optional int): Deployment duration in hours (default: `1`).
+- Returns: `task_id`, `salt`, `recipient`, `amount`, `amount_usd`, `duration_hours`,
   `policy_hash`, `escrow_address`, `token_address`.
 
 #### 3. `deploy_with_escrow`

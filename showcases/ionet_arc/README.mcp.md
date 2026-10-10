@@ -79,9 +79,9 @@ To solve this, the architecture separates the seller's service from the buyer's 
   price ascending.
 
 - **`propose_deployment`**:
-  Arguments: `budget_cap_usd`, `customer_address`, optional `hardware_id`.
-  Calculates 1-hour duration cost, generates unique `task_id`, salt, policy hash, and returns
-  formal escrow terms.
+  Arguments: `budget_cap_usd`, `customer_address`, optional `hardware_id`, optional
+  `duration_hours`. Calculates duration cost from real hardware hourly rates, validates budget
+  ceiling, generates unique `task_id`, salt, policy hash, and returns formal escrow terms.
 
 - **`deploy_with_escrow`**:
   Arguments: `task_id`.
