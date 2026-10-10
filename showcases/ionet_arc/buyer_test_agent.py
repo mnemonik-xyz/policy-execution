@@ -20,12 +20,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import httpx2
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+import httpx2  # noqa: E402
+from mcp import ClientSession  # noqa: E402
+from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
-from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService
-from showcases.ionet_arc.escrow import EscrowClient, EthRpc, should_trust_env
+from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService  # noqa: E402
+from showcases.ionet_arc.escrow import EscrowClient, EthRpc, should_trust_env  # noqa: E402
 
 
 def extract_result(res):
