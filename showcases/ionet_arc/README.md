@@ -320,22 +320,22 @@ there is zero or one job, for compatibility. Collect output outside the containe
 Jobs transcribe one at a time to avoid GPU contention. A restart with preserved state reports
 unfinished work as `interrupted`.
 
-The worker uses CUDA/FP16 `faster-whisper`. Timing includes model loading and
-transcription. Hashes identify bytes, not correctness. Local tests use an
-explicit fake transcription engine and do not claim a GPU/model run.
+The worker uses CUDA/FP16 `faster-whisper` cached across jobs. Timing includes transcription.
+Hashes identify bytes, not correctness. Input audio files are unlinked after job completion
+unless `WARRANT_KEEP_INPUTS=1` is set. Local tests use an explicit fake transcription engine
+and do not claim a GPU/model run.
 
 ## Operational logs
 
-The worker writes structured JSON events to its standard output: `worker_started`,
-`job_accepted`, `job_started`, `job_completed`, `job_failed`, and restart interruption events.
-Job events contain only the job ID, byte count, queue depth, elapsed time, and requested
-language—not authorization values, audio bytes, or transcript text. Startup and job start/end
-events include a best-effort `nvidia-smi` snapshot for each GPU: utilization, memory used/total,
-temperature, and power draw. Long-running jobs emit `job_running` snapshots every 10 seconds;
-set `WARRANT_GPU_LOG_INTERVAL_SECONDS` (minimum: 1) to adjust that cadence. On CPU deployments
-or when telemetry is unavailable, the event contains an `available: false` reason and
-transcription continues normally. Set `WARRANT_LOG_LEVEL` to adjust the standard `INFO` logging
-level.
+The worker writes clean, human-readable operational logs to standard output: worker startup,
+job acceptance, execution progress, completion, failure, and restart interruption events.
+Logs summarize job ID prefix, byte size, queue depth, elapsed time, and requested language—never
+authorization tokens, audio bytes, or transcript text. Startup and job lifecycle events include
+a best-effort `nvidia-smi` snapshot for each GPU: utilization, memory used/total, temperature,
+and power draw. Long-running jobs emit progress snapshots every 10 seconds (configurable via
+`WARRANT_GPU_LOG_INTERVAL_SECONDS`, minimum: 1). If telemetry is unavailable, the log displays
+`N/A` and continues normally. Set `WARRANT_LOG_JSON=1` for raw JSON logs or `WARRANT_LOG_LEVEL`
+to adjust the log level.
 
 ## Cleanup and recovery
 

@@ -220,6 +220,8 @@ class LocalMockWorker:
             return f"http://127.0.0.1:{self.port}"
 
     def stop(self):
+        if self.worker:
+            self.worker.close()
         if self.server:
             self.server.shutdown()
             self.server.server_close()
