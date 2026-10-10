@@ -6,17 +6,17 @@ is operational evidence, not a zkVM proof of transcription correctness.
 """
 import hashlib
 import hmac
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 MODEL_ID = "Systran/faster-whisper-small"
 MODEL_REVISION = "536b0662742c02347bc0e980a01041f333bce120"

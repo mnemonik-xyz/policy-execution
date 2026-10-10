@@ -1,25 +1,33 @@
 import asyncio
 import hashlib
-from http.server import ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
-import tempfile
 import socket
+import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
 import urllib.error
 import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from showcases.ionet_arc.adapter import (Cloud, DEPLOY, DESTROY, ENDPOINT, PilotError,
-                                         decode_result, deploy, destroy, read_json)
+from showcases.ionet_arc import adapter
+from showcases.ionet_arc.adapter import (
+    DEPLOY,
+    DESTROY,
+    ENDPOINT,
+    Cloud,
+    PilotError,
+    decode_result,
+    deploy,
+    destroy,
+    read_json,
+)
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
 from showcases.ionet_arc.worker import Worker, gpu_metrics, handler
-from showcases.ionet_arc import adapter
-
 
 ARGS = {"billing_model": "duration", "hardware_id": 10, "location_ids": [20],
         "duration_hours": 1, "gpus_per_container": 1, "replica_count": 1}
@@ -163,8 +171,8 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.call_tool.await_count, 1)
 
     async def test_sdk_streamable_http_discovery_and_tool_call(self):
-        from mcp.server.mcpserver import MCPServer
         import uvicorn
+        from mcp.server.mcpserver import MCPServer
         mcp = MCPServer("local-test-provider")
 
         @mcp.tool()

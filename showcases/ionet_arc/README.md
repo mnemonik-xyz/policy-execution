@@ -120,6 +120,21 @@ not raw account responses.
 For running the standalone Streamable HTTP MCP server for external agents,
 see [README.mcp.md](README.mcp.md).
 
+### Linting
+
+Python sources are linted with [Ruff](https://docs.astral.sh/ruff/); the
+configuration is in the root `ruff.toml` and CI runs the same check. Install
+the pinned dev dependencies (runtime requirements plus Ruff) and run from the
+repository root:
+
+```sh
+.venv/bin/pip install -r showcases/ionet_arc/requirements-dev.txt
+.venv/bin/ruff check showcases
+.venv/bin/ruff check showcases --fix   # apply safe auto-fixes
+```
+
+Without a virtualenv, `uvx ruff check showcases` works too.
+
 ## Deploying contracts and running on Arc Testnet
 
 The Warrant transcription showcase connects io.net container provisioning with on-chain

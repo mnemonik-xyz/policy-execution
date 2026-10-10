@@ -12,11 +12,11 @@ import argparse
 import asyncio
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
 import urllib.parse
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))

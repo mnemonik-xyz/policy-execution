@@ -3,10 +3,10 @@ import functools
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import urllib.request
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHAIN_ID = 31337

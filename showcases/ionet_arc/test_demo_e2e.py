@@ -1,15 +1,16 @@
 """End-to-end demonstration test running Anvil, MCP Server, and Client Agent."""
-from showcases.ionet_arc.escrow import find_binary
 import os
-from pathlib import Path
 import shutil
 import socket
 import subprocess
 import tempfile
 import time
 import unittest
-import urllib.request
 import urllib.error
+import urllib.request
+from pathlib import Path
+
+from showcases.ionet_arc.escrow import find_binary
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / ".venv" / "bin" / "python"

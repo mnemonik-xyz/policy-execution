@@ -4,7 +4,6 @@ import asyncio
 import atexit
 import base64
 import hashlib
-from http.server import ThreadingHTTPServer
 import json
 import os
 import pathlib
@@ -16,16 +15,17 @@ import threading
 import time
 import urllib.parse
 import uuid
+from http.server import ThreadingHTTPServer
 
 # Ensure repository root is on sys.path
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import httpx2
+import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import Response
-import uvicorn
 
 from showcases.ionet_arc.adapter import (
     PilotError,
@@ -54,7 +54,7 @@ class BasicAuthMiddleware:
     def __init__(self, app, username: str, password: str):
         self.app = app
         self.expected_auth = "Basic " + base64.b64encode(
-            f"{username}:{password}".encode("utf-8")
+            f"{username}:{password}".encode()
         ).decode("ascii")
 
     async def __call__(self, scope, receive, send):
@@ -88,7 +88,7 @@ def safe_tool_error(exc: Exception) -> ToolError:
     if pilot:
         return ToolError(str(pilot))
     return ToolError(
-        f"Operation failed: {str(exc)}"
+        f"Operation failed: {exc!s}"
     )
 
 
