@@ -16,7 +16,9 @@ from showcases.ionet_arc.worker import (
     clear_model_cache,
     format_event,
     get_model,
+    get_pipeline,
     gpu_metrics,
+    inference_batch_size,
     log_event,
     transcribe,
 )
@@ -53,21 +55,57 @@ class WorkerModelCacheTests(unittest.TestCase):
             self.assertEqual(mock_whisper.call_count, 3)
             self.assertIsNot(model1, model4)
 
-    def test_transcribe_uses_cached_model(self):
+    def test_get_pipeline_caches_instances(self):
+        mock_fw = MagicMock()
+        mock_model = MagicMock()
+        mock_fw.WhisperModel.return_value = mock_model
+        mock_fw.BatchedInferencePipeline.side_effect = lambda *args, **kwargs: MagicMock()
+
+        with patch.dict(sys.modules, {"faster_whisper": mock_fw}):
+            pipeline1 = get_pipeline("/models/whisper", device="cuda", compute_type="float16")
+            pipeline2 = get_pipeline("/models/whisper", device="cuda", compute_type="float16")
+            self.assertIs(pipeline1, pipeline2)
+            mock_fw.BatchedInferencePipeline.assert_called_once_with(model=mock_model)
+
+            clear_model_cache()
+            pipeline3 = get_pipeline("/models/whisper", device="cuda", compute_type="float16")
+            self.assertIsNot(pipeline1, pipeline3)
+            self.assertEqual(mock_fw.BatchedInferencePipeline.call_count, 2)
+
+    def test_transcribe_uses_cached_pipeline(self):
         mock_fw = MagicMock()
         mock_whisper = mock_fw.WhisperModel
+        mock_pipeline_cls = mock_fw.BatchedInferencePipeline
         mock_model = MagicMock()
+        mock_pipeline = MagicMock()
         mock_segment = MagicMock(start=0.0, end=1.2, text="hello world")
         mock_info = MagicMock(language="en", duration=1.2)
-        mock_model.transcribe.return_value = ([mock_segment], mock_info)
+        mock_pipeline.transcribe.return_value = ([mock_segment], mock_info)
         mock_whisper.return_value = mock_model
+        mock_pipeline_cls.return_value = mock_pipeline
 
         with patch.dict(sys.modules, {"faster_whisper": mock_fw}):
             result = transcribe("dummy.wav", "/models/test", language="en")
             self.assertEqual(result["language"], "en")
             self.assertEqual(result["audio_seconds"], 1.2)
             self.assertEqual(result["segments"][0]["text"], "hello world")
-            mock_model.transcribe.assert_called_once_with("dummy.wav", beam_size=5, language="en")
+            mock_pipeline.transcribe.assert_called_once_with(
+                "dummy.wav", batch_size=8, vad_filter=True, language="en"
+            )
+
+    def test_inference_batch_size_configuration(self):
+        with patch.dict(os.environ):
+            os.environ.pop("WARRANT_BATCH_SIZE", None)
+            self.assertEqual(inference_batch_size(), 8)
+
+        with patch.dict(os.environ, {"WARRANT_BATCH_SIZE": "16"}):
+            self.assertEqual(inference_batch_size(), 16)
+
+        with patch.dict(os.environ, {"WARRANT_BATCH_SIZE": "0"}):
+            self.assertEqual(inference_batch_size(), 1)
+
+        with patch.dict(os.environ, {"WARRANT_BATCH_SIZE": "invalid"}):
+            self.assertEqual(inference_batch_size(), 8)
 
 
 class WorkerExecutionTests(unittest.TestCase):

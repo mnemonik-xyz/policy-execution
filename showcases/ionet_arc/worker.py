@@ -28,7 +28,8 @@ MAX_AUDIO_BYTES = 64 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
 
 _MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
-_MODEL_LOCK = threading.Lock()
+_PIPELINE_CACHE: dict[tuple[str, str, str], Any] = {}
+_MODEL_LOCK = threading.RLock()
 
 
 def get_model(model_dir: str | Path, device: str = "cuda", compute_type: str = "float16") -> Any:
@@ -44,10 +45,23 @@ def get_model(model_dir: str | Path, device: str = "cuda", compute_type: str = "
         return _MODEL_CACHE[key]
 
 
+def get_pipeline(model_dir: str | Path, device: str = "cuda", compute_type: str = "float16") -> Any:
+    """Retrieve or lazily instantiate a BatchedInferencePipeline cached by (model_dir, device, compute_type)."""
+    key = (str(model_dir), device, compute_type)
+    with _MODEL_LOCK:
+        if key not in _PIPELINE_CACHE:
+            from faster_whisper import BatchedInferencePipeline
+
+            model = get_model(model_dir, device=device, compute_type=compute_type)
+            _PIPELINE_CACHE[key] = BatchedInferencePipeline(model=model)
+        return _PIPELINE_CACHE[key]
+
+
 def clear_model_cache() -> None:
-    """Clear cached WhisperModel instances (useful for testing or releasing VRAM)."""
+    """Clear cached WhisperModel and pipeline instances (useful for testing or releasing VRAM)."""
     with _MODEL_LOCK:
         _MODEL_CACHE.clear()
+        _PIPELINE_CACHE.clear()
 
 
 def gpu_metrics() -> dict[str, Any]:
@@ -162,13 +176,25 @@ def gpu_log_interval() -> float:
         return 10.0
 
 
+def inference_batch_size() -> int:
+    try:
+        return max(int(os.getenv("WARRANT_BATCH_SIZE", "8")), 1)
+    except ValueError:
+        return 8
+
+
 def transcribe(audio: str | Path, model_dir: str | Path, language: str | None = None) -> dict[str, Any]:
-    """Transcribe audio file using cached WhisperModel instance."""
+    """Transcribe audio file using cached BatchedInferencePipeline instance."""
     device = os.getenv("WARRANT_DEVICE", "cuda")
     compute_type = os.getenv("WARRANT_COMPUTE_TYPE", "float16" if device == "cuda" else "default")
     lang = language or os.getenv("WARRANT_LANGUAGE")
-    model = get_model(model_dir, device=device, compute_type=compute_type)
-    segments, info = model.transcribe(str(audio), beam_size=5, language=lang)
+    pipeline = get_pipeline(model_dir, device=device, compute_type=compute_type)
+    segments, info = pipeline.transcribe(
+        str(audio),
+        batch_size=inference_batch_size(),
+        vad_filter=True,
+        language=lang,
+    )
     return {
         "language": info.language,
         "audio_seconds": info.duration,
