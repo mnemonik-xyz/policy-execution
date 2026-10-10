@@ -192,7 +192,8 @@ Start the Seller MCP daemon configured with your Arc Testnet addresses and `IO_N
 
 For offline dry runs without io.net API keys, add `--mock-ionet`. If `--rpc-url` points to
 a local Anvil instance (`http://127.0.0.1:8545`), the server automatically deploys local test
-escrow contracts.
+escrow contracts using unlocked accounts. When targeting a remote network like Arc Testnet,
+set `WARRANT_PRIVATE_KEY` in the environment for local transaction signing.
 
 > [!NOTE]
 > Settlement in the local MCP demo uses mock journal verification (`settle_mock`). For production

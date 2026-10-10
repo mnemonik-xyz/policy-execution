@@ -1,12 +1,20 @@
-"""Escrow contract interactions, journal encoding, and settlement logic for Warrant."""
+"""Escrow contract interactions, journal encoding, and settlement logic for Warrant.
+
+Uses eth-abi and eth-account for fast, lightweight in-process EVM interaction without cast subprocesses.
+"""
 import functools
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
+
+from eth_abi import decode, encode
+from eth_account import Account
+from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHAIN_ID = 31337
@@ -41,6 +49,15 @@ def address20(val) -> bytes:
     return bytes.fromhex(s.zfill(40))
 
 
+def to_addr_str(val) -> str:
+    if isinstance(val, bytes):
+        return to_checksum_address("0x" + val[-20:].hex())
+    s = str(val).strip()
+    if not s.startswith("0x"):
+        s = "0x" + s
+    return to_checksum_address(s)
+
+
 def encode_journal(
     policy_hash: str | bytes,
     chain_id: int,
@@ -56,32 +73,35 @@ def encode_journal(
     evidence_hash: str | bytes,
 ) -> bytes:
     """Encode exactly twelve 32-byte words (384 bytes) matching PolicyExecutionVault.Authorization."""
-    out = bytearray(384)
-    # word 0: policyHash
-    out[0:32] = bytes32(policy_hash)
-    # word 1: chainId (uint64)
-    out[32:64] = chain_id.to_bytes(32, "big")
-    # word 2: vault (address)
-    out[64:96] = b"\x00" * 12 + address20(vault)
-    # word 3: token (address)
-    out[96:128] = b"\x00" * 12 + address20(token)
-    # word 4: recipient (address)
-    out[128:160] = b"\x00" * 12 + address20(recipient)
-    # word 5: amount (uint64)
-    out[160:192] = int(amount).to_bytes(32, "big")
-    # word 6: taskId (bytes32)
-    out[192:224] = bytes32(task_id)
-    # word 7: deliverableHash (bytes32)
-    out[224:256] = bytes32(deliverable_hash)
-    # word 8: policyVersion (uint64)
-    out[256:288] = int(policy_version).to_bytes(32, "big")
-    # word 9: validAfter (uint64)
-    out[288:320] = int(valid_after).to_bytes(32, "big")
-    # word 10: validUntil (uint64)
-    out[320:352] = int(valid_until).to_bytes(32, "big")
-    # word 11: evidenceHash (bytes32)
-    out[352:384] = bytes32(evidence_hash)
-    return bytes(out)
+    types = [
+        "bytes32",
+        "uint64",
+        "address",
+        "address",
+        "address",
+        "uint64",
+        "bytes32",
+        "bytes32",
+        "uint64",
+        "uint64",
+        "uint64",
+        "bytes32",
+    ]
+    vals = [
+        bytes32(policy_hash),
+        int(chain_id),
+        to_addr_str(vault),
+        to_addr_str(token),
+        to_addr_str(recipient),
+        int(amount),
+        bytes32(task_id),
+        bytes32(deliverable_hash),
+        int(policy_version),
+        int(valid_after),
+        int(valid_until),
+        bytes32(evidence_hash),
+    ]
+    return encode(types, vals)
 
 
 class EthRpc:
@@ -90,13 +110,15 @@ class EthRpc:
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
 
-    def rpc(self, method: str, params: list | None = None):
+    def rpc(self, method: str, params: list | None = None) -> any:
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
         req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
         if "error" in data:
             raise RuntimeError(f"RPC error {method}: {data['error']}")
+        if "result" not in data:
+            raise RuntimeError(f"RPC response missing result for {method}")
         return data["result"]
 
     def chain_id(self) -> int:
@@ -123,7 +145,7 @@ def find_binary(name: str) -> str:
 
 
 class EscrowClient:
-    """Interface to query and settle TaskEscrow on-chain."""
+    """Interface to query and settle TaskEscrow on-chain using eth-abi and eth-account."""
 
     STATES = ("Missing", "Offered", "Accepted", "Paid", "Refunded")
 
@@ -134,6 +156,7 @@ class EscrowClient:
         token_address: str | None = None,
         verifier_address: str | None = None,
         server_account: str | None = None,
+        private_keys: dict[str, str] | None = None,
     ):
         self.rpc_url = rpc_url
         self.rpc = EthRpc(rpc_url)
@@ -141,78 +164,114 @@ class EscrowClient:
         self.token = token_address
         self.verifier = verifier_address
         self.server_account = server_account
+        self.private_keys = {k.lower(): v for k, v in (private_keys or {}).items()}
 
-    def call_cast(self, *args, cwd: Path = REPO_ROOT) -> str:
-        env = dict(os.environ)
-        cmd = [find_binary("cast"), *[str(a) for a in args], "--rpc-url", self.rpc_url]
-        res = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
-        if res.returncode != 0:
-            err = res.stderr.strip() or res.stdout.strip()
-            raise RuntimeError(f"cast {' '.join(str(a) for a in args)} failed: {err}")
-        return res.stdout.strip()
+    def register_key(self, address: str, private_key: str):
+        self.private_keys[address.lower()] = private_key
 
-    def send_cast(self, from_account: str, *args, cwd: Path = REPO_ROOT) -> dict:
-        env = dict(os.environ)
-        cmd = [
-            find_binary("cast"),
-            "send",
-            *[str(a) for a in args],
-            "--from",
-            from_account,
-            "--unlocked",
-            "--rpc-url",
-            self.rpc_url,
-            "--json",
-        ]
-        res = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"cast send failed: {res.stderr.strip() or res.stdout.strip()}")
-        receipt = json.loads(res.stdout)
-        if int(receipt.get("status", "0"), 16) != 1:
+    def call_contract(
+        self,
+        to_address: str,
+        signature: str,
+        types: list,
+        args: list,
+        output_types: list,
+    ) -> tuple:
+        selector = function_signature_to_4byte_selector(signature)
+        calldata = selector + encode(types, args)
+        target = to_checksum_address(to_address)
+        raw_res = self.rpc.rpc("eth_call", [{"to": target, "data": "0x" + calldata.hex()}, "latest"])
+        if not raw_res or raw_res == "0x":
+            raise RuntimeError(f"Contract call to {signature} returned empty response")
+        return decode(output_types, bytes.fromhex(raw_res[2:]))
+
+    def send_transaction(self, from_account: str, to_address: str, calldata: bytes) -> dict:
+        to_addr = to_checksum_address(to_address)
+        from_addr = to_checksum_address(from_account)
+        pk = self.private_keys.get(from_addr.lower())
+        if not pk and os.environ.get("WARRANT_PRIVATE_KEY"):
+            pk = os.environ.get("WARRANT_PRIVATE_KEY")
+
+        if pk:
+            acc = Account.from_key(pk)
+            nonce = int(self.rpc.rpc("eth_getTransactionCount", [acc.address, "pending"]), 16)
+            chain_id = int(self.rpc.chain_id())
+            gas_price = int(self.rpc.rpc("eth_gasPrice", []), 16)
+            try:
+                gas_est = int(
+                    self.rpc.rpc(
+                        "eth_estimateGas",
+                        [{"from": acc.address, "to": to_addr, "data": "0x" + calldata.hex()}],
+                    ),
+                    16,
+                )
+                gas = int(gas_est * 1.2)
+            except Exception:
+                gas = 500_000
+
+            tx = {
+                "to": to_addr,
+                "value": 0,
+                "data": calldata,
+                "nonce": nonce,
+                "chainId": chain_id,
+                "gas": gas,
+                "gasPrice": gas_price,
+            }
+            signed = acc.sign_transaction(tx)
+            tx_hash = self.rpc.rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+        else:
+            # Unlocked account (e.g. local Anvil)
+            tx_params = {
+                "from": from_addr,
+                "to": to_addr,
+                "data": "0x" + calldata.hex(),
+            }
+            tx_hash = self.rpc.rpc("eth_sendTransaction", [tx_params])
+
+        receipt = self.wait_for_receipt(tx_hash)
+        status = receipt.get("status")
+        if status is not None and int(str(status), 16) != 1:
             raise RuntimeError(f"Transaction reverted: {receipt}")
         return receipt
 
+    def wait_for_receipt(self, tx_hash: str, timeout: float = 30.0) -> dict:
+        started = time.time()
+        while time.time() - started < timeout:
+            receipt = self.rpc.rpc("eth_getTransactionReceipt", [tx_hash])
+            if receipt:
+                return receipt
+            time.sleep(0.05)
+        raise TimeoutError(f"Transaction receipt timeout for {tx_hash}")
+
     def task_id_for(self, customer: str, salt: str) -> str:
         """Call TaskEscrow.taskIdFor(customer, salt)."""
-        res = self.call_cast("call", self.escrow, "taskIdFor(address,bytes32)(bytes32)", customer, salt)
-        return res.split()[0]
+        res = self.call_contract(
+            self.escrow,
+            "taskIdFor(address,bytes32)",
+            ["address", "bytes32"],
+            [to_checksum_address(customer), bytes32(salt)],
+            ["bytes32"],
+        )
+        return "0x" + res[0].hex()
 
     def get_task(self, task_id: str) -> dict:
         """Read Task struct from tasks(taskId)."""
-        res = self.call_cast(
-            "call",
+        res = self.call_contract(
             self.escrow,
-            "tasks(bytes32)(address,address,bytes32,uint64,uint64,uint64,uint64,uint8)",
-            task_id,
+            "tasks(bytes32)",
+            ["bytes32"],
+            [bytes32(task_id)],
+            ["address", "address", "bytes32", "uint64", "uint64", "uint64", "uint64", "uint8"],
         )
-        lines = [line.strip() for line in res.splitlines() if line.strip()]
-        if len(lines) < 8:
-            parts = res.split()
-            if len(parts) >= 8:
-                lines = parts
-            else:
-                raise RuntimeError(f"Unexpected tasks output format: {res}")
-
-        def _parse_uint(val) -> int:
-            if isinstance(val, int):
-                return val
-            return int(str(val).split()[0].split("[")[0].strip())
-
-        customer = lines[0].split()[0]
-        recipient = lines[1].split()[0]
-        policy_hash = lines[2].split()[0]
-        policy_version = _parse_uint(lines[3])
-        amount = _parse_uint(lines[4])
-        accept_by = _parse_uint(lines[5])
-        settle_by = _parse_uint(lines[6])
-        state_idx = _parse_uint(lines[7])
+        customer, recipient, policy_hash, policy_version, amount, accept_by, settle_by, state_idx = res
         state_name = self.STATES[state_idx] if state_idx < len(self.STATES) else "Unknown"
 
         return {
             "task_id": task_id,
-            "customer": customer,
-            "recipient": recipient,
-            "policy_hash": policy_hash,
+            "customer": to_checksum_address(customer),
+            "recipient": to_checksum_address(recipient),
+            "policy_hash": "0x" + policy_hash.hex(),
             "policy_version": policy_version,
             "amount": amount,
             "accept_by": accept_by,
@@ -225,7 +284,9 @@ class EscrowClient:
         sender = sender or self.server_account
         if not sender:
             raise ValueError("Sender required to accept task")
-        return self.send_cast(sender, self.escrow, "accept(bytes32)", task_id)
+        selector = function_signature_to_4byte_selector("accept(bytes32)")
+        calldata = selector + encode(["bytes32"], [bytes32(task_id)])
+        return self.send_transaction(sender, self.escrow, calldata)
 
     def settle_mock(
         self,
@@ -235,26 +296,40 @@ class EscrowClient:
     ) -> dict:
         """Approve journal on JournalVerifier and settle TaskEscrow with mock seal."""
         sender = sender or self.server_account
-        journal_hex = "0x" + journal_bytes.hex()
         # Approve on verifier
         if self.verifier:
-            self.send_cast(sender, self.verifier, "approve(bytes)", journal_hex)
+            selector_approve = function_signature_to_4byte_selector("approve(bytes)")
+            calldata_approve = selector_approve + encode(["bytes"], [journal_bytes])
+            self.send_transaction(sender, self.verifier, calldata_approve)
         # Settle on escrow
-        return self.send_cast(sender, self.escrow, "settle(bytes,bytes)", seal_hex, journal_hex)
+        seal = bytes.fromhex(seal_hex[2:] if seal_hex.startswith("0x") else seal_hex)
+        selector_settle = function_signature_to_4byte_selector("settle(bytes,bytes)")
+        calldata_settle = selector_settle + encode(["bytes", "bytes"], [seal, journal_bytes])
+        return self.send_transaction(sender, self.escrow, calldata_settle)
 
     def token_balance(self, account: str) -> int:
         """Read ERC-20 token balance for account."""
-        res = self.call_cast("call", self.token, "balanceOf(address)(uint256)", account)
-        return int(res.split()[0].split("[")[0].strip())
+        res = self.call_contract(
+            self.token,
+            "balanceOf(address)",
+            ["address"],
+            [to_checksum_address(account)],
+            ["uint256"],
+        )
+        return res[0]
 
     def approve_token(self, spender: str, amount: int, sender: str) -> dict:
         """Approve spender allowance on ERC-20 token."""
-        return self.send_cast(sender, self.token, "approve(address,uint256)", spender, amount)
+        selector = function_signature_to_4byte_selector("approve(address,uint256)")
+        calldata = selector + encode(["address", "uint256"], [to_checksum_address(spender), int(amount)])
+        return self.send_transaction(sender, self.token, calldata)
 
     def mint_token(self, account: str, amount: int, sender: str | None = None) -> dict:
         """Mint test tokens to account (TestToken on local Anvil / testnet)."""
         sender = sender or account
-        return self.send_cast(sender, self.token, "mint(address,uint256)", account, amount)
+        selector = function_signature_to_4byte_selector("mint(address,uint256)")
+        calldata = selector + encode(["address", "uint256"], [to_checksum_address(account), int(amount)])
+        return self.send_transaction(sender, self.token, calldata)
 
     def offer(
         self,
@@ -268,18 +343,20 @@ class EscrowClient:
         sender: str,
     ) -> dict:
         """Submit TaskEscrow.offer() on-chain."""
-        return self.send_cast(
-            sender,
-            self.escrow,
-            "offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)",
-            salt,
-            recipient,
-            policy_hash,
-            policy_version,
-            amount,
-            accept_by,
-            settle_by,
+        selector = function_signature_to_4byte_selector("offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)")
+        calldata = selector + encode(
+            ["bytes32", "address", "bytes32", "uint64", "uint64", "uint64", "uint64"],
+            [
+                bytes32(salt),
+                to_checksum_address(recipient),
+                bytes32(policy_hash),
+                int(policy_version),
+                int(amount),
+                int(accept_by),
+                int(settle_by),
+            ],
         )
+        return self.send_transaction(sender, self.escrow, calldata)
 
     def deploy_local_anvil(self, customer: str, agent: str) -> dict:
         """Deploy TestToken, JournalVerifier, and TaskEscrow to local anvil node."""
@@ -315,8 +392,8 @@ class EscrowClient:
         self.server_account = agent
 
         # Mint and approve test tokens for customer
-        self.send_cast(customer, token, "mint(address,uint256)", customer, 100_000_000)
-        self.send_cast(customer, token, "approve(address,uint256)", escrow, 100_000_000)
+        self.mint_token(customer, 100_000_000, sender=customer)
+        self.approve_token(escrow, 100_000_000, sender=customer)
 
         return {
             "token": token,
@@ -388,4 +465,3 @@ def ensure_policy_hash(
         )
         return res.stdout.strip()
     return "0x" + hashlib.sha256(canonical(params_obj)).hexdigest()
-
