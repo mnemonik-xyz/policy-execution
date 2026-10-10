@@ -87,15 +87,51 @@ def safe_tool_error(exc: Exception) -> ToolError:
     )
 
 
+DEFAULT_MOCK_HARDWARE = [
+    {
+        "hardware_id": 3,
+        "hardware_name": "GeForce RTX 3090",
+        "price": 0.27,
+        "available": 5,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+    {
+        "hardware_id": 12,
+        "hardware_name": "GeForce RTX 4090",
+        "price": 0.30,
+        "available": 100,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+    {
+        "hardware_id": "gpu_1x_l40",
+        "hardware_name": "L40",
+        "price": 0.66,
+        "available": 10,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+]
+
+
 def load_cached_hardware() -> list[dict]:
-    """Fallback hardware list from checked-in artifact when running offline/mock."""
-    hw_file = REPO_ROOT / "artifacts" / "io-hardware.json"
-    if hw_file.exists():
-        data = json.loads(hw_file.read_text())
-        res = data.get("result", {})
-        if "data" in res and "data" in res["data"]:
-            return res["data"]["data"]
-    return []
+    """Fallback hardware list when running offline or without live credentials."""
+    for cand in [
+        REPO_ROOT / "showcases" / "ionet_arc" / "mock_hardware.json",
+        REPO_ROOT / "artifacts" / "io-hardware.json",
+    ]:
+        if cand.exists():
+            try:
+                data = json.loads(cand.read_text())
+                res = data.get("result", {})
+                if "data" in res and "data" in res["data"]:
+                    return res["data"]["data"]
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                pass
+    return DEFAULT_MOCK_HARDWARE
 
 
 def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
@@ -509,6 +545,10 @@ class WarrantTranscriptionService:
             worker_token = secrets.token_hex(24)
             deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
             public_url = await self._provision_container(proposal, deployment_id, worker_token)
+            if not public_url:
+                raise ToolError(
+                    f"Container deployment failed to report a ready public URL within timeout for '{deployment_id}'."
+                )
 
             # 3. Settle deliverable on TaskEscrow
             deliverable_record = {
@@ -638,9 +678,10 @@ class WarrantTranscriptionService:
             if len(audio_bytes) == 0:
                 raise ToolError("Audio file is empty.")
 
+            worker_base = public_url.rstrip("/")
             audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
             query = f"?language={language.strip().lower()}" if language else ""
-            req_url = f"{public_url}/job{query}"
+            req_url = f"{worker_base}/job{query}"
 
             headers = {
                 "Authorization": f"Bearer {worker_token}",
@@ -649,7 +690,7 @@ class WarrantTranscriptionService:
                 "Content-Length": str(len(audio_bytes)),
             }
 
-            req_parsed = urllib.parse.urlsplit(public_url)
+            req_parsed = urllib.parse.urlsplit(worker_base)
             trust_env = req_parsed.hostname not in ("127.0.0.1", "localhost", "::1")
 
             try:
@@ -662,7 +703,7 @@ class WarrantTranscriptionService:
                     if not job_id:
                         raise ToolError(f"Unexpected worker response: {resp_data}")
 
-                    poll_url = f"{public_url}/job/{job_id}"
+                    poll_url = f"{worker_base}/job/{job_id}"
                     poll_headers = {"Authorization": f"Bearer {worker_token}"}
                     return await self._poll_transcription(client, poll_url, poll_headers, job_id)
             except (httpx2.HTTPError, OSError) as net_err:

@@ -16,15 +16,16 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import httpx2
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+import httpx2  # noqa: E402
+from mcp import ClientSession  # noqa: E402
+from mcp.client.streamable_http import streamable_http_client  # noqa: 402
 
-from showcases.ionet_arc.escrow import find_binary
+from showcases.ionet_arc.escrow import find_binary  # noqa: 402
 
 
 def run_cmd(*args, cwd=ROOT):
@@ -104,7 +105,9 @@ async def run_client(
         creds = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {creds}"
 
-    async with httpx2.AsyncClient(headers=headers, timeout=60) as http_client:
+    parsed_mcp = urllib.parse.urlsplit(mcp_url)
+    trust_env = parsed_mcp.hostname not in ("127.0.0.1", "localhost", "::1")
+    async with httpx2.AsyncClient(headers=headers, timeout=60, trust_env=trust_env) as http_client:
         async with streamable_http_client(mcp_url, http_client=http_client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=60) as session:
                 await session.initialize()

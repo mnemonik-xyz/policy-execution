@@ -238,6 +238,32 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("deploy_with_escrow", {"task_id": task_id})
         self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
 
+    async def test_deploy_with_escrow_fails_if_container_provisioning_fails(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+        import time
+
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+
+        with patch.object(
+            self.mcp._tool_manager._tools["deploy_with_escrow"].fn.__self__,
+            "_provision_container",
+            return_value=None,
+        ):
+            with self.assertRaises(ToolError) as ctx:
+                await self.call("deploy_with_escrow", {"task_id": task_id})
+            self.assertIn("failed to report a ready public URL", str(ctx.exception))
+            # Escrow settlement MUST NOT be called if container is not ready
+            self.mock_escrow.settle_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
