@@ -242,6 +242,45 @@ class EscrowClient:
         # Settle on escrow
         return self.send_cast(sender, self.escrow, "settle(bytes,bytes)", seal_hex, journal_hex)
 
+    def token_balance(self, account: str) -> int:
+        """Read ERC-20 token balance for account."""
+        res = self.call_cast("call", self.token, "balanceOf(address)(uint256)", account)
+        return int(res.split()[0].split("[")[0].strip())
+
+    def approve_token(self, spender: str, amount: int, sender: str) -> dict:
+        """Approve spender allowance on ERC-20 token."""
+        return self.send_cast(sender, self.token, "approve(address,uint256)", spender, amount)
+
+    def mint_token(self, account: str, amount: int, sender: str | None = None) -> dict:
+        """Mint test tokens to account (TestToken on local Anvil / testnet)."""
+        sender = sender or account
+        return self.send_cast(sender, self.token, "mint(address,uint256)", account, amount)
+
+    def offer(
+        self,
+        salt: str,
+        recipient: str,
+        policy_hash: str,
+        policy_version: int,
+        amount: int,
+        accept_by: int,
+        settle_by: int,
+        sender: str,
+    ) -> dict:
+        """Submit TaskEscrow.offer() on-chain."""
+        return self.send_cast(
+            sender,
+            self.escrow,
+            "offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)",
+            salt,
+            recipient,
+            policy_hash,
+            policy_version,
+            amount,
+            accept_by,
+            settle_by,
+        )
+
     def deploy_local_anvil(self, customer: str, agent: str) -> dict:
         """Deploy TestToken, JournalVerifier, and TaskEscrow to local anvil node."""
         contracts_dir = REPO_ROOT / "contracts"
@@ -287,3 +326,66 @@ class EscrowClient:
             "agent": agent,
             "chain_id": self.rpc.chain_id(),
         }
+
+
+def ensure_policy_hash(
+    escrow_address: str,
+    token_address: str,
+    chain_id: int,
+    max_amount: int,
+    state_dir: Path,
+    categories: list[int] | None = None,
+    valid_after: int = 1000,
+    valid_until: int = 2_000_000_000,
+) -> str:
+    """Instantiate and hash accepted-contractor-v1 policy for this scope."""
+    params_template = REPO_ROOT / "templates" / "example-parameters.json"
+    template_file = REPO_ROOT / "templates" / "accepted-contractor-v1.json"
+    policy_binary = None
+    for cand in [
+        REPO_ROOT / "target" / "release" / "warrant-policy",
+        REPO_ROOT / "target" / "debug" / "warrant-policy",
+        Path(shutil.which("warrant-policy") or ""),
+    ]:
+        if cand and cand.exists() and cand.is_file():
+            policy_binary = cand
+            break
+
+    escrow_bytes = list(bytes.fromhex(escrow_address[2:] if escrow_address.startswith("0x") else escrow_address))
+    token_bytes = list(bytes.fromhex(token_address[2:] if token_address.startswith("0x") else token_address))
+
+    params_obj = json.loads(params_template.read_text())
+    params_obj["policy"]["scope"] = {
+        "chain_id": chain_id,
+        "vault": escrow_bytes,
+        "token": token_bytes,
+    }
+    params_obj["policy"]["valid_after"] = valid_after
+    params_obj["policy"]["valid_until"] = valid_until
+    params_obj["bindings"] = {
+        "max_amount": max_amount,
+        "categories": categories or [DEFAULT_CATEGORY],
+    }
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    params_path = state_dir / "policy_parameters.json"
+    policy_path = state_dir / "policy.json"
+    params_path.write_text(json.dumps(params_obj, indent=2))
+
+    if policy_binary and template_file.exists():
+        if policy_path.exists():
+            policy_path.unlink()
+        subprocess.run(
+            [str(policy_binary), "instantiate", str(template_file), str(params_path), str(policy_path)],
+            check=True,
+            capture_output=True,
+        )
+        res = subprocess.run(
+            [str(policy_binary), "hash", str(policy_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout.strip()
+    return "0x" + hashlib.sha256(canonical(params_obj)).hexdigest()
+

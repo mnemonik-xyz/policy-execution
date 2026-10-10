@@ -86,7 +86,7 @@ Python 3.12 is used in CI. Run from the repository root:
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r showcases/ionet_arc/requirements.txt
-.venv/bin/python -m unittest showcases.ionet_arc.test_pilot -v
+.venv/bin/python -m unittest discover showcases/ionet_arc -v
 .venv/bin/python scripts/ionet-showcase.py arc-check \
   --network testnet --out artifacts/arc-preflight.json
 ```
@@ -176,9 +176,9 @@ Record the deployed contract addresses from Foundry output:
 - `RiscZeroGroth16Verifier` contract address
 - Arc Testnet USDC address: `0x3600000000000000000000000000000000000000`
 
-### 3. Run the Warrant transcription MCP server
+### 3. Run the Seller MCP Server (Transcription Service)
 
-Start the MCP daemon configured with your Arc Testnet addresses and `IO_NET_API_KEY`:
+Start the Seller MCP daemon configured with your Arc Testnet addresses and `IO_NET_API_KEY`:
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
@@ -199,26 +199,45 @@ escrow contracts.
 > settlement on Arc Testnet with `RiscZeroGroth16Verifier`, a cryptographic Groth16 seal must
 > be generated via the RISC0 prover (e.g., Bonsai) matching the guest image ID.
 
-### 4. Run the autonomous client agent
+### 4. Run the Buyer Warrant MCP Server (Local Guardrail)
 
-In a separate terminal, launch the autonomous client agent with an audio file (e.g. `./adv.mp3`):
+Start the local Buyer Warrant guardrail sidecar:
+
+```sh
+.venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
+  --transport http \
+  --host 127.0.0.1 --port 8001 \
+  --rpc-url https://rpc.testnet.arc.io \
+  --escrow-address <DEPLOYED_TASK_ESCROW> \
+  --token-address 0x3600000000000000000000000000000000000000 \
+  --buyer-account <BUYER_WALLET_ADDRESS> \
+  --max-budget-usd 2.00
+```
+
+For desktop LLM environments (Claude Desktop / Cursor / Antigravity), run with `--transport stdio`
+instead of HTTP.
+
+### 5. Run the Autonomous Client Agent Demonstration
+
+In another terminal, launch the client agent with an audio file (e.g. `./sample.mp3`):
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.buyer_test_agent \
   --mcp-url http://127.0.0.1:8000/mcp \
+  --buyer-mcp-url http://127.0.0.1:8001/mcp \
   --rpc-url https://rpc.testnet.arc.io \
   --audio ./sample.mp3
 ```
 
 The client agent performs the end-to-end flow:
-1. Discovers suitable Whisper single GPUs on io.net (`list_suitable_hardware`).
-2. Requests an agreement proposal (`propose_deployment`).
-3. Verifies proposal against local Warrant policy constraints.
-4. Funds `TaskEscrow.offer()` on Arc Testnet using testnet USDC.
-5. Invokes `deploy_with_escrow`: server accepts on-chain, provisions the container on io.net
+1. Discovers suitable Whisper single GPUs on io.net (`seller:list_suitable_hardware`).
+2. Requests an agreement proposal (`seller:propose_deployment`).
+3. Passes the proposal to the local Buyer Warrant guardrail (`buyer:warrant_evaluate_and_offer`),
+   which verifies budget, duration, and policy hash before funding `TaskEscrow.offer()` on Arc.
+4. Invokes `seller:deploy_with_escrow`: server accepts on-chain, provisions the container on io.net
    for 1-hour duration, and executes `TaskEscrow.settle()` with a 384-byte journal.
-6. Calls `transcribe_audio` through MCP to transcribe `./adv.mp3` and print output + segments.
-7. Inspects deployment health and settlement status via `get_deployment_status`.
+5. Calls `seller:transcribe_audio` through MCP to transcribe `./sample.mp3` and print output.
+6. Inspects deployment health and settlement status via `seller:get_deployment_status`.
 
 ## First live deployment (legacy CLI)
 

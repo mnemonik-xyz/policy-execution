@@ -84,12 +84,47 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             except Exception:
                 pass
             time.sleep(0.1)
+        # 3. Start Buyer MCP server
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            cls.buyer_mcp_port = s.getsockname()[1]
+        cls.buyer_mcp_url = f"http://127.0.0.1:{cls.buyer_mcp_port}/mcp"
+        buyer_cmd = [
+            str(PYTHON),
+            str(ROOT / "showcases" / "ionet_arc" / "buyer_mcp_server.py"),
+            "--transport",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cls.buyer_mcp_port),
+            "--state-dir",
+            str(Path(cls.tmp_dir) / "buyer_state"),
+            "--rpc-url",
+            cls.rpc_url,
+        ]
+        cls.buyer_proc = subprocess.Popen(buyer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+        # Wait for buyer server
+        for _ in range(50):
+            try:
+                with opener.open(f"http://127.0.0.1:{cls.buyer_mcp_port}/mcp", timeout=1):
+                    pass
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 404, 405, 406):  # Starlette up
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
         else:
             cls.tearDownClass()
-            raise RuntimeError("MCP server failed to start")
+            raise RuntimeError("Buyer MCP server failed to start")
 
     @classmethod
     def tearDownClass(cls):
+        if hasattr(cls, "buyer_proc") and cls.buyer_proc:
+            cls.buyer_proc.terminate()
+            cls.buyer_proc.wait(timeout=2)
         if hasattr(cls, "server_proc") and cls.server_proc:
             cls.server_proc.terminate()
             cls.server_proc.wait(timeout=2)
@@ -106,9 +141,14 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         cmd = [
             str(PYTHON),
             str(ROOT / "showcases" / "ionet_arc" / "buyer_test_agent.py"),
-            "--mcp-url", self.mcp_url,
-            "--rpc-url", self.rpc_url,
-            "--audio", str(self.test_audio),
+            "--mcp-url",
+            self.mcp_url,
+            "--buyer-mcp-url",
+            self.buyer_mcp_url,
+            "--rpc-url",
+            self.rpc_url,
+            "--audio",
+            str(self.test_audio),
         ]
         res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env)
         print("CLIENT OUTPUT:\n", res.stdout)

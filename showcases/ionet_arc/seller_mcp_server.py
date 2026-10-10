@@ -8,7 +8,6 @@ import json
 import os
 import pathlib
 import secrets
-import shutil
 import subprocess
 import sys
 import threading
@@ -44,6 +43,7 @@ from showcases.ionet_arc.escrow import (
     EscrowClient,
     canonical,
     encode_journal,
+    ensure_policy_hash,
 )
 from showcases.ionet_arc.worker import Worker, handler
 
@@ -184,62 +184,6 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
 
     suitable.sort(key=lambda x: x["price_per_hour_usd"])
     return suitable
-
-
-def ensure_policy_hash(
-    escrow_address: str,
-    token_address: str,
-    chain_id: int,
-    max_amount: int,
-    state_dir: pathlib.Path,
-) -> str:
-    """Instantiate and hash accepted-contractor-v1 policy for this scope."""
-    params_template = REPO_ROOT / "templates" / "example-parameters.json"
-    template_file = REPO_ROOT / "templates" / "accepted-contractor-v1.json"
-    policy_binary = None
-    for cand in [
-        REPO_ROOT / "target" / "release" / "warrant-policy",
-        REPO_ROOT / "target" / "debug" / "warrant-policy",
-        pathlib.Path(shutil.which("warrant-policy") or ""),
-    ]:
-        if cand and cand.exists() and cand.is_file():
-            policy_binary = cand
-            break
-
-    escrow_bytes = list(bytes.fromhex(escrow_address[2:] if escrow_address.startswith("0x") else escrow_address))
-    token_bytes = list(bytes.fromhex(token_address[2:] if token_address.startswith("0x") else token_address))
-
-    params_obj = json.loads(params_template.read_text())
-    params_obj["policy"]["scope"] = {
-        "chain_id": chain_id,
-        "vault": escrow_bytes,
-        "token": token_bytes,
-    }
-    params_obj["policy"]["valid_after"] = 1000
-    params_obj["policy"]["valid_until"] = int(time.time()) + 86400 * 30
-    params_obj["bindings"] = {
-        "max_amount": max_amount,
-        "categories": [DEFAULT_CATEGORY],
-    }
-
-    params_path = state_dir / "policy_parameters.json"
-    policy_path = state_dir / "policy.json"
-    params_path.write_text(json.dumps(params_obj, indent=2))
-
-    if policy_binary and template_file.exists():
-        subprocess.run(
-            [str(policy_binary), "instantiate", str(template_file), str(params_path), str(policy_path)],
-            check=True,
-            capture_output=True,
-        )
-        res = subprocess.run(
-            [str(policy_binary), "hash", str(policy_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return res.stdout.strip()
-    return "0x" + hashlib.sha256(canonical(params_obj)).hexdigest()
 
 
 class LocalMockWorker:

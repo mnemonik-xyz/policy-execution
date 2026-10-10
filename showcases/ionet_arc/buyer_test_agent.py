@@ -79,6 +79,17 @@ def extract_result(res):
     return {}
 
 
+async def fund_via_buyer_mcp(buyer_mcp_url: str, proposal: dict) -> dict:
+    parsed = urllib.parse.urlsplit(buyer_mcp_url)
+    trust_env = parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+    async with httpx2.AsyncClient(timeout=60, trust_env=trust_env) as http_client:
+        async with streamable_http_client(buyer_mcp_url, http_client=http_client) as (r, w):
+            async with ClientSession(r, w, read_timeout_seconds=60) as session:
+                await session.initialize()
+                res = await session.call_tool("warrant_evaluate_and_offer", {"proposal": proposal})
+                return extract_result(res)
+
+
 async def run_client(
     mcp_url: str,
     rpc_url: str,
@@ -86,6 +97,7 @@ async def run_client(
     auth_user: str | None = None,
     auth_pass: str | None = None,
     max_budget_usdc: float = 1.00,
+    buyer_mcp_url: str | None = None,
 ):
     print("=" * 70)
     print("  WARRANT AUTONOMOUS TRANSCRIPTION AGENT")
@@ -144,51 +156,57 @@ async def run_client(
                 print(f"  • TaskEscrow:     {proposal['escrow_address']}")
 
                 # Step 3: Policy Verification & Escrow Payment
-                print("\n[Step 3] Verifying proposal against local Warrant policy...")
-                proposed_cost = float(proposal["amount_usd"])
-                if proposed_cost > max_budget_usdc:
-                    raise RuntimeError(
-                        f"Policy rejection: proposed cost ${proposed_cost} exceeds budget cap ${max_budget_usdc}"
+                if buyer_mcp_url:
+                    print(f"\n[Step 3] Delegating proposal evaluation to Buyer Warrant MCP ({buyer_mcp_url})...")
+                    offer_res = await fund_via_buyer_mcp(buyer_mcp_url, proposal)
+                    print(f" Policy evaluation: {offer_res.get('status', 'APPROVED')}")
+                    print(f" TaskEscrow funded on-chain: tx {offer_res.get('transaction_hash')}")
+                else:
+                    print("\n[Step 3] Verifying proposal against local Warrant policy...")
+                    proposed_cost = float(proposal["amount_usd"])
+                    if proposed_cost > max_budget_usdc:
+                        raise RuntimeError(
+                            f"Policy rejection: proposed cost ${proposed_cost} exceeds budget cap ${max_budget_usdc}"
+                        )
+                    if proposal["duration_hours"] != 1:
+                        raise RuntimeError("Policy rejection: duration must be exactly 1 hour for pilot")
+                    print(" Policy evaluation: APPROVED (within budget and category constraints)")
+
+                    escrow_addr = proposal["escrow_address"]
+                    token_addr = proposal["token_address"]
+                    amount = int(proposal["amount"])
+                    salt = proposal["salt"]
+                    recipient = proposal["recipient"]
+                    policy_hash = proposal["policy_hash"]
+                    policy_version = int(proposal["policy_version"])
+                    now = int(time.time())
+                    accept_by = now + 3600
+                    settle_by = now + 86400
+
+                    # Ensure customer has enough token balance & allowance
+                    balance_str = call_view(rpc_url, token_addr, "balanceOf(address)(uint256)", customer).split()[0]
+                    if int(balance_str) < amount:
+                        print(f"Minting test tokens to {customer}...")
+                        send_tx(rpc_url, customer, token_addr, "mint(address,uint256)", customer, amount * 10)
+
+                    print("Approving TaskEscrow allowance...")
+                    send_tx(rpc_url, customer, token_addr, "approve(address,uint256)", escrow_addr, amount)
+
+                    print("Submitting TaskEscrow.offer() on-chain...")
+                    offer_tx = send_tx(
+                        rpc_url,
+                        customer,
+                        escrow_addr,
+                        "offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)",
+                        salt,
+                        recipient,
+                        policy_hash,
+                        policy_version,
+                        amount,
+                        accept_by,
+                        settle_by,
                     )
-                if proposal["duration_hours"] != 1:
-                    raise RuntimeError("Policy rejection: duration must be exactly 1 hour for pilot")
-                print(" Policy evaluation: APPROVED (within budget and category constraints)")
-
-                escrow_addr = proposal["escrow_address"]
-                token_addr = proposal["token_address"]
-                amount = int(proposal["amount"])
-                salt = proposal["salt"]
-                recipient = proposal["recipient"]
-                policy_hash = proposal["policy_hash"]
-                policy_version = int(proposal["policy_version"])
-                now = int(time.time())
-                accept_by = now + 3600
-                settle_by = now + 86400
-
-                # Ensure customer has enough token balance & allowance
-                balance_str = call_view(rpc_url, token_addr, "balanceOf(address)(uint256)", customer).split()[0]
-                if int(balance_str) < amount:
-                    print(f"Minting test tokens to {customer}...")
-                    send_tx(rpc_url, customer, token_addr, "mint(address,uint256)", customer, amount * 10)
-
-                print("Approving TaskEscrow allowance...")
-                send_tx(rpc_url, customer, token_addr, "approve(address,uint256)", escrow_addr, amount)
-
-                print("Submitting TaskEscrow.offer() on-chain...")
-                offer_tx = send_tx(
-                    rpc_url,
-                    customer,
-                    escrow_addr,
-                    "offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)",
-                    salt,
-                    recipient,
-                    policy_hash,
-                    policy_version,
-                    amount,
-                    accept_by,
-                    settle_by,
-                )
-                print(f" TaskEscrow funded on-chain: tx {offer_tx['transactionHash']}")
+                    print(f" TaskEscrow funded on-chain: tx {offer_tx['transactionHash']}")
 
                 # Step 4: deploy_with_escrow
                 print("\n[Step 4] Calling deploy_with_escrow on MCP server...")
@@ -247,6 +265,11 @@ def main():
     parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
     parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
     parser.add_argument("--max-budget", type=float, default=1.00, help="Max budget ceiling in USDC (default: 1.00)")
+    parser.add_argument(
+        "--buyer-mcp-url",
+        default=os.environ.get("BUYER_MCP_URL"),
+        help="Optional Buyer Warrant MCP server streamable HTTP endpoint",
+    )
     args = parser.parse_args()
 
     if not args.audio:
@@ -262,6 +285,7 @@ def main():
             auth_user=args.auth_user,
             auth_pass=args.auth_pass,
             max_budget_usdc=args.max_budget,
+            buyer_mcp_url=args.buyer_mcp_url,
         )
     )
 
