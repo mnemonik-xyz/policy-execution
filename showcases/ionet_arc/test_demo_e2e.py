@@ -163,6 +163,27 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         self.assertIn("TRANSCRIPTION RESULT", res.stdout)
         self.assertIn("Autonomous Warrant transcription showcase completed successfully!", res.stdout)
 
+    def test_run_client_in_process_warrant_service(self):
+        env = dict(os.environ)
+        env["no_proxy"] = "127.0.0.1,localhost"
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        cmd = [
+            str(PYTHON),
+            str(ROOT / "showcases" / "ionet_arc" / "buyer_test_agent.py"),
+            "--mcp-url",
+            self.mcp_url,
+            "--rpc-url",
+            self.rpc_url,
+            "--audio",
+            str(self.test_audio),
+        ]
+        res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("WARRANT AUTONOMOUS TRANSCRIPTION AGENT", res.stdout)
+        self.assertIn("Policy evaluation: APPROVED", res.stdout)
+        self.assertIn("TaskEscrow funded on-chain", res.stdout)
+        self.assertIn("Autonomous Warrant transcription showcase completed successfully!", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

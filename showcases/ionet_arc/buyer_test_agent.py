@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -25,44 +24,8 @@ import httpx2  # noqa: E402
 from mcp import ClientSession  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
-from showcases.ionet_arc.escrow import find_binary  # noqa: E402
-
-
-def run_cmd(*args, cwd=ROOT):
-    cmd = [find_binary(str(args[0])), *[str(a) for a in args[1:]]]
-    res = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"{' '.join(str(a) for a in args)} failed: {res.stderr.strip() or res.stdout.strip()}")
-    return res.stdout.strip()
-
-
-def send_tx(rpc_url: str, from_addr: str, *cast_args):
-    cmd = [
-        find_binary("cast"),
-        "send",
-        *[str(a) for a in cast_args],
-        "--from",
-        from_addr,
-        "--unlocked",
-        "--rpc-url",
-        rpc_url,
-        "--json",
-    ]
-    res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"cast send failed: {res.stderr.strip() or res.stdout.strip()}")
-    receipt = json.loads(res.stdout)
-    if int(receipt.get("status", "0"), 16) != 1:
-        raise RuntimeError(f"Transaction reverted: {receipt}")
-    return receipt
-
-
-def call_view(rpc_url: str, *cast_args):
-    cmd = [find_binary("cast"), "call", *[str(a) for a in cast_args], "--rpc-url", rpc_url]
-    res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"cast call failed: {res.stderr.strip() or res.stdout.strip()}")
-    return res.stdout.strip()
+from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService  # noqa: E402
+from showcases.ionet_arc.escrow import EscrowClient, EthRpc  # noqa: E402
 
 
 def extract_result(res):
@@ -104,7 +67,7 @@ async def run_client(
     print("=" * 70)
 
     # 1. Inspect on-chain environment
-    accounts = json.loads(run_cmd("cast", "rpc", "eth_accounts", "--rpc-url", rpc_url))
+    accounts = EthRpc(rpc_url).accounts()
     customer = accounts[0]
     agent = accounts[1] if len(accounts) > 1 else accounts[0]
     print(f"Customer wallet: {customer}")
@@ -159,54 +122,19 @@ async def run_client(
                 if buyer_mcp_url:
                     print(f"\n[Step 3] Delegating proposal evaluation to Buyer Warrant MCP ({buyer_mcp_url})...")
                     offer_res = await fund_via_buyer_mcp(buyer_mcp_url, proposal)
-                    print(f" Policy evaluation: {offer_res.get('status', 'APPROVED')}")
-                    print(f" TaskEscrow funded on-chain: tx {offer_res.get('transaction_hash')}")
                 else:
                     print("\n[Step 3] Verifying proposal against local Warrant policy...")
-                    proposed_cost = float(proposal["amount_usd"])
-                    if proposed_cost > max_budget_usdc:
-                        raise RuntimeError(
-                            f"Policy rejection: proposed cost ${proposed_cost} exceeds budget cap ${max_budget_usdc}"
-                        )
-                    if proposal["duration_hours"] != 1:
-                        raise RuntimeError("Policy rejection: duration must be exactly 1 hour for pilot")
-                    print(" Policy evaluation: APPROVED (within budget and category constraints)")
-
-                    escrow_addr = proposal["escrow_address"]
-                    token_addr = proposal["token_address"]
-                    amount = int(proposal["amount"])
-                    salt = proposal["salt"]
-                    recipient = proposal["recipient"]
-                    policy_hash = proposal["policy_hash"]
-                    policy_version = int(proposal["policy_version"])
-                    now = int(time.time())
-                    accept_by = now + 3600
-                    settle_by = now + 86400
-
-                    # Ensure customer has enough token balance & allowance
-                    balance_str = call_view(rpc_url, token_addr, "balanceOf(address)(uint256)", customer).split()[0]
-                    if int(balance_str) < amount:
-                        print(f"Minting test tokens to {customer}...")
-                        send_tx(rpc_url, customer, token_addr, "mint(address,uint256)", customer, amount * 10)
-
-                    print("Approving TaskEscrow allowance...")
-                    send_tx(rpc_url, customer, token_addr, "approve(address,uint256)", escrow_addr, amount)
-
-                    print("Submitting TaskEscrow.offer() on-chain...")
-                    offer_tx = send_tx(
-                        rpc_url,
-                        customer,
-                        escrow_addr,
-                        "offer(bytes32,address,bytes32,uint64,uint64,uint64,uint64)",
-                        salt,
-                        recipient,
-                        policy_hash,
-                        policy_version,
-                        amount,
-                        accept_by,
-                        settle_by,
+                    service = BuyerWarrantService(
+                        state_dir=ROOT / "artifacts" / "buyer_state",
+                        escrow_client=EscrowClient(rpc_url=rpc_url, server_account=customer),
+                        max_budget_usd=max_budget_usdc,
+                        buyer_account=customer,
+                        auto_mint=True,
                     )
-                    print(f" TaskEscrow funded on-chain: tx {offer_tx['transactionHash']}")
+                    offer_res = await service.warrant_evaluate_and_offer(proposal)
+
+                print(f" Policy evaluation: {offer_res.get('status', 'APPROVED')}")
+                print(f" TaskEscrow funded on-chain: tx {offer_res.get('transaction_hash')}")
 
                 # Step 4: deploy_with_escrow
                 print("\n[Step 4] Calling deploy_with_escrow on MCP server...")
