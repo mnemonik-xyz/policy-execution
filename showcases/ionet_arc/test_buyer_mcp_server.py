@@ -1,4 +1,5 @@
 """Tests for Buyer Warrant guardrail MCP server."""
+
 import json
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.approve_token.return_value = {"transactionHash": "0x" + "01" * 32}
         self.mock_escrow.offer.return_value = {"transactionHash": "0x" + "02" * 32}
         self.mock_escrow.mint_token.return_value = {"transactionHash": "0x" + "03" * 32}
+        self.mock_escrow.task_id_for.return_value = "0x" + "55" * 32
         self.mock_escrow.get_task.return_value = {
             "task_id": "0x" + "99" * 32,
             "state": "Offered",
@@ -245,6 +247,33 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await server.call_tool("warrant_evaluate_and_offer", {"proposal": proposal})
         self.assertIn("Insufficient token balance", str(ctx.exception))
+
+    async def test_warrant_evaluate_and_offer_task_id_mismatch(self):
+        expected_hash = ensure_policy_hash(
+            escrow_address=self.mock_escrow.escrow,
+            token_address=self.mock_escrow.token,
+            chain_id=31337,
+            max_amount=100_000_000,
+            state_dir=self.state_dir,
+            categories=[DEFAULT_CATEGORY],
+        )
+        proposal = {
+            "task_id": "0x" + "99" * 32,
+            "amount": 1_000_000,
+            "amount_usd": "1.00",
+            "duration_hours": 1,
+            "salt": "0x" + "66" * 32,
+            "recipient": "0x" + "44" * 20,
+            "policy_hash": expected_hash,
+            "policy_version": 1,
+            "category": DEFAULT_CATEGORY,
+            "escrow_address": self.mock_escrow.escrow,
+            "token_address": self.mock_escrow.token,
+        }
+        self.mock_escrow.task_id_for.return_value = "0x" + "55" * 32
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+        self.assertIn("does not match", str(ctx.exception))
 
     async def test_warrant_check_escrow_status(self):
         res = await self.call("warrant_check_escrow_status", {"task_id": "0x" + "99" * 32})

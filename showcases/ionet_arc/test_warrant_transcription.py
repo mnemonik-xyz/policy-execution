@@ -275,6 +275,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ToolError) as ctx:
                 await self.call("deploy_with_escrow", {"task_id": task_id})
             self.assertIn("failed to report a ready public URL", str(ctx.exception))
+            # Task MUST NOT be accepted on-chain if container provisioning fails (prevents 24h capital lockup)
+            self.mock_escrow.accept.assert_not_called()
             # Escrow settlement MUST NOT be called if container is not ready
             self.mock_escrow.settle_mock.assert_not_called()
 

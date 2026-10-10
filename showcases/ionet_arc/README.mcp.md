@@ -65,8 +65,8 @@ To solve this, the architecture separates the seller's service from the buyer's 
   Arguments: `proposal` (or unpacked task terms: `task_id`, `amount`, `amount_usd`, `salt`,
   `recipient`, `policy_hash`, `duration_hours`, etc.).
   Validates that cost $\le$ max budget, duration $\le$ max duration, category is permitted,
-  and independently derives/verifies the `warrant-policy` hash. Approves ERC-20 token allowance
-  and submits `TaskEscrow.offer()` on-chain.
+  verifies `task_id` matches derived `taskIdFor`, and independently derives/verifies the
+  `warrant-policy` hash. Approves ERC-20 token allowance and submits `TaskEscrow.offer()` on-chain.
 
 - **`warrant_check_escrow_status`**:
   Arguments: `task_id`.
@@ -85,8 +85,9 @@ To solve this, the architecture separates the seller's service from the buyer's 
 
 - **`deploy_with_escrow`**:
   Arguments: `task_id`.
-  Verifies on-chain deposit via `TaskEscrow`, accepts task, provisions the 1-hour container,
-  settles the escrow deliverable on-chain via `TaskEscrow.settle()`, and activates the worker.
+  Verifies on-chain deposit via `TaskEscrow`, provisions the 1-hour container, accepts the task
+  on-chain once provisioned, settles the deliverable on-chain via `TaskEscrow.settle()`, and
+  activates the worker.
 
 - **`transcribe_audio`**:
   Arguments: `audio_path`, optional `language`.

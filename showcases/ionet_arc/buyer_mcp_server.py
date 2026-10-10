@@ -8,6 +8,7 @@ Exposes tools for the buyer's LLM agent:
 
 Supports stdio (standard for desktop LLM agents) and Streamable HTTP transports.
 """
+
 import argparse
 import json
 import os
@@ -148,8 +149,9 @@ class BuyerWarrantService:
         recipient: str,
         policy_hash: str,
         policy_version: int,
+        buyer_account: str | None = None,
     ) -> dict:
-        buyer_account = self._resolve_buyer_account()
+        buyer_account = buyer_account or self._resolve_buyer_account()
         self.escrow_client.escrow = escrow_addr
         self.escrow_client.token = token_addr
 
@@ -167,9 +169,7 @@ class BuyerWarrantService:
                         f"Insufficient balance ({balance} < {atomic_amount}) and auto-mint failed: {e}"
                     ) from e
             else:
-                raise ToolError(
-                    f"Insufficient token balance ({balance} < {atomic_amount}) for buyer {buyer_account}."
-                )
+                raise ToolError(f"Insufficient token balance ({balance} < {atomic_amount}) for buyer {buyer_account}.")
 
         try:
             self.escrow_client.approve_token(escrow_addr, atomic_amount, sender=buyer_account)
@@ -266,6 +266,19 @@ class BuyerWarrantService:
         chain_id = self._resolve_chain_id()
         expected_hash = self._verify_policy_hash(escrow_addr, token_addr, chain_id, category, policy_hash)
 
+        buyer_account = self._resolve_buyer_account()
+        self.escrow_client.escrow = escrow_addr
+        try:
+            expected_task_id = self.escrow_client.task_id_for(buyer_account, salt)
+        except Exception as e:
+            raise ToolError(f"Failed to derive taskIdFor({buyer_account}, {salt}): {e}") from e
+
+        if str(task_id).lower() != str(expected_task_id).lower():
+            raise ToolError(
+                f"Policy rejection: proposed task_id '{task_id}' does not match "
+                f"derived taskIdFor('{buyer_account}', '{salt}'): '{expected_task_id}'"
+            )
+
         funded = self._fund_escrow(
             escrow_addr=escrow_addr,
             token_addr=token_addr,
@@ -274,6 +287,7 @@ class BuyerWarrantService:
             recipient=recipient,
             policy_hash=expected_hash,
             policy_version=policy_version,
+            buyer_account=buyer_account,
         )
 
         return {

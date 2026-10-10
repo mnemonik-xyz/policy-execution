@@ -421,7 +421,7 @@ class WarrantTranscriptionService:
         except Exception as exc:
             raise safe_tool_error(exc) from None
 
-    def _verify_and_accept_task(self, task_id: str, proposal: dict):
+    def _verify_task_offered(self, task_id: str, proposal: dict) -> dict:
         try:
             task_data = self.escrow_client.get_task(task_id)
         except Exception as e:
@@ -453,6 +453,13 @@ class WarrantTranscriptionService:
                 f"On-chain settleBy ({task_data.get('settle_by')}) does not cover required duration "
                 f"(minimum {min_settle_by})."
             )
+
+        return task_data
+
+    def _accept_task(self, task_id: str, proposal: dict, task_state: str | None = None):
+        if task_state is None:
+            task_data = self.escrow_client.get_task(task_id)
+            task_state = task_data.get("state")
 
         if task_state == "Offered":
             sender = proposal.get("recipient") or self.escrow_client.server_account
@@ -593,8 +600,8 @@ class WarrantTranscriptionService:
             proposal = read_json(prop_path)
             now = int(time.time())
 
-            # 1. Verify on-chain escrow state
-            self._verify_and_accept_task(task_id, proposal)
+            # 1. Verify on-chain escrow state and terms (do not accept yet to prevent capital lockup on failure)
+            task_data = self._verify_task_offered(task_id, proposal)
 
             # 2. Provision container (1h duration)
             worker_token = secrets.token_hex(24)
@@ -605,7 +612,10 @@ class WarrantTranscriptionService:
                     f"Container deployment failed to report a ready public URL within timeout for '{deployment_id}'."
                 )
 
-            # 3. Settle deliverable on TaskEscrow
+            # 3. Accept task on-chain now that container provisioning has succeeded
+            self._accept_task(task_id, proposal, task_data.get("state"))
+
+            # 4. Settle deliverable on TaskEscrow
             deliverable_record = {
                 "deployment_id": deployment_id,
                 "image_url": PILOT_IMAGE,

@@ -39,8 +39,9 @@ Inspect local spending constraints and configured buyer wallet before requesting
 
 #### 2. `warrant_evaluate_and_offer`
 Validates a seller's proposal against local constraints (budget $\le \$2$, duration $\le 1\text{h}$,
-category in whitelist), independently verifies the cryptographic `warrant-policy` hash, approves
-ERC-20 token allowance, and submits `TaskEscrow.offer()` on-chain.
+category in whitelist), verifies `task_id` matches `taskIdFor`, independently derives/verifies
+the cryptographic `warrant-policy` hash, approves ERC-20 token allowance, and submits
+`TaskEscrow.offer()` on-chain.
 - Arguments:
   - `proposal` (object, required): Full proposal object returned from `propose_deployment`.
     Alternatively accepts unpacked fields (`task_id`, `amount`, `amount_usd`, `salt`, `recipient`,
@@ -78,8 +79,9 @@ calculated from actual hardware hourly pricing and duration.
   `policy_hash`, `escrow_address`, `token_address`.
 
 #### 3. `deploy_with_escrow`
-Verifies on-chain escrow funding, accepts the task, provisions the container on io.net, settles
-the deliverable with a 384-byte authorization journal, and activates the transcription worker.
+Verifies on-chain escrow funding, provisions the container on io.net, accepts the task on-chain
+once provisioned, settles the deliverable with a 384-byte authorization journal, and activates
+the transcription worker.
 - Arguments: `task_id` (string, required).
 - Returns: `status` (`"deployed"`), `deployment_id`, `public_url`, `expires_at`,
   `settlement_transaction`.
