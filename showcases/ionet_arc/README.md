@@ -339,6 +339,10 @@ python3 -m venv .venv
 Run test suite:
 
 ```sh
+# Run entire test suite
+.venv/bin/python -m unittest discover showcases/ionet_arc -v
+
+# Or run individual suites:
 # Buyer Warrant guardrail MCP server unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_buyer_mcp_server -v
 

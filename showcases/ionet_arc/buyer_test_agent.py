@@ -77,7 +77,6 @@ async def run_client(
 
     headers = {}
     if auth_user and auth_pass:
-        import base64
         creds = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {creds}"
 

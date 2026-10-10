@@ -3,6 +3,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -13,16 +14,42 @@ from pathlib import Path
 from showcases.ionet_arc.escrow import find_binary
 
 ROOT = Path(__file__).resolve().parents[2]
-PYTHON = ROOT / ".venv" / "bin" / "python"
+PYTHON = Path(sys.executable)
 
 
 os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
 
 
+def _check_prerequisites() -> None:
+    for name in ("anvil", "cast", "forge"):
+        binary = find_binary(name)
+        if not shutil.which(binary) and not Path(binary).exists():
+            raise unittest.SkipTest(f"{name} binary not found; skipping end-to-end tests")
+    if not (ROOT / "contracts" / "node_modules").exists():
+        raise unittest.SkipTest("contracts/node_modules not found; skipping end-to-end tests")
+
+
+def _wait_for_http(url: str, timeout_steps: int = 50) -> None:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for _ in range(timeout_steps):
+        try:
+            with opener.open(url, timeout=1):
+                pass
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 404, 405, 406):
+                return
+        except Exception:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError(f"Service at {url} failed to start")
+
+
 class EndToEndWarrantTranscriptionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        _check_prerequisites()
+
         # 1. Start Anvil
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
@@ -71,19 +98,12 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         env["no_proxy"] = "127.0.0.1,localhost"
         env["NO_PROXY"] = "127.0.0.1,localhost"
         cls.server_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        try:
+            _wait_for_http(cls.mcp_url)
+        except RuntimeError:
+            cls.tearDownClass()
+            raise
 
-        # Wait for server
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        for _ in range(50):
-            try:
-                with opener.open(f"http://127.0.0.1:{cls.mcp_port}/mcp", timeout=1):
-                    pass
-            except urllib.error.HTTPError as e:
-                if e.code in (400, 404, 405, 406):  # Starlette up
-                    break
-            except Exception:
-                pass
-            time.sleep(0.1)
         # 3. Start Buyer MCP server
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
@@ -104,21 +124,11 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.rpc_url,
         ]
         cls.buyer_proc = subprocess.Popen(buyer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-
-        # Wait for buyer server
-        for _ in range(50):
-            try:
-                with opener.open(f"http://127.0.0.1:{cls.buyer_mcp_port}/mcp", timeout=1):
-                    pass
-            except urllib.error.HTTPError as e:
-                if e.code in (400, 404, 405, 406):  # Starlette up
-                    break
-            except Exception:
-                pass
-            time.sleep(0.1)
-        else:
+        try:
+            _wait_for_http(cls.buyer_mcp_url)
+        except RuntimeError:
             cls.tearDownClass()
-            raise RuntimeError("Buyer MCP server failed to start")
+            raise
 
     @classmethod
     def tearDownClass(cls):

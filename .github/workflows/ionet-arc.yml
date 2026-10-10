@@ -23,10 +23,8 @@ jobs:
       - run: pip install -r showcases/ionet_arc/requirements-dev.txt
       - name: Lint Python sources
         run: ruff check showcases
-      - name: Exercise budgets, recovery, payment validation, and HTTP worker
-        run: python -m unittest showcases.ionet_arc.test_pilot -v
-      - name: Warrant transcription MCP server unit tests
-        run: python -m unittest showcases.ionet_arc.test_warrant_transcription -v
+      - name: Run io.net Arc showcase test suite
+        run: python -m unittest discover showcases/ionet_arc -v
       - name: Check CLI imports
         run: |
           python scripts/ionet-showcase.py --help
