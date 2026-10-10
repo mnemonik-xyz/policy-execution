@@ -43,7 +43,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             self.mcp = create_server(self.state_dir, mock_ionet=True)
 
-    async def call(self, tool_name: str, arguments: dict = None) -> dict:
+    async def call(self, tool_name: str, arguments: dict | None = None) -> dict:
         arguments = arguments or {}
         res = await self.mcp.call_tool(tool_name, arguments)
         return json.loads(res.content[0].text)
@@ -274,7 +274,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                 ssh_host="petertower",
             )
 
-        async def local_call(tool_name: str, arguments: dict = None) -> dict:
+        async def local_call(tool_name: str, arguments: dict | None = None) -> dict:
             res = await local_mcp.call_tool(tool_name, arguments or {})
             return json.loads(res.content[0].text)
 
@@ -338,7 +338,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                 ssh_host="petertower",
             )
 
-        async def local_call(tool_name: str, arguments: dict = None) -> dict:
+        async def local_call(tool_name: str, arguments: dict | None = None) -> dict:
             res = await local_mcp.call_tool(tool_name, arguments or {})
             return json.loads(res.content[0].text)
 

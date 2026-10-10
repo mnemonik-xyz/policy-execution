@@ -76,7 +76,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(50):
             try:
-                with opener.open(f"http://127.0.0.1:{cls.mcp_port}/mcp", timeout=1) as r:
+                with opener.open(f"http://127.0.0.1:{cls.mcp_port}/mcp", timeout=1):
                     pass
             except urllib.error.HTTPError as e:
                 if e.code in (400, 404, 405, 406):  # Starlette up

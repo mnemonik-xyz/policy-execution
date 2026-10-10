@@ -213,7 +213,7 @@ class ArcAndPaymentTests(unittest.TestCase):
         for values in ([hex(1)], [hex(5042), hex(18)]):
             replies = iter(values)
             with self.assertRaises(PilotError):
-                preflight("mainnet", call=lambda *args: next(replies))
+                preflight("mainnet", call=lambda *args, replies=replies: next(replies))
 
     def test_exact_payment_separate_from_bridge_fees(self):
         result = self.plan(quote_state())
@@ -316,9 +316,9 @@ class WorkerTests(unittest.TestCase):
             return response.status, json.load(response)
 
     def test_language_argument_and_validation(self):
-        code, err = self.request("/job?language=invalid_lang", b"audio")
+        code, _err = self.request("/job?language=invalid_lang", b"audio")
         self.assertEqual(code, 400)
-        code, err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
+        code, _err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
         self.assertEqual(code, 400)
 
     @patch("showcases.ionet_arc.worker.subprocess.run")

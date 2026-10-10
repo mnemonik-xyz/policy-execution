@@ -90,7 +90,7 @@ class EthRpc:
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
 
-    def rpc(self, method: str, params: list = None):
+    def rpc(self, method: str, params: list | None = None):
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
         req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -125,7 +125,7 @@ def find_binary(name: str) -> str:
 class EscrowClient:
     """Interface to query and settle TaskEscrow on-chain."""
 
-    STATES = ["Missing", "Offered", "Accepted", "Paid", "Refunded"]
+    STATES = ("Missing", "Offered", "Accepted", "Paid", "Refunded")
 
     def __init__(
         self,
@@ -221,7 +221,7 @@ class EscrowClient:
             "state": state_name,
         }
 
-    def accept(self, task_id: str, sender: str = None) -> dict:
+    def accept(self, task_id: str, sender: str | None = None) -> dict:
         sender = sender or self.server_account
         if not sender:
             raise ValueError("Sender required to accept task")
@@ -230,7 +230,7 @@ class EscrowClient:
     def settle_mock(
         self,
         journal_bytes: bytes,
-        sender: str = None,
+        sender: str | None = None,
         seal_hex: str = MOCK_SEAL,
     ) -> dict:
         """Approve journal on JournalVerifier and settle TaskEscrow with mock seal."""

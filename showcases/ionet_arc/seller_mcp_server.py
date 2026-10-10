@@ -20,6 +20,8 @@ from http.server import ThreadingHTTPServer
 # Ensure repository root is on sys.path
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
+import contextlib
+
 import httpx2
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -145,9 +147,7 @@ def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
     if isinstance(hw_id, str):
         lower = hw_id.lower()
         return "1x" in lower or "1-24g" in lower
-    if isinstance(hw_id, int):
-        return True
-    return False
+    return bool(isinstance(hw_id, int))
 
 
 def _is_whisper_friendly(hw_name: str, hw_id: str | int | None) -> bool:
@@ -311,15 +311,13 @@ class WarrantTranscriptionService:
 
     def _cleanup_ssh_container(self):
         if self.local_server and self._ssh_container_started:
-            try:
+            with contextlib.suppress(Exception):
                 subprocess.run(
                     ["ssh", self.ssh_host, "docker", "stop", "warrant-transcription"],
                     capture_output=True,
                     timeout=10,
                     check=False,
                 )
-            except Exception:
-                pass
 
     async def list_suitable_hardware(self) -> list[dict]:
         try:
@@ -386,8 +384,8 @@ class WarrantTranscriptionService:
 
     async def propose_deployment(
         self,
-        hardware_id: str | int = None,
-        customer_address: str = None,
+        hardware_id: str | int | None = None,
+        customer_address: str | None = None,
         location_id: str = "US",
         budget_cap_usd: str = "1.00",
     ) -> dict:
@@ -472,23 +470,17 @@ class WarrantTranscriptionService:
             raise ToolError(
                 f"On-chain amount ({task_data.get('amount')}) does not match proposal ({proposal.get('amount')})."
             )
-        if task_data.get("recipient") and str(task_data["recipient"]).lower() != str(proposal.get("recipient", "")).lower():
-            raise ToolError(
-                f"On-chain recipient ({task_data.get('recipient')}) does not match proposal ({proposal.get('recipient')})."
-            )
-        if task_data.get("policy_hash") and str(task_data["policy_hash"]).lower() != str(proposal.get("policy_hash", "")).lower():
-            raise ToolError(
-                f"On-chain policyHash ({task_data.get('policy_hash')}) does not match proposal ({proposal.get('policy_hash')})."
-            )
-        if task_data.get("customer") and str(task_data["customer"]).lower() != str(proposal.get("customer", "")).lower():
-            raise ToolError(
-                f"On-chain customer ({task_data.get('customer')}) does not match proposal ({proposal.get('customer')})."
-            )
+        for key, label in (("recipient", "recipient"), ("policy_hash", "policyHash"), ("customer", "customer")):
+            if task_data.get(key) and str(task_data[key]).lower() != str(proposal.get(key, "")).lower():
+                raise ToolError(
+                    f"On-chain {label} ({task_data.get(key)}) does not match proposal ({proposal.get(key)})."
+                )
         now = int(time.time())
         min_settle_by = now + proposal.get("duration_hours", 1) * 3600
         if task_data.get("settle_by") and task_data["settle_by"] < min_settle_by:
             raise ToolError(
-                f"On-chain settleBy ({task_data.get('settle_by')}) does not cover required duration (minimum {min_settle_by})."
+                f"On-chain settleBy ({task_data.get('settle_by')}) does not cover required duration "
+                f"(minimum {min_settle_by})."
             )
 
         if task_state == "Offered":
@@ -732,7 +724,7 @@ class WarrantTranscriptionService:
 
         raise ToolError("Transcription timed out waiting for worker.")
 
-    async def transcribe_audio(self, audio_path: str, language: str = None) -> dict:
+    async def transcribe_audio(self, audio_path: str, language: str | None = None) -> dict:
         try:
             session_file = self.state_dir / "active_session.json"
             if not session_file.exists():
@@ -797,7 +789,7 @@ class WarrantTranscriptionService:
                         audio_bytes, audio_sha256, language=language
                     )
                     if code not in (200, 202):
-                        raise ToolError(f"Local worker rejected job: {job_data}")
+                        raise ToolError(f"Local worker rejected job: {job_data}") from net_err
                     job_id = job_data["job_id"]
                     for _ in range(120):
                         st_job = self.active_local_worker.worker.get(job_id)
@@ -815,14 +807,14 @@ class WarrantTranscriptionService:
                                 "elapsed_seconds": st_job.get("elapsed_seconds"),
                             }
                         elif st_job and st_job.get("status") in ("failed", "interrupted"):
-                            raise ToolError(f"Local worker job failed: {st_job.get('error')}")
+                            raise ToolError(f"Local worker job failed: {st_job.get('error')}") from net_err
                         await asyncio.sleep(0.5)
-                    raise ToolError("Local worker job timed out.")
+                    raise ToolError("Local worker job timed out.") from net_err
                 raise ToolError(f"Worker connection failed: {net_err}") from net_err
         except Exception as exc:
             raise safe_tool_error(exc) from None
 
-    async def get_deployment_status(self, task_id: str = None) -> dict:
+    async def get_deployment_status(self, task_id: str | None = None) -> dict:
         if task_id:
             session_file = self.state_dir / "sessions" / f"{task_id}.json"
         else:

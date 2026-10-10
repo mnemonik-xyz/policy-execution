@@ -23,9 +23,9 @@ sys.path.insert(0, str(ROOT))
 
 import httpx2  # noqa: E402
 from mcp import ClientSession  # noqa: E402
-from mcp.client.streamable_http import streamable_http_client  # noqa: 402
+from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
-from showcases.ionet_arc.escrow import find_binary  # noqa: 402
+from showcases.ionet_arc.escrow import find_binary  # noqa: E402
 
 
 def run_cmd(*args, cwd=ROOT):
