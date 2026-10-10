@@ -1,0 +1,25 @@
+line-length = 120
+target-version = "py312"
+src = ["."]
+
+[lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "SIM",     # simplify
+    "C4",      # comprehensions
+    "RUF",     # ruff-specific
+    "C90",     # mccabe complexity
+]
+ignore = [
+    "SIM117",  # nested `with` is clearer for long async context stacks
+]
+
+[lint.mccabe]
+max-complexity = 14  # Ruff scores ~2 lower than the IDE's mccabe (threshold 15)
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["B011"]

@@ -1,7 +1,6 @@
 """Arc network profiles and read-only checks; no signing or asset transfers."""
-import json
-import urllib.request
 from .adapter import PilotError
+from .escrow import EthRpc
 
 USDC = "0x3600000000000000000000000000000000000000"
 NETWORKS = {
@@ -11,13 +10,10 @@ NETWORKS = {
 
 
 def rpc(url, method, params):
-    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    request = urllib.request.Request(url, payload, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = json.load(response)
-    if "error" in data or "result" not in data:
-        raise PilotError("Arc RPC request failed")
-    return data["result"]
+    try:
+        return EthRpc(url).rpc(method, params)
+    except Exception as exc:
+        raise PilotError(f"Arc RPC request failed: {exc}") from exc
 
 
 def preflight(network, rpc_url=None, call=rpc):
@@ -28,7 +24,14 @@ def preflight(network, rpc_url=None, call=rpc):
     decimals = int(call(url, "eth_call", [{"to": USDC, "data": "0x313ce567"}, "latest"]), 16)
     if decimals != 6:
         raise PilotError("Unexpected Arc USDC ERC-20 decimals")
-    return {"network": network, "chain_id": profile["chain_id"], "usdc": USDC,
-            "erc20_decimals": decimals, "native_decimals": 18,
-            "cctp_domain": 26, "read_only": True,
-            "verifier_checked": False, "escrow_deployed": False}
+    return {
+        "network": network,
+        "chain_id": profile["chain_id"],
+        "usdc": USDC,
+        "erc20_decimals": decimals,
+        "native_decimals": 18,
+        "cctp_domain": 26,
+        "read_only": True,
+        "verifier_checked": False,
+        "escrow_deployed": False,
+    }
