@@ -136,7 +136,7 @@ guardrail sidecar:
   activates the worker.
 
 - **`transcribe_audio`**:
-  Arguments: `audio_path`, optional `language`, optional `task_id`.
+  Arguments: `audio_base64` (base64-encoded audio bytes), optional `language`, optional `task_id`.
   Transcribes audio on the active 1-hour worker and returns text plus timestamped segments.
   Optionally provide `task_id` to route to a specific deployment session.
 

@@ -1,5 +1,6 @@
 """Tests for Warrant io.net transcription MCP server."""
 
+import base64
 import json
 import tempfile
 import unittest
@@ -13,6 +14,10 @@ from showcases.ionet_arc.seller_mcp_server import (
     create_server,
     filter_suitable_gpus,
 )
+
+
+def encode_audio(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
 class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
@@ -149,7 +154,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         audio_file.write_bytes(b"dummy audio content")
 
         with self.assertRaises(ToolError) as ctx:
-            await self.call("transcribe_audio", {"audio_path": str(audio_file)})
+            await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file)})
         self.assertIn("No active deployment session found", str(ctx.exception))
 
     async def test_deploy_with_escrow_fails_if_unfunded_on_chain(self):
@@ -196,10 +201,14 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         audio_file = self.state_dir / "sample.mp3"
         audio_file.write_bytes(b"mock sample audio bytes")
 
-        trans_res = await self.call("transcribe_audio", {"audio_path": str(audio_file), "language": "en"})
+        trans_res = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "language": "en"})
         self.assertEqual(trans_res["status"], "complete")
         self.assertIn("Warrant autonomous transcription pilot", trans_res["text"])
         self.assertEqual(trans_res["language"], "en")
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("transcribe_audio", {"audio_base64": "/etc/passwd"})
+        self.assertIn("not valid base64", str(ctx.exception))
 
         # 5. Check deployment status
         status = await self.call("get_deployment_status")
@@ -432,19 +441,19 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         audio_file = self.state_dir / "sample.mp3"
         audio_file.write_bytes(b"concurrent mock audio")
 
-        res_trans1 = await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": t1})
+        res_trans1 = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": t1})
         self.assertEqual(res_trans1["status"], "complete")
 
-        res_trans2 = await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": t2})
+        res_trans2 = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": t2})
         self.assertEqual(res_trans2["status"], "complete")
 
         # Default without task_id routes to latest active session
-        res_default = await self.call("transcribe_audio", {"audio_path": str(audio_file)})
+        res_default = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file)})
         self.assertEqual(res_default["status"], "complete")
 
         # Nonexistent task_id raises ToolError
         with self.assertRaises(ToolError) as ctx:
-            await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": "0xnonexistent"})
+            await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": "0xnonexistent"})
         self.assertIn("No deployment session found for task '0xnonexistent'", str(ctx.exception))
 
 

@@ -87,9 +87,10 @@ the transcription worker.
   `settlement_transaction`.
 
 #### 4. `transcribe_audio`
-Transcribes an audio file using the active 1-hour Whisper deployment on io.net.
+Transcribes audio using the active 1-hour Whisper deployment on io.net.
 - Arguments:
-  - `audio_path` (string, required): Local path to audio file (e.g. `./sample.mp3`).
+  - `audio_base64` (string, required): Base64-encoded audio file bytes (the caller reads the
+    file; the seller never accesses its own filesystem).
   - `language` (optional string): 2-letter ISO language code (e.g. `"en"`).
   - `task_id` (optional string): Target task ID to route inference when multiple deployments exist.
 - Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`.

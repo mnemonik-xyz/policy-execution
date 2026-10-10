@@ -691,7 +691,7 @@ class WarrantTranscriptionService:
                 "message": (
                     "Deployment active and escrow settled.\n"
                     "Container will automatically terminate after 1 hour duration.\n"
-                    "You can now call transcribe_audio(audio_path) while the server is active."
+                    "You can now call transcribe_audio(audio_base64) while the server is active."
                 ),
             }
         except Exception as exc:
@@ -781,7 +781,7 @@ class WarrantTranscriptionService:
 
     async def transcribe_audio(
         self,
-        audio_path: str,
+        audio_base64: str,
         language: str | None = None,
         task_id: str | None = None,
     ) -> dict:
@@ -791,11 +791,10 @@ class WarrantTranscriptionService:
             public_url = session["public_url"]
             worker_token = session.get("worker_token")
 
-            path = pathlib.Path(audio_path)
-            if not path.is_file():
-                raise ToolError(f"Audio file not found: {audio_path}")
-
-            audio_bytes = path.read_bytes()
+            try:
+                audio_bytes = base64.b64decode(audio_base64, validate=True)
+            except ValueError as exc:
+                raise ToolError("audio_base64 is not valid base64.") from exc
             if len(audio_bytes) == 0:
                 raise ToolError("Audio file is empty.")
 
@@ -955,7 +954,8 @@ def create_server(
     server.tool(
         name="transcribe_audio",
         description=(
-            "Transcribe an audio file using an active 1-hour Whisper deployment on io.net.\n"
+            "Transcribe audio (passed as base64-encoded bytes in audio_base64) using an active "
+            "1-hour Whisper deployment on io.net.\n"
             "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be expired.\n"
             "Optionally provide task_id to target a specific deployment when multiple tasks exist."
         ),

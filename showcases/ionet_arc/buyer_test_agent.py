@@ -10,6 +10,7 @@ Demonstrates the 4-step Warrant lifecycle:
 """
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -151,7 +152,10 @@ async def run_client(
                 start_t = time.time()
                 res_trans = await session.call_tool(
                     "transcribe_audio",
-                    {"audio_path": str(audio_path.resolve()), "language": "en"},
+                    {
+                        "audio_base64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+                        "language": "en",
+                    },
                 )
                 trans_result = extract_result(res_trans)
                 elapsed = time.time() - start_t
