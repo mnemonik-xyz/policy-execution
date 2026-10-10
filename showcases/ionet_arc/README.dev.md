@@ -76,9 +76,9 @@ Verify tests pass locally:
 
 ### Step 2: Build and Push Worker Image
 
-Run the **Build io.net Arc transcription image** workflow from GitHub Actions using `workflow_dispatch`.
-It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for `linux/amd64` with CUDA
-for GPU execution on io.net, plus the separate
+Run the **Build io.net Arc transcription image** workflow from GitHub Actions using
+`workflow_dispatch`. It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for
+`linux/amd64` with CUDA for GPU execution on io.net, plus the separate
 `ghcr.io/mnemonik-xyz/warrant-transcription:pilot-arm64` image for CPU inference on Apple
 Silicon Macs.
 

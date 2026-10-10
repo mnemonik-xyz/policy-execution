@@ -206,7 +206,26 @@ class WorkerExecutionTests(unittest.TestCase):
         self.assertEqual(code, 503)
         self.assertIn("shut down", err["error"])
 
-    def test_gpu_metrics_unavailable_handling(self):
+    def test_gpu_metrics(self):
+        mock_res = MagicMock()
+        mock_res.stdout = "0, 78, 1024, 24576, 65, 201.5\n"
+        with patch("subprocess.run", return_value=mock_res):
+            metrics = gpu_metrics()
+            self.assertTrue(metrics["available"])
+            self.assertEqual(
+                metrics["gpus"],
+                [
+                    {
+                        "index": "0",
+                        "utilization_percent": "78",
+                        "memory_used_mib": "1024",
+                        "memory_total_mib": "24576",
+                        "temperature_celsius": "65",
+                        "power_watts": "201.5",
+                    }
+                ],
+            )
+
         with patch("subprocess.run", side_effect=FileNotFoundError):
             metrics = gpu_metrics()
             self.assertFalse(metrics["available"])

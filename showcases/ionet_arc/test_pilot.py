@@ -27,25 +27,48 @@ from showcases.ionet_arc.adapter import (
 )
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
-from showcases.ionet_arc.worker import Worker, gpu_metrics, handler
+from showcases.ionet_arc.worker import Worker, handler
 
-ARGS = {"billing_model": "duration", "hardware_id": 10, "location_ids": [20],
-        "duration_hours": 1, "gpus_per_container": 1, "replica_count": 1}
+ARGS = {
+    "billing_model": "duration",
+    "hardware_id": 10,
+    "location_ids": [20],
+    "duration_hours": 1,
+    "gpus_per_container": 1,
+    "replica_count": 1,
+}
 DEPLOYMENT_ID = "3c90c3cc-0d44-4b50-8888-8dd25736052a"
 
 
 def estimate():
     # Synthetic test response, deliberately not presented as io.net's schema.
-    return {"tool": "caas_get_price_estimate", "observed_at": int(time.time()),
-            "arguments": ARGS.copy(), "result": {"test_total_usd": "1.25"}}
+    return {
+        "tool": "caas_get_price_estimate",
+        "observed_at": int(time.time()),
+        "arguments": ARGS.copy(),
+        "result": {"test_total_usd": "1.25"},
+    }
 
 
 def quote_state(network="mainnet"):
     caip, mint = SOLANA[network]
-    return {"endpoint": ENDPOINT, "phase": "payment_required", "created_at": int(time.time()),
-            "payment": {"x402Version": 2, "accepts": [{"scheme": "exact", "network": caip,
-                                                       "asset": mint, "payTo": SOLANA["testnet"][1],
-                                                       "maxAmountRequired": "3820000"}]}}
+    return {
+        "endpoint": ENDPOINT,
+        "phase": "payment_required",
+        "created_at": int(time.time()),
+        "payment": {
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": caip,
+                    "asset": mint,
+                    "payTo": SOLANA["testnet"][1],
+                    "maxAmountRequired": "3820000",
+                }
+            ],
+        },
+    }
 
 
 class DeploymentTests(unittest.IsolatedAsyncioTestCase):
@@ -57,8 +80,9 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.cloud.call.return_value = {"status": "success", "deployment_id": DEPLOYMENT_ID}
 
     async def launch(self, **kwargs):
-        return await deploy(self.cloud, kwargs.get("args", ARGS), self.state,
-                            kwargs.get("estimate", estimate()), "/test_total_usd", "2")
+        return await deploy(
+            self.cloud, kwargs.get("args", ARGS), self.state, kwargs.get("estimate", estimate()), "/test_total_usd", "2"
+        )
 
     async def test_success_then_duplicate_cannot_spend(self):
         result = await self.launch()
@@ -93,9 +117,16 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read_json(self.state)["phase"], "submission_unknown")
 
     async def test_invalid_billing_and_unbounded_capacity_rejected_before_call(self):
-        for change in ({"billing_model": "invalid"}, {"duration_hours": 2}, {"replica_count": 2},
-                       {"hardware_id": ""}, {"node_pool_id": "private"},
-                       {"location_ids": []}, {"gpus_per_container": True}, {"duration_hours": -1}):
+        for change in (
+            {"billing_model": "invalid"},
+            {"duration_hours": 2},
+            {"replica_count": 2},
+            {"hardware_id": ""},
+            {"node_pool_id": "private"},
+            {"location_ids": []},
+            {"gpus_per_container": True},
+            {"duration_hours": -1},
+        ):
             with self.subTest(change=change), self.assertRaises(PilotError):
                 await self.launch(args=dict(ARGS, **change))
         self.cloud.call.assert_not_awaited()
@@ -156,9 +187,11 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_sdk_result_shapes_and_schema_validation(self):
         from mcp import types
+
         session = AsyncMock()
         session.call_tool.return_value = types.CallToolResult(
-            content=[types.TextContent(type="text", text='{"status":"ok"}')])
+            content=[types.TextContent(type="text", text='{"status":"ok"}')]
+        )
         schemas = {"get_credit_status": {"type": "object", "additionalProperties": False}}
         cloud = Cloud(session, schemas)
         self.assertEqual(await cloud.call("get_credit_status", {}), {"status": "ok"})
@@ -173,6 +206,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_sdk_streamable_http_discovery_and_tool_call(self):
         import uvicorn
         from mcp.server.mcpserver import MCPServer
+
         mcp = MCPServer("local-test-provider")
 
         @mcp.tool()
@@ -182,17 +216,20 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-        server = uvicorn.Server(uvicorn.Config(mcp.streamable_http_app(), log_level="error",
-                                               timeout_graceful_shutdown=1))
+        server = uvicorn.Server(
+            uvicorn.Config(mcp.streamable_http_app(), log_level="error", timeout_graceful_shutdown=1)
+        )
         task = asyncio.create_task(server.serve(sockets=[sock]))
         try:
             for _ in range(100):
                 if server.started or task.done():
                     break
-                await asyncio.sleep(.01)
+                await asyncio.sleep(0.01)
             self.assertTrue(server.started)
-            with patch.object(adapter, "ENDPOINT", f"http://127.0.0.1:{port}/mcp"), \
-                    patch.dict(os.environ, {"IO_NET_API_KEY": "local-test-key"}):
+            with (
+                patch.object(adapter, "ENDPOINT", f"http://127.0.0.1:{port}/mcp"),
+                patch.dict(os.environ, {"IO_NET_API_KEY": "local-test-key"}),
+            ):
                 result = await adapter.connected(lambda cloud: cloud.call("get_credit_status", {}))
             self.assertEqual(result, {"test_credit": "10.00"})
         finally:
@@ -225,8 +262,13 @@ class ArcAndPaymentTests(unittest.TestCase):
         self.assertEqual(result["provider_payment"]["amount"], "3820000")
 
     def test_cross_environment_wrong_mint_and_bad_recipient_rejected(self):
-        for key, value in (("network", SOLANA["testnet"][0]), ("asset", SOLANA["testnet"][1]),
-                           ("scheme", "upto"), ("payTo", "0x1234"), ("payTo", "1" * 32)):
+        for key, value in (
+            ("network", SOLANA["testnet"][0]),
+            ("asset", SOLANA["testnet"][1]),
+            ("scheme", "upto"),
+            ("payTo", "0x1234"),
+            ("payTo", "1" * 32),
+        ):
             state = quote_state()
             state["payment"]["accepts"][0][key] = value
             with self.subTest(key=key), self.assertRaises(PilotError):
@@ -258,9 +300,11 @@ class ArcAndPaymentTests(unittest.TestCase):
             self.plan(state)
 
     def test_tool_failure_does_not_echo_secrets(self):
-        for result in ({"isError": True, "content": [{"type": "text", "text": "SECRET"}]},
-                       {"structuredContent": {"status": "error", "error": "SECRET"}},
-                       {"content": [{"type": "text", "text": "SECRET"}]}):
+        for result in (
+            {"isError": True, "content": [{"type": "text", "text": "SECRET"}]},
+            {"structuredContent": {"status": "error", "error": "SECRET"}},
+            {"content": [{"type": "text", "text": "SECRET"}]},
+        ):
             with self.assertRaises(PilotError) as ctx:
                 decode_result(result)
             self.assertNotIn("SECRET", str(ctx.exception))
@@ -292,6 +336,7 @@ class WorkerTests(unittest.TestCase):
             self.calls.append(audio.read_bytes())
             self.done.set()
             return {"language": "en", "segments": [{"start": 0, "end": 1, "text": "test fixture"}]}
+
         self.worker = Worker(self.tmp.name, "test-token-" * 4, engine)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.worker))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -321,15 +366,6 @@ class WorkerTests(unittest.TestCase):
         code, _err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
         self.assertEqual(code, 400)
 
-    @patch("showcases.ionet_arc.worker.subprocess.run")
-    def test_gpu_metrics_and_unavailable_fallback(self, run):
-        run.return_value.stdout = "0, 78, 1024, 24576, 65, 201.5\n"
-        self.assertEqual(gpu_metrics(), {"available": True, "gpus": [{
-            "index": "0", "utilization_percent": "78", "memory_used_mib": "1024",
-            "memory_total_mib": "24576", "temperature_celsius": "65", "power_watts": "201.5"}]})
-        run.side_effect = FileNotFoundError()
-        self.assertEqual(gpu_metrics(), {"available": False, "reason": "nvidia_smi_unavailable"})
-
     def test_upload_poll_duplicate_and_persistent_results(self):
         first_audio = b"fake audio for unit test"
         code, first = self.request("/job", first_audio)
@@ -339,7 +375,7 @@ class WorkerTests(unittest.TestCase):
             code, job = self.request(f"/job/{first['job_id']}")
             if job["status"] == "complete":
                 break
-            time.sleep(.01)
+            time.sleep(0.01)
         self.assertEqual(job["status"], "complete")
         data = json.dumps(job["result"], sort_keys=True, separators=(",", ":")).encode()
         self.assertEqual(job["result_sha256"], hashlib.sha256(data).hexdigest())
@@ -353,13 +389,12 @@ class WorkerTests(unittest.TestCase):
             code, second_result = self.request(f"/job/{second['job_id']}")
             if second_result["status"] == "complete":
                 break
-            time.sleep(.01)
+            time.sleep(0.01)
         self.assertEqual(second_result["status"], "complete")
         self.assertEqual(self.request("/job")[0], 400)
         code, listing = self.request("/jobs")
         self.assertEqual(code, 200)
-        self.assertEqual({job["job_id"] for job in listing["jobs"]},
-                         {first["job_id"], second["job_id"]})
+        self.assertEqual({job["job_id"] for job in listing["jobs"]}, {first["job_id"], second["job_id"]})
         self.assertEqual(len(self.calls), 2)
         restored = Worker(self.tmp.name, self.worker.token)
         self.assertEqual(restored.get(first["job_id"])["status"], "complete")
@@ -371,12 +406,6 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.request("/job", b"audio", auth=False)[0], 401)
         self.assertEqual(self.request("/job", b"audio", checksum="0" * 64)[0], 400)
         self.assertEqual(self.calls, [])
-
-    def test_restart_marks_incomplete_job_interrupted(self):
-        Path(self.tmp.name, "jobs.json").write_text(json.dumps({"jobs": {
-            "0" * 64: {"status": "running", "input_sha256": "0" * 64, "job_id": "0" * 64}}}))
-        restored = Worker(self.tmp.name, self.worker.token)
-        self.assertEqual(restored.job["status"], "interrupted")
 
 
 if __name__ == "__main__":

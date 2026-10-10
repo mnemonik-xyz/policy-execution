@@ -180,13 +180,19 @@ the local Warrant tool for policy check and escrow funding, deploy, and transcri
 ## Running Automated Tests
 
 ```sh
-# Buyer Warrant guardrail MCP server unit tests (11 tests)
+# Buyer Warrant guardrail MCP server unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_buyer_mcp_server -v
 
-# Seller transcription MCP server unit tests (11 tests)
+# Seller transcription MCP server unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_warrant_transcription -v
 
-# Core io.net CaaS pilot & worker unit tests (24 tests)
+# TaskEscrow Web3 client unit tests
+.venv/bin/python -m unittest showcases.ionet_arc.test_escrow -v
+
+# Whisper worker unit tests (queue, model caching, telemetry)
+.venv/bin/python -m unittest showcases.ionet_arc.test_worker -v
+
+# Core io.net CaaS pilot unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_pilot -v
 
 # End-to-end integration test (spins up Anvil, Seller MCP, Buyer MCP, Agent)

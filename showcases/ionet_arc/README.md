@@ -1,148 +1,116 @@
-# io.net workload pilot with Warrant on Arc
+# io.net GPU Workload Pilot with Warrant on Arc
 
-This is the first infrastructure milestone for a real solver-bounty showcase:
-a buyer purchases a verified schedule, a separate runner executes a useful
-transcription workload on io.net, and Warrant settles the solver fee on Arc.
+This showcase demonstrates autonomous cloud compute procurement, container deployment, and
+on-chain escrow settlement on Arc (chain ID `5042002`) using the Warrant policy framework.
 
-Implemented here: an MCP client, a bounded CaaS deployment flow, persistent
-write-intent records, a GPU transcription HTTP worker, read-only Arc checks,
-and validation of provider payment requests. **Automatic bridging, payment,
-and settlement-triggered workload execution are not implemented yet.** These
-files do not claim live GPU execution or public-chain settlement. The existing
-[solver demo](../../solver-bounty/README.md) remains the local proof/payment demo.
+An autonomous buyer LLM agent interacts with an io.net GPU compute seller MCP server. A local
+Buyer Warrant MCP guardrail verifies policy rules (budget cap, lease duration, deterministic
+policy hash) before funding `TaskEscrow` on Arc. Once escrow is funded, the seller provisions a
+`faster-whisper` transcription worker container on io.net, settles the escrow on-chain, and
+transcribes audio submitted by the buyer.
 
-## Responsibilities and proof boundary
+> [!IMPORTANT]
+> For the complete dual-MCP protocol and tool specifications, see [README.mcp.md](README.mcp.md).
+> For the manual CLI deployment runbook without MCP, see [README.dev.md](README.dev.md).
 
-- **Buyer and seller**: Agree to jobs, resources, runtime estimates, prices and fees.
-  *Evidence*: Buyer-approved committed inputs.
-- **Warrant on Arc**: Pay for a schedule satisfying the committed constraints.
-  *Evidence*: Pinned solver guest and Groth16 verification.
-- **io.net adapter**: Discover, estimate, provision, inspect, terminate.
-  *Evidence*: Authenticated provider API.
-- **Transcription worker**: Run audio job, return transcript and timing.
-  *Evidence*: Cloud execution evidence; no correctness proof.
-- **CCTP service (next milestone)**: Fund a Solana operational wallet from Arc.
-  *Evidence*: Circle attestation and destination confirmation.
-- **Provider payment service (next milestone)**: Pay the current exact top-up request once.
-  *Evidence*: Solana transaction and provider credit confirmation.
+---
 
-The bounty and infrastructure budgets are separate. Cross-chain funding stays
-outside the escrow and is not atomic with Warrant settlement. The schedule
-proof does not prove cloud execution, truthful prices, actual runtimes,
-transcription quality, optimality, or realized savings.
+## Showcase Limitations
 
-The v1 checker sums job-duration × units × price. A duration-billed deployment
-can include idle time and startup overhead. Keep this distinction visible
-until a versioned billing-aware checker is introduced. A whole-deployment
-quote must not be substituted for `price_per_unit_tick` and presented as a
-proven cloud bill.
+This showcase is an infrastructure and agent-interaction pilot. It contains several important
+architectural simplifications and trust boundaries:
 
-## Arc and USDC funding
+1. **No Real Zero-Knowledge (ZK) Proof**:
+   - The on-chain `TaskEscrow` settlement on Arc uses mock / digest journal verification
+     (`settle_mock`), passing a 384-byte plain authorization journal.
+   - It does **not** generate or verify cryptographic zero-knowledge Groth16 or STARK proofs from
+     a RISC Zero zk-prover (such as Bonsai).
+2. **No Proof of Deployed Container or Hardware**:
+   - The compute seller provides **no cryptographic or verifiable proof** that the container was
+     actually deployed on io.net, that the agreed GPU hardware was allocated, or that the container
+     is executing honestly.
+   - The `deliverable_record` and `deliverable_hash` recorded on-chain are unilaterally asserted by
+     the seller, not authenticated by hardware attestations (e.g. Confidential Computing / TEE)
+     or independent third parties.
+3. **Immediate Escrow Settlement (Upfront Fund Extraction)**:
+   - The seller MCP server invokes `TaskEscrow.settle()` **immediately upon container launch** (or
+     mock local worker startup) to claim and withdraw the buyer's escrowed USDC.
+   - The buyer's funds are extracted **before** the buyer submits their audio workload or receives
+     any transcription results.
+   - If the container crashes, fails to initialize, or goes unreachable, the buyer has already
+     surrendered their payment without automated on-chain dispute resolution or refund recourse.
+4. **Trust Boundary**:
+   - The Buyer Warrant MCP guardrail successfully enforces local buyer constraints (budget ceiling,
+     duration limit, and deterministic policy hash matching) prior to committing funds on-chain.
+   - However, once funds are deposited into `TaskEscrow`, the actual execution phase relies on
+     counterparty trust in the seller rather than trustless verification.
 
-Official documentation checked on 2026-10-04:
+---
+
+## Architecture and Proof Boundary
+
+- **Buyer LLM Agent**: Interacts with the seller to discover GPUs, request proposals, and submit
+  audio jobs.
+- **Buyer Warrant MCP Server (`buyer_mcp_server.py`)**: Local trusted guardrail sidecar. Holds
+  wallet keys, enforces spending limits, derives/verifies `warrant-policy` hashes, and signs
+  `TaskEscrow.offer()`.
+- **Seller MCP Server (`seller_mcp_server.py`)**: Remote service hosted by the provider. Discovers
+  suitable single-GPU hardware on io.net, generates proposals with dynamic hardware pricing,
+  accepts tasks, provisions containers, and settles deliverables on Arc.
+- **Arc `TaskEscrow` Contract**: Holds buyer USDC in escrow until valid terms and deliverable
+  settlement are executed.
+- **Transcription Worker (`worker.py`)**: CUDA/FP16 `faster-whisper` container exposing HTTP
+  endpoints (`/health`, `/job`, `/jobs`) with structured operational logs and GPU telemetry.
+
+---
+
+## Arc and USDC Parameters
+
+Official network parameters for Arc:
 
 | Parameter | Arc mainnet | Arc testnet |
 | --- | --- | --- |
 | Chain ID | 5042 | 5042002 |
-| RPC | `https://rpc.mainnet.arc.io` | `https://rpc.testnet.arc.io` |
+| RPC URL | `https://rpc.mainnet.arc.io` | `https://rpc.testnet.arc.io` |
 | USDC ERC-20 | `0x3600000000000000000000000000000000000000` | Same address |
 | ERC-20 decimals | 6 | 6 |
 | Native gas decimals | 18 | 18 |
-| CCTP domain | 26 | 26 |
 
-Native and ERC-20 USDC share one balance. Use six-decimal integer units for
-Warrant token amounts and reserve native USDC for gas. Do not double-count the
-two views. Chain IDs are not CCTP domain IDs.
+Native and ERC-20 USDC share a unified balance on Arc. Warrant token amounts use six-decimal
+integer units ($1.00 \text{ USDC} = 1\,000\,000$ atomic units), reserving native USDC for gas fees.
 
-Circle lists Arc and Solana (domain 5) as CCTP-supported networks. App Kit's
-Bridge capability / standalone Bridge Kit manages burn, attestation and mint.
-The intended operational flow is:
+---
 
-1. Keep the bounty and settlement on Arc.
-2. Quote a CCTP transfer to our operational wallet on Solana, accounting for
-   fees so the net received amount covers the provider payment.
-3. Journal burn transaction, message, attestation and mint progress. Resume an
-   incomplete transfer rather than burning again.
-4. Confirm destination USDC balance and arrange Solana transaction fees or a
-   configured sponsor.
-5. Revalidate the current io.net request's network, native USDC mint, recipient
-   and exact amount; pay it once and record the transaction.
-6. Confirm account credit and reconcile before retrying deployment.
+## Installation and Testing
 
-Direct CCTP minting to the provider's address is not assumed to satisfy its
-payment matching. Bridge fees must not reduce the provider payment. Testnet
-USDC cannot purchase real compute; the parser rejects a testnet funding route
-for a mainnet payment request.
-
-`payment-plan` produces a **non-executable** description. Its bridge gross
-amount remains unset until a fee quote exists. It never signs or marks a bill
-paid. Automatic bridging requires the next milestone's wallet integration,
-transaction journal, reconciliation and spending policy.
-
-## Install and inspect
-
-Python 3.12 is used in CI. Run from the repository root:
+Python 3.12+ is supported. Install dependencies from the repository root:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r showcases/ionet_arc/requirements.txt
-.venv/bin/python -m unittest discover showcases/ionet_arc -v
-.venv/bin/python scripts/ionet-showcase.py arc-check \
-  --network testnet --out artifacts/arc-preflight.json
 ```
 
-`arc-check --network mainnet` is also read-only. It checks RPC chain ID and
-USDC ERC-20 decimals; it does not validate the verifier or deploy contracts.
-Local mocked RPC tests are not public-network validation. Arc-specific EVM
-behavior needs Arc testnet or Arc Foundry testing before deployment.
-
-Configure `IO_NET_API_KEY` in the process environment with `io-cloud` access.
-Do not put it in argument files. The client sends it to the documented MCP
-endpoint using the `x-api-key` header. The official MCP SDK handles sessions
-and transport.
+Run unit tests:
 
 ```sh
-.venv/bin/python scripts/ionet-showcase.py discover \
-  --out artifacts/io-tools.json
-.venv/bin/python scripts/ionet-showcase.py read caas_get_hardware_ids \
-  --out artifacts/io-hardware.json
-.venv/bin/python scripts/ionet-showcase.py read get_credit_status \
-  --out artifacts/io-credit-before.json
+.venv/bin/python -m unittest discover showcases/ionet_arc -v
 ```
 
-Form arguments from the discovered `inputSchemas`. Calls validate against
-those schemas and fail on mismatches. The REST deployment docs currently
-specify the body as `any`; this pilot does not invent a complete request.
-Captured responses have restrictive local file permissions but may contain
-account data or container environment variables. Publish reviewed evidence,
-not raw account responses.
-
-For running the standalone Streamable HTTP MCP server for external agents,
-see [README.mcp.md](README.mcp.md).
-
-### Linting
-
-Python sources are linted with [Ruff](https://docs.astral.sh/ruff/); the
-configuration is in the root `ruff.toml` and CI runs the same check. Install
-the pinned dev dependencies (runtime requirements plus Ruff) and run from the
-repository root:
+Python sources are linted and formatted with [Ruff](https://docs.astral.sh/ruff/):
 
 ```sh
 .venv/bin/pip install -r showcases/ionet_arc/requirements-dev.txt
-.venv/bin/ruff check showcases
-.venv/bin/ruff check showcases --fix   # apply safe auto-fixes
+.venv/bin/ruff check showcases/ionet_arc
+.venv/bin/ruff format --check showcases/ionet_arc
 ```
 
-Without a virtualenv, `uvx ruff check showcases` works too.
+---
 
-## Deploying contracts and running on Arc Testnet
+## Deploying Contracts and Running the Demonstration
 
-The Warrant transcription showcase connects io.net container provisioning with on-chain
-`TaskEscrow` verification and settlement on Arc Testnet (chain ID `5042002`).
+### 1. Build Host and Obtain Guest Image ID
 
-### 1. Build host and obtain guest image ID
-
-From the repository root, build the Rust `warrant-host` binary to inspect the policy guest image ID:
+Build the Rust `warrant-host` binary to inspect the policy guest image ID:
 
 ```sh
 RISC0_BUILD_LOCKED=1 cargo build -p warrant-host --release --locked
@@ -150,9 +118,9 @@ IMAGE_ID=$(target/release/warrant-host image-id)
 echo "Warrant Guest Image ID: $IMAGE_ID"
 ```
 
-### 2. Deploy contracts to Arc Testnet
+### 2. Deploy Contracts to Arc Testnet
 
-Deploy `TaskEscrow` and `RiscZeroGroth16Verifier` using Foundry from the `contracts/` directory:
+Deploy `TaskEscrow` and `RiscZeroGroth16Verifier` from the `contracts/` directory using Foundry:
 
 ```sh
 cd contracts
@@ -162,23 +130,13 @@ export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
 export WARRANT_IMAGE_ID="$IMAGE_ID"
 export WARRANT_DEPLOYER="<your-deployer-address>"
 
-# Simulation run:
-forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
-  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --slow
-
-# Broadcast transactions on Arc Testnet:
 forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
   --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
 ```
 
-Record the deployed contract addresses from Foundry output:
-- `TaskEscrow` contract address
-- `RiscZeroGroth16Verifier` contract address
-- Arc Testnet USDC address: `0x3600000000000000000000000000000000000000`
+### 3. Run the Seller MCP Server
 
-### 3. Run the Seller MCP Server (Transcription Service)
-
-Start the Seller MCP daemon configured with your Arc Testnet addresses and `IO_NET_API_KEY`:
+Start the Seller MCP daemon configured with your Arc Testnet contract addresses:
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
@@ -190,19 +148,12 @@ Start the Seller MCP daemon configured with your Arc Testnet addresses and `IO_N
   --server-account <SERVER_RECIPIENT_ADDRESS>
 ```
 
-For offline dry runs without io.net API keys, add `--mock-ionet`. If `--rpc-url` points to
-a local Anvil instance (`http://127.0.0.1:8545`), the server automatically deploys local test
-escrow contracts using unlocked accounts. When targeting a remote network like Arc Testnet,
-set `WARRANT_PRIVATE_KEY` in the environment for local transaction signing.
+Add `--mock-ionet` for offline local testing without an io.net API key. When `--rpc-url` targets
+local Anvil (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
-> [!NOTE]
-> Settlement in the local MCP demo uses mock journal verification (`settle_mock`). For production
-> settlement on Arc Testnet with `RiscZeroGroth16Verifier`, a cryptographic Groth16 seal must
-> be generated via the RISC0 prover (e.g., Bonsai) matching the guest image ID.
+### 4. Run the Buyer Warrant MCP Server
 
-### 4. Run the Buyer Warrant MCP Server (Local Guardrail)
-
-Start the local Buyer Warrant guardrail sidecar:
+Start the Buyer Warrant guardrail sidecar:
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
@@ -215,12 +166,12 @@ Start the local Buyer Warrant guardrail sidecar:
   --max-budget-usd 2.00
 ```
 
-For desktop LLM environments (Claude Desktop / Cursor / Antigravity), run with `--transport stdio`
-instead of HTTP.
+For desktop LLM agent environments (Claude Desktop / Cursor / Antigravity), specify
+`--transport stdio`. See [README.mcp.md](README.mcp.md) for full configuration details.
 
-### 5. Run the Autonomous Client Agent Demonstration
+### 5. Run the Autonomous Client Agent
 
-In another terminal, launch the client agent with an audio file (e.g. `./sample.mp3`):
+Launch the client agent with an audio file (e.g. `./sample.mp3`):
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.buyer_test_agent \
@@ -230,171 +181,51 @@ In another terminal, launch the client agent with an audio file (e.g. `./sample.
   --audio ./sample.mp3
 ```
 
-The client agent performs the end-to-end flow:
-1. Discovers suitable Whisper single GPUs on io.net (`seller:list_suitable_hardware`).
-2. Requests an agreement proposal (`seller:propose_deployment`).
-3. Passes the proposal to the local Buyer Warrant guardrail (`buyer:warrant_evaluate_and_offer`),
-   which verifies budget, duration, and policy hash before funding `TaskEscrow.offer()` on Arc.
-4. Invokes `seller:deploy_with_escrow`: server accepts on-chain, provisions the container on io.net
-   for 1-hour duration, and executes `TaskEscrow.settle()` with a 384-byte journal.
-5. Calls `seller:transcribe_audio` through MCP to transcribe `./sample.mp3` and print output.
-6. Inspects deployment health and settlement status via `seller:get_deployment_status`.
+The agent runs the end-to-end lifecycle:
+1. Discovers suitable single-GPU hardware on io.net (`seller:list_suitable_hardware`).
+2. Requests an agreement proposal with dynamic pricing (`seller:propose_deployment`).
+3. Evaluates proposal terms and funds escrow on Arc (`buyer:warrant_evaluate_and_offer`).
+4. Provisions container and settles escrow (`seller:deploy_with_escrow`).
+5. Transcribes audio on the active Whisper container (`seller:transcribe_audio`).
+6. Inspects deployment health and status (`seller:get_deployment_status`).
 
-## First live deployment (legacy CLI)
+---
 
-The pilot allows exactly one GPU, one replica, one hour, and explicit `billing_model: "duration"`
-or `"payg"`. Note that PayG does not bound container lifetime on the provider side: destroy
-promptly after testing to prevent ongoing metered billing.
+## Worker HTTP API and Operational Logs
 
-1. Select an integer CaaS hardware ID and one integer location ID from live
-   discovery and availability. Regional string hardware IDs are unsuitable
-   for the documented CaaS deployment tool.
-2. Build and publish the worker image to your registry. Use the resulting
-   immutable image digest when deploying. Image publication is an operator
-   step; this adapter does not guess a registry or publish images.
-
-   ```sh
-   docker build -t warrant-transcription:pilot showcases/ionet_arc
-   ```
-
-3. Generate a random worker token of at least 32 characters and pass it through
-   the container environment as `WARRANT_WORKER_TOKEN`. This is distinct from
-   the io.net API key. Expose HTTP port 8080. The image downloads a pinned model
-   revision at build time.
-4. Create `price-args.json` with `hardware_id`, `location_ids`, `duration_hours`,
-   `gpus_per_container`, and `replica_count`, following discovered schemas.
-   Create `deploy-args.json` with matching resources, explicit duration billing,
-   and the image/port/environment fields required by the deployment schema.
-5. Fetch the estimate and inspect its total USD field and included charges:
-
-   ```sh
-   .venv/bin/python scripts/ionet-showcase.py read caas_get_price_estimate \
-     --args price-args.json --out artifacts/io-estimate.json
-   ```
-
-6. Deploy using the total USD field's JSON pointer and an agreed limit:
-
-   ```sh
-   .venv/bin/python scripts/ionet-showcase.py deploy \
-     --args deploy-args.json --estimate artifacts/io-estimate.json \
-     --usd-pointer /REPLACE_WITH_TOTAL_USD_FIELD \
-     --max-cost-usd AGREED_LIMIT --state artifacts/io-deployment.json
-   ```
-
-The pointer is relative to the provider result. The adapter rejects estimates
-older than five minutes, changed resources, invalid prices and estimates over
-the limit. This is an estimate gate, not an atomic provider billing cap. Bound
-available cloud credits for the pilot and measure actual charges separately.
-
-A `payment_required` response is persisted and stops the flow. To inspect an
-Arc-funded route using a fresh state:
-
-```sh
-.venv/bin/python scripts/ionet-showcase.py payment-plan \
-  --state artifacts/io-deployment.json --network mainnet \
-  --solana-wallet YOUR_OPERATIONAL_PUBLIC_KEY \
-  --max-payment-usdc AGREED_LIMIT --out artifacts/io-payment-plan.json
-```
-
-This does not pay. An already funded io.net account can support the first
-infrastructure spike; label that as prefunding, not automated bridging.
-
-## Execute and collect
-
-Use `read caas_get_deployment` and `read caas_get_deployment_containers` with
-arguments from discovery to find the assigned public HTTPS endpoint.
+The Whisper container HTTP service (`worker.py`) exposes the following endpoints:
 
 | Request | Authentication | Result |
 | --- | --- | --- |
-| `GET /health` | None | Process health; no GPU-readiness claim |
-| `POST /job` | `Bearer WORKER_TOKEN` | Upload raw audio, receive job status & `job_id` |
-| `GET /job/<job_id>` | Same token | Status, transcript, hashes, revision and timing for one job |
-| `GET /jobs` | Same token | All submitted jobs |
+| `GET /health` | None | Process health status |
+| `POST /job` | `Bearer WORKER_TOKEN` | Upload raw audio, receive job status and `job_id` |
+| `GET /job/<job_id>` | Same token | Status, transcript text, segments, and timing for one job |
+| `GET /jobs` | Same token | Status of all submitted jobs |
 
-For uploads, supply `Content-Length` and `X-Audio-SHA256` (lowercase SHA-256 of the audio). An
-optional language code can be passed via `?language=<code>` or `X-Language: <code>`. Maximum
-size is 64 MiB. No caller-supplied URL is fetched. The response `job_id` is the input SHA-256;
-use it to poll `GET /job/<job_id>`. Repeated submission of the same input returns its existing
-job, while different inputs create independent jobs. `GET /job` remains available only when
-there is zero or one job, for compatibility. Collect output outside the container before cleanup.
-Jobs transcribe one at a time to avoid GPU contention. A restart with preserved state reports
-unfinished work as `interrupted`.
+Uploads require `Content-Length` and `X-Audio-SHA256`. An optional language code may be passed
+via `?language=<code>` or `X-Language: <code>`. Maximum upload size is 64 MiB. The `job_id` is
+the lowercase SHA-256 hash of the input audio bytes.
 
-The worker uses CUDA/FP16 `faster-whisper` cached across jobs. Timing includes transcription.
-Hashes identify bytes, not correctness. Input audio files are unlinked after job completion
-unless `WARRANT_KEEP_INPUTS=1` is set. Local tests use an explicit fake transcription engine
-and do not claim a GPU/model run.
+The worker writes human-readable operational logs with job ID prefixes, elapsed execution time,
+and best-effort `nvidia-smi` GPU telemetry (utilization, memory used/total, temperature, power).
+Set `WARRANT_LOG_JSON=1` for raw JSON logs.
 
-## Operational logs
+---
 
-The worker writes clean, human-readable operational logs to standard output: worker startup,
-job acceptance, execution progress, completion, failure, and restart interruption events.
-Logs summarize job ID prefix, byte size, queue depth, elapsed time, and requested language—never
-authorization tokens, audio bytes, or transcript text. Startup and job lifecycle events include
-a best-effort `nvidia-smi` snapshot for each GPU: utilization, memory used/total, temperature,
-and power draw. Long-running jobs emit progress snapshots every 10 seconds (configurable via
-`WARRANT_GPU_LOG_INTERVAL_SECONDS`, minimum: 1). If telemetry is unavailable, the log displays
-`N/A` and continues normally. Set `WARRANT_LOG_JSON=1` for raw JSON logs or `WARRANT_LOG_LEVEL`
-to adjust the log level.
+## Manual CLI Deployment Runbook
 
-## Cleanup and recovery
+For running manual container discovery, price estimation, deployment, and teardown via the
+standalone CLI (`scripts/ionet-showcase.py`) without MCP agents, refer to the
+[Developer Runbook](README.dev.md).
 
-```sh
-.venv/bin/python scripts/ionet-showcase.py destroy \
-  --state artifacts/io-deployment.json
-```
+---
 
-Only the saved deployment ID is targeted. A destroy acknowledgement is recorded
-as `destroy_requested`, not proof of stopped resources/billing. Read deployment
-status and credits afterwards and retain the observations.
+## Primary References
 
-| State | Required action |
-| --- | --- |
-| `submission_unknown` | Inspect deployments: the request may have succeeded before timeout. |
-| `payment_required` | Resolve credits/payment, then reconcile before another attempt. |
-| `deployed` | Collect results and request cleanup. |
-| `destroy_unknown` | Inspect that deployment before retrying cleanup. |
-| `destroy_requested` | Confirm termination and billing cessation with the provider. |
-
-The intent is fsynced before a deployment call. Reusing its state filename is
-rejected. Paid calls are never automatically retried. Keep original evidence;
-use a new state file only after reconciling whether another attempt is needed.
-This is not a claim of provider-side idempotency.
-
-## Remaining milestones
-
-1. Authenticated io.net spike: capture real response schemas, run the built image
-   on a GPU, collect a useful transcript, measure charges, confirm termination.
-   Requires API access, image registry, public audio and an infrastructure budget.
-2. Add CCTP/Bridge Kit signing/recovery and exact provider payment. Rehearse Arc
-   testnet → Solana devnet separately from real io.net billing.
-3. Benchmark a useful batch and version the billing-aware checker. Compare a
-   simple baseline, seller schedules and total economic cost.
-4. Connect independent buyer/seller/relayer/runner processes. Bind Arc chain,
-   escrow, token and image in the policy; prevent duplicate provisioning when
-   replaying settlement events.
-5. Validate solver-specific proofs and settlement on Arc testnet. Existing
-   `scripts/check-arc.py` covers a read-only task/invoice constructor probe,
-   not solver settlement or funding integration.
-6. Review contracts and operations, run a bounded Arc mainnet pilot, publish
-   evidence, then update Warrant/Tameion pins to the reviewed implementation.
-
-Publish input/model/image commitments, schedules, proof and settlement,
-cloud lifecycle records, transcript output, funding transactions where used,
-measured cloud/prover/gas costs and cleanup evidence. Claim savings only when
-those measurements support them.
-
-## Primary references
-
-- [io.net Agent Cloud: tools, billing and x402](https://io.net/docs/guides/clouds/agent-cloud)
-- [CaaS HTTP container constraints](https://io.net/docs/reference/caas/deploy-a-container)
-- [CaaS price parameters](https://io.net/docs/reference/caas/price-estimation)
-- [Arc connection details](https://docs.arc.io/arc/references/connect-to-arc)
+- [io.net Agent Cloud documentation](https://io.net/docs/guides/clouds/agent-cloud)
+- [CaaS container deployment reference](https://io.net/docs/reference/caas/deploy-a-container)
+- [CaaS price estimation reference](https://io.net/docs/reference/caas/price-estimation)
+- [Arc connection details and RPC](https://docs.arc.io/arc/references/connect-to-arc)
 - [Arc EVM differences](https://docs.arc.io/integrate/evm-differences)
-- [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses)
-- [CCTP supported chains and domains][cctp-chains]
-- [Circle-issued USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses)
-- [App Kit Bridge / Bridge Kit](https://docs.arc.io/app-kit/bridge)
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-
-[cctp-chains]: https://developers.circle.com/cctp/concepts/supported-chains-and-domains
+- [Circle USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses)
+- [faster-whisper repository](https://github.com/SYSTRAN/faster-whisper)

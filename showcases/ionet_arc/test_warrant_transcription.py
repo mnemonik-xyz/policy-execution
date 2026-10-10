@@ -8,10 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from showcases.ionet_arc.escrow import (
-    DEFAULT_CATEGORY,
-    encode_journal,
-)
+from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
 from showcases.ionet_arc.seller_mcp_server import (
     create_server,
     filter_suitable_gpus,
@@ -100,24 +97,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filtered[1]["hardware_id"], 12)
         self.assertEqual(filtered[1]["price_per_hour_usd"], 0.30)
         self.assertEqual(filtered[2]["hardware_id"], "gpu_1x_l40")
-
-    def test_journal_encoding_384_bytes(self):
-        journal = encode_journal(
-            policy_hash="0x" + "11" * 32,
-            chain_id=31337,
-            vault="0x" + "22" * 20,
-            token="0x" + "33" * 20,
-            recipient="0x" + "44" * 20,
-            amount=1_000_000,
-            task_id="0x" + "55" * 32,
-            deliverable_hash="0x" + "66" * 32,
-            policy_version=1,
-            valid_after=1000,
-            valid_until=5000,
-            evidence_hash="0x" + "77" * 32,
-        )
-        self.assertEqual(len(journal), 384)
-        self.assertEqual(journal[:32], bytes.fromhex("11" * 32))
 
     async def test_propose_deployment_generates_valid_terms(self):
         proposal = await self.call("propose_deployment", {"budget_cap_usd": "1.00"})
