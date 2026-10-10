@@ -1,0 +1,21 @@
+line-length = 120
+target-version = "py312"
+src = ["."]
+
+[lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "SIM",     # simplify
+    "C4",      # comprehensions
+    "RUF",     # ruff-specific
+]
+ignore = [
+    "SIM117",  # nested `with` is clearer for long async context stacks
+]
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["B011"]
