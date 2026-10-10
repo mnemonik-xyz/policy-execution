@@ -696,6 +696,20 @@ class WarrantTranscriptionService:
         except Exception as exc:
             raise safe_tool_error(exc) from None
 
+    @staticmethod
+    def _transcription_result(job_id: str, job_status: dict) -> dict:
+        res = job_status.get("result", {})
+        segments = res.get("segments", [])
+        return {
+            "status": "complete",
+            "job_id": job_id,
+            "text": " ".join(s.get("text", "").strip() for s in segments),
+            "language": res.get("language"),
+            "audio_seconds": res.get("audio_seconds"),
+            "segments": segments,
+            "elapsed_seconds": job_status.get("elapsed_seconds"),
+        }
+
     async def _poll_transcription(self, client: httpx2.AsyncClient, poll_url: str, headers: dict, job_id: str) -> dict:
         for _ in range(120):  # poll up to 60 seconds
             try:
@@ -704,18 +718,7 @@ class WarrantTranscriptionService:
                     job_status = resp.json()
                     st = job_status.get("status")
                     if st == "complete":
-                        res = job_status.get("result", {})
-                        segments = res.get("segments", [])
-                        full_text = " ".join(s.get("text", "").strip() for s in segments)
-                        return {
-                            "status": "complete",
-                            "job_id": job_id,
-                            "text": full_text,
-                            "language": res.get("language"),
-                            "audio_seconds": res.get("audio_seconds"),
-                            "segments": segments,
-                            "elapsed_seconds": job_status.get("elapsed_seconds"),
-                        }
+                        return self._transcription_result(job_id, job_status)
                     elif st in ("failed", "interrupted"):
                         raise ToolError(f"Transcription job failed: {job_status.get('error', st)}")
             except httpx2.HTTPError:
@@ -724,27 +727,30 @@ class WarrantTranscriptionService:
 
         raise ToolError("Transcription timed out waiting for worker.")
 
+    def _active_session(self) -> dict:
+        session_file = self.state_dir / "active_session.json"
+        if not session_file.exists():
+            raise ToolError(
+                "No active deployment session found. "
+                "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
+            )
+
+        session = read_json(session_file)
+        if time.time() > session.get("expires_at", 0):
+            raise ToolError(
+                f"Deployment session expired at {session.get('expires_at')}. "
+                "The 1-hour duration window has ended. A new proposal and deployment are required."
+            )
+
+        if not session.get("public_url"):
+            raise ToolError("Deployment public URL is not ready yet.")
+        return session
+
     async def transcribe_audio(self, audio_path: str, language: str | None = None) -> dict:
         try:
-            session_file = self.state_dir / "active_session.json"
-            if not session_file.exists():
-                raise ToolError(
-                    "No active deployment session found. "
-                    "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
-                )
-
-            session = read_json(session_file)
-            now = time.time()
-            if now > session.get("expires_at", 0):
-                raise ToolError(
-                    f"Deployment session expired at {session.get('expires_at')}. "
-                    "The 1-hour duration window has ended. A new proposal and deployment are required."
-                )
-
-            public_url = session.get("public_url")
+            session = self._active_session()
+            public_url = session["public_url"]
             worker_token = session.get("worker_token")
-            if not public_url:
-                raise ToolError("Deployment public URL is not ready yet.")
 
             path = pathlib.Path(audio_path)
             if not path.is_file():
@@ -785,34 +791,27 @@ class WarrantTranscriptionService:
             except (httpx2.HTTPError, OSError) as net_err:
                 # Direct in-process worker fallback for sandboxed/mock testbeds
                 if self.active_local_worker and getattr(self.active_local_worker, "worker", None):
-                    code, job_data = self.active_local_worker.worker.submit(
-                        audio_bytes, audio_sha256, language=language
-                    )
-                    if code not in (200, 202):
-                        raise ToolError(f"Local worker rejected job: {job_data}") from net_err
-                    job_id = job_data["job_id"]
-                    for _ in range(120):
-                        st_job = self.active_local_worker.worker.get(job_id)
-                        if st_job and st_job.get("status") == "complete":
-                            res = st_job.get("result", {})
-                            segments = res.get("segments", [])
-                            full_text = " ".join(s.get("text", "").strip() for s in segments)
-                            return {
-                                "status": "complete",
-                                "job_id": job_id,
-                                "text": full_text,
-                                "language": res.get("language"),
-                                "audio_seconds": res.get("audio_seconds"),
-                                "segments": segments,
-                                "elapsed_seconds": st_job.get("elapsed_seconds"),
-                            }
-                        elif st_job and st_job.get("status") in ("failed", "interrupted"):
-                            raise ToolError(f"Local worker job failed: {st_job.get('error')}") from net_err
-                        await asyncio.sleep(0.5)
-                    raise ToolError("Local worker job timed out.") from net_err
+                    return await self._transcribe_with_local_worker(audio_bytes, audio_sha256, language, net_err)
                 raise ToolError(f"Worker connection failed: {net_err}") from net_err
         except Exception as exc:
             raise safe_tool_error(exc) from None
+
+    async def _transcribe_with_local_worker(
+        self, audio_bytes: bytes, audio_sha256: str, language: str | None, net_err: Exception
+    ) -> dict:
+        worker = self.active_local_worker.worker
+        code, job_data = worker.submit(audio_bytes, audio_sha256, language=language)
+        if code not in (200, 202):
+            raise ToolError(f"Local worker rejected job: {job_data}") from net_err
+        job_id = job_data["job_id"]
+        for _ in range(120):
+            st_job = worker.get(job_id)
+            if st_job and st_job.get("status") == "complete":
+                return self._transcription_result(job_id, st_job)
+            if st_job and st_job.get("status") in ("failed", "interrupted"):
+                raise ToolError(f"Local worker job failed: {st_job.get('error')}") from net_err
+            await asyncio.sleep(0.5)
+        raise ToolError("Local worker job timed out.") from net_err
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         if task_id:
