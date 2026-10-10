@@ -155,8 +155,17 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
 
-        # 2. Simulate task Offered on-chain
-        self.mock_escrow.get_task.return_value = {"task_id": task_id, "state": "Offered"}
+        # 2. Simulate task Offered on-chain with matching terms
+        import time
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
 
         # 3. Deploy with escrow
         dep_result = await self.call("deploy_with_escrow", {"task_id": task_id})
@@ -183,6 +192,51 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["active"])
         self.assertFalse(status["is_expired"])
         self.assertGreater(status["remaining_seconds"], 3500)
+
+    async def test_deploy_with_escrow_fails_on_terms_mismatch(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+        import time
+
+        # Amount mismatch
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": 999,
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": task_id})
+        self.assertIn("does not match proposal", str(ctx.exception))
+
+        # Recipient mismatch
+        self.mock_escrow.get_task.return_value["amount"] = proposal["amount"]
+        self.mock_escrow.get_task.return_value["recipient"] = "0x" + "99" * 20
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": task_id})
+        self.assertIn("does not match proposal", str(ctx.exception))
+
+    async def test_deploy_with_escrow_fails_if_settlement_reverts(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+        import time
+
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+        self.mock_escrow.settle_mock.side_effect = RuntimeError("execution reverted: InvalidAuthorization")
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": task_id})
+        self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
 
 
 if __name__ == "__main__":

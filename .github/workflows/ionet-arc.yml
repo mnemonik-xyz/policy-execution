@@ -5,6 +5,8 @@ on:
     paths:
       - 'showcases/ionet_arc/**'
       - 'scripts/ionet-showcase.py'
+      - 'scripts/ionet-mcp-server.py'
+      - 'scripts/warrant-transcription-client.py'
       - '.github/workflows/ionet-arc.yml'
   workflow_dispatch:
 
@@ -23,5 +25,10 @@ jobs:
       - run: pip install -r showcases/ionet_arc/requirements.txt
       - name: Exercise budgets, recovery, payment validation, and HTTP worker
         run: python -m unittest showcases.ionet_arc.test_pilot -v
+      - name: Warrant transcription MCP server unit tests
+        run: python -m unittest showcases.ionet_arc.test_warrant_transcription -v
       - name: Check CLI imports
-        run: python scripts/ionet-showcase.py --help
+        run: |
+          python scripts/ionet-showcase.py --help
+          python scripts/ionet-mcp-server.py --help
+          python scripts/warrant-transcription-client.py --help

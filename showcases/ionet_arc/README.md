@@ -179,6 +179,11 @@ For offline dry runs without io.net API keys, add `--mock-ionet`. If `--rpc-url`
 a local Anvil instance (`http://127.0.0.1:8545`), the server automatically deploys local test
 escrow contracts.
 
+> [!NOTE]
+> Settlement in the local MCP demo uses mock journal verification (`settle_mock`). For production
+> settlement on Arc Testnet with `RiscZeroGroth16Verifier`, a cryptographic Groth16 seal must
+> be generated via the RISC0 prover (e.g., Bonsai) matching the guest image ID.
+
 ### 4. Run the autonomous client agent
 
 In a separate terminal, launch the autonomous client agent with an audio file (e.g. `./adv.mp3`):

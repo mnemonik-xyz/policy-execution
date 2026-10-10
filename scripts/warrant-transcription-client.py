@@ -13,27 +13,18 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-
-def find_binary(name: str) -> str:
-    found = shutil.which(name)
-    if found:
-        return found
-    fallback = Path.home() / ".foundry" / "bin" / name
-    if fallback.exists():
-        return str(fallback)
-    return name
+from showcases.ionet_arc.escrow import find_binary
 
 
 def run_cmd(*args, cwd=ROOT):

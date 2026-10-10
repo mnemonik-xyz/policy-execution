@@ -1,4 +1,5 @@
 """Escrow contract interactions, journal encoding, and settlement logic for Warrant."""
+import functools
 import hashlib
 import json
 import os
@@ -110,6 +111,7 @@ class EthRpc:
         return int(block["timestamp"], 16)
 
 
+@functools.lru_cache(maxsize=16)
 def find_binary(name: str) -> str:
     found = shutil.which(name)
     if found:
