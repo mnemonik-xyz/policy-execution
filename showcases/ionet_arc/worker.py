@@ -8,7 +8,6 @@ is operational evidence, not a zkVM proof of transcription correctness.
 import contextlib
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import os
@@ -185,7 +184,6 @@ class Worker:
         self.root.mkdir(parents=True, exist_ok=True)
         self.engine, self.model_dir = engine, model_dir
         self.lock = threading.Lock()
-        self.run_lock = threading.Lock()
         self._closed = False
         self._queue: queue.Queue = queue.Queue()
         self.jobs = self.load_jobs()
@@ -235,14 +233,6 @@ class Worker:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    @property
-    def job(self) -> dict[str, Any] | None:
-        """Compatibility view for callers of the original single-job worker."""
-        with self.lock:
-            if len(self.jobs) == 1:
-                return next(iter(self.jobs.values())).copy()
-            return None
-
     def load_jobs(self) -> dict[str, dict[str, Any]]:
         state = self.root / "jobs.json"
         if state.exists():
@@ -251,18 +241,7 @@ class Worker:
             except (json.JSONDecodeError, OSError) as exc:
                 LOGGER.warning("Could not read %s, starting fresh: %s", state, exc)
                 return {}
-        # Upgrade state written by the original single-job pilot without rerunning it.
-        legacy = self.root / "job.json"
-        if not legacy.exists():
-            return {}
-        try:
-            job = json.loads(legacy.read_text())
-            job_id = job["input_sha256"]
-            job["job_id"] = job_id
-            return {job_id: job}
-        except (json.JSONDecodeError, KeyError, OSError) as exc:
-            LOGGER.warning("Could not read legacy state %s: %s", legacy, exc)
-            return {}
+        return {}
 
     def persist(self) -> None:
         fd, name = tempfile.mkstemp(dir=self.root)
@@ -314,68 +293,56 @@ class Worker:
         )
         return 202, job
 
-    def _call_engine(self, audio: Path, language: str | None = None) -> Any:
-        try:
-            sig = inspect.signature(self.engine)
-            if "language" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                return self.engine(audio, self.model_dir, language=language)
-        except (ValueError, TypeError):
-            pass
-        return self.engine(audio, self.model_dir)
-
     def run(self, job_id: str, audio: str | Path, language: str | None = None) -> None:
         audio_path = Path(audio)
-        with self.run_lock:
-            with self.lock:
-                self.jobs[job_id]["status"] = "running"
-                self.persist()
-            log_event("job_started", job_id=job_id, gpu=gpu_metrics())
-            started = time.monotonic()
-            telemetry_stop = threading.Event()
-            telemetry = threading.Thread(
-                target=self.log_running_gpu_metrics,
-                args=(job_id, telemetry_stop),
-                daemon=True,
-            )
+        with self.lock:
+            self.jobs[job_id]["status"] = "running"
+            self.persist()
+        log_event("job_started", job_id=job_id, gpu=gpu_metrics())
+        started = time.monotonic()
+        telemetry_stop = threading.Event()
+        telemetry = threading.Thread(
+            target=self.log_running_gpu_metrics,
+            args=(job_id, telemetry_stop),
+            daemon=True,
+        )
+        try:
+            telemetry.start()
             try:
-                telemetry.start()
-                try:
-                    output = self._call_engine(audio_path, language=language)
-                    result_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-                    update = {
-                        "status": "complete",
-                        "result": output,
-                        "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
-                        "elapsed_seconds": time.monotonic() - started,
-                    }
-                except Exception as exc:
-                    LOGGER.exception("Transcription error for job %s: %s", job_id, exc)
-                    update = {"status": "failed", "error": "Transcription failed"}
-                finally:
-                    telemetry_stop.set()
-                    telemetry.join(timeout=3)
+                output = self.engine(audio_path, self.model_dir, language=language)
+                result_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                update = {
+                    "status": "complete",
+                    "result": output,
+                    "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+            except Exception as exc:
+                LOGGER.exception("Transcription error for job %s: %s", job_id, exc)
+                update = {"status": "failed", "error": "Transcription failed"}
             finally:
-                if not os.getenv("WARRANT_KEEP_INPUTS"):
-                    try:
-                        if audio_path.exists():
-                            audio_path.unlink()
-                    except OSError as exc:
-                        LOGGER.warning("Failed to remove input audio %s: %s", audio_path, exc)
+                telemetry_stop.set()
+                telemetry.join(timeout=3)
+        finally:
+            if not os.getenv("WARRANT_KEEP_INPUTS"):
+                try:
+                    if audio_path.exists():
+                        audio_path.unlink()
+                except OSError as exc:
+                    LOGGER.warning("Failed to remove input audio %s: %s", audio_path, exc)
 
-            with self.lock:
-                self.jobs[job_id].update(update)
-                self.persist()
-            if update["status"] == "complete":
-                log_event(
-                    "job_completed",
-                    job_id=job_id,
-                    elapsed_seconds=update["elapsed_seconds"],
-                    gpu=gpu_metrics(),
-                )
-            else:
-                log_event("job_failed", job_id=job_id, gpu=gpu_metrics())
+        with self.lock:
+            self.jobs[job_id].update(update)
+            self.persist()
+        if update["status"] == "complete":
+            log_event(
+                "job_completed",
+                job_id=job_id,
+                elapsed_seconds=update["elapsed_seconds"],
+                gpu=gpu_metrics(),
+            )
+        else:
+            log_event("job_failed", job_id=job_id, gpu=gpu_metrics())
 
     def log_running_gpu_metrics(self, job_id: str, stop: threading.Event) -> None:
         while not stop.wait(gpu_log_interval()):
@@ -405,14 +372,7 @@ def _handle_get(request: BaseHTTPRequestHandler, worker: Worker) -> None:
             return request.reply(404, {"error": "not found"})
         job = worker.get(job_id)
         return request.reply(200, job) if job else request.reply(404, {"error": "not found"})
-    if parsed.path != "/job":
-        return request.reply(404, {"error": "not found"})
-    jobs = worker.list()
-    if not jobs:
-        return request.reply(200, {"status": "empty"})
-    if len(jobs) == 1:
-        return request.reply(200, jobs[0])
-    return request.reply(400, {"error": "job_id required; use GET /job/<job_id> or GET /jobs"})
+    return request.reply(404, {"error": "not found"})
 
 
 def _handle_post(request: BaseHTTPRequestHandler, worker: Worker) -> None:

@@ -117,7 +117,7 @@ class WorkerExecutionTests(unittest.TestCase):
             self.assertEqual(executed_order, [audio1, audio2])
 
     def test_audio_cleanup_on_completion_and_failure(self):
-        def failing_engine(audio, model_dir):
+        def failing_engine(audio, model_dir, language=None):
             raise RuntimeError("transcription failed intentionally")
 
         with Worker(self.root, self.token, engine=failing_engine) as worker:
@@ -137,7 +137,7 @@ class WorkerExecutionTests(unittest.TestCase):
             self.assertFalse(audio_path.exists(), "Temporary audio must be unlinked after job ends")
 
     def test_warrant_keep_inputs_preserves_audio(self):
-        def echo_engine(audio, model_dir):
+        def echo_engine(audio, model_dir, language=None):
             return {"language": "en", "segments": []}
 
         with patch.dict(os.environ, {"WARRANT_KEEP_INPUTS": "1"}):
@@ -158,7 +158,7 @@ class WorkerExecutionTests(unittest.TestCase):
     def test_duplicate_submission_does_not_reprocess(self):
         call_count = 0
 
-        def count_engine(audio, model_dir):
+        def count_engine(audio, model_dir, language=None):
             nonlocal call_count
             call_count += 1
             return {"language": "en", "segments": []}

@@ -332,7 +332,7 @@ class WorkerTests(unittest.TestCase):
         self.calls = []
         self.done = threading.Event()
 
-        def engine(audio, model_dir):
+        def engine(audio, model_dir, language=None):
             self.calls.append(audio.read_bytes())
             self.done.set()
             return {"language": "en", "segments": [{"start": 0, "end": 1, "text": "test fixture"}]}
@@ -391,7 +391,7 @@ class WorkerTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(second_result["status"], "complete")
-        self.assertEqual(self.request("/job")[0], 400)
+        self.assertEqual(self.request("/job")[0], 404)
         code, listing = self.request("/jobs")
         self.assertEqual(code, 200)
         self.assertEqual({job["job_id"] for job in listing["jobs"]}, {first["job_id"], second["job_id"]})

@@ -239,7 +239,7 @@ class WarrantTranscriptionService:
         escrow_client: EscrowClient,
         use_mock_ionet: bool,
         local_server: bool = False,
-        ssh_host: str = "petertower",
+        ssh_host: str = "localhost",
         worker_url: str | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
@@ -254,7 +254,6 @@ class WarrantTranscriptionService:
         self.ssh_host = ssh_host
         self.worker_url = worker_url
         self.local_mock_workers: dict[str, LocalMockWorker] = {}
-        self.active_local_worker = None
         self._ssh_container_started = False
         if self.local_server:
             atexit.register(self._cleanup_ssh_container)
@@ -264,7 +263,6 @@ class WarrantTranscriptionService:
         for worker in list(self.local_mock_workers.values()):
             worker.stop()
         self.local_mock_workers.clear()
-        self.active_local_worker = None
 
     def _cleanup_ssh_container(self):
         if self.local_server and self._ssh_container_started:
@@ -551,7 +549,6 @@ class WarrantTranscriptionService:
             worker_data = self.state_dir / "worker_data" / task_id
             mock_worker = LocalMockWorker(worker_data, worker_token)
             self.local_mock_workers[task_id] = mock_worker
-            self.active_local_worker = mock_worker
             return mock_worker.start()
 
         duration = proposal.get("duration_hours", 1)
@@ -802,7 +799,6 @@ class WarrantTranscriptionService:
     ) -> dict:
         try:
             session = self._active_session(task_id)
-            target_task_id = session.get("task_id", task_id)
             public_url = session["public_url"]
             worker_token = session.get("worker_token")
 
@@ -841,42 +837,9 @@ class WarrantTranscriptionService:
                     poll_headers = {"Authorization": f"Bearer {worker_token}"}
                     return await self._poll_transcription(client, poll_url, poll_headers, job_id)
             except (httpx2.HTTPError, OSError) as net_err:
-                # Direct in-process worker fallback for sandboxed/mock testbeds
-                local_worker = (
-                    self.local_mock_workers.get(target_task_id) if target_task_id else None
-                ) or self.active_local_worker
-                if local_worker and getattr(local_worker, "worker", None):
-                    return await self._transcribe_with_local_worker(
-                        audio_bytes, audio_sha256, language, net_err, local_worker=local_worker
-                    )
                 raise ToolError(f"Worker connection failed: {net_err}") from net_err
         except Exception as exc:
             raise safe_tool_error(exc) from None
-
-    async def _transcribe_with_local_worker(
-        self,
-        audio_bytes: bytes,
-        audio_sha256: str,
-        language: str | None,
-        net_err: Exception,
-        local_worker: LocalMockWorker | None = None,
-    ) -> dict:
-        lw = local_worker or self.active_local_worker
-        if not lw or not getattr(lw, "worker", None):
-            raise ToolError(f"Worker connection failed: {net_err}") from net_err
-        worker = lw.worker
-        code, job_data = worker.submit(audio_bytes, audio_sha256, language=language)
-        if code not in (200, 202):
-            raise ToolError(f"Local worker rejected job: {job_data}") from net_err
-        job_id = job_data["job_id"]
-        try:
-            return await self._poll_job_status(
-                lambda: worker.get(job_id),
-                job_id,
-                timeout_error="Local worker job timed out.",
-            )
-        except ToolError as exc:
-            raise ToolError(str(exc)) from net_err
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         session = self._lookup_session(task_id)
@@ -913,7 +876,7 @@ class ServerConfig:
     server_account: str | None = None
     mock_ionet: bool = False
     local_server: bool = False
-    ssh_host: str = "petertower"
+    ssh_host: str = "localhost"
     worker_url: str | None = None
 
     def __post_init__(self):
@@ -1099,16 +1062,15 @@ def main():
     )
     parser.add_argument(
         "--local-server",
-        "--ssh-deploy",
         dest="local_server",
         action="store_true",
-        default=os.environ.get("LOCAL_SERVER", os.environ.get("SSH_DEPLOY", "")).lower() in ("1", "true"),
+        default=os.environ.get("LOCAL_SERVER", "").lower() in ("1", "true"),
         help="Deploy container to local/remote server via SSH instead of live io.net CaaS",
     )
     parser.add_argument(
         "--ssh-host",
-        default=os.environ.get("SSH_HOST", "petertower"),
-        help="SSH host target for container deployment (default: petertower)",
+        default=os.environ.get("SSH_HOST", "localhost"),
+        help="SSH host target for container deployment (default: localhost)",
     )
     parser.add_argument(
         "--worker-url",
