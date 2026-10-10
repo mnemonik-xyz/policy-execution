@@ -166,7 +166,7 @@ Record the deployed contract addresses from Foundry output:
 Start the MCP daemon configured with your Arc Testnet addresses and `IO_NET_API_KEY`:
 
 ```sh
-.venv/bin/python scripts/ionet-mcp-server.py \
+.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
   --rpc-url https://rpc.testnet.arc.io \
   --escrow-address <DEPLOYED_TASK_ESCROW> \

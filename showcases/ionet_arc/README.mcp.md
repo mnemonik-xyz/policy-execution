@@ -20,7 +20,7 @@ can be called repeatedly.
 Start the daemon from the repository root:
 
 ```sh
-.venv/bin/python scripts/ionet-mcp-server.py \
+.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
   --rpc-url http://127.0.0.1:8545 \
   --auth-user <USER> --auth-pass <PASS>
@@ -29,7 +29,7 @@ Start the daemon from the repository root:
 For local testing without io.net API credentials, pass `--mock-ionet`:
 
 ```sh
-.venv/bin/python scripts/ionet-mcp-server.py \
+.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 127.0.0.1 --port 8000 \
   --rpc-url http://127.0.0.1:8545 \
   --mock-ionet

@@ -6,7 +6,7 @@ description: Guide and verified call formats for the Warrant io.net transcriptio
 # Warrant io.net Audio Transcription MCP Skill
 
 Guidelines and verified call formats for driving the Warrant audio transcription MCP server
-(`scripts/ionet-mcp-server.py`).
+(`showcases/ionet_arc/seller_mcp_server.py`).
 
 ## Core Principles
 

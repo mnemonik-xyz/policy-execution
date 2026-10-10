@@ -241,14 +241,16 @@ def main():
     parser.add_argument(
         "--audio",
         type=Path,
-        default=ROOT / "adv.mp3",
-        help="Audio file to transcribe (default: adv.mp3)",
+        default=ROOT / "adv.mp3" if (ROOT / "adv.mp3").exists() else None,
+        help="Audio file to transcribe (e.g. sample.mp3)",
     )
     parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
     parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
     parser.add_argument("--max-budget", type=float, default=1.00, help="Max budget ceiling in USDC (default: 1.00)")
     args = parser.parse_args()
 
+    if not args.audio:
+        sys.exit("Error: Please provide an audio file with --audio <path_to_audio>.")
     if not args.audio.exists():
         sys.exit(f"Error: audio file '{args.audio}' does not exist.")
 

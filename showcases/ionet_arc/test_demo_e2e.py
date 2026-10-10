@@ -1,5 +1,5 @@
 """End-to-end demonstration test running Anvil, MCP Server, and Client Agent."""
-import asyncio
+from showcases.ionet_arc.escrow import find_binary
 import os
 from pathlib import Path
 import shutil
@@ -13,9 +13,7 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / ".venv" / "bin" / "python"
-ADV_AUDIO = ROOT / "adv.mp3"
 
-from showcases.ionet_arc.escrow import find_binary
 
 os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
@@ -30,7 +28,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.anvil_port = s.getsockname()[1]
         cls.rpc_url = f"http://127.0.0.1:{cls.anvil_port}"
         cls.anvil_proc = subprocess.Popen(
-            [find_binary("anvil"), "--host", "127.0.0.1", "--port", str(cls.anvil_port), "--chain-id", "31337", "--silent"],
+            [find_binary("anvil"), "--host", "127.0.0.1", "--port",
+             str(cls.anvil_port), "--chain-id", "31337", "--silent"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -38,7 +37,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         # Wait for anvil
         for _ in range(50):
             try:
-                res = subprocess.run([find_binary("cast"), "chain-id", "--rpc-url", cls.rpc_url], capture_output=True, text=True)
+                res = subprocess.run([find_binary("cast"), "chain-id", "--rpc-url",
+                                     cls.rpc_url], capture_output=True, text=True)
                 if res.returncode == 0 and res.stdout.strip() == "31337":
                     break
             except Exception:
@@ -54,10 +54,12 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.mcp_port = s.getsockname()[1]
         cls.mcp_url = f"http://127.0.0.1:{cls.mcp_port}/mcp"
         cls.tmp_dir = tempfile.mkdtemp(prefix="warrant-state-")
+        cls.test_audio = Path(cls.tmp_dir) / "test_sample.mp3"
+        cls.test_audio.write_bytes(b"mock sample audio bytes for autonomous transcription pilot")
 
         cmd = [
             str(PYTHON),
-            str(ROOT / "scripts" / "ionet-mcp-server.py"),
+            str(ROOT / "showcases" / "ionet_arc" / "seller_mcp_server.py"),
             "--host", "127.0.0.1",
             "--port", str(cls.mcp_port),
             "--state-dir", cls.tmp_dir,
@@ -105,7 +107,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             str(ROOT / "scripts" / "warrant-transcription-client.py"),
             "--mcp-url", self.mcp_url,
             "--rpc-url", self.rpc_url,
-            "--audio", str(ADV_AUDIO),
+            "--audio", str(self.test_audio),
         ]
         res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env)
         print("CLIENT OUTPUT:\n", res.stdout)

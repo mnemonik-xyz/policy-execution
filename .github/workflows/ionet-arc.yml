@@ -5,7 +5,6 @@ on:
     paths:
       - 'showcases/ionet_arc/**'
       - 'scripts/ionet-showcase.py'
-      - 'scripts/ionet-mcp-server.py'
       - 'scripts/warrant-transcription-client.py'
       - '.github/workflows/ionet-arc.yml'
   workflow_dispatch:
@@ -30,5 +29,5 @@ jobs:
       - name: Check CLI imports
         run: |
           python scripts/ionet-showcase.py --help
-          python scripts/ionet-mcp-server.py --help
+          python -m showcases.ionet_arc.seller_mcp_server --help
           python scripts/warrant-transcription-client.py --help

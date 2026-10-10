@@ -11,7 +11,7 @@ from showcases.ionet_arc.escrow import (
     DEFAULT_CATEGORY,
     encode_journal,
 )
-from showcases.ionet_arc.server import (
+from showcases.ionet_arc.seller_mcp_server import (
     create_server,
     filter_suitable_gpus,
 )
@@ -40,7 +40,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.settle_mock.return_value = {"transactionHash": "0x" + "aa" * 32}
 
         # Create server with mock EscrowClient and mock_ionet=True
-        with patch("showcases.ionet_arc.server.EscrowClient", return_value=self.mock_escrow):
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             self.mcp = create_server(self.state_dir, mock_ionet=True)
 
     async def call(self, tool_name: str, arguments: dict = None) -> dict:
@@ -266,7 +266,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_server_ssh_deployment_success(self):
         # Create server with local_server=True
-        with patch("showcases.ionet_arc.server.EscrowClient", return_value=self.mock_escrow):
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
                 mock_ionet=True,
@@ -330,7 +330,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-transcription"])
 
     async def test_local_server_ssh_deployment_run_failure(self):
-        with patch("showcases.ionet_arc.server.EscrowClient", return_value=self.mock_escrow):
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
                 mock_ionet=True,
