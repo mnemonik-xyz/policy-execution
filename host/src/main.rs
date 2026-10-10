@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use risc0_zkvm::sha::{Digest, Digestible};
+use risc0_zkvm::sha::{Digest, Digestible, Sha256};
 use risc0_zkvm::{
     default_executor, default_prover, ExecutorEnv, InnerReceipt, ProverOpts, Receipt,
 };
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
     );
     let args: Vec<String> = std::env::args().collect();
     ensure!(
-        args.len() >= 2 && (args[1].ends_with("image-id") || args.len() >= 3),
+        args.len() >= 2 && (args[1].ends_with("image-id") || args[1] == "invoice-build-info" || args.len() >= 3),
         "Usage: warrant-host [invoice-|solver-]image-id | [invoice-|solver-]evaluate|execute|prove input.json [receipt.bin] | invoice-sign signer-key.hex policy.json rpc-url request.json output.json | verify receipt.bin | wrap receipt.bin output.bin | export-evm receipt.bin output.json"
     );
     match args[1].as_str() {
@@ -171,6 +171,24 @@ fn main() -> Result<()> {
             "0x{}",
             hex::encode(Digest::from(WARRANT_INVOICE_GUEST_ID).as_bytes())
         ),
+        "invoice-build-info" => {
+            let computed = risc0_zkvm::compute_image_id(WARRANT_INVOICE_GUEST_ELF)?;
+            ensure!(
+                computed == Digest::from(WARRANT_INVOICE_GUEST_ID),
+                "Embedded invoice image mismatch"
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "guest": "warrant-invoice-guest",
+                    "imageId": format!("0x{}", hex::encode(computed.as_bytes())),
+                    "elfSha256": hex::encode(risc0_zkvm::sha::Impl::hash_bytes(WARRANT_INVOICE_GUEST_ELF).as_bytes()),
+                    "journalSchema": "warrant/invoice-journal/v1",
+                    "journalBytes": 480,
+                    "checkerVersion": warrant_policy::evidence::CHECKER_VERSION,
+                })
+            );
+        }
         "invoice-sign" => {
             // Signer mode: the buyer-run service evaluates natively and signs the
             // journal for InvoiceEscrow.settleSigned. It holds the policy and the

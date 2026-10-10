@@ -62,6 +62,16 @@ They do not touch the invoice `Rule`, so the invoice guest image id is unchanged
   checks S1 to S25 and S27, Bitcoin, EVM and Solana primitives, the policy DSL
   and warrant payloads (144 tests; every check caught when disabled).
 
+## Strict proof-only invoices (2026-10-09)
+
+`ProofInvoiceEscrow` rejects signature and buyer-approval bypasses. Escrows created
+by one `ProofInvoiceFactory` share customer obligation consumption across guest
+image changes. The invoice runtime uses verified payment-field construction,
+validity intersection and currency conversion in addition to the policy evaluator.
+See [assurance scope and release gates](formal-payment-assurance.md) for the exact
+Verus and symbolic Solidity properties, reproducible commands and remaining gaps.
+This work is not an end-to-end formal certification or production approval.
+
 ## Multi-currency invoices (2026-10-08)
 
 Implements [multi-currency invoices](../multi-currency/spec.md). Invoices in USD,

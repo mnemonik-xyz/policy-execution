@@ -1,5 +1,12 @@
 # Warrant payment contracts
 
+- `src/ProofInvoiceEscrow.sol` and `src/ProofInvoiceFactory.sol`: strict proof-only
+  settlement and replay protection shared by a factory's escrows. See the
+  [assurance scope and candidate release workflow](../formal-payment-assurance.md).
+  `WARRANT_PROOF_ONLY=true` selects a **new** factory in `DeployInvoice.s.sol`.
+  To retain replay history when changing the guest, use the existing factory's
+  `createEscrow(imageId)` instead. Customer approval of the image remains required.
+
 - `src/PolicyExecutionVault.sol`: customer-controlled, revocable spending delegation.
 - `src/TaskEscrow.sol`: funded fixed-price agreements, locked when the recipient accepts.
 - `src/InvoiceEscrow.sol`: funded purchase orders settled by proven, signed or

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.24;
 import {InvoiceEscrow} from "../src/InvoiceEscrow.sol";
+import {ProofInvoiceEscrow} from "../src/ProofInvoiceEscrow.sol";
+import {ProofInvoiceFactory} from "../src/ProofInvoiceFactory.sol";
 import {RiscZeroGroth16Verifier} from "../vendor/risc0/contracts/src/groth16/RiscZeroGroth16Verifier.sol";
 import {ControlID} from "../vendor/risc0/contracts/src/groth16/ControlID.sol";
 
 interface DeployInvoiceVm {
     function envAddress(string calldata) external returns (address);
     function envBytes32(string calldata) external returns (bytes32);
+    function envOr(string calldata, bool) external returns (bool);
     function startBroadcast() external;
     function stopBroadcast() external;
 }
@@ -19,10 +22,16 @@ contract DeployInvoice {
     function run() external returns (RiscZeroGroth16Verifier verifier, InvoiceEscrow escrow) {
         address token = vm.envAddress("WARRANT_TOKEN");
         bytes32 imageId = vm.envBytes32("WARRANT_IMAGE_ID");
+        bool proofOnly = vm.envOr("WARRANT_PROOF_ONLY", false);
         // Signers, allowances and proof thresholds are chosen per order at offer time.
         vm.startBroadcast();
         verifier = new RiscZeroGroth16Verifier(ControlID.CONTROL_ROOT, ControlID.BN254_CONTROL_ID);
-        escrow = new InvoiceEscrow(token, address(verifier), imageId);
+        if (proofOnly) {
+            ProofInvoiceFactory factory = new ProofInvoiceFactory(token, address(verifier));
+            escrow = factory.createEscrow(imageId);
+        } else {
+            escrow = new InvoiceEscrow(token, address(verifier), imageId);
+        }
         vm.stopBroadcast();
         emit Deployment(address(verifier), address(escrow), token, imageId, block.chainid);
     }

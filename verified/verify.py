@@ -60,6 +60,11 @@ def main():
                                      "None => {},\n                    Some(true) => {},"),
         "unknown line label ignored": ("None => {\n                unknown = true;\n            },", "None => {},"),
         "ask becomes allow": ("None => Decision::Ask,", "None => Decision::Allow,"),
+        "payment amount substitution": ("amount: facts.amount,", "amount: 1,"),
+        "payment recipient substitution": ("recipient: facts.recipient,", "recipient: [0; 20],"),
+        "payment window widening": ("valid_until: until,", "valid_until: u64::MAX,"),
+        "window intersection widening": ("if a1 <= b1 { a1 } else { b1 })", "if a1 >= b1 { a1 } else { b1 })"),
+        "conversion truncation": ("Some(amount as u64)", "Some(1)"),
     }
     with tempfile.TemporaryDirectory(prefix="warrant-verus-mutations-") as directory:
         for name, (before, after) in mutations.items():

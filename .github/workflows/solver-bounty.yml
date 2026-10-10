@@ -22,7 +22,7 @@ jobs:
     # Adding a label must not re-run the fast tests.
     if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and prover
@@ -46,9 +46,30 @@ jobs:
           cargo test --locked -p warrant-policy -p warrant-solver
           forge test --root contracts
       - name: Guest execution agrees with native checks
-        run: cargo test --release --locked -p warrant-host --test solver_execution
+        run: cargo test --release --locked -p warrant-host --test solver_execution --test execution --test tooling
       - name: Canary script guard tests
         run: python3 scripts/test_solver_canary.py
+      - name: Invoice release gate tests
+        run: python3 scripts/test_proof_release.py
+      - name: Invoice formal checks
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip \
+            --output /tmp/verus.zip
+          echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  /tmp/verus.zip' | sha256sum --check
+          unzip -q /tmp/verus.zip -d /tmp/warrant-verus
+          python3 verified/verify.py --verus /tmp/warrant-verus/verus-x86-linux/verus --mutations
+          python3 -m venv /tmp/warrant-formal
+          /tmp/warrant-formal/bin/pip install halmos==0.3.3
+          FOUNDRY_PROFILE=formal /tmp/warrant-formal/bin/python scripts/run-halmos.py \
+            --root contracts --forge-build-out out-formal --contract ProofInvoiceEscrowTest \
+            --solver z3 --solver-timeout-assertion 30000 --json-output /tmp/invoice-symbolic.json
+          python3 - <<'PY'
+          import json, runpy
+          release = runpy.run_path('scripts/proof-release.py')
+          with open('/tmp/invoice-symbolic.json') as report:
+              release['validate_symbolic'](json.load(report))
+          PY
 
   solver-proof:
     if: >-
