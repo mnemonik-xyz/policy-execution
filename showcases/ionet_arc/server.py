@@ -1,5 +1,6 @@
 """Streamable HTTP MCP server for Warrant GPU transcription on io.net CaaS."""
 import asyncio
+import atexit
 import base64
 import hashlib
 from http.server import ThreadingHTTPServer
@@ -284,6 +285,9 @@ class WarrantTranscriptionService:
         state_dir: pathlib.Path,
         escrow_client: EscrowClient,
         use_mock_ionet: bool,
+        local_server: bool = False,
+        ssh_host: str = "petertower",
+        worker_url: str | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +297,25 @@ class WarrantTranscriptionService:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.escrow_client = escrow_client
         self.use_mock_ionet = use_mock_ionet
+        self.local_server = local_server
+        self.ssh_host = ssh_host
+        self.worker_url = worker_url
         self.active_local_worker = None
+        self._ssh_container_started = False
+        if self.local_server:
+            atexit.register(self._cleanup_ssh_container)
+
+    def _cleanup_ssh_container(self):
+        if self.local_server and self._ssh_container_started:
+            try:
+                subprocess.run(
+                    ["ssh", self.ssh_host, "docker", "stop", "warrant-transcription"],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                pass
 
     async def list_suitable_hardware(self) -> list[dict]:
         try:
@@ -473,6 +495,64 @@ class WarrantTranscriptionService:
                 raise ToolError(f"Failed to accept TaskEscrow task '{task_id}' on-chain: {e}") from e
 
     async def _provision_container(self, proposal: dict, deployment_id: str, worker_token: str) -> str | None:
+        if self.local_server:
+            # 1. Clean up any existing container on SSH host
+            await asyncio.to_thread(
+                subprocess.run,
+                ["ssh", self.ssh_host, "docker", "rm", "-f", "warrant-transcription"],
+                capture_output=True,
+                check=False,
+            )
+
+            # 2. Start container on SSH host
+            run_cmd = [
+                "ssh",
+                self.ssh_host,
+                "docker", "run", "-d", "--rm",
+                "--name", "warrant-transcription",
+                "--gpus", "all",
+                "-p", "8080:8080",
+                "-e", f"WARRANT_WORKER_TOKEN={worker_token}",
+                PILOT_IMAGE,
+            ]
+            run_res = await asyncio.to_thread(
+                subprocess.run,
+                run_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if run_res.returncode != 0:
+                err_msg = run_res.stderr.strip() or run_res.stdout.strip()
+                raise ToolError(f"Failed to start container on {self.ssh_host}: {err_msg}")
+
+            self._ssh_container_started = True
+
+            # 3. Poll container health endpoint until ready
+            target_url = (self.worker_url or f"http://{self.ssh_host}:8080").rstrip("/")
+            health_url = f"{target_url}/health"
+            req_parsed = urllib.parse.urlsplit(target_url)
+            trust_env = req_parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+
+            ready = False
+            for _ in range(30):
+                await asyncio.sleep(1)
+                try:
+                    async with httpx2.AsyncClient(timeout=3.0, trust_env=trust_env) as client:
+                        resp = await client.get(health_url)
+                        if resp.status_code == 200:
+                            ready = True
+                            break
+                except Exception:
+                    pass
+
+            if not ready:
+                raise ToolError(
+                    f"Container on {self.ssh_host} failed to become healthy at {health_url} within 30 seconds."
+                )
+
+            return target_url
+
         if self.use_mock_ionet:
             if self.active_local_worker:
                 self.active_local_worker.stop()
@@ -772,6 +852,9 @@ def create_server(
     verifier_address: str | None = None,
     server_account: str | None = None,
     mock_ionet: bool = False,
+    local_server: bool = False,
+    ssh_host: str = "petertower",
+    worker_url: str | None = None,
 ) -> MCPServer:
     """Create and configure the Warrant Transcription MCP server."""
     server = MCPServer("warrant-transcription")
@@ -790,6 +873,9 @@ def create_server(
         state_dir=state_dir,
         escrow_client=escrow_client,
         use_mock_ionet=use_mock_ionet,
+        local_server=local_server,
+        ssh_host=ssh_host,
+        worker_url=worker_url,
     )
 
     server.tool(
@@ -844,6 +930,9 @@ def create_app(
     verifier_address: str | None = None,
     server_account: str | None = None,
     mock_ionet: bool = False,
+    local_server: bool = False,
+    ssh_host: str = "petertower",
+    worker_url: str | None = None,
 ):
     """Build ASGI app with streamable HTTP transport and basic auth."""
     server = create_server(
@@ -854,6 +943,9 @@ def create_app(
         verifier_address=verifier_address,
         server_account=server_account,
         mock_ionet=mock_ionet,
+        local_server=local_server,
+        ssh_host=ssh_host,
+        worker_url=worker_url,
     )
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = server.streamable_http_app(transport_security=sec)
@@ -876,6 +968,9 @@ def run_server(
     verifier_address: str | None = None,
     server_account: str | None = None,
     mock_ionet: bool = False,
+    local_server: bool = False,
+    ssh_host: str = "petertower",
+    worker_url: str | None = None,
 ):
     """Run MCP server with uvicorn."""
     app = create_app(
@@ -888,5 +983,8 @@ def run_server(
         verifier_address=verifier_address,
         server_account=server_account,
         mock_ionet=mock_ionet,
+        local_server=local_server,
+        ssh_host=ssh_host,
+        worker_url=worker_url,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

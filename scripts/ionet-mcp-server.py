@@ -71,6 +71,24 @@ def main():
         default=os.environ.get("MOCK_IONET", "").lower() in ("1", "true"),
         help="Run using local mock worker instead of live io.net CaaS",
     )
+    parser.add_argument(
+        "--local-server",
+        "--ssh-deploy",
+        dest="local_server",
+        action="store_true",
+        default=os.environ.get("LOCAL_SERVER", os.environ.get("SSH_DEPLOY", "")).lower() in ("1", "true"),
+        help="Deploy container to local/remote server via SSH instead of live io.net CaaS",
+    )
+    parser.add_argument(
+        "--ssh-host",
+        default=os.environ.get("SSH_HOST", "petertower"),
+        help="SSH host target for container deployment (default: petertower)",
+    )
+    parser.add_argument(
+        "--worker-url",
+        default=os.environ.get("WORKER_URL"),
+        help="HTTP URL for the deployed worker (default: http://<ssh-host>:8080)",
+    )
     args = parser.parse_args()
 
     run_server(
@@ -85,6 +103,9 @@ def main():
         verifier_address=args.verifier_address,
         server_account=args.server_account,
         mock_ionet=args.mock_ionet,
+        local_server=args.local_server,
+        ssh_host=args.ssh_host,
+        worker_url=args.worker_url,
     )
 
 

@@ -264,6 +264,109 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             # Escrow settlement MUST NOT be called if container is not ready
             self.mock_escrow.settle_mock.assert_not_called()
 
+    async def test_local_server_ssh_deployment_success(self):
+        # Create server with local_server=True
+        with patch("showcases.ionet_arc.server.EscrowClient", return_value=self.mock_escrow):
+            local_mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                local_server=True,
+                ssh_host="petertower",
+            )
+
+        async def local_call(tool_name: str, arguments: dict = None) -> dict:
+            res = await local_mcp.call_tool(tool_name, arguments or {})
+            return json.loads(res.content[0].text)
+
+        proposal = await local_call("propose_deployment")
+        task_id = proposal["task_id"]
+        import time
+
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+
+        # Mock subprocess.run for ssh docker calls
+        mock_run_results = [
+            MagicMock(returncode=0),  # rm -f
+            MagicMock(returncode=0, stdout="container-id-123\n", stderr=""),  # run -d
+        ]
+        mock_health_resp = MagicMock(status_code=200)
+
+        with patch("subprocess.run", side_effect=mock_run_results) as mock_subproc, \
+             patch("httpx2.AsyncClient.get", return_value=mock_health_resp):
+            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
+
+            self.assertEqual(dep_res["status"], "deployed")
+            self.assertEqual(dep_res["public_url"], "http://petertower:8080")
+            self.assertEqual(mock_subproc.call_count, 2)
+
+            # Check first call: docker rm -f
+            first_cmd = mock_subproc.call_args_list[0][0][0]
+            self.assertEqual(first_cmd[:5], ["ssh", "petertower", "docker", "rm", "-f"])
+            self.assertEqual(first_cmd[5], "warrant-transcription")
+
+            # Check second call: docker run
+            second_cmd = mock_subproc.call_args_list[1][0][0]
+            self.assertEqual(second_cmd[:5], ["ssh", "petertower", "docker", "run", "-d"])
+            self.assertIn("--gpus", second_cmd)
+            self.assertIn("all", second_cmd)
+            self.assertIn("-p", second_cmd)
+            self.assertIn("8080:8080", second_cmd)
+
+            # Check teardown logic
+            service = local_mcp._tool_manager._tools["deploy_with_escrow"].fn.__self__
+            mock_subproc.reset_mock()
+            mock_subproc.return_value = MagicMock(returncode=0)
+            service._cleanup_ssh_container()
+            mock_subproc.assert_called_once()
+            teardown_cmd = mock_subproc.call_args[0][0]
+            self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-transcription"])
+
+    async def test_local_server_ssh_deployment_run_failure(self):
+        with patch("showcases.ionet_arc.server.EscrowClient", return_value=self.mock_escrow):
+            local_mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                local_server=True,
+                ssh_host="petertower",
+            )
+
+        async def local_call(tool_name: str, arguments: dict = None) -> dict:
+            res = await local_mcp.call_tool(tool_name, arguments or {})
+            return json.loads(res.content[0].text)
+
+        proposal = await local_call("propose_deployment")
+        task_id = proposal["task_id"]
+        import time
+
+        self.mock_escrow.get_task.return_value = {
+            "task_id": task_id,
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": proposal["policy_hash"],
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+
+        mock_run_results = [
+            MagicMock(returncode=0),  # rm -f
+            MagicMock(returncode=1, stderr="docker: permission denied"),  # run failure
+        ]
+
+        with patch("subprocess.run", side_effect=mock_run_results):
+            with self.assertRaises(ToolError) as ctx:
+                await local_call("deploy_with_escrow", {"task_id": task_id})
+            self.assertIn("Failed to start container on petertower", str(ctx.exception))
+            self.assertIn("docker: permission denied", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
