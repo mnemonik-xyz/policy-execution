@@ -78,7 +78,8 @@ The server exposes 5 focused tools:
 
 ## Running the Client Agent Demonstration
 
-The client agent (`scripts/warrant-transcription-client.py`) automates the full client workflow:
+The test client agent (`showcases/ionet_arc/buyer_test_agent.py`) automates the full
+client workflow:
 1. Connects to the server over MCP Streamable HTTP.
 2. Discovers suitable GPUs via `list_suitable_hardware`.
 3. Requests a formal proposal via `propose_deployment`.
@@ -91,10 +92,10 @@ The client agent (`scripts/warrant-transcription-client.py`) automates the full 
 ### Example Run
 
 ```sh
-.venv/bin/python scripts/warrant-transcription-client.py \
+.venv/bin/python -m showcases.ionet_arc.buyer_test_agent \
   --mcp-url http://127.0.0.1:8000/mcp \
   --rpc-url http://127.0.0.1:8545 \
-  --audio ./adv.mp3
+  --audio ./sample.mp3
 ```
 
 ## Running Automated Tests

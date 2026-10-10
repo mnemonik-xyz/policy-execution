@@ -104,7 +104,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         env["NO_PROXY"] = "127.0.0.1,localhost"
         cmd = [
             str(PYTHON),
-            str(ROOT / "scripts" / "warrant-transcription-client.py"),
+            str(ROOT / "showcases" / "ionet_arc" / "buyer_test_agent.py"),
             "--mcp-url", self.mcp_url,
             "--rpc-url", self.rpc_url,
             "--audio", str(self.test_audio),

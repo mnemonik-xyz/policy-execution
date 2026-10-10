@@ -189,10 +189,10 @@ escrow contracts.
 In a separate terminal, launch the autonomous client agent with an audio file (e.g. `./adv.mp3`):
 
 ```sh
-.venv/bin/python scripts/warrant-transcription-client.py \
+.venv/bin/python -m showcases.ionet_arc.buyer_test_agent \
   --mcp-url http://127.0.0.1:8000/mcp \
   --rpc-url https://rpc.testnet.arc.io \
-  --audio ./adv.mp3
+  --audio ./sample.mp3
 ```
 
 The client agent performs the end-to-end flow:

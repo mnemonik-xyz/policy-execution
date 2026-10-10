@@ -5,7 +5,6 @@ on:
     paths:
       - 'showcases/ionet_arc/**'
       - 'scripts/ionet-showcase.py'
-      - 'scripts/warrant-transcription-client.py'
       - '.github/workflows/ionet-arc.yml'
   workflow_dispatch:
 
@@ -30,4 +29,4 @@ jobs:
         run: |
           python scripts/ionet-showcase.py --help
           python -m showcases.ionet_arc.seller_mcp_server --help
-          python scripts/warrant-transcription-client.py --help
+          python -m showcases.ionet_arc.buyer_test_agent --help
