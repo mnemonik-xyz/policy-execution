@@ -1,0 +1,21 @@
+# Warrant io.net Transcription MCP Guidelines
+
+When using the Warrant Transcription MCP servers (Seller & Buyer Guardrail), follow
+the strict lifecycle workflow:
+
+1. Lifecycle workflow:
+   - Discover GPUs: `seller:list_suitable_hardware()`
+   - Request proposal: `seller:propose_deployment(customer_address="<optional>")`
+   - Fund escrow: `buyer:warrant_evaluate_and_offer(proposal)` (local policy check,
+     cryptographic policy hash verification, token approval, and on-chain offer)
+   - Deploy & settle: `seller:deploy_with_escrow(task_id="<task_id>")`
+   - Transcribe audio: `seller:transcribe_audio(audio_path="<path>", language="en")`
+   - Inspect status: `seller:get_deployment_status()` or `buyer:warrant_check_escrow_status()`
+
+2. Key Constraints:
+   - No Destroy Tool: The deployment uses a 1-hour fixed duration (`billing_model: "duration"`)
+     and automatically terminates on io.net. Do not search for or invoke a destroy tool.
+   - Repeated Invocations: While the 1-hour container session is active, `transcribe_audio`
+     can be called repeatedly for multiple audio files.
+   - Hardware Selection: Single GPUs suitable for Whisper are automatically prioritized and
+     sorted by price ascending.
