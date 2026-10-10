@@ -90,10 +90,12 @@ To solve this, the architecture separates the seller's service from the buyer's 
   activates the worker.
 
 - **`transcribe_audio`**:
-  Arguments: `audio_path`, optional `language`.
+  Arguments: `audio_path`, optional `language`, optional `task_id`.
   Transcribes audio on the active 1-hour worker and returns text plus timestamped segments.
+  Optionally provide `task_id` to route to a specific deployment session.
 
 - **`get_deployment_status`**:
+  Arguments: optional `task_id`.
   Inspects worker health, public URL, remaining duration in 1h window, and settlement tx hash.
 
 ---

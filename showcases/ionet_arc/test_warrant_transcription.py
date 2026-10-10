@@ -385,6 +385,68 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Failed to start container on petertower", str(ctx.exception))
             self.assertIn("docker: permission denied", str(ctx.exception))
 
+    async def test_multi_session_concurrency_and_routing(self):
+        import time
+
+        self.mock_escrow.task_id_for.side_effect = lambda customer, salt: f"0x{int(salt, 16):064x}"
+
+        # Generate proposal 1
+        p1 = await self.call("propose_deployment")
+        t1 = p1["task_id"]
+
+        # Generate proposal 2
+        p2 = await self.call("propose_deployment")
+        t2 = p2["task_id"]
+        self.assertNotEqual(t1, t2)
+
+        def mock_get_task(task_id):
+            prop = p1 if task_id == t1 else p2
+            return {
+                "task_id": task_id,
+                "state": "Offered",
+                "amount": prop["amount"],
+                "recipient": prop["recipient"],
+                "policy_hash": prop["policy_hash"],
+                "customer": prop["customer"],
+                "settle_by": int(time.time()) + 86400,
+            }
+
+        self.mock_escrow.get_task.side_effect = mock_get_task
+
+        # Deploy both tasks
+        res1 = await self.call("deploy_with_escrow", {"task_id": t1})
+        self.assertEqual(res1["status"], "deployed")
+        res2 = await self.call("deploy_with_escrow", {"task_id": t2})
+        self.assertEqual(res2["status"], "deployed")
+
+        # Check status individually by task_id
+        st1 = await self.call("get_deployment_status", {"task_id": t1})
+        self.assertEqual(st1["task_id"], t1)
+        self.assertTrue(st1["active"])
+
+        st2 = await self.call("get_deployment_status", {"task_id": t2})
+        self.assertEqual(st2["task_id"], t2)
+        self.assertTrue(st2["active"])
+
+        # Check transcription routed specifically to t1 and t2
+        audio_file = self.state_dir / "sample.mp3"
+        audio_file.write_bytes(b"concurrent mock audio")
+
+        res_trans1 = await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": t1})
+        self.assertEqual(res_trans1["status"], "complete")
+
+        res_trans2 = await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": t2})
+        self.assertEqual(res_trans2["status"], "complete")
+
+        # Default without task_id routes to latest active session
+        res_default = await self.call("transcribe_audio", {"audio_path": str(audio_file)})
+        self.assertEqual(res_default["status"], "complete")
+
+        # Nonexistent task_id raises ToolError
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("transcribe_audio", {"audio_path": str(audio_file), "task_id": "0xnonexistent"})
+        self.assertIn("No deployment session found for task '0xnonexistent'", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

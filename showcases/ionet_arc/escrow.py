@@ -2,8 +2,8 @@
 
 Uses eth-abi and eth-account for fast, lightweight in-process EVM interaction without cast subprocesses.
 """
+
 import functools
-import hashlib
 import json
 import os
 import shutil
@@ -16,19 +16,31 @@ from eth_abi import decode, encode
 from eth_account import Account
 from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 
+from .adapter import canonical, digest
+
+__all__ = [
+    "DEFAULT_CATEGORY",
+    "DEFAULT_CHAIN_ID",
+    "MOCK_IMAGE_ID",
+    "MOCK_SEAL",
+    "REPO_ROOT",
+    "EscrowClient",
+    "EthRpc",
+    "address20",
+    "bytes32",
+    "canonical",
+    "digest",
+    "encode_journal",
+    "ensure_policy_hash",
+    "find_binary",
+    "to_addr_str",
+]
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 100
 MOCK_SEAL = "0xabcd"
 MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-
-
-def digest(value):
-    return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def bytes32(val) -> bytes:
@@ -464,4 +476,4 @@ def ensure_policy_hash(
             text=True,
         )
         return res.stdout.strip()
-    return "0x" + hashlib.sha256(canonical(params_obj)).hexdigest()
+    return "0x" + digest(params_obj)

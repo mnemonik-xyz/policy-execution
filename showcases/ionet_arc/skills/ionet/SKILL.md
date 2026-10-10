@@ -91,9 +91,10 @@ Transcribes an audio file using the active 1-hour Whisper deployment on io.net.
 - Arguments:
   - `audio_path` (string, required): Local path to audio file (e.g. `./sample.mp3`).
   - `language` (optional string): 2-letter ISO language code (e.g. `"en"`).
+  - `task_id` (optional string): Target task ID to route inference when multiple deployments exist.
 - Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`.
 
 #### 5. `get_deployment_status`
 Inspects active container health, public URL, and remaining seconds in the 1-hour window.
-- Arguments: none (`{}`).
+- Arguments: `task_id` (optional string).
 - Returns: `active` (bool), `is_expired` (bool), `remaining_seconds`, `settlement_transaction`.

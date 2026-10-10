@@ -32,6 +32,7 @@ from starlette.responses import Response
 
 from showcases.ionet_arc.adapter import (
     PilotError,
+    canonical,
     connected,
     deploy,
     read_json,
@@ -43,7 +44,6 @@ from showcases.ionet_arc.escrow import (
     DEFAULT_CHAIN_ID,
     REPO_ROOT,
     EscrowClient,
-    canonical,
     encode_journal,
     ensure_policy_hash,
 )
@@ -250,10 +250,18 @@ class WarrantTranscriptionService:
         self.local_server = local_server
         self.ssh_host = ssh_host
         self.worker_url = worker_url
+        self.local_mock_workers: dict[str, LocalMockWorker] = {}
         self.active_local_worker = None
         self._ssh_container_started = False
         if self.local_server:
             atexit.register(self._cleanup_ssh_container)
+        atexit.register(self.stop)
+
+    def stop(self):
+        for worker in list(self.local_mock_workers.values()):
+            worker.stop()
+        self.local_mock_workers.clear()
+        self.active_local_worker = None
 
     def _cleanup_ssh_container(self):
         if self.local_server and self._ssh_container_started:
@@ -535,10 +543,14 @@ class WarrantTranscriptionService:
             return target_url
 
         if self.use_mock_ionet:
-            if self.active_local_worker:
-                self.active_local_worker.stop()
-            self.active_local_worker = LocalMockWorker(self.state_dir / "worker_data", worker_token)
-            return self.active_local_worker.start()
+            task_id = proposal.get("task_id", deployment_id)
+            if task_id in self.local_mock_workers:
+                self.local_mock_workers[task_id].stop()
+            worker_data = self.state_dir / "worker_data" / task_id
+            mock_worker = LocalMockWorker(worker_data, worker_token)
+            self.local_mock_workers[task_id] = mock_worker
+            self.active_local_worker = mock_worker
+            return mock_worker.start()
 
         duration = proposal.get("duration_hours", 1)
         deploy_args = {
@@ -716,18 +728,50 @@ class WarrantTranscriptionService:
 
         raise ToolError("Transcription timed out waiting for worker.")
 
-    def _active_session(self) -> dict:
-        session_file = self.state_dir / "active_session.json"
-        if not session_file.exists():
-            raise ToolError(
-                "No active deployment session found. "
-                "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
-            )
+    def _find_latest_unexpired_session(self) -> dict | None:
+        now = time.time()
+        sessions_dir = self.state_dir / "sessions"
+        if not sessions_dir.exists():
+            return None
+        candidates = []
+        for p in sessions_dir.glob("*.json"):
+            try:
+                s = read_json(p)
+                if s.get("expires_at", 0) > now and s.get("public_url"):
+                    candidates.append(s)
+            except Exception:
+                pass
+        if not candidates:
+            return None
+        candidates.sort(key=lambda s: s.get("deployed_at", 0), reverse=True)
+        return candidates[0]
 
-        session = read_json(session_file)
+    def _active_session(self, task_id: str | None = None) -> dict:
+        if task_id:
+            session_file = self.state_dir / "sessions" / f"{task_id}.json"
+            if not session_file.exists():
+                raise ToolError(f"No deployment session found for task '{task_id}'.")
+            session = read_json(session_file)
+        else:
+            session_file = self.state_dir / "active_session.json"
+            session = None
+            if session_file.exists():
+                candidate = read_json(session_file)
+                if time.time() <= candidate.get("expires_at", 0):
+                    session = candidate
+            if session is None:
+                session = self._find_latest_unexpired_session()
+
+            if session is None:
+                raise ToolError(
+                    "No active deployment session found. "
+                    "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
+                )
+
         if time.time() > session.get("expires_at", 0):
+            target = f"for task '{task_id}' " if task_id else ""
             raise ToolError(
-                f"Deployment session expired at {session.get('expires_at')}. "
+                f"Deployment session {target}expired at {session.get('expires_at')}. "
                 "The 1-hour duration window has ended. A new proposal and deployment are required."
             )
 
@@ -735,9 +779,15 @@ class WarrantTranscriptionService:
             raise ToolError("Deployment public URL is not ready yet.")
         return session
 
-    async def transcribe_audio(self, audio_path: str, language: str | None = None) -> dict:
+    async def transcribe_audio(
+        self,
+        audio_path: str,
+        language: str | None = None,
+        task_id: str | None = None,
+    ) -> dict:
         try:
-            session = self._active_session()
+            session = self._active_session(task_id)
+            target_task_id = session.get("task_id", task_id)
             public_url = session["public_url"]
             worker_token = session.get("worker_token")
 
@@ -779,16 +829,29 @@ class WarrantTranscriptionService:
                     return await self._poll_transcription(client, poll_url, poll_headers, job_id)
             except (httpx2.HTTPError, OSError) as net_err:
                 # Direct in-process worker fallback for sandboxed/mock testbeds
-                if self.active_local_worker and getattr(self.active_local_worker, "worker", None):
-                    return await self._transcribe_with_local_worker(audio_bytes, audio_sha256, language, net_err)
+                local_worker = (
+                    self.local_mock_workers.get(target_task_id) if target_task_id else None
+                ) or self.active_local_worker
+                if local_worker and getattr(local_worker, "worker", None):
+                    return await self._transcribe_with_local_worker(
+                        audio_bytes, audio_sha256, language, net_err, local_worker=local_worker
+                    )
                 raise ToolError(f"Worker connection failed: {net_err}") from net_err
         except Exception as exc:
             raise safe_tool_error(exc) from None
 
     async def _transcribe_with_local_worker(
-        self, audio_bytes: bytes, audio_sha256: str, language: str | None, net_err: Exception
+        self,
+        audio_bytes: bytes,
+        audio_sha256: str,
+        language: str | None,
+        net_err: Exception,
+        local_worker: LocalMockWorker | None = None,
     ) -> dict:
-        worker = self.active_local_worker.worker
+        lw = local_worker or self.active_local_worker
+        if not lw or not getattr(lw, "worker", None):
+            raise ToolError(f"Worker connection failed: {net_err}") from net_err
+        worker = lw.worker
         code, job_data = worker.submit(audio_bytes, audio_sha256, language=language)
         if code not in (200, 202):
             raise ToolError(f"Local worker rejected job: {job_data}") from net_err
@@ -805,14 +868,15 @@ class WarrantTranscriptionService:
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         if task_id:
             session_file = self.state_dir / "sessions" / f"{task_id}.json"
+            if not session_file.exists():
+                return {"active": False, "message": f"No deployment session found for task '{task_id}'."}
+            session = read_json(session_file)
         else:
             session_file = self.state_dir / "active_session.json"
+            session = read_json(session_file) if session_file.exists() else self._find_latest_unexpired_session()
+            if not session:
+                return {"active": False, "message": "No deployment session active."}
 
-        if not session_file.exists():
-            session_file = self.state_dir / "active_session.json"
-        if not session_file.exists():
-            return {"active": False, "message": "No deployment session active."}
-        session = read_json(session_file)
         now = time.time()
         remaining = max(0, int(session.get("expires_at", 0) - now))
         is_expired = remaining == 0
@@ -891,14 +955,18 @@ def create_server(
     server.tool(
         name="transcribe_audio",
         description=(
-            "Transcribe an audio file using the active 1-hour Whisper deployment on io.net.\n"
-            "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be expired."
+            "Transcribe an audio file using an active 1-hour Whisper deployment on io.net.\n"
+            "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be expired.\n"
+            "Optionally provide task_id to target a specific deployment when multiple tasks exist."
         ),
     )(service.transcribe_audio)
 
     server.tool(
         name="get_deployment_status",
-        description="Check status of active 1-hour transcription deployment and remaining duration.",
+        description=(
+            "Check status of active 1-hour transcription deployment and remaining duration.\n"
+            "Optionally provide task_id to inspect a specific deployment session."
+        ),
     )(service.get_deployment_status)
 
     return server
