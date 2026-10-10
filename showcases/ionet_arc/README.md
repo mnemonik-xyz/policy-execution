@@ -226,6 +226,20 @@ forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
   --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
 ```
 
+### 3. Verify Contracts
+
+Verify the deployed contracts on Arc Testnet via Blockscout using the saved broadcast artifacts:
+
+```sh
+forge script script/Deploy.s.sol:Deploy \
+  --rpc-url "$WARRANT_RPC_URL" \
+  --broadcast \
+  --resume \
+  --verify \
+  --verifier blockscout \
+  --verifier-url https://explorer.testnet.arc.io/api
+```
+
 ---
 
 ## Running the Showcase
