@@ -1,0 +1,16 @@
+# Showcase manifest linking deployed contracts, policy template, and credentials.
+chain_id: 5042002
+escrow_address: '0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51'
+verifier_address: '0x0932F120DEe4cA83676B8224769eE52b7d6D00c6'
+token_address: '0x3600000000000000000000000000000000000000'
+seller_address: '0x9F188809b2ba2e29653693C4069c212a95C1B8c4'
+category: 42
+max_amount: 2000000  # 2.00 USDC
+public_files:
+  manifest: showcases/ionet_arc/config/showcase_manifest.yaml
+  buyer_policy_template: showcases/ionet_arc/config/buyer_policy_template.yaml
+  vendor_credential: showcases/ionet_arc/config/vendor_credential.yaml
+  vendor_signature: showcases/ionet_arc/config/vendor_signature.yaml
+private_key_files:
+  registry_key: showcases/ionet_arc/.keys/registry.key
+  buyer_acceptance_key: showcases/ionet_arc/.keys/buyer_acceptance.key
