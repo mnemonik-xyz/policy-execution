@@ -306,41 +306,75 @@ class WarrantTranscriptionService:
 
     def _resolve_addresses_and_chain(self, customer_address: str | None) -> tuple[str, int]:
         escrow_client = self.escrow_client
-        if not customer_address:
-            try:
-                accounts = escrow_client.rpc.accounts()
-                customer_address = accounts[0] if accounts else "0x" + "11" * 20
-            except Exception:
-                customer_address = "0x" + "11" * 20
-
-        if not escrow_client.server_account:
-            try:
-                accounts = escrow_client.rpc.accounts()
-                escrow_client.server_account = accounts[1] if len(accounts) > 1 else accounts[0]
-            except Exception:
-                escrow_client.server_account = "0x" + "22" * 20
-
         try:
             chain_id = escrow_client.rpc.chain_id()
         except Exception:
             chain_id = DEFAULT_CHAIN_ID
 
+        if not customer_address:
+            try:
+                accounts = escrow_client.rpc.accounts()
+                customer_address = accounts[0] if accounts else None
+            except Exception:
+                customer_address = None
+
+        if not customer_address:
+            raise ToolError(
+                "Customer address was not provided and no unlocked accounts were returned by RPC."
+            )
+
+        if not escrow_client.server_account:
+            try:
+                accounts = escrow_client.rpc.accounts()
+                escrow_client.server_account = accounts[1] if len(accounts) > 1 else (accounts[0] if accounts else None)
+            except Exception:
+                pass
+
+        if not escrow_client.server_account:
+            manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+            if manifest_path.exists():
+                try:
+                    import yaml
+
+                    m = yaml.safe_load(manifest_path.read_text()) or {}
+                    if m.get("chain_id") == chain_id:
+                        escrow_client.server_account = m.get("seller_address")
+                except Exception:
+                    pass
+
+        if not escrow_client.server_account:
+            raise ToolError(
+                "Server payout account is not configured and no unlocked accounts were returned by RPC."
+            )
+
         return customer_address, chain_id
 
-    def _ensure_escrow_contracts(self, customer_address: str):
+    def _ensure_escrow_contracts(self, chain_id: int):
         escrow_client = self.escrow_client
+        if not escrow_client.escrow or not escrow_client.token:
+            manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+            if manifest_path.exists():
+                try:
+                    import yaml
+
+                    m = yaml.safe_load(manifest_path.read_text()) or {}
+                    if m.get("chain_id") == chain_id:
+                        escrow_client.escrow = escrow_client.escrow or m.get("escrow_address")
+                        escrow_client.token = escrow_client.token or m.get("token_address")
+                        escrow_client.verifier = escrow_client.verifier or m.get("verifier_address")
+                except Exception:
+                    pass
+
         if not escrow_client.escrow:
-            try:
-                dep = escrow_client.deploy_local_anvil(customer_address, escrow_client.server_account)
-                print(f"Auto-deployed TaskEscrow on Anvil: {dep['escrow']}", file=sys.stderr)
-            except Exception as err:
-                print(
-                    f"Warning: Could not auto-deploy on local anvil ({err}); using dummy addresses",
-                    file=sys.stderr,
-                )
-                escrow_client.escrow = "0x" + "33" * 20
-                escrow_client.token = "0x" + "44" * 20
-                escrow_client.verifier = "0x" + "55" * 20
+            raise ToolError(
+                f"TaskEscrow address is not configured for chain {chain_id}. "
+                "Provide --escrow-address or specify in config/manifest.yaml."
+            )
+        if not escrow_client.token:
+            raise ToolError(
+                f"Payment token address is not configured for chain {chain_id}. "
+                "Provide --token-address or specify in config/manifest.yaml."
+            )
 
     async def propose_deployment(
         self,
@@ -360,7 +394,7 @@ class WarrantTranscriptionService:
 
             selected_hw = self._select_hardware(candidates, hardware_id)
             customer_address, chain_id = self._resolve_addresses_and_chain(customer_address)
-            self._ensure_escrow_contracts(customer_address)
+            self._ensure_escrow_contracts(chain_id)
 
             salt = "0x" + secrets.token_hex(32)
             task_id = self.escrow_client.task_id_for(customer_address, salt)

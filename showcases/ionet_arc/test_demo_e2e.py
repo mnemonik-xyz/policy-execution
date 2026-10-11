@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from showcases.ionet_arc.escrow import find_binary
+from showcases.ionet_arc.escrow import EscrowClient, find_binary
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = Path(sys.executable)
@@ -95,7 +95,17 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.tearDownClass()
             raise RuntimeError("Anvil failed to start")
 
-        # 2. Start MCP server
+        # 2. Deploy real test contracts on Anvil testbed
+        escrow_client = EscrowClient(rpc_url=cls.rpc_url)
+        accounts = escrow_client.rpc.accounts()
+        cls.customer_account = accounts[0]
+        cls.server_account = accounts[1]
+        dep = escrow_client.deploy_local_anvil(cls.customer_account, cls.server_account)
+        cls.escrow_address = dep["escrow"]
+        cls.token_address = dep["token"]
+        cls.verifier_address = dep["verifier"]
+
+        # 3. Start Seller MCP server
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             cls.mcp_port = s.getsockname()[1]
@@ -115,6 +125,14 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.tmp_dir,
             "--rpc-url",
             cls.rpc_url,
+            "--escrow-address",
+            cls.escrow_address,
+            "--token-address",
+            cls.token_address,
+            "--verifier-address",
+            cls.verifier_address,
+            "--server-account",
+            cls.server_account,
             "--mock-ionet",
         ]
         env = _clean_env()
@@ -125,7 +143,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.tearDownClass()
             raise
 
-        # 3. Start Buyer MCP server
+        # 4. Start Buyer MCP server
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             cls.buyer_mcp_port = s.getsockname()[1]
@@ -143,6 +161,12 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             str(Path(cls.tmp_dir) / "buyer_state"),
             "--rpc-url",
             cls.rpc_url,
+            "--escrow-address",
+            cls.escrow_address,
+            "--token-address",
+            cls.token_address,
+            "--buyer-account",
+            cls.customer_account,
             "--auto-mint",
         ]
         cls.buyer_proc = subprocess.Popen(buyer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
