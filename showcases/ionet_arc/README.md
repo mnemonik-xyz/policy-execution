@@ -140,9 +140,9 @@ sequenceDiagram
     Note over Buyer,Escrow: Phase 3: Policy Evaluation & Escrow Funding
     Buyer->>BuyerMCP: warrant_evaluate_and_offer(proposal)
     BuyerMCP->>BuyerMCP: Checks budget ceiling and 1h duration limits
-    BuyerMCP->>BuyerMCP: Instantiates policy template (25m validity window, keys)
+    BuyerMCP->>BuyerMCP: Instantiates policy template (15m validity window, keys)
     BuyerMCP->>BuyerMCP: Derives cryptographic policy_hash
-    BuyerMCP->>Escrow: approve(amount) + offer(task_id, policy_hash, accept_by=10m, settle_by=25m)
+    BuyerMCP->>Escrow: approve(amount) + offer(task_id, policy_hash, accept_by=5m, settle_by=15m)
     Escrow-->>BuyerMCP: Funds locked in State.Offered (tx hash)
     BuyerMCP-->>Buyer: Offer confirmed {status: "APPROVED", policy, policy_hash}
     end

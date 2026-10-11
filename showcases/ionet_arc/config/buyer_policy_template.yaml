@@ -1,16 +1,9 @@
 # Buyer policy template for TaskEscrow on Arc Testnet.
 # Concrete policy timestamps (valid_after/valid_until) are stamped per request.
 version: 1
-scope:
-  chain_id: 5042002
-  vault: '0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51'
-  token: '0x3600000000000000000000000000000000000000'
-registry_key: '0x0242bfa2d797a625be258f98909b840bf63e3c59722d127e584a1b0bc8d5eedc1a'
-acceptance_key: '0x03ff6eb16b3aad552b204bd468621bae3195349ceefc1997031a5246cf366e3d4d'
 rule:
   all:
   - accepted
   - amount_at_most: 2000000  # 2.00 USDC
   - vendor_category_in:
     - 42
-validity_duration_seconds: 3600
