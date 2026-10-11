@@ -304,16 +304,16 @@ class WarrantTranscriptionService:
                 return c
         raise ToolError(f"Requested hardware_id '{hardware_id}' is not in available candidates.")
 
-    def _resolve_addresses_and_chain(self, customer_address: str | None) -> tuple[str, int]:
+    async def _resolve_addresses_and_chain(self, customer_address: str | None) -> tuple[str, int]:
         escrow_client = self.escrow_client
         try:
-            chain_id = escrow_client.rpc.chain_id()
+            chain_id = await asyncio.to_thread(escrow_client.rpc.chain_id)
         except Exception:
             chain_id = DEFAULT_CHAIN_ID
 
         if not customer_address:
             try:
-                accounts = escrow_client.rpc.accounts()
+                accounts = await asyncio.to_thread(escrow_client.rpc.accounts)
                 customer_address = accounts[0] if accounts else None
             except Exception:
                 customer_address = None
@@ -325,7 +325,7 @@ class WarrantTranscriptionService:
 
         if not escrow_client.server_account:
             try:
-                accounts = escrow_client.rpc.accounts()
+                accounts = await asyncio.to_thread(escrow_client.rpc.accounts)
                 escrow_client.server_account = accounts[1] if len(accounts) > 1 else (accounts[0] if accounts else None)
             except Exception:
                 pass
@@ -393,11 +393,11 @@ class WarrantTranscriptionService:
                 raise ToolError("No available suitable GPUs found.")
 
             selected_hw = self._select_hardware(candidates, hardware_id)
-            customer_address, chain_id = self._resolve_addresses_and_chain(customer_address)
+            customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
             self._ensure_escrow_contracts(chain_id)
 
             salt = "0x" + secrets.token_hex(32)
-            task_id = self.escrow_client.task_id_for(customer_address, salt)
+            task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
 
             # Dynamic pricing based on real hardware cost and duration
             price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
@@ -422,7 +422,8 @@ class WarrantTranscriptionService:
                 else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
             )
 
-            policy_hash = ensure_policy_hash(
+            policy_hash = await asyncio.to_thread(
+                ensure_policy_hash,
                 self.escrow_client.escrow,
                 self.escrow_client.token,
                 chain_id,
@@ -468,9 +469,9 @@ class WarrantTranscriptionService:
         except Exception as exc:
             raise safe_tool_error(exc) from None
 
-    def _verify_task_offered(self, task_id: str, proposal: dict) -> dict:
+    async def _verify_task_offered(self, task_id: str, proposal: dict) -> dict:
         try:
-            task_data = self.escrow_client.get_task(task_id)
+            task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
         except Exception as e:
             raise ToolError(f"Failed to query TaskEscrow for task '{task_id}': {e}") from e
 
@@ -503,15 +504,15 @@ class WarrantTranscriptionService:
 
         return task_data
 
-    def _accept_task(self, task_id: str, proposal: dict, task_state: str | None = None):
+    async def _accept_task(self, task_id: str, proposal: dict, task_state: str | None = None):
         if task_state is None:
-            task_data = self.escrow_client.get_task(task_id)
+            task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
             task_state = task_data.get("state")
 
         if task_state == "Offered":
             sender = proposal.get("recipient") or self.escrow_client.server_account
             try:
-                self.escrow_client.accept(task_id, sender=sender)
+                await asyncio.to_thread(self.escrow_client.accept, task_id, sender=sender)
             except Exception as e:
                 raise ToolError(f"Failed to accept TaskEscrow task '{task_id}' on-chain: {e}") from e
 
@@ -678,10 +679,10 @@ class WarrantTranscriptionService:
             now = int(time.time())
 
             # 1. Verify on-chain escrow state and terms
-            task_data = self._verify_task_offered(task_id, proposal)
+            task_data = await self._verify_task_offered(task_id, proposal)
 
             # 2. Accept task on-chain first to commit agreement before spinning up hardware
-            self._accept_task(task_id, proposal, task_data.get("state"))
+            await self._accept_task(task_id, proposal, task_data.get("state"))
 
             # 3. Generate capability token and deliverable hash
             worker_token = secrets.token_hex(24)
@@ -1054,14 +1055,15 @@ class WarrantTranscriptionService:
 
             # Execute real native off-chain policy evaluation (<10ms)
             try:
-                _auth, journal_bytes = evaluate_authorization(policy, request, evidence)
+                _auth, journal_bytes = await asyncio.to_thread(evaluate_authorization, policy, request, evidence)
             except Exception as e:
                 raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
 
             # Settle on-chain via TaskEscrow (Option B: JournalVerifier approves digest, settles with mock seal)
             settlement_tx = None
             try:
-                settle_res = self.escrow_client.settle_mock(
+                settle_res = await asyncio.to_thread(
+                    self.escrow_client.settle_mock,
                     journal_bytes,
                     sender=session.get("recipient") or self.escrow_client.server_account,
                 )

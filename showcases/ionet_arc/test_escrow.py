@@ -1,4 +1,4 @@
-"""Unit tests for EscrowClient and EthRpc using eth-abi and eth-account."""
+import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +8,7 @@ from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 
 from showcases.ionet_arc.escrow import (
     EscrowClient,
+    EthRpc,
     encode_journal,
     should_trust_env,
 )
@@ -106,6 +107,12 @@ class EscrowClientTests(unittest.TestCase):
 
         res = self.client.task_id_for(customer, salt)
         self.assertEqual(res, "0x" + "77" * 32)
+        self.assertEqual(self.mock_rpc.rpc.call_count, 1)
+
+        # Second call with identical arguments must hit cache without additional RPC calls
+        res_cached = self.client.task_id_for(customer, salt)
+        self.assertEqual(res_cached, "0x" + "77" * 32)
+        self.assertEqual(self.mock_rpc.rpc.call_count, 1)
 
     def test_send_transaction_unlocked_mode(self):
         from_account = "0x" + "aa" * 20
@@ -209,6 +216,61 @@ class EscrowClientTests(unittest.TestCase):
         self.assertTrue(should_trust_env("http://petertower:8080"))
         self.assertTrue(should_trust_env("https://mcp.io.solutions/mcp"))
         self.assertTrue(should_trust_env("remote.example.com"))
+
+    def test_eth_rpc_chain_id_and_accounts_caching(self):
+        rpc = EthRpc("http://mock-chain-test.internal:8545")
+        with patch.object(rpc, "rpc") as mock_call:
+            mock_call.side_effect = lambda method, params=None: "0x7a69" if method == "eth_chainId" else ["0x1111"]
+
+            # First chain_id query fetches from RPC
+            cid1 = rpc.chain_id()
+            self.assertEqual(cid1, 31337)
+            self.assertEqual(mock_call.call_count, 1)
+
+            # Second chain_id query hits cache without RPC call
+            cid2 = rpc.chain_id()
+            self.assertEqual(cid2, 31337)
+            self.assertEqual(mock_call.call_count, 1)
+
+            # New instance with identical RPC URL reuses static chain_id cache
+            rpc2 = EthRpc("http://mock-chain-test.internal:8545")
+            self.assertEqual(rpc2.chain_id(), 31337)
+            self.assertEqual(mock_call.call_count, 1)
+
+            # Accounts caching
+            accs1 = rpc.accounts()
+            self.assertEqual(accs1, ["0x1111"])
+            self.assertEqual(mock_call.call_count, 2)
+
+            accs2 = rpc.accounts(use_cache=True)
+            self.assertEqual(accs2, ["0x1111"])
+            self.assertEqual(mock_call.call_count, 2)
+
+    def test_eth_rpc_async_methods(self):
+        rpc = EthRpc("http://mock-chain-async.internal:8545")
+        with patch.object(rpc, "rpc") as mock_call:
+            mock_call.side_effect = lambda method, params=None: "0x7a69" if method == "eth_chainId" else ["0x2222"]
+
+            async def _run():
+                cid = await rpc.async_chain_id()
+                accs = await rpc.async_accounts()
+                res = await rpc.async_rpc("eth_blockNumber")
+                return cid, accs, res
+
+            cid, accs, _res = asyncio.run(_run())
+            self.assertEqual(cid, 31337)
+            self.assertEqual(accs, ["0x2222"])
+            self.assertIsNotNone(_res)
+
+    def test_escrow_client_async_helpers(self):
+        async def _run():
+            tid = await self.client.async_task_id_for("0x" + "aa" * 20, "0x" + "bb" * 32)
+            return tid
+
+        expected_task_id = bytes.fromhex("77" * 32)
+        self.mock_rpc.rpc.return_value = "0x" + encode(["bytes32"], [expected_task_id]).hex()
+        res = asyncio.run(_run())
+        self.assertEqual(res, "0x" + "77" * 32)
 
 
 if __name__ == "__main__":

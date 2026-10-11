@@ -3,6 +3,7 @@
 Uses eth-abi and eth-account for fast, lightweight in-process EVM interaction without cast subprocesses.
 """
 
+import asyncio
 import contextlib
 import functools
 import json
@@ -145,22 +146,26 @@ def encode_journal(
     return encode(types, vals)
 
 
+_CHAIN_ID_CACHE: dict[str, int] = {}
+
+
 class EthRpc:
-    """Lightweight JSON-RPC client."""
+    """Lightweight JSON-RPC client with static query caching and non-blocking helpers."""
 
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
-        self._chain_id: int | None = None
-
-    def rpc(self, method: str, params: list | None = None) -> any:
-        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
-        req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
-        opener = (
+        self._chain_id: int | None = _CHAIN_ID_CACHE.get(rpc_url)
+        self._accounts: list[str] | None = None
+        self._opener = (
             urllib.request.build_opener(urllib.request.ProxyHandler({}))
             if not should_trust_env(self.rpc_url)
             else urllib.request.build_opener()
         )
-        with opener.open(req, timeout=15) as resp:
+
+    def rpc(self, method: str, params: list | None = None) -> any:
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
+        req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
+        with self._opener.open(req, timeout=15) as resp:
             data = json.load(resp)
         if "error" in data:
             raise RuntimeError(f"RPC error {method}: {data['error']}")
@@ -168,18 +173,39 @@ class EthRpc:
             raise RuntimeError(f"RPC response missing result for {method}")
         return data["result"]
 
+    async def async_rpc(self, method: str, params: list | None = None) -> any:
+        """Execute RPC query in background thread to prevent blocking the event loop."""
+        return await asyncio.to_thread(self.rpc, method, params)
+
     def chain_id(self) -> int:
         if self._chain_id is None:
-            res = self.rpc("eth_chainId")
-            self._chain_id = int(res, 16)
+            if self.rpc_url in _CHAIN_ID_CACHE:
+                self._chain_id = _CHAIN_ID_CACHE[self.rpc_url]
+            else:
+                res = self.rpc("eth_chainId")
+                self._chain_id = int(res, 16)
+                _CHAIN_ID_CACHE[self.rpc_url] = self._chain_id
         return self._chain_id
 
-    def accounts(self) -> list[str]:
-        return self.rpc("eth_accounts")
+    async def async_chain_id(self) -> int:
+        """Asynchronously retrieve or query chain_id without blocking event loop."""
+        return await asyncio.to_thread(self.chain_id)
+
+    def accounts(self, use_cache: bool = True) -> list[str]:
+        if not use_cache or self._accounts is None:
+            self._accounts = self.rpc("eth_accounts")
+        return list(self._accounts)
+
+    async def async_accounts(self, use_cache: bool = True) -> list[str]:
+        """Asynchronously query accounts without blocking event loop."""
+        return await asyncio.to_thread(self.accounts, use_cache)
 
     def latest_timestamp(self) -> int:
         block = self.rpc("eth_getBlockByNumber", ["latest", False])
         return int(block["timestamp"], 16)
+
+    async def async_latest_timestamp(self) -> int:
+        return await asyncio.to_thread(self.latest_timestamp)
 
 
 @functools.lru_cache(maxsize=16)
@@ -410,6 +436,7 @@ class EscrowClient:
         self.verifier = verifier_address
         self.server_account = server_account
         self.private_keys = {k.lower(): v for k, v in (private_keys or {}).items()}
+        self._task_id_cache: dict[tuple[str, str, bytes], str] = {}
 
     def register_key(self, address: str, private_key: str):
         self.private_keys[address.lower()] = private_key
@@ -493,15 +520,25 @@ class EscrowClient:
         raise TimeoutError(f"Transaction receipt timeout for {tx_hash}")
 
     def task_id_for(self, customer: str, salt: str) -> str:
-        """Call TaskEscrow.taskIdFor(customer, salt)."""
+        """Call TaskEscrow.taskIdFor(customer, salt) with result caching."""
+        cache_key = (
+            to_checksum_address(self.escrow) if self.escrow else "",
+            to_checksum_address(customer),
+            bytes32(salt),
+        )
+        if cache_key in self._task_id_cache:
+            return self._task_id_cache[cache_key]
+
         res = self.call_contract(
             self.escrow,
             "taskIdFor(address,bytes32)",
             ["address", "bytes32"],
-            [to_checksum_address(customer), bytes32(salt)],
+            [cache_key[1], cache_key[2]],
             ["bytes32"],
         )
-        return "0x" + res[0].hex()
+        tid = "0x" + res[0].hex()
+        self._task_id_cache[cache_key] = tid
+        return tid
 
     def get_task(self, task_id: str) -> dict:
         """Read Task struct from tasks(taskId)."""
@@ -670,6 +707,73 @@ class EscrowClient:
             "agent": agent,
             "chain_id": self.rpc.chain_id(),
         }
+
+    async def async_task_id_for(self, customer: str, salt: str) -> str:
+        return await asyncio.to_thread(self.task_id_for, customer, salt)
+
+    async def async_get_task(self, task_id: str) -> dict:
+        return await asyncio.to_thread(self.get_task, task_id)
+
+    async def async_accept(self, task_id: str, sender: str | None = None) -> dict:
+        return await asyncio.to_thread(self.accept, task_id, sender)
+
+    async def async_settle_mock(
+        self,
+        journal_bytes: bytes,
+        sender: str | None = None,
+        seal_hex: str = MOCK_SEAL,
+    ) -> dict:
+        return await asyncio.to_thread(self.settle_mock, journal_bytes, sender, seal_hex)
+
+    async def async_settle(
+        self,
+        seal: bytes | str,
+        journal_bytes: bytes,
+        sender: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(self.settle, seal, journal_bytes, sender)
+
+    async def async_offer(
+        self,
+        salt: str,
+        recipient: str,
+        policy_hash: str,
+        policy_version: int,
+        amount: int,
+        accept_by: int,
+        settle_by: int,
+        sender: str,
+    ) -> dict:
+        return await asyncio.to_thread(
+            self.offer,
+            salt,
+            recipient,
+            policy_hash,
+            policy_version,
+            amount,
+            accept_by,
+            settle_by,
+            sender,
+        )
+
+    async def async_token_balance(self, account: str) -> int:
+        return await asyncio.to_thread(self.token_balance, account)
+
+    async def async_approve_token(
+        self,
+        spender: str,
+        amount: int,
+        sender: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(self.approve_token, spender, amount, sender)
+
+    async def async_mint_token(
+        self,
+        recipient: str,
+        amount: int,
+        sender: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(self.mint_token, recipient, amount, sender)
 
 
 def ensure_policy_hash(

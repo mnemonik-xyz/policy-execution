@@ -11,6 +11,7 @@ Supports stdio (standard for desktop LLM agents) and Streamable HTTP transports.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import pathlib
@@ -305,7 +306,7 @@ class BuyerWarrantService:
         buyer_account = self._resolve_buyer_account()
         self.escrow_client.escrow = escrow_addr
         try:
-            expected_task_id = self.escrow_client.task_id_for(buyer_account, salt)
+            expected_task_id = await asyncio.to_thread(self.escrow_client.task_id_for, buyer_account, salt)
         except Exception as e:
             raise ToolError(f"Failed to derive taskIdFor({buyer_account}, {salt}): {e}") from e
 
@@ -317,7 +318,8 @@ class BuyerWarrantService:
 
         # Compile buyer policy template into concrete Policy and cryptographic policy_hash
         try:
-            concrete_policy, derived_policy_hash = compile_buyer_policy(
+            concrete_policy, derived_policy_hash = await asyncio.to_thread(
+                compile_buyer_policy,
                 template_path=self.template_path,
                 manifest_path=self.manifest_path,
                 chain_id=chain_id,
@@ -334,7 +336,8 @@ class BuyerWarrantService:
                 f"but locally compiled policy hash is {derived_policy_hash}"
             )
 
-        funded = self._fund_escrow(
+        funded = await asyncio.to_thread(
+            self._fund_escrow,
             escrow_addr=escrow_addr,
             token_addr=token_addr,
             atomic_amount=atomic_amount,
@@ -426,7 +429,11 @@ class BuyerWarrantService:
         }
 
         try:
-            sig_bytes = sign_acceptance(acceptance, key_path=self.buyer_acceptance_key_path)
+            sig_bytes = await asyncio.to_thread(
+                sign_acceptance,
+                acceptance,
+                key_path=self.buyer_acceptance_key_path,
+            )
         except Exception as e:
             raise ToolError(f"Failed to sign acceptance evidence: {e}") from e
 
@@ -441,7 +448,7 @@ class BuyerWarrantService:
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
         """Query TaskEscrow state on-chain for a task ID."""
         try:
-            task_data = self.escrow_client.get_task(task_id)
+            task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
             return {
                 "task_id": task_id,
                 "state": task_data.get("state"),
