@@ -8,6 +8,7 @@ Demonstrates the 4-step Warrant lifecycle:
 4. Call deploy_with_escrow to provision the container and settle the escrow deliverable.
 5. Call transcribe_audio on given audio file (adv.mp3) and print the transcript.
 """
+
 import argparse
 import asyncio
 import base64
@@ -29,11 +30,15 @@ from showcases.ionet_arc.escrow import EscrowClient, EthRpc, should_trust_env  #
 
 
 def extract_result(res):
+    is_err = getattr(res, "is_error", False) or getattr(res, "isError", False)
+    if is_err:
+        err_msg = res.content[0].text if (res.content and hasattr(res.content[0], "text")) else "MCP ToolError"
+        return {"status": "ERROR", "error": err_msg}
     if res.content and len(res.content) > 0 and hasattr(res.content[0], "text"):
         try:
             return json.loads(res.content[0].text)
         except Exception:
-            pass
+            return {"status": "ERROR", "error": res.content[0].text}
     if hasattr(res, "structuredContent") and res.structuredContent:
         sc = res.structuredContent
         if isinstance(sc, dict) and "result" in sc:
@@ -49,6 +54,44 @@ async def fund_via_buyer_mcp(buyer_mcp_url: str, proposal: dict) -> dict:
                 await session.initialize()
                 res = await session.call_tool("warrant_evaluate_and_offer", {"proposal": proposal})
                 return extract_result(res)
+
+
+async def sign_acceptance_via_buyer_mcp(
+    buyer_mcp_url: str,
+    task_id: str,
+    deliverable_hash: str,
+    recipient: str,
+    amount: int,
+) -> dict:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(buyer_mcp_url)) as http_client:
+        async with streamable_http_client(buyer_mcp_url, http_client=http_client) as (r, w):
+            async with ClientSession(r, w, read_timeout_seconds=60) as session:
+                await session.initialize()
+                res = await session.call_tool(
+                    "warrant_sign_acceptance",
+                    {
+                        "task_id": task_id,
+                        "deliverable_hash": deliverable_hash,
+                        "recipient": recipient,
+                        "amount": amount,
+                    },
+                )
+                return extract_result(res)
+
+
+async def poll_deployment_ready(session: ClientSession, task_id: str, max_polls: int = 60) -> dict:
+    """Poll get_deployment_status until container status is ready or fails."""
+    for poll_i in range(max_polls):
+        res_stat = await session.call_tool("get_deployment_status", {"task_id": task_id})
+        stat = extract_result(res_stat)
+        st = stat.get("status")
+        if st == "ready":
+            return stat
+        if st == "failed":
+            sys.exit(f"Deployment failed: {stat.get('error')}")
+        print(f"  • Polling ({poll_i + 1}/{max_polls}): status={st} ...")
+        await asyncio.sleep(2)
+    sys.exit("Timeout waiting for deployment to become ready.")
 
 
 async def run_client(
@@ -90,7 +133,7 @@ async def run_client(
                 if isinstance(hw_list, dict) and "result" in hw_list:
                     hw_list = hw_list["result"]
                 print(f"Discovered {len(hw_list)} suitable single-GPU candidates on io.net:")
-                for hw in (hw_list[:5] if isinstance(hw_list, list) else []):
+                for hw in hw_list[:5] if isinstance(hw_list, list) else []:
                     name = hw["hardware_name"]
                     hw_id = hw["hardware_id"]
                     price = hw["price_per_hour_usd"]
@@ -114,6 +157,7 @@ async def run_client(
                 print(f"  • TaskEscrow:     {proposal['escrow_address']}")
 
                 # Step 3: Policy Verification & Escrow Payment
+                service = None
                 if buyer_mcp_url:
                     print(f"\n[Step 3] Delegating proposal evaluation to Buyer Warrant MCP ({buyer_mcp_url})...")
                     offer_res = await fund_via_buyer_mcp(buyer_mcp_url, proposal)
@@ -128,27 +172,83 @@ async def run_client(
                     )
                     offer_res = await service.warrant_evaluate_and_offer(proposal)
 
+                if offer_res.get("status") != "APPROVED":
+                    sys.exit(f"Policy evaluation or escrow funding failed: {offer_res}")
+
                 print(f" Policy evaluation: {offer_res.get('status', 'APPROVED')}")
                 print(f" TaskEscrow funded on-chain: tx {offer_res.get('transaction_hash')}")
 
                 # Step 4: deploy_with_escrow
                 print("\n[Step 4] Calling deploy_with_escrow on MCP server...")
-                res_dep = await session.call_tool("deploy_with_escrow", {"task_id": proposal["task_id"]})
+                res_dep = await session.call_tool(
+                    "deploy_with_escrow",
+                    {"task_id": proposal["task_id"], "policy": offer_res.get("policy")},
+                )
                 dep_info = extract_result(res_dep)
-                print("Deployment provisioned and escrow settled:")
-                print(f"  • Deployment ID: {dep_info.get('deployment_id')}")
-                print(f"  • Public URL:    {dep_info.get('public_url')}")
-                print(f"  • Settlement TX: {dep_info.get('settlement_transaction')}")
-                print("  • Duration:      1 hour (auto-destroys upon completion)")
+                if dep_info.get("status") == "ERROR":
+                    sys.exit(f"deploy_with_escrow failed: {dep_info.get('error')}")
+                print(f"Deployment initiated: status={dep_info.get('status')}")
 
-                # Step 5: transcribe_audio
-                print(f"\n[Step 5] Transcribing audio file '{audio_path.name}' via MCP...")
+                # Step 5: Poll get_deployment_status until container is ready
+                print("\n[Step 5] Polling deployment status until worker container is ready...")
+                ready_stat = await poll_deployment_ready(session, proposal["task_id"])
+
+                public_url = ready_stat["public_url"].rstrip("/")
+                worker_token = ready_stat.get("worker_token")
+                deliverable_hash = ready_stat.get("deliverable_hash")
+                print("Worker container is online:")
+                print(f"  • Public URL:       {public_url}")
+                print(f"  • Deliverable hash: {deliverable_hash}")
+
+                # Step 6: Health Verification
+                health_url = f"{public_url}/health"
+                print(f"\n[Step 6] Verifying container health endpoint ({health_url})...")
+                trust_env = should_trust_env(public_url)
+                async with httpx2.AsyncClient(timeout=10.0, trust_env=trust_env) as client:
+                    resp = await client.get(health_url, headers={"Authorization": f"Bearer {worker_token}"})
+                    if resp.status_code != 200:
+                        sys.exit(f"Worker health check failed with HTTP {resp.status_code}: {resp.text}")
+                    print(f" Container healthy: {resp.text.strip()}")
+
+                # Step 7: Deliverable sign-off & Escrow settlement
+                print("\n[Step 7] Signing Acceptance and submitting evidence for escrow settlement...")
+                if buyer_mcp_url:
+                    sign_res = await sign_acceptance_via_buyer_mcp(
+                        buyer_mcp_url=buyer_mcp_url,
+                        task_id=proposal["task_id"],
+                        deliverable_hash=deliverable_hash,
+                        recipient=proposal["recipient"],
+                        amount=proposal["amount"],
+                    )
+                else:
+                    sign_res = await service.warrant_sign_acceptance(
+                        task_id=proposal["task_id"],
+                        deliverable_hash=deliverable_hash,
+                        recipient=proposal["recipient"],
+                        amount=proposal["amount"],
+                    )
+                print(f" Acceptance signed: status={sign_res.get('status')}")
+
+                res_settle = await session.call_tool(
+                    "submit_acceptance",
+                    {
+                        "task_id": proposal["task_id"],
+                        "acceptance": sign_res["acceptance"],
+                        "signature": sign_res["signature"],
+                    },
+                )
+                settle_info = extract_result(res_settle)
+                print(f" TaskEscrow settled on-chain: tx {settle_info.get('settlement_transaction')}")
+
+                # Step 8: transcribe_audio
+                print(f"\n[Step 8] Transcribing audio file '{audio_path.name}' via MCP...")
                 start_t = time.time()
                 res_trans = await session.call_tool(
                     "transcribe_audio",
                     {
                         "audio_base64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
                         "language": "en",
+                        "task_id": proposal["task_id"],
                     },
                 )
                 trans_result = extract_result(res_trans)
@@ -161,18 +261,19 @@ async def run_client(
                 print(f"Language:      {trans_result.get('language')}")
                 print(f"Audio length:  {trans_result.get('audio_seconds')}s")
                 print(f"Latency:       {elapsed:.2f}s")
-                print(f"Text:\n\n\"{trans_result.get('text')}\"\n")
+                print(f'Text:\n\n"{trans_result.get("text")}"\n')
                 if trans_result.get("segments"):
                     print("Segments:")
                     for seg in trans_result["segments"]:
                         print(f"  [{seg['start']:.2f}s - {seg['end']:.2f}s] {seg['text'].strip()}")
                 print("=" * 70)
 
-                # Step 6: get_deployment_status
-                print("\n[Step 6] Inspecting live deployment session status...")
-                res_stat = await session.call_tool("get_deployment_status", {})
+                # Step 9: Final inspection of live deployment session status
+                print("\n[Step 9] Inspecting final deployment session status...")
+                res_stat = await session.call_tool("get_deployment_status", {"task_id": proposal["task_id"]})
                 stat = extract_result(res_stat)
                 print(f"Active session:    {stat.get('active')}")
+                print(f"Status:            {stat.get('status')}")
                 print(f"Remaining time:    {stat.get('remaining_seconds')} seconds in 1h window")
                 print(f"Settlement tx:     {stat.get('settlement_transaction')}")
                 print("\n Autonomous Warrant transcription showcase completed successfully!")

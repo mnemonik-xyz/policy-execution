@@ -3,16 +3,19 @@
 Uses eth-abi and eth-account for fast, lightweight in-process EVM interaction without cast subprocesses.
 """
 
+import contextlib
 import functools
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import yaml
 from eth_abi import decode, encode
 from eth_account import Account
 from eth_utils import function_signature_to_4byte_selector, to_checksum_address
@@ -30,17 +33,21 @@ __all__ = [
     "address20",
     "bytes32",
     "canonical",
+    "compile_buyer_policy",
     "digest",
     "encode_journal",
     "ensure_policy_hash",
+    "evaluate_authorization",
     "find_binary",
+    "find_warrant_binary",
     "should_trust_env",
+    "sign_acceptance",
     "to_addr_str",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHAIN_ID = 31337
-DEFAULT_CATEGORY = 100
+DEFAULT_CATEGORY = 42
 MOCK_SEAL = "0xabcd"
 MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
 
@@ -54,25 +61,37 @@ def should_trust_env(url_or_hostname: str | None) -> bool:
 
 
 def bytes32(val) -> bytes:
-    if isinstance(val, bytes):
-        return val.rjust(32, b"\x00") if len(val) < 32 else val[:32]
+    if isinstance(val, (bytes, bytearray)):
+        if len(val) == 32:
+            return bytes(val)
+        raise ValueError(f"bytes32 requires exactly 32 bytes, got {len(val)}")
+    if isinstance(val, int):
+        return val.to_bytes(32, "big")
     s = str(val).strip()
     if s.startswith("0x"):
         s = s[2:]
-    return bytes.fromhex(s.zfill(64))
+    raw = bytes.fromhex(s)
+    if len(raw) != 32:
+        raise ValueError(f"bytes32 requires exactly 32 bytes (64 hex characters), got {len(raw)} ({s})")
+    return raw
 
 
 def address20(val) -> bytes:
-    if isinstance(val, bytes):
-        return val.rjust(20, b"\x00") if len(val) < 20 else val[:20]
+    if isinstance(val, (bytes, bytearray)):
+        if len(val) == 20:
+            return bytes(val)
+        raise ValueError(f"address20 requires exactly 20 bytes, got {len(val)}")
     s = str(val).strip()
     if s.startswith("0x"):
         s = s[2:]
-    return bytes.fromhex(s.zfill(40))
+    raw = bytes.fromhex(s)
+    if len(raw) != 20:
+        raise ValueError(f"address20 requires exactly 20 bytes (40 hex characters), got {len(raw)} ({s})")
+    return raw
 
 
 def to_addr_str(val) -> str:
-    if isinstance(val, bytes):
+    if isinstance(val, (bytes, bytearray)):
         return to_checksum_address("0x" + val[-20:].hex())
     s = str(val).strip()
     if not s.startswith("0x"):
@@ -131,11 +150,17 @@ class EthRpc:
 
     def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
+        self._chain_id: int | None = None
 
     def rpc(self, method: str, params: list | None = None) -> any:
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
         req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        opener = (
+            urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            if not should_trust_env(self.rpc_url)
+            else urllib.request.build_opener()
+        )
+        with opener.open(req, timeout=15) as resp:
             data = json.load(resp)
         if "error" in data:
             raise RuntimeError(f"RPC error {method}: {data['error']}")
@@ -144,8 +169,10 @@ class EthRpc:
         return data["result"]
 
     def chain_id(self) -> int:
-        res = self.rpc("eth_chainId")
-        return int(res, 16)
+        if self._chain_id is None:
+            res = self.rpc("eth_chainId")
+            self._chain_id = int(res, 16)
+        return self._chain_id
 
     def accounts(self) -> list[str]:
         return self.rpc("eth_accounts")
@@ -164,6 +191,202 @@ def find_binary(name: str) -> str:
     if fallback.exists():
         return str(fallback)
     return name
+
+
+def find_warrant_binary(name: str) -> Path:
+    for cand in [
+        REPO_ROOT / "target" / "release" / name,
+        REPO_ROOT / "target" / "debug" / name,
+        Path(shutil.which(name) or ""),
+    ]:
+        if cand and cand.exists() and cand.is_file():
+            return cand
+    raise FileNotFoundError(f"Could not find compiled binary '{name}'. Run 'cargo build --release -p warrant-host'.")
+
+
+def compile_buyer_policy(
+    template_path: Path | None = None,
+    manifest_path: Path | None = None,
+    chain_id: int | None = None,
+    escrow_address: str | None = None,
+    token_address: str | None = None,
+    max_amount: int | None = None,
+    valid_after_buffer: int = 300,
+    validity_seconds: int = 900,
+) -> tuple[dict, str]:
+    """Compile buyer policy template into concrete Policy and compute its cryptographic policy_hash."""
+    manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
+    template_path = template_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml")
+
+    manifest = yaml.safe_load(manifest_path.read_text()) if manifest_path.exists() else {}
+    template = yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
+
+    chain_id = chain_id or manifest.get("chain_id", DEFAULT_CHAIN_ID)
+    escrow_address = escrow_address or manifest.get("escrow_address")
+    token_address = token_address or manifest.get("token_address")
+    max_amount = max_amount or manifest.get("max_amount", 2_000_000)
+    validity_seconds = int(manifest.get("validity_seconds", validity_seconds))
+
+    if not escrow_address or not token_address:
+        raise ValueError("escrow_address and token_address must be specified")
+
+    evidence_bin = find_warrant_binary("warrant-evidence")
+    policy_bin = find_warrant_binary("warrant-policy")
+
+    reg_key_rel = manifest.get("private_key_files", {}).get("registry_key", "showcases/ionet_arc/.keys/registry.key")
+    acc_key_rel = manifest.get("private_key_files", {}).get(
+        "buyer_acceptance_key", "showcases/ionet_arc/.keys/buyer_acceptance.key"
+    )
+
+    reg_key_path = REPO_ROOT / reg_key_rel
+    acc_key_path = REPO_ROOT / acc_key_rel
+
+    if not reg_key_path.exists() or not acc_key_path.exists():
+        raise FileNotFoundError(f"Authority keys missing: {reg_key_path} or {acc_key_path}")
+
+    reg_pub = json.loads(
+        subprocess.run(
+            [str(evidence_bin), "public-key", str(reg_key_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    acc_pub = json.loads(
+        subprocess.run(
+            [str(evidence_bin), "public-key", str(acc_key_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+
+    now = int(time.time())
+    valid_after = now - valid_after_buffer
+    valid_until = now + validity_seconds
+
+    category = int(manifest.get("category", DEFAULT_CATEGORY))
+    rule = template.get("rule") or {
+        "all": [
+            "accepted",
+            {"amount_at_most": int(max_amount)},
+            {"vendor_category_in": [category]},
+        ]
+    }
+
+    policy = {
+        "version": int(template.get("version", 1)),
+        "scope": {
+            "chain_id": int(chain_id),
+            "vault": list(address20(escrow_address)),
+            "token": list(address20(token_address)),
+        },
+        "valid_after": valid_after,
+        "valid_until": valid_until,
+        "registry_key": reg_pub,
+        "acceptance_key": acc_pub,
+        "rule": rule,
+    }
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(policy, f)
+        temp_file = Path(f.name)
+
+    try:
+        res = subprocess.run([str(policy_bin), "hash", str(temp_file)], capture_output=True, text=True, check=True)
+        policy_hash = res.stdout.strip()
+    finally:
+        temp_file.unlink(missing_ok=True)
+
+    return policy, policy_hash
+
+
+def sign_acceptance(acceptance: dict, key_path: Path | None = None) -> list[int]:
+    """Sign Acceptance struct with buyer_acceptance.key using warrant-evidence."""
+    key_path = key_path or (REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key")
+    if not key_path.exists():
+        raise FileNotFoundError(f"Buyer acceptance key not found at {key_path}")
+
+    evidence_bin = find_warrant_binary("warrant-evidence")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        acc_file = tmp / "statement.json"
+        sig_file = tmp / "signature.json"
+        acc_file.write_text(json.dumps(acceptance))
+
+        subprocess.run(
+            [str(evidence_bin), "sign-acceptance", str(key_path), str(acc_file), str(sig_file)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(sig_file.read_text().strip())
+
+
+def sign_vendor_credential(credential: dict, key_path: Path | None = None) -> list[int]:
+    """Sign VendorCredential struct with registry.key using warrant-evidence."""
+    key_path = key_path or (REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "registry.key")
+    if not key_path.exists():
+        raise FileNotFoundError(f"Registry authority key not found at {key_path}")
+
+    evidence_bin = find_warrant_binary("warrant-evidence")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        cred_file = tmp / "credential.json"
+        sig_file = tmp / "signature.json"
+        cred_file.write_text(json.dumps(credential))
+
+        subprocess.run(
+            [str(evidence_bin), "sign-vendor", str(key_path), str(cred_file), str(sig_file)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(sig_file.read_text().strip())
+
+
+def evaluate_authorization(policy: dict, request: dict, evidence: dict) -> tuple[dict, bytes]:
+    """Execute native warrant-host evaluate on Input (policy + request + evidence).
+
+    Returns (auth_dict, journal_bytes).
+    """
+    host_bin = find_warrant_binary("warrant-host")
+    input_obj = {
+        "policy": policy,
+        "request": request,
+        "evidence": evidence,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        input_file = tmp / "input.json"
+        input_file.write_text(json.dumps(input_obj))
+
+        res = subprocess.run(
+            [str(host_bin), "evaluate", str(input_file)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        auth = json.loads(res.stdout.strip())
+
+    journal_bytes = encode_journal(
+        policy_hash=bytes(auth["policy_hash"]),
+        chain_id=auth["request"]["scope"]["chain_id"],
+        vault=bytes(auth["request"]["scope"]["vault"]),
+        token=bytes(auth["request"]["scope"]["token"]),
+        recipient=bytes(auth["request"]["recipient"]),
+        amount=auth["request"]["amount"],
+        task_id=bytes(auth["request"]["task_id"]),
+        deliverable_hash=bytes(auth["request"]["deliverable_hash"]),
+        policy_version=auth["policy_version"],
+        valid_after=auth["valid_after"],
+        valid_until=auth["valid_until"],
+        evidence_hash=bytes(auth["evidence_hash"]),
+    )
+    return auth, journal_bytes
 
 
 class EscrowClient:
@@ -212,7 +435,10 @@ class EscrowClient:
         from_addr = to_checksum_address(from_account)
         pk = self.private_keys.get(from_addr.lower())
         if not pk and os.environ.get("WARRANT_PRIVATE_KEY"):
-            pk = os.environ.get("WARRANT_PRIVATE_KEY")
+            candidate_pk = os.environ.get("WARRANT_PRIVATE_KEY")
+            acc = Account.from_key(candidate_pk)
+            if acc.address.lower() == from_addr.lower():
+                pk = candidate_pk
 
         if pk:
             acc = Account.from_key(pk)
@@ -310,24 +536,43 @@ class EscrowClient:
         calldata = selector + encode(["bytes32"], [bytes32(task_id)])
         return self.send_transaction(sender, self.escrow, calldata)
 
+    def approve_journal(self, journal_bytes: bytes, sender: str | None = None) -> dict:
+        """Call JournalVerifier.approve(journal)."""
+        sender = sender or self.server_account
+        if not sender:
+            raise ValueError("Sender required to approve journal")
+        if not self.verifier:
+            raise ValueError("Verifier address required to approve journal")
+        selector = function_signature_to_4byte_selector("approve(bytes)")
+        calldata = selector + encode(["bytes"], [journal_bytes])
+        return self.send_transaction(sender, self.verifier, calldata)
+
+    def settle(self, seal: bytes | str, journal_bytes: bytes, sender: str | None = None) -> dict:
+        """Call TaskEscrow.settle(seal, journal)."""
+        sender = sender or self.server_account
+        if not sender:
+            raise ValueError("Sender required to settle task")
+        seal_bytes = (
+            bytes.fromhex(seal[2:] if str(seal).startswith("0x") else str(seal))
+            if isinstance(seal, str)
+            else bytes(seal)
+        )
+        selector = function_signature_to_4byte_selector("settle(bytes,bytes)")
+        calldata = selector + encode(["bytes", "bytes"], [seal_bytes, journal_bytes])
+        return self.send_transaction(sender, self.escrow, calldata)
+
     def settle_mock(
         self,
         journal_bytes: bytes,
         sender: str | None = None,
         seal_hex: str = MOCK_SEAL,
     ) -> dict:
-        """Approve journal on JournalVerifier and settle TaskEscrow with mock seal."""
+        """Approve journal on JournalVerifier (if configured) and settle TaskEscrow with mock seal."""
         sender = sender or self.server_account
-        # Approve on verifier
         if self.verifier:
-            selector_approve = function_signature_to_4byte_selector("approve(bytes)")
-            calldata_approve = selector_approve + encode(["bytes"], [journal_bytes])
-            self.send_transaction(sender, self.verifier, calldata_approve)
-        # Settle on escrow
-        seal = bytes.fromhex(seal_hex[2:] if seal_hex.startswith("0x") else seal_hex)
-        selector_settle = function_signature_to_4byte_selector("settle(bytes,bytes)")
-        calldata_settle = selector_settle + encode(["bytes", "bytes"], [seal, journal_bytes])
-        return self.send_transaction(sender, self.escrow, calldata_settle)
+            with contextlib.suppress(Exception):
+                self.approve_journal(journal_bytes, sender=sender)
+        return self.settle(seal_hex, journal_bytes, sender=sender)
 
     def token_balance(self, account: str) -> int:
         """Read ERC-20 token balance for account."""
@@ -432,26 +677,35 @@ def ensure_policy_hash(
     token_address: str,
     chain_id: int,
     max_amount: int,
-    state_dir: Path,
+    state_dir: Path | None = None,
     categories: list[int] | None = None,
     valid_after: int = 1000,
     valid_until: int = 2_000_000_000,
 ) -> str:
-    """Instantiate and hash accepted-contractor-v1 policy for this scope."""
+    """Instantiate and hash policy for this scope."""
+    manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+    template_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
+    if manifest_path.exists() and template_path.exists():
+        try:
+            _, pol_hash = compile_buyer_policy(
+                template_path=template_path,
+                manifest_path=manifest_path,
+                chain_id=chain_id,
+                escrow_address=escrow_address,
+                token_address=token_address,
+                max_amount=max_amount,
+            )
+            return pol_hash
+        except Exception:
+            pass
+
+    # Fallback to templates/example-parameters.json if config doesn't exist
     params_template = REPO_ROOT / "templates" / "example-parameters.json"
     template_file = REPO_ROOT / "templates" / "accepted-contractor-v1.json"
-    policy_binary = None
-    for cand in [
-        REPO_ROOT / "target" / "release" / "warrant-policy",
-        REPO_ROOT / "target" / "debug" / "warrant-policy",
-        Path(shutil.which("warrant-policy") or ""),
-    ]:
-        if cand and cand.exists() and cand.is_file():
-            policy_binary = cand
-            break
+    policy_binary = find_warrant_binary("warrant-policy")
 
-    escrow_bytes = list(bytes.fromhex(escrow_address[2:] if escrow_address.startswith("0x") else escrow_address))
-    token_bytes = list(bytes.fromhex(token_address[2:] if token_address.startswith("0x") else token_address))
+    escrow_bytes = list(address20(escrow_address))
+    token_bytes = list(address20(token_address))
 
     params_obj = json.loads(params_template.read_text())
     params_obj["policy"]["scope"] = {
@@ -466,14 +720,11 @@ def ensure_policy_hash(
         "categories": categories or [DEFAULT_CATEGORY],
     }
 
-    state_dir.mkdir(parents=True, exist_ok=True)
-    params_path = state_dir / "policy_parameters.json"
-    policy_path = state_dir / "policy.json"
-    params_path.write_text(json.dumps(params_obj, indent=2))
-
-    if policy_binary and template_file.exists():
-        if policy_path.exists():
-            policy_path.unlink()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        params_path = tmp / "params.json"
+        policy_path = tmp / "policy.json"
+        params_path.write_text(json.dumps(params_obj, indent=2))
         subprocess.run(
             [str(policy_binary), "instantiate", str(template_file), str(params_path), str(policy_path)],
             check=True,
@@ -486,4 +737,3 @@ def ensure_policy_hash(
             text=True,
         )
         return res.stdout.strip()
-    return "0x" + digest(params_obj)

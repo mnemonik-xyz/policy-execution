@@ -1,4 +1,5 @@
 """End-to-end demonstration test running Anvil, MCP Server, and Client Agent."""
+
 import os
 import shutil
 import socket
@@ -30,6 +31,15 @@ def _check_prerequisites() -> None:
         raise unittest.SkipTest("contracts/node_modules not found; skipping end-to-end tests")
 
 
+def _clean_env() -> dict:
+    env = dict(os.environ)
+    for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        env.pop(k, None)
+    env["no_proxy"] = "*"
+    env["NO_PROXY"] = "*"
+    return env
+
+
 def _wait_for_http(url: str, timeout_steps: int = 50) -> None:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for _ in range(timeout_steps):
@@ -56,8 +66,16 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.anvil_port = s.getsockname()[1]
         cls.rpc_url = f"http://127.0.0.1:{cls.anvil_port}"
         cls.anvil_proc = subprocess.Popen(
-            [find_binary("anvil"), "--host", "127.0.0.1", "--port",
-             str(cls.anvil_port), "--chain-id", "31337", "--silent"],
+            [
+                find_binary("anvil"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(cls.anvil_port),
+                "--chain-id",
+                "31337",
+                "--silent",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -65,8 +83,9 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         # Wait for anvil
         for _ in range(50):
             try:
-                res = subprocess.run([find_binary("cast"), "chain-id", "--rpc-url",
-                                     cls.rpc_url], capture_output=True, text=True)
+                res = subprocess.run(
+                    [find_binary("cast"), "chain-id", "--rpc-url", cls.rpc_url], capture_output=True, text=True
+                )
                 if res.returncode == 0 and res.stdout.strip() == "31337":
                     break
             except Exception:
@@ -88,15 +107,17 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         cmd = [
             str(PYTHON),
             str(ROOT / "showcases" / "ionet_arc" / "seller_mcp_server.py"),
-            "--host", "127.0.0.1",
-            "--port", str(cls.mcp_port),
-            "--state-dir", cls.tmp_dir,
-            "--rpc-url", cls.rpc_url,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cls.mcp_port),
+            "--state-dir",
+            cls.tmp_dir,
+            "--rpc-url",
+            cls.rpc_url,
             "--mock-ionet",
         ]
-        env = dict(os.environ)
-        env["no_proxy"] = "127.0.0.1,localhost"
-        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env = _clean_env()
         cls.server_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         try:
             _wait_for_http(cls.mcp_url)
@@ -122,6 +143,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             str(Path(cls.tmp_dir) / "buyer_state"),
             "--rpc-url",
             cls.rpc_url,
+            "--auto-mint",
         ]
         cls.buyer_proc = subprocess.Popen(buyer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         try:
@@ -145,9 +167,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def test_run_client_against_live_server_and_anvil(self):
-        env = dict(os.environ)
-        env["no_proxy"] = "127.0.0.1,localhost"
-        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env = _clean_env()
         cmd = [
             str(PYTHON),
             str(ROOT / "showcases" / "ionet_arc" / "buyer_test_agent.py"),
@@ -168,15 +188,12 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         self.assertIn("WARRANT AUTONOMOUS TRANSCRIPTION AGENT", res.stdout)
         self.assertIn("Policy evaluation: APPROVED", res.stdout)
         self.assertIn("TaskEscrow funded on-chain", res.stdout)
-        self.assertIn("Deployment provisioned and escrow settled", res.stdout)
-        self.assertIn("Settlement TX: 0x", res.stdout)
+        self.assertIn("TaskEscrow settled on-chain: tx 0x", res.stdout)
         self.assertIn("TRANSCRIPTION RESULT", res.stdout)
         self.assertIn("Autonomous Warrant transcription showcase completed successfully!", res.stdout)
 
     def test_run_client_in_process_warrant_service(self):
-        env = dict(os.environ)
-        env["no_proxy"] = "127.0.0.1,localhost"
-        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env = _clean_env()
         cmd = [
             str(PYTHON),
             str(ROOT / "showcases" / "ionet_arc" / "buyer_test_agent.py"),

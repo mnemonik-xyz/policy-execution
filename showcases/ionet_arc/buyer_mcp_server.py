@@ -4,7 +4,8 @@ Exposes tools for the buyer's LLM agent:
 1. warrant_get_policy: Inspect local budget cap, duration limits, and allowed categories.
 2. warrant_evaluate_and_offer: Cryptographically verify seller proposals against policy
    and fund TaskEscrow on-chain.
-3. warrant_check_escrow_status: Query on-chain TaskEscrow status for task tracking.
+3. warrant_sign_acceptance: Sign deliverable acceptance after verifying worker health.
+4. warrant_check_escrow_status: Query on-chain TaskEscrow status for task tracking.
 
 Supports stdio (standard for desktop LLM agents) and Streamable HTTP transports.
 """
@@ -16,20 +17,25 @@ import pathlib
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 
 # Ensure repository root is on sys.path
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
-import uvicorn
-from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.transport_security import TransportSecuritySettings
+import uvicorn  # noqa: E402
+from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 
-from showcases.ionet_arc.escrow import (
+from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     EscrowClient,
-    ensure_policy_hash,
+    address20,
+    bytes32,
+    compile_buyer_policy,
+    sign_acceptance,
 )
 
 
@@ -46,10 +52,15 @@ class BuyerWarrantService:
         buyer_account: str | None = None,
         pinned_escrow: str | None = None,
         pinned_token: str | None = None,
-        auto_mint: bool = True,
+        auto_mint: bool = False,
+        manifest_path: pathlib.Path | None = None,
+        template_path: pathlib.Path | None = None,
+        buyer_acceptance_key_path: pathlib.Path | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.tasks_dir = self.state_dir / "tasks"
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.escrow_client = escrow_client
         self.max_budget_usd = float(max_budget_usd)
         self.max_duration_hours = int(max_duration_hours)
@@ -58,6 +69,30 @@ class BuyerWarrantService:
         self.pinned_escrow = pinned_escrow
         self.pinned_token = pinned_token
         self.auto_mint = auto_mint
+
+        self.manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
+        self.template_path = template_path or (
+            REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
+        )
+        self.buyer_acceptance_key_path = buyer_acceptance_key_path or (
+            REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
+        )
+
+        # Pin addresses from manifest if not provided and chain matches
+        if self.manifest_path.exists():
+            try:
+                import yaml
+
+                manifest = yaml.safe_load(self.manifest_path.read_text()) or {}
+                manifest_chain = manifest.get("chain_id")
+                active_chain = self._resolve_chain_id()
+                if manifest_chain is None or manifest_chain == active_chain:
+                    if not self.pinned_escrow and manifest.get("escrow_address"):
+                        self.pinned_escrow = manifest["escrow_address"]
+                    if not self.pinned_token and manifest.get("token_address"):
+                        self.pinned_token = manifest["token_address"]
+            except Exception:
+                pass
 
     def _resolve_buyer_account(self) -> str:
         if self.buyer_account:
@@ -69,7 +104,7 @@ class BuyerWarrantService:
                 return self.buyer_account
         except Exception:
             pass
-        return "0x" + "11" * 20
+        raise ToolError("Buyer account is not configured and no unlocked accounts were returned by RPC.")
 
     def _resolve_chain_id(self) -> int:
         try:
@@ -93,16 +128,30 @@ class BuyerWarrantService:
     def _validate_proposal_terms(
         self,
         cost_usd: float,
+        atomic_amount: int,
         duration_hours: int | None,
         category: int,
         escrow_addr: str,
         token_addr: str,
+        chain_id: int,
     ):
         if cost_usd > self.max_budget_usd:
             raise ToolError(
                 f"Policy rejection: proposed cost ${cost_usd:.4f} exceeds max budget cap ${self.max_budget_usd:.4f}"
             )
-        if duration_hours is not None and duration_hours > self.max_duration_hours:
+        max_atomic = round(self.max_budget_usd * 1_000_000)
+        if atomic_amount > max_atomic:
+            raise ToolError(
+                f"Policy rejection: proposed amount {atomic_amount} atomic units exceeds budget limit {max_atomic}"
+            )
+        expected_atomic = round(cost_usd * 1_000_000)
+        if abs(atomic_amount - expected_atomic) > 1:
+            raise ToolError(
+                f"Policy rejection: atomic amount {atomic_amount} does not match amount_usd ${cost_usd:.4f}"
+            )
+        if duration_hours is None or duration_hours <= 0:
+            raise ToolError("Policy rejection: duration_hours is required and must be at least 1")
+        if duration_hours > self.max_duration_hours:
             raise ToolError(
                 f"Policy rejection: proposed duration {duration_hours}h exceeds max duration {self.max_duration_hours}h"
             )
@@ -118,28 +167,11 @@ class BuyerWarrantService:
             raise ToolError(
                 f"Policy rejection: token address {token_addr} does not match pinned token {self.pinned_token}"
             )
-
-    def _verify_policy_hash(
-        self,
-        escrow_addr: str,
-        token_addr: str,
-        chain_id: int,
-        category: int,
-        claimed_hash: str | None,
-    ) -> str:
-        expected_hash = ensure_policy_hash(
-            escrow_address=escrow_addr,
-            token_address=token_addr,
-            chain_id=chain_id,
-            max_amount=100_000_000,
-            state_dir=self.state_dir,
-            categories=[category],
-        )
-        if claimed_hash and claimed_hash.lower() != expected_hash.lower():
+        active_chain = self._resolve_chain_id()
+        if chain_id != active_chain:
             raise ToolError(
-                f"Policy hash mismatch: proposal claimed {claimed_hash} but locally derived hash is {expected_hash}"
+                f"Policy rejection: proposed chain_id {chain_id} does not match RPC chain_id {active_chain}"
             )
-        return expected_hash
 
     def _fund_escrow(
         self,
@@ -151,6 +183,7 @@ class BuyerWarrantService:
         policy_hash: str,
         policy_version: int,
         buyer_account: str | None = None,
+        validity_seconds: int = 900,
     ) -> dict:
         buyer_account = buyer_account or self._resolve_buyer_account()
         self.escrow_client.escrow = escrow_addr
@@ -164,7 +197,7 @@ class BuyerWarrantService:
         if balance < atomic_amount:
             if self.auto_mint:
                 try:
-                    self.escrow_client.mint_token(buyer_account, atomic_amount * 10, sender=buyer_account)
+                    self.escrow_client.mint_token(buyer_account, atomic_amount * 2, sender=buyer_account)
                 except Exception as e:
                     raise ToolError(
                         f"Insufficient balance ({balance} < {atomic_amount}) and auto-mint failed: {e}"
@@ -178,8 +211,9 @@ class BuyerWarrantService:
             raise ToolError(f"Failed to approve TaskEscrow token allowance: {e}") from e
 
         now = int(time.time())
-        accept_by = now + 3600
-        settle_by = now + 86400
+        accept_by = now + 300
+        settle_by = now + validity_seconds
+
         try:
             receipt = self.escrow_client.offer(
                 salt=salt,
@@ -192,7 +226,7 @@ class BuyerWarrantService:
                 sender=buyer_account,
             )
         except Exception as e:
-            raise ToolError(f"Failed to submit TaskEscrow.offer() on-chain: {e}") from e
+            raise ToolError(f"TaskEscrow.offer() reverted on-chain: {e}") from e
 
         return {
             "receipt": receipt,
@@ -201,45 +235,40 @@ class BuyerWarrantService:
             "buyer_account": buyer_account,
         }
 
-    def _parse_proposal_dict(self, proposal: dict | str | None) -> dict:
-        if isinstance(proposal, str):
-            try:
-                return json.loads(proposal)
-            except Exception as e:
-                raise ToolError(f"Invalid proposal JSON: {e}") from e
-        if isinstance(proposal, dict):
-            return dict(proposal)
-        return {}
-
     async def warrant_evaluate_and_offer(
         self,
-        proposal: dict | str | None = None,
+        proposal: dict | None = None,
         task_id: str | None = None,
         amount: int | str | None = None,
-        amount_usd: float | str | None = None,
-        duration_hours: int | None = None,
+        amount_usd: str | float | None = None,
         salt: str | None = None,
         recipient: str | None = None,
-        policy_hash: str | None = None,
-        policy_version: int = 1,
-        category: int = DEFAULT_CATEGORY,
         escrow_address: str | None = None,
         token_address: str | None = None,
+        category: int = DEFAULT_CATEGORY,
+        duration_hours: int | None = 1,
+        policy_hash: str | None = None,
+        policy_version: int = 1,
+        chain_id: int | None = None,
     ) -> dict:
-        """Validate proposal against Warrant policy and fund TaskEscrow on-chain."""
-        prop = self._parse_proposal_dict(proposal)
+        """Evaluate proposal against local constraints, stamp concrete policy, and fund TaskEscrow on-chain."""
+        if proposal and isinstance(proposal, dict):
+            task_id = proposal.get("task_id", task_id)
+            amount = proposal.get("amount", amount)
+            amount_usd = proposal.get("amount_usd", amount_usd)
+            salt = proposal.get("salt", salt)
+            recipient = proposal.get("recipient", recipient)
+            escrow_address = proposal.get("escrow_address", escrow_address)
+            token_address = proposal.get("token_address", token_address)
+            category = proposal.get("category", category)
+            duration_hours = proposal.get("duration_hours", duration_hours)
+            policy_hash = proposal.get("policy_hash", policy_hash)
+            policy_version = proposal.get("policy_version", policy_version)
+            chain_id = proposal.get("chain_id", chain_id)
 
-        task_id = prop.get("task_id") or task_id
-        amount = prop.get("amount") if prop.get("amount") is not None else amount
-        amount_usd = prop.get("amount_usd") if prop.get("amount_usd") is not None else amount_usd
-        duration_hours = prop.get("duration_hours") if prop.get("duration_hours") is not None else duration_hours
-        salt = prop.get("salt") or salt
-        recipient = prop.get("recipient") or recipient
-        policy_hash = prop.get("policy_hash") or policy_hash
-        policy_version = int(prop.get("policy_version") or policy_version or 1)
-        category = int(prop.get("category") or category or DEFAULT_CATEGORY)
-        escrow_addr = prop.get("escrow_address") or escrow_address or self.pinned_escrow or self.escrow_client.escrow
-        token_addr = prop.get("token_address") or token_address or self.pinned_token or self.escrow_client.token
+        escrow_addr = escrow_address or self.pinned_escrow or self.escrow_client.escrow
+        token_addr = token_address or self.pinned_token or self.escrow_client.token
+        chain_id = chain_id or self._resolve_chain_id()
 
         missing = []
         if not task_id:
@@ -259,13 +288,19 @@ class BuyerWarrantService:
         if missing:
             raise ToolError(f"Missing required proposal fields: {', '.join(missing)}")
 
-        cost_usd = float(amount_usd)
+        cost_usd = float(Decimal(str(amount_usd)))
         atomic_amount = int(amount)
         duration = int(duration_hours) if duration_hours is not None else None
 
-        self._validate_proposal_terms(cost_usd, duration, category, escrow_addr, token_addr)
-        chain_id = self._resolve_chain_id()
-        expected_hash = self._verify_policy_hash(escrow_addr, token_addr, chain_id, category, policy_hash)
+        self._validate_proposal_terms(
+            cost_usd=cost_usd,
+            atomic_amount=atomic_amount,
+            duration_hours=duration,
+            category=category,
+            escrow_addr=escrow_addr,
+            token_addr=token_addr,
+            chain_id=chain_id,
+        )
 
         buyer_account = self._resolve_buyer_account()
         self.escrow_client.escrow = escrow_addr
@@ -280,32 +315,127 @@ class BuyerWarrantService:
                 f"derived taskIdFor('{buyer_account}', '{salt}'): '{expected_task_id}'"
             )
 
+        # Compile buyer policy template into concrete Policy and cryptographic policy_hash
+        try:
+            concrete_policy, derived_policy_hash = compile_buyer_policy(
+                template_path=self.template_path,
+                manifest_path=self.manifest_path,
+                chain_id=chain_id,
+                escrow_address=escrow_addr,
+                token_address=token_addr,
+                max_amount=atomic_amount,
+            )
+        except Exception as e:
+            raise ToolError(f"Failed to compile buyer policy template: {e}") from e
+
+        if policy_hash and policy_hash.lower() != derived_policy_hash.lower():
+            raise ToolError(
+                f"Policy hash mismatch: proposal claimed {policy_hash} "
+                f"but locally compiled policy hash is {derived_policy_hash}"
+            )
+
         funded = self._fund_escrow(
             escrow_addr=escrow_addr,
             token_addr=token_addr,
             atomic_amount=atomic_amount,
             salt=salt,
             recipient=recipient,
-            policy_hash=expected_hash,
+            policy_hash=derived_policy_hash,
             policy_version=policy_version,
             buyer_account=buyer_account,
         )
 
+        # Record task state for subsequent acceptance verification
+        task_record = {
+            "task_id": task_id,
+            "status": "OFFERED",
+            "salt": salt,
+            "customer": funded["buyer_account"],
+            "recipient": recipient,
+            "amount": atomic_amount,
+            "amount_usd": str(amount_usd),
+            "policy": concrete_policy,
+            "policy_hash": derived_policy_hash,
+            "policy_version": policy_version,
+            "escrow_address": escrow_addr,
+            "token_address": token_addr,
+            "accept_by": funded["accept_by"],
+            "settle_by": funded["settle_by"],
+            "transaction_hash": funded["receipt"].get("transactionHash"),
+        }
+        (self.tasks_dir / f"{task_id}.json").write_text(json.dumps(task_record, indent=2))
+
         return {
-            "status": "APPROVED_AND_OFFERED",
+            "status": "APPROVED",
             "task_id": task_id,
             "transaction_hash": funded["receipt"].get("transactionHash"),
             "customer": funded["buyer_account"],
             "recipient": recipient,
             "amount": atomic_amount,
             "amount_usd": str(amount_usd),
-            "policy_hash": expected_hash,
+            "policy": concrete_policy,
+            "policy_hash": derived_policy_hash,
             "policy_version": policy_version,
             "escrow_address": escrow_addr,
             "token_address": token_addr,
             "accept_by": funded["accept_by"],
             "settle_by": funded["settle_by"],
-            "message": "Task escrow successfully funded on-chain. Proceed to call seller's deploy_with_escrow tool.",
+            "message": "TaskEscrow successfully funded on-chain. Deliverable is committed.",
+        }
+
+    async def warrant_sign_acceptance(
+        self,
+        task_id: str,
+        deliverable_hash: str,
+        recipient: str,
+        amount: int | str,
+    ) -> dict:
+        """Sign Acceptance statement with buyer authority key after verifying deliverable health."""
+        task_path = self.tasks_dir / f"{task_id}.json"
+        if not task_path.exists():
+            raise ToolError(f"Task '{task_id}' not found in buyer state. Offer must be created first.")
+
+        task_data = json.loads(task_path.read_text())
+        policy = task_data.get("policy", {})
+
+        atomic_amount = int(amount)
+        if atomic_amount != int(task_data.get("amount", 0)):
+            raise ToolError(
+                f"Acceptance amount {atomic_amount} does not match offered task amount {task_data.get('amount')}"
+            )
+        if recipient.lower() != str(task_data.get("recipient", "")).lower():
+            raise ToolError(
+                f"Acceptance recipient {recipient} does not match offered task recipient {task_data.get('recipient')}"
+            )
+
+        scope = policy.get("scope") or {
+            "chain_id": self._resolve_chain_id(),
+            "vault": list(address20(self.pinned_escrow or self.escrow_client.escrow)),
+            "token": list(address20(self.pinned_token or self.escrow_client.token)),
+        }
+
+        acceptance = {
+            "scope": scope,
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(deliverable_hash)),
+            "recipient": list(address20(recipient)),
+            "amount": atomic_amount,
+            "accepted": True,
+            "valid_after": int(policy.get("valid_after", int(time.time()) - 300)),
+            "valid_until": int(policy.get("valid_until", int(time.time()) + 900)),
+        }
+
+        try:
+            sig_bytes = sign_acceptance(acceptance, key_path=self.buyer_acceptance_key_path)
+        except Exception as e:
+            raise ToolError(f"Failed to sign acceptance evidence: {e}") from e
+
+        return {
+            "status": "signed",
+            "task_id": task_id,
+            "acceptance": acceptance,
+            "signature": sig_bytes,
+            "message": "Deliverable acceptance signed. Submit this evidence to the compute seller for settlement.",
         }
 
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
@@ -342,7 +472,10 @@ class ServerConfig:
     max_budget_usd: float = 2.00
     max_duration_hours: int = 1
     allowed_categories: list[int] | None = None
-    auto_mint: bool = True
+    auto_mint: bool = False
+    manifest_path: pathlib.Path | None = None
+    template_path: pathlib.Path | None = None
+    buyer_acceptance_key_path: pathlib.Path | None = None
     escrow_client: EscrowClient | None = None
 
     def __post_init__(self):
@@ -353,34 +486,31 @@ class ServerConfig:
 BuyerServerConfig = ServerConfig
 
 
-def _normalize_config(
-    config: ServerConfig | pathlib.Path | str | None = None,
-    **kwargs,
-) -> ServerConfig:
+def _normalize_config(config: ServerConfig | pathlib.Path | str | None = None, **kwargs) -> ServerConfig:
     if isinstance(config, ServerConfig):
-        if kwargs:
-            return ServerConfig(**{**config.__dict__, **kwargs})
-        return config
-    if isinstance(config, (pathlib.Path, str)):
-        kwargs["state_dir"] = pathlib.Path(config)
-    return ServerConfig(**kwargs)
+        cfg = config
+    elif isinstance(config, (pathlib.Path, str)):
+        path = pathlib.Path(config)
+        data = json.loads(path.read_text()) if path.exists() else {}
+        cfg = ServerConfig(**data)
+    else:
+        cfg = ServerConfig()
+
+    for k, v in kwargs.items():
+        if hasattr(cfg, k) and v is not None:
+            setattr(cfg, k, v)
+    return cfg
 
 
-def create_server(
-    config: ServerConfig | pathlib.Path | str | None = None,
-    **kwargs,
-) -> MCPServer:
-    """Instantiate and configure the Buyer Warrant MCPServer."""
+def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwargs) -> MCPServer:
+    """Build configured MCPServer with Buyer Warrant tools."""
     cfg = _normalize_config(config, **kwargs)
-
-    escrow_client = cfg.escrow_client
-    if escrow_client is None:
-        escrow_client = EscrowClient(
-            rpc_url=cfg.rpc_url,
-            escrow_address=cfg.escrow_address,
-            token_address=cfg.token_address,
-            server_account=cfg.buyer_account,
-        )
+    escrow_client = cfg.escrow_client or EscrowClient(
+        rpc_url=cfg.rpc_url,
+        escrow_address=cfg.escrow_address,
+        token_address=cfg.token_address,
+        server_account=cfg.buyer_account,
+    )
 
     service = BuyerWarrantService(
         state_dir=cfg.state_dir,
@@ -392,9 +522,19 @@ def create_server(
         pinned_escrow=cfg.escrow_address,
         pinned_token=cfg.token_address,
         auto_mint=cfg.auto_mint,
+        manifest_path=cfg.manifest_path,
+        template_path=cfg.template_path,
+        buyer_acceptance_key_path=cfg.buyer_acceptance_key_path,
     )
 
-    server = MCPServer("buyer-warrant-mcp-server")
+    server = MCPServer(
+        name="buyer-warrant-guardrail",
+        instructions=(
+            "You are the Buyer Warrant guardrail sidecar. You verify that compute proposals adhere to "
+            "spending caps, duration caps, and category whitelist, stamp buyer policies, submit on-chain "
+            "offers to TaskEscrow, and sign deliverable acceptance evidence."
+        ),
+    )
 
     server.tool(
         name="warrant_get_policy",
@@ -408,10 +548,18 @@ def create_server(
         name="warrant_evaluate_and_offer",
         description=(
             "Validate a seller's deployment proposal against local Warrant policy constraints "
-            "(budget cap, duration, category, and independent cryptographic policy hash), "
-            "approve token allowance, and fund the TaskEscrow contract on-chain."
+            "(budget cap, duration, category), stamp buyer policy template with authority keys, "
+            "approve token allowance, and fund TaskEscrow on-chain."
         ),
     )(service.warrant_evaluate_and_offer)
+
+    server.tool(
+        name="warrant_sign_acceptance",
+        description=(
+            "Sign an off-chain Acceptance deliverable receipt for an offered TaskEscrow task using the "
+            "buyer's private acceptance key. Required by compute seller before on-chain escrow settlement."
+        ),
+    )(service.warrant_sign_acceptance)
 
     server.tool(
         name="warrant_check_escrow_status",
@@ -500,40 +648,29 @@ def main():
         help="Maximum allowable duration in hours (default: 1)",
     )
     parser.add_argument(
-        "--allowed-categories",
-        default=os.environ.get("WARRANT_ALLOWED_CATEGORIES", str(DEFAULT_CATEGORY)),
-        help=f"Comma-separated list of allowed category IDs (default: {DEFAULT_CATEGORY})",
-    )
-    parser.add_argument(
-        "--no-auto-mint",
+        "--auto-mint",
         action="store_true",
-        default=os.environ.get("WARRANT_NO_AUTO_MINT", "").lower() in ("1", "true"),
-        help="Disable automatic test token minting if balance is insufficient",
+        help="Auto-mint tokens on local test networks if buyer balance is low (default: False)",
     )
     parser.add_argument(
         "--state-dir",
-        type=pathlib.Path,
-        default=pathlib.Path(os.environ.get("WARRANT_BUYER_STATE_DIR", "artifacts/buyer_state")),
-        help="Directory to persist buyer policy state (default: artifacts/buyer_state)",
+        default="artifacts/buyer_state",
+        help="Directory to store local buyer state and task history",
     )
     args = parser.parse_args()
 
-    cat_list = [int(c.strip()) for c in args.allowed_categories.split(",") if c.strip()]
-    transport = "http" if args.transport in ("http", "streamable-http") else "stdio"
-
     config = ServerConfig(
-        transport=transport,
+        transport=args.transport,
         host=args.host,
         port=args.port,
-        state_dir=args.state_dir,
         rpc_url=args.rpc_url,
         escrow_address=args.escrow_address,
         token_address=args.token_address,
         buyer_account=args.buyer_account,
         max_budget_usd=args.max_budget_usd,
         max_duration_hours=args.max_duration_hours,
-        allowed_categories=cat_list,
-        auto_mint=not args.no_auto_mint,
+        auto_mint=args.auto_mint,
+        state_dir=pathlib.Path(args.state_dir),
     )
     run_server(config)
 

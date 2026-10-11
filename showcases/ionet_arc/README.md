@@ -16,33 +16,35 @@ transcribes audio submitted by the buyer.
 
 ## Showcase Limitations
 
-This showcase is an infrastructure and agent-interaction pilot. It contains several important
-architectural simplifications and trust boundaries:
+This showcase is an infrastructure and agent-interaction pilot. It demonstrates cryptographic
+policy evaluation, capability deliverable verification, and dual-MCP orchestration with the
+following design trade-offs:
 
-1. **No Real Zero-Knowledge (ZK) Proof**:
-   - The on-chain `TaskEscrow` settlement on Arc uses mock / digest journal verification
-     (`settle_mock`), passing a 384-byte plain authorization journal.
-   - It does **not** generate or verify cryptographic zero-knowledge Groth16 or STARK proofs from
-     a RISC Zero zk-prover (such as Bonsai).
-2. **No Proof of Deployed Container or Hardware**:
-   - The compute seller provides **no cryptographic or verifiable proof** that the container was
-     actually deployed on io.net, that the agreed GPU hardware was allocated, or that the container
-     is executing honestly.
-   - The `deliverable_record` and `deliverable_hash` recorded on-chain are unilaterally asserted by
-     the seller, not authenticated by hardware attestations (e.g. Confidential Computing / TEE)
-     or independent third parties.
-3. **Immediate Escrow Settlement (Upfront Fund Extraction)**:
-   - The seller MCP server invokes `TaskEscrow.settle()` **immediately upon container launch** (or
-     mock local worker startup) to claim and withdraw the buyer's escrowed USDC.
-   - The buyer's funds are extracted **before** the buyer submits their audio workload or receives
-     any transcription results.
-   - If the container crashes, fails to initialize, or goes unreachable, the buyer has already
-     surrendered their payment without automated on-chain dispute resolution or refund recourse.
+1. **Mock On-Chain ZK Verification (`JournalVerifier`)**:
+   - On-chain `TaskEscrow` settlement on Arc uses pre-approved digest verification
+     (`JournalVerifier`) with a mock seal (`0xabcd`), rather than full RISC Zero Groth16
+     proving (which requires Docker and takes 2–4 minutes per proof).
+   - Off-chain policy evaluation is **fully real and cryptographic**: the native Rust
+     `warrant-host evaluate` binary executes in under 10ms, cryptographically verifying all
+     ECDSA authority signatures (`registry.key`, `buyer_acceptance.key`), category limits,
+     and budget constraints to produce the canonical 384-byte authorization journal.
+2. **No Hardware TEE Attestation**:
+   - The compute seller provides **no hardware attestation** (such as AMD SEV-SNP or Intel TDX)
+     proving that the container was isolated in a Confidential VM or that io.net allocated
+     the claimed GPU model.
+   - Capability verification relies on the secret `WARRANT_WORKER_TOKEN` and its matching
+     `deliverable_hash = sha256(WARRANT_WORKER_TOKEN)`. Once the buyer agent verifies container
+     `/health` with the bearer token, it signs an `Acceptance` statement authorizing settlement.
+3. **Escrow Safety with Capability Tokens**:
+   - Unlike naive pilots that settle escrow immediately upon deployment, this showcase enforces
+     a two-step workflow: the seller accepts the task on-chain to commit terms, provisions the
+     container in the background, and can only claim escrow payment after the buyer verifies
+     `/health` and signs an `Acceptance` evidence struct off-chain.
 4. **Trust Boundary**:
-   - The Buyer Warrant MCP guardrail successfully enforces local buyer constraints (budget ceiling,
-     duration limit, and deterministic policy hash matching) prior to committing funds on-chain.
-   - However, once funds are deposited into `TaskEscrow`, the actual execution phase relies on
-     counterparty trust in the seller rather than trustless verification.
+   - The local Buyer Guardrail strictly prevents unauthorized transactions or spending cap
+     violations before funds ever leave the buyer's wallet.
+   - For post-settlement transcription, the buyer directly submits inference jobs to the
+     authenticated worker during its 1-hour lease window.
 
 ---
 
@@ -108,7 +110,7 @@ contract on Arc.
 The capability deliverable is the authenticated GPU worker session: the seller generates a secret
 `WARRANT_WORKER_TOKEN`, derives `deliverable_hash = sha256(WARRANT_WORKER_TOKEN)`, and provides it
 alongside `public_url`. Once the buyer agent verifies container `/health`, the buyer signs an
-`Acceptance` statement off-chain, enabling the seller to settle via RISC Zero zkVM on Arc:
+`Acceptance` statement off-chain, enabling the seller to settle on Arc:
 
 ```mermaid
 sequenceDiagram
@@ -118,7 +120,7 @@ sequenceDiagram
     participant SellerMCP as Seller MCP Server (io.net)
     participant Escrow as TaskEscrow (Arc)
     participant Worker as Whisper Worker (io.net)
-    participant Prover as RISC Zero zkVM Prover
+    participant Host as warrant-host (Evaluator)
 
     %% Phase 1: Hardware Discovery
     rect rgb(240, 248, 255)
@@ -154,38 +156,44 @@ sequenceDiagram
     SellerMCP->>Escrow: Read tasks(task_id) -> verify policy_hash, amount, recipient
     SellerMCP->>Escrow: accept(task_id) on-chain
     Note over Escrow: State.Accepted: agreement committed, buyer cannot cancel
-    end
-
-    %% Phase 5: Container Launch & Capability Deliverable
-    rect rgb(250, 240, 255)
-    Note over SellerMCP,Worker: Phase 5: Container Launch & Capability Deliverable
     SellerMCP->>SellerMCP: Generates random WARRANT_WORKER_TOKEN
     SellerMCP->>SellerMCP: Derives deliverable_hash = sha256(WARRANT_WORKER_TOKEN)
-    SellerMCP->>Worker: Provisions GPU container on io.net (injects token env)
+    SellerMCP->>Worker: Starts background provisioning on io.net
+    SellerMCP-->>Buyer: {status: "provisioning", task_id, deliverable_hash}
+    end
+
+    %% Phase 5: Async Polling for Container Launch
+    rect rgb(250, 240, 255)
+    Note over Buyer,Worker: Phase 5: Async Polling for Container Launch
+    loop Poll until status is ready
+        Buyer->>SellerMCP: get_deployment_status(task_id)
+        SellerMCP-->>Buyer: {status: "provisioning", elapsed_seconds}
+    end
     Worker-->>SellerMCP: Container online at public_url
-    SellerMCP-->>Buyer: Returns {public_url, worker_token, deliverable_hash}
+    Buyer->>SellerMCP: get_deployment_status(task_id)
+    SellerMCP-->>Buyer: {status: "ready", public_url, worker_token, deliverable_hash}
     end
 
     %% Phase 6: Health Verification & Deliverable Sign-off
     rect rgb(240, 255, 255)
     Note over Buyer,BuyerMCP: Phase 6: Health Verification & Deliverable Sign-off
     Buyer->>Worker: GET /health (Authorization: Bearer <worker_token>)
-    Worker-->>Buyer: 200 OK {status: "healthy", model: "whisper-large-v3"}
+    Worker-->>Buyer: 200 OK {"status": "ok"}
     Buyer->>BuyerMCP: warrant_sign_acceptance(task_id, deliverable_hash, recipient, amount)
-    BuyerMCP->>BuyerMCP: Signs Acceptance {task_id, deliverable_hash, accepted: true}
-    BuyerMCP-->>Buyer: Signed Acceptance & ECDSA signature
-    Buyer->>SellerMCP: Submit Acceptance evidence to seller
+    BuyerMCP->>BuyerMCP: Signs Acceptance using buyer_acceptance.key
+    BuyerMCP-->>Buyer: Signed Acceptance evidence & ECDSA signature
     end
 
-    %% Phase 7: zkVM Settlement
+    %% Phase 7: Off-Chain Evaluation & Settlement
     rect rgb(255, 255, 240)
-    Note over SellerMCP,Escrow: Phase 7: Zero-Knowledge Settlement
-    SellerMCP->>Prover: warrant-host prove(policy, vendor_credential, acceptance)
-    Prover->>Prover: Proves category 42, amount <= cap, and accepted == true
-    Prover-->>SellerMCP: Groth16 seal & 384-byte journal
-    SellerMCP->>Escrow: settle(seal, journal)
-    Escrow->>Escrow: Verifies Groth16 proof, marks State.Paid
+    Note over SellerMCP,Escrow: Phase 7: Off-Chain Evaluation & Settlement
+    Buyer->>SellerMCP: submit_acceptance(task_id, acceptance, signature)
+    SellerMCP->>Host: warrant-host evaluate(policy, request, evidence) (<10ms)
+    Host-->>SellerMCP: 384-byte authorization journal
+    SellerMCP->>Escrow: JournalVerifier.approve(journal) + settle(0xabcd, journal)
+    Escrow->>Escrow: Verifies approved journal, marks State.Paid
     Escrow-->>SellerMCP: Releases USDC to seller recipient
+    SellerMCP-->>Buyer: {status: "settled", settlement_transaction}
     end
 
     %% Phase 8: Workload Execution
@@ -214,6 +222,11 @@ sequenceDiagram
   verifies `task_id` matches derived `taskIdFor`, and independently derives/verifies the
   `warrant-policy` hash. Approves ERC-20 token allowance and submits `TaskEscrow.offer()` on-chain.
 
+- **`warrant_sign_acceptance`**:
+  Arguments: `task_id`, `deliverable_hash`, `recipient`, `amount`.
+  Signs an off-chain Acceptance deliverable receipt for an offered TaskEscrow task using the
+  buyer's private acceptance key (`buyer_acceptance.key`).
+
 - **`warrant_check_escrow_status`**:
   Arguments: `task_id`.
   Queries on-chain `TaskEscrow` state (`Missing`, `Offered`, `Accepted`, `Paid`, `Refunded`).
@@ -230,19 +243,26 @@ sequenceDiagram
   ceiling, generates unique `task_id`, salt, policy hash, and returns formal escrow terms.
 
 - **`deploy_with_escrow`**:
-  Arguments: `task_id`.
-  Verifies on-chain deposit via `TaskEscrow`, provisions the 1-hour container, accepts the task
-  on-chain once provisioned, settles the deliverable on-chain via `TaskEscrow.settle()`, and
-  activates the worker.
+  Arguments: `task_id`, optional `policy`.
+  Verifies on-chain deposit via `TaskEscrow`, accepts task on-chain (`State.Accepted`) to commit
+  terms, generates `WARRANT_WORKER_TOKEN` and deliverable hash, launches container provisioning
+  in background, and returns `status: "provisioning"`.
+
+- **`get_deployment_status`**:
+  Arguments: optional `task_id`.
+  Inspects provisioning status (`provisioning`, `ready`, or `failed`), worker health, public URL,
+  worker token, remaining duration in 1h window, and settlement transaction hash.
+
+- **`submit_acceptance`**:
+  Arguments: `task_id`, `acceptance`, `signature`.
+  Verifies buyer-signed Acceptance evidence off-chain via native Warrant
+  (`warrant-host evaluate`), approves the 384-byte journal on `JournalVerifier`, and settles
+  payment on `TaskEscrow` on-chain.
 
 - **`transcribe_audio`**:
   Arguments: `audio_base64` (base64-encoded audio bytes), optional `language`, optional `task_id`.
   Transcribes audio on the active 1-hour worker and returns text plus timestamped segments.
   Optionally provide `task_id` to route to a specific deployment session.
-
-- **`get_deployment_status`**:
-  Arguments: optional `task_id`.
-  Inspects worker health, public URL, remaining duration in 1h window, and settlement tx hash.
 
 ---
 
@@ -322,7 +342,12 @@ export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
 export WARRANT_IMAGE_ID="$IMAGE_ID"
 export WARRANT_DEPLOYER="<your-deployer-address>"
 
+# Option A: Full RISC Zero Groth16 Verifier (requires Docker proving):
 forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
+  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
+
+# Option B: Fast JournalVerifier (pre-approved digest for showcase / testnets):
+forge script script/DeployMock.s.sol:DeployMock --rpc-url "$WARRANT_RPC_URL" \
   --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
 ```
 
@@ -401,9 +426,11 @@ The LLM autonomously drives the end-to-end lifecycle:
 1. Discovers suitable single-GPU hardware on io.net (`seller:list_suitable_hardware`).
 2. Requests an agreement proposal with dynamic pricing (`seller:propose_deployment`).
 3. Evaluates proposal terms and funds escrow on Arc (`buyer:warrant_evaluate_and_offer`).
-4. Provisions container and settles escrow (`seller:deploy_with_escrow`).
-5. Transcribes audio on the active Whisper container (`seller:transcribe_audio`).
-6. Inspects deployment health and status (`seller:get_deployment_status`).
+4. Commits agreement on-chain and starts container provisioning (`seller:deploy_with_escrow`).
+5. Polls until container is online (`seller:get_deployment_status`).
+6. Verifies container `/health` and signs deliverable receipt (`buyer:warrant_sign_acceptance`).
+7. Submits acceptance to settle escrow on-chain (`seller:submit_acceptance`).
+8. Transcribes audio on the active Whisper container (`seller:transcribe_audio`).
 
 #### B. Headless Automated Test Runner
 

@@ -191,16 +191,46 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         # 3. Deploy with escrow
         dep_result = await self.call("deploy_with_escrow", {"task_id": task_id})
-        self.assertEqual(dep_result["status"], "deployed")
+        self.assertIn(dep_result["status"], ("provisioning", "ready"))
         self.assertEqual(dep_result["task_id"], task_id)
-        self.assertTrue(dep_result["public_url"].startswith("http://127.0.0.1:"))
 
-        # Check acceptance and settlement were called on escrow client
+        # Check acceptance was called on escrow client
         self.mock_escrow.accept.assert_called_once_with(task_id, sender=proposal["recipient"])
-        self.mock_escrow.settle_mock.assert_called_once()
-        self.assertEqual(self.mock_escrow.settle_mock.call_args.kwargs.get("sender"), proposal["recipient"])
 
-        # 4. Transcribe audio
+        # 4. Check deployment status
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+        self.assertEqual(status["status"], "ready")
+        self.assertTrue(status["active"])
+        self.assertFalse(status["is_expired"])
+        self.assertTrue(status["public_url"].startswith("http://127.0.0.1:"))
+        self.assertGreater(status["remaining_seconds"], 3500)
+
+        # 5. Submit acceptance and settle escrow
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": int(time.time()) - 300,
+            "valid_until": int(time.time()) + 900,
+        }
+        sig = sign_acceptance(acceptance)
+        settle_res = await self.call(
+            "submit_acceptance",
+            {"task_id": task_id, "acceptance": acceptance, "signature": sig},
+        )
+        self.assertEqual(settle_res["status"], "settled")
+        self.mock_escrow.settle_mock.assert_called_once()
+
+        # 6. Transcribe audio
         audio_file = self.state_dir / "sample.mp3"
         audio_file.write_bytes(b"mock sample audio bytes")
 
@@ -212,12 +242,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await self.call("transcribe_audio", {"audio_base64": "/etc/passwd"})
         self.assertIn("not valid base64", str(ctx.exception))
-
-        # 5. Check deployment status
-        status = await self.call("get_deployment_status")
-        self.assertTrue(status["active"])
-        self.assertFalse(status["is_expired"])
-        self.assertGreater(status["remaining_seconds"], 3500)
 
     async def test_deploy_with_escrow_fails_on_terms_mismatch(self):
         proposal = await self.call("propose_deployment")
@@ -245,7 +269,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("deploy_with_escrow", {"task_id": task_id})
         self.assertIn("does not match proposal", str(ctx.exception))
 
-    async def test_deploy_with_escrow_fails_if_settlement_reverts(self):
+    async def test_submit_acceptance_fails_if_settlement_reverts(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
         import time
@@ -259,9 +283,30 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "customer": proposal["customer"],
             "settle_by": int(time.time()) + 86400,
         }
+        await self.call("deploy_with_escrow", {"task_id": task_id})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": int(time.time()) - 300,
+            "valid_until": int(time.time()) + 900,
+        }
+        sig = sign_acceptance(acceptance)
+
         self.mock_escrow.settle_mock.side_effect = RuntimeError("execution reverted: InvalidAuthorization")
         with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": task_id})
+            await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
         self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
 
     async def test_deploy_with_escrow_fails_if_container_provisioning_fails(self):
@@ -282,15 +327,16 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             self.mcp._tool_manager._tools["deploy_with_escrow"].fn.__self__,
             "_provision_container",
-            return_value=None,
+            side_effect=ToolError("Container failed to start"),
         ):
-            with self.assertRaises(ToolError) as ctx:
-                await self.call("deploy_with_escrow", {"task_id": task_id})
-            self.assertIn("failed to report a ready public URL", str(ctx.exception))
-            # Task MUST NOT be accepted on-chain if container provisioning fails (prevents 24h capital lockup)
-            self.mock_escrow.accept.assert_not_called()
-            # Escrow settlement MUST NOT be called if container is not ready
-            self.mock_escrow.settle_mock.assert_not_called()
+            dep_res = await self.call("deploy_with_escrow", {"task_id": task_id})
+            self.assertIn(dep_res["status"], ("provisioning", "failed"))
+            import asyncio
+
+            await asyncio.sleep(0.05)
+            status = await self.call("get_deployment_status", {"task_id": task_id})
+            self.assertEqual(status["status"], "failed")
+            self.assertIn("Container failed to start", status["error"])
 
     async def test_local_server_ssh_deployment_success(self):
         # Create server with local_server=True
@@ -332,9 +378,19 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             patch("httpx2.AsyncClient.get", return_value=mock_health_resp),
         ):
             dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
+            self.assertIn(dep_res["status"], ("provisioning", "ready"))
 
-            self.assertEqual(dep_res["status"], "deployed")
-            self.assertEqual(dep_res["public_url"], "http://petertower:8080")
+            import asyncio
+
+            stat = None
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                stat = await local_call("get_deployment_status", {"task_id": task_id})
+                if stat.get("status") == "ready":
+                    break
+
+            self.assertEqual(stat["status"], "ready")
+            self.assertEqual(stat["public_url"], "http://petertower:8080")
             self.assertEqual(mock_subproc.call_count, 2)
 
             # Check first call: docker rm -f
@@ -344,7 +400,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
             # Check second call: docker run
             second_cmd = mock_subproc.call_args_list[1][0][0]
-            self.assertEqual(second_cmd[:5], ["ssh", "petertower", "docker", "run", "-d"])
+            second_bin = second_cmd[:5]
+            self.assertEqual(second_bin, ["ssh", "petertower", "docker", "run", "-d"])
             self.assertIn("--gpus", second_cmd)
             self.assertIn("all", second_cmd)
             self.assertIn("-p", second_cmd)
@@ -392,10 +449,19 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch("subprocess.run", side_effect=mock_run_results):
-            with self.assertRaises(ToolError) as ctx:
-                await local_call("deploy_with_escrow", {"task_id": task_id})
-            self.assertIn("Failed to start container on petertower", str(ctx.exception))
-            self.assertIn("docker: permission denied", str(ctx.exception))
+            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
+            self.assertIn(dep_res["status"], ("provisioning", "failed"))
+            import asyncio
+
+            stat = None
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                stat = await local_call("get_deployment_status", {"task_id": task_id})
+                if stat.get("status") == "failed":
+                    break
+            self.assertEqual(stat["status"], "failed")
+            self.assertIn("Failed to start container on petertower", stat["error"])
+            self.assertIn("docker: permission denied", stat["error"])
 
     async def test_multi_session_concurrency_and_routing(self):
         import time
@@ -427,18 +493,20 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         # Deploy both tasks
         res1 = await self.call("deploy_with_escrow", {"task_id": t1})
-        self.assertEqual(res1["status"], "deployed")
+        self.assertIn(res1["status"], ("provisioning", "ready"))
         res2 = await self.call("deploy_with_escrow", {"task_id": t2})
-        self.assertEqual(res2["status"], "deployed")
+        self.assertIn(res2["status"], ("provisioning", "ready"))
 
         # Check status individually by task_id
         st1 = await self.call("get_deployment_status", {"task_id": t1})
         self.assertEqual(st1["task_id"], t1)
         self.assertTrue(st1["active"])
+        self.assertEqual(st1["status"], "ready")
 
         st2 = await self.call("get_deployment_status", {"task_id": t2})
         self.assertEqual(st2["task_id"], t2)
         self.assertTrue(st2["active"])
+        self.assertEqual(st2["status"], "ready")
 
         # Check transcription routed specifically to t1 and t2
         audio_file = self.state_dir / "sample.mp3"

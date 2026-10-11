@@ -32,7 +32,6 @@ from starlette.responses import Response
 
 from showcases.ionet_arc.adapter import (
     PilotError,
-    canonical,
     connected,
     deploy,
     read_json,
@@ -44,9 +43,13 @@ from showcases.ionet_arc.escrow import (
     DEFAULT_CHAIN_ID,
     REPO_ROOT,
     EscrowClient,
-    encode_journal,
+    address20,
+    bytes32,
+    compile_buyer_policy,
     ensure_policy_hash,
+    evaluate_authorization,
     should_trust_env,
+    sign_vendor_credential,
 )
 from showcases.ionet_arc.worker import Worker, handler
 
@@ -132,11 +135,11 @@ def load_cached_hardware() -> list[dict]:
         if cand.exists():
             try:
                 data = json.loads(cand.read_text())
+                if isinstance(data, list):
+                    return data
                 res = data.get("result", {})
                 if "data" in res and "data" in res["data"]:
                     return res["data"]["data"]
-                if isinstance(data, list):
-                    return data
             except Exception:
                 pass
     return DEFAULT_MOCK_HARDWARE
@@ -254,6 +257,7 @@ class WarrantTranscriptionService:
         self.ssh_host = ssh_host
         self.worker_url = worker_url
         self.local_mock_workers: dict[str, LocalMockWorker] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
         if self.local_server:
             atexit.register(self._cleanup_ssh_container)
@@ -361,14 +365,6 @@ class WarrantTranscriptionService:
             salt = "0x" + secrets.token_hex(32)
             task_id = self.escrow_client.task_id_for(customer_address, salt)
 
-            policy_hash = ensure_policy_hash(
-                self.escrow_client.escrow,
-                self.escrow_client.token,
-                chain_id,
-                100_000_000,
-                self.state_dir,
-            )
-
             # Dynamic pricing based on real hardware cost and duration
             price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
             duration = Decimal(str(duration_hours))
@@ -392,6 +388,14 @@ class WarrantTranscriptionService:
                 else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
             )
 
+            policy_hash = ensure_policy_hash(
+                self.escrow_client.escrow,
+                self.escrow_client.token,
+                chain_id,
+                token_amount,
+                self.state_dir,
+            )
+
             proposal = {
                 "status": "proposed",
                 "task_id": task_id,
@@ -410,7 +414,7 @@ class WarrantTranscriptionService:
                 "hardware_id": selected_hw["hardware_id"],
                 "hardware_name": selected_hw["hardware_name"],
                 "price_per_hour_usd": selected_hw["price_per_hour_usd"],
-                "location_ids": location_id,
+                "location_ids": selected_hw.get("location") or location_id,
                 "duration_hours": duration_hours,
                 "billing_model": "duration",
                 "image_url": PILOT_IMAGE,
@@ -456,10 +460,10 @@ class WarrantTranscriptionService:
                     f"On-chain {label} ({task_data.get(key)}) does not match proposal ({proposal.get(key)})."
                 )
         now = int(time.time())
-        min_settle_by = now + proposal.get("duration_hours", 1) * 3600
+        min_settle_by = now + 60
         if task_data.get("settle_by") and task_data["settle_by"] < min_settle_by:
             raise ToolError(
-                f"On-chain settleBy ({task_data.get('settle_by')}) does not cover required duration "
+                f"On-chain settleBy ({task_data.get('settle_by')}) does not provide sufficient time "
                 f"(minimum {min_settle_by})."
             )
 
@@ -602,95 +606,100 @@ class WarrantTranscriptionService:
         _, public_url = await connected(op)
         return public_url
 
-    async def deploy_with_escrow(self, task_id: str) -> dict:
+    async def _provision_container_bg(
+        self,
+        task_id: str,
+        proposal: dict,
+        deployment_id: str,
+        worker_token: str,
+    ):
+        try:
+            public_url = await self._provision_container(proposal, deployment_id, worker_token)
+            now = int(time.time())
+            session = self._lookup_session(task_id) or {}
+            session["status"] = "ready"
+            session["public_url"] = public_url
+            session["deployed_at"] = now
+            session["expires_at"] = now + proposal.get("duration_hours", 1) * 3600
+            save(self.state_dir / "active_session.json", session)
+            save(self.state_dir / "sessions" / f"{task_id}.json", session)
+        except Exception as exc:
+            session = self._lookup_session(task_id) or {}
+            session["status"] = "failed"
+            session["error"] = str(exc)
+            save(self.state_dir / "active_session.json", session)
+            save(self.state_dir / "sessions" / f"{task_id}.json", session)
+
+    async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
         try:
             prop_path = self.proposals_dir / f"{task_id}.json"
             if not prop_path.exists():
                 raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
             proposal = read_json(prop_path)
+            if policy:
+                proposal["policy"] = policy
+                save(prop_path, proposal)
+
             now = int(time.time())
 
-            # 1. Verify on-chain escrow state and terms (do not accept yet to prevent capital lockup on failure)
+            # 1. Verify on-chain escrow state and terms
             task_data = self._verify_task_offered(task_id, proposal)
 
-            # 2. Provision container (1h duration)
-            worker_token = secrets.token_hex(24)
-            deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
-            public_url = await self._provision_container(proposal, deployment_id, worker_token)
-            if not public_url:
-                raise ToolError(
-                    f"Container deployment failed to report a ready public URL within timeout for '{deployment_id}'."
-                )
-
-            # 3. Accept task on-chain now that container provisioning has succeeded
+            # 2. Accept task on-chain first to commit agreement before spinning up hardware
             self._accept_task(task_id, proposal, task_data.get("state"))
 
-            # 4. Settle deliverable on TaskEscrow
-            deliverable_record = {
-                "deployment_id": deployment_id,
-                "image_url": PILOT_IMAGE,
-                "traffic_port": 8080,
-                "hardware_id": proposal["hardware_id"],
-                "duration_hours": proposal.get("duration_hours", 1),
-                "deployed_at": now,
-            }
-            deliverable_hash = "0x" + hashlib.sha256(canonical(deliverable_record)).hexdigest()
-            evidence_hash = "0x" + hashlib.sha256(b"warrant-transcription-deployment-evidence").hexdigest()
+            # 3. Generate capability token and deliverable hash
+            worker_token = secrets.token_hex(24)
+            deliverable_hash = "0x" + hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
+            deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
 
-            journal_bytes = encode_journal(
-                policy_hash=proposal["policy_hash"],
-                chain_id=proposal["chain_id"],
-                vault=proposal["escrow_address"],
-                token=proposal["token_address"],
-                recipient=proposal["recipient"],
-                amount=proposal["amount"],
-                task_id=task_id,
-                deliverable_hash=deliverable_hash,
-                policy_version=1,
-                valid_after=now - 300,
-                valid_until=now + 86400,
-                evidence_hash=evidence_hash,
-            )
-
-            settlement_tx = None
-            try:
-                settle_res = self.escrow_client.settle_mock(
-                    journal_bytes,
-                    sender=proposal.get("recipient") or self.escrow_client.server_account,
-                )
-                settlement_tx = settle_res.get("transactionHash")
-            except Exception as err:
-                raise ToolError(f"Escrow settlement failed on-chain: {err}") from err
-
-            # 4. Save active deployment session (1 hour duration)
+            # 4. Save active deployment session (provisioning)
             session = {
-                "status": "deployed",
+                "status": "provisioning",
                 "task_id": task_id,
                 "deployment_id": deployment_id,
-                "public_url": public_url,
                 "worker_token": worker_token,
+                "deliverable_hash": deliverable_hash,
                 "hardware_id": proposal["hardware_id"],
-                "deployed_at": now,
-                "expires_at": now + 3600,
-                "duration_hours": 1,
-                "settlement_tx": settlement_tx,
+                "recipient": proposal["recipient"],
+                "amount": proposal["amount"],
+                "chain_id": proposal["chain_id"],
+                "escrow_address": proposal["escrow_address"],
+                "token_address": proposal["token_address"],
+                "policy_hash": proposal["policy_hash"],
+                "policy": proposal.get("policy"),
+                "duration_hours": proposal.get("duration_hours", 1),
+                "started_at": now,
+                "public_url": None,
+                "settlement_tx": None,
+                "error": None,
             }
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
+            # 5. Spawn background provisioning
+            bg_task = asyncio.create_task(self._provision_container_bg(task_id, proposal, deployment_id, worker_token))
+            self._bg_tasks.add(bg_task)
+            bg_task.add_done_callback(self._bg_tasks.discard)
+
+            # Brief pause to allow instant local mock workers to complete
+            await asyncio.sleep(0.02)
+
+            curr = self._lookup_session(task_id) or session
+            curr_status = curr.get("status", "provisioning")
+
             return {
-                "status": "deployed",
+                "status": curr_status,
                 "task_id": task_id,
                 "deployment_id": deployment_id,
-                "public_url": public_url,
-                "expires_at": session["expires_at"],
-                "duration_hours": 1,
-                "settlement_transaction": settlement_tx,
+                "public_url": curr.get("public_url"),
+                "deliverable_hash": deliverable_hash,
                 "message": (
-                    "Deployment active and escrow settled.\n"
-                    "Container will automatically terminate after 1 hour duration.\n"
-                    "You can now call transcribe_audio(audio_base64) while the server is active."
+                    "Deployment initiated. Container provisioning in background.\n"
+                    "Poll get_deployment_status(task_id) until status is 'ready'."
+                    if curr_status == "provisioning"
+                    else "Container is ready. Verify /health and submit signed acceptance."
                 ),
             }
         except Exception as exc:
@@ -845,21 +854,201 @@ class WarrantTranscriptionService:
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
-            return {"active": False, "message": msg}
+            return {"active": False, "status": "missing", "message": msg}
 
+        status = session.get("status", "ready")
         now = time.time()
+
+        if status == "provisioning":
+            elapsed = int(now - session.get("started_at", now))
+            return {
+                "active": False,
+                "status": "provisioning",
+                "task_id": session.get("task_id"),
+                "deployment_id": session.get("deployment_id"),
+                "deliverable_hash": session.get("deliverable_hash"),
+                "elapsed_seconds": elapsed,
+                "message": f"Container is provisioning ({elapsed}s elapsed). Please continue polling.",
+            }
+
+        if status == "failed":
+            return {
+                "active": False,
+                "status": "failed",
+                "task_id": session.get("task_id"),
+                "deployment_id": session.get("deployment_id"),
+                "error": session.get("error"),
+                "message": f"Container provisioning failed: {session.get('error')}",
+            }
+
         remaining = max(0, int(session.get("expires_at", 0) - now))
         is_expired = remaining == 0
         return {
             "active": not is_expired,
+            "status": status,
             "task_id": session.get("task_id"),
             "deployment_id": session.get("deployment_id"),
             "public_url": session.get("public_url"),
+            "worker_token": session.get("worker_token"),
+            "deliverable_hash": session.get("deliverable_hash"),
             "hardware_id": session.get("hardware_id"),
             "remaining_seconds": remaining,
             "is_expired": is_expired,
             "settlement_transaction": session.get("settlement_tx"),
         }
+
+    def _resolve_vendor_credential(self, session: dict) -> tuple[dict, list[int]]:
+        """Resolve VendorCredential and its 64-byte signature matching session scope and recipient."""
+        import yaml
+
+        cred_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_credential.yaml"
+        sig_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_signature.yaml"
+
+        now = int(time.time())
+        scope = {
+            "chain_id": int(session["chain_id"]),
+            "vault": list(address20(session["escrow_address"])),
+            "token": list(address20(session["token_address"])),
+        }
+        recipient = list(address20(session["recipient"]))
+
+        if cred_path.exists() and sig_path.exists():
+            try:
+                c_yaml = yaml.safe_load(cred_path.read_text())
+                s_yaml = yaml.safe_load(sig_path.read_text())
+                c_scope = c_yaml.get("scope", {})
+                if (
+                    int(c_scope.get("chain_id", 0)) == scope["chain_id"]
+                    and address20(c_scope.get("vault", "")) == address20(session["escrow_address"])
+                    and address20(c_scope.get("token", "")) == address20(session["token_address"])
+                    and address20(c_yaml.get("recipient", "")) == address20(session["recipient"])
+                    and c_yaml.get("valid_after", 0) <= now <= c_yaml.get("valid_until", 0)
+                ):
+                    cred_obj = {
+                        "scope": scope,
+                        "recipient": recipient,
+                        "category": int(c_yaml.get("category", DEFAULT_CATEGORY)),
+                        "valid_after": int(c_yaml["valid_after"]),
+                        "valid_until": int(c_yaml["valid_until"]),
+                    }
+                    raw_sig = s_yaml["signature"].replace("0x", "")
+                    sig_bytes = list(bytes.fromhex(raw_sig))
+                    return cred_obj, sig_bytes
+            except Exception:
+                pass
+
+        # Dynamically generate and sign vendor credential using registry.key
+        cred_obj = {
+            "scope": scope,
+            "recipient": recipient,
+            "category": DEFAULT_CATEGORY,
+            "valid_after": now - 3600,
+            "valid_until": now + 365 * 86400,
+        }
+        sig_bytes = sign_vendor_credential(cred_obj)
+        return cred_obj, sig_bytes
+
+    async def submit_acceptance(
+        self,
+        task_id: str,
+        acceptance: dict,
+        signature: list[int] | str,
+    ) -> dict:
+        """Verify buyer acceptance evidence off-chain, approve journal, and settle TaskEscrow on-chain."""
+        try:
+            session = self._lookup_session(task_id)
+            if not session:
+                raise ToolError(f"No deployment session found for task '{task_id}'.")
+
+            if session.get("status") == "settled" and session.get("settlement_tx"):
+                return {
+                    "status": "settled",
+                    "task_id": task_id,
+                    "settlement_transaction": session.get("settlement_tx"),
+                    "message": "Task is already settled.",
+                }
+
+            expected_deliv = session.get("deliverable_hash")
+            acc_deliv = acceptance.get("deliverable_hash")
+            acc_deliv_hex = "0x" + bytes(acc_deliv).hex() if isinstance(acc_deliv, list) else str(acc_deliv).lower()
+
+            if expected_deliv and acc_deliv_hex != expected_deliv.lower():
+                raise ToolError(
+                    f"Deliverable hash mismatch: acceptance provided {acc_deliv_hex} "
+                    f"but worker generated {expected_deliv}"
+                )
+
+            # Resolve policy
+            policy = session.get("policy")
+            if not policy:
+                policy, _ = compile_buyer_policy(
+                    chain_id=session["chain_id"],
+                    escrow_address=session["escrow_address"],
+                    token_address=session["token_address"],
+                    max_amount=session["amount"],
+                )
+
+            # Build Request struct
+            request = {
+                "scope": {
+                    "chain_id": int(session["chain_id"]),
+                    "vault": list(address20(session["escrow_address"])),
+                    "token": list(address20(session["token_address"])),
+                },
+                "task_id": list(bytes32(task_id)),
+                "deliverable_hash": list(bytes32(session["deliverable_hash"])),
+                "recipient": list(address20(session["recipient"])),
+                "amount": int(session["amount"]),
+            }
+
+            # Convert signature if passed as hex string
+            if isinstance(signature, str):
+                raw_sig = signature.replace("0x", "")
+                acc_sig_bytes = list(bytes.fromhex(raw_sig))
+            else:
+                acc_sig_bytes = list(signature)
+
+            # Resolve VendorCredential and sign
+            v_cred, v_sig = self._resolve_vendor_credential(session)
+
+            evidence = {
+                "vendor": v_cred,
+                "vendor_signature": v_sig,
+                "acceptance": acceptance,
+                "acceptance_signature": acc_sig_bytes,
+            }
+
+            # Execute real native off-chain policy evaluation (<10ms)
+            try:
+                _auth, journal_bytes = evaluate_authorization(policy, request, evidence)
+            except Exception as e:
+                raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
+
+            # Settle on-chain via TaskEscrow (Option B: JournalVerifier approves digest, settles with mock seal)
+            settlement_tx = None
+            try:
+                settle_res = self.escrow_client.settle_mock(
+                    journal_bytes,
+                    sender=session.get("recipient") or self.escrow_client.server_account,
+                )
+                settlement_tx = settle_res.get("transactionHash")
+            except Exception as err:
+                raise ToolError(f"Escrow settlement failed on-chain: {err}") from err
+
+            session["status"] = "settled"
+            session["settlement_tx"] = settlement_tx
+            session["journal_hex"] = "0x" + journal_bytes.hex()
+            save(self.state_dir / "active_session.json", session)
+            save(self.state_dir / "sessions" / f"{task_id}.json", session)
+
+            return {
+                "status": "settled",
+                "task_id": task_id,
+                "settlement_transaction": settlement_tx,
+                "message": "Authorization successfully verified off-chain and TaskEscrow settled on-chain.",
+            }
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
 
 
 @dataclass
@@ -970,6 +1159,15 @@ def create_server(
             "Optionally provide task_id to inspect a specific deployment session."
         ),
     )(service.get_deployment_status)
+
+    server.tool(
+        name="submit_acceptance",
+        description=(
+            "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
+            "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, "
+            "and settles payment on TaskEscrow on-chain."
+        ),
+    )(service.submit_acceptance)
 
     return server
 

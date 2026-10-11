@@ -97,7 +97,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         }
 
         res = await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
-        self.assertEqual(res["status"], "APPROVED_AND_OFFERED")
+        self.assertEqual(res["status"], "APPROVED")
         self.assertEqual(res["task_id"], "0x" + "55" * 32)
         self.assertEqual(res["transaction_hash"], "0x" + "02" * 32)
         self.assertEqual(res["customer"], "0x" + "aa" * 20)
@@ -209,8 +209,38 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         }
 
         res = await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
-        self.assertEqual(res["status"], "APPROVED_AND_OFFERED")
+        self.assertEqual(res["status"], "APPROVED")
         self.mock_escrow.mint_token.assert_called_once()
+
+    async def test_warrant_sign_acceptance(self):
+        proposal = {
+            "task_id": "0x" + "55" * 32,
+            "amount": 1_000_000,
+            "amount_usd": "1.00",
+            "duration_hours": 1,
+            "salt": "0x" + "66" * 32,
+            "recipient": "0x" + "44" * 20,
+            "category": DEFAULT_CATEGORY,
+            "escrow_address": self.mock_escrow.escrow,
+            "token_address": self.mock_escrow.token,
+        }
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+
+        # Test signing acceptance
+        deliv_hash = "0x" + "77" * 32
+        res = await self.call(
+            "warrant_sign_acceptance",
+            {
+                "task_id": "0x" + "55" * 32,
+                "deliverable_hash": deliv_hash,
+                "recipient": "0x" + "44" * 20,
+                "amount": 1_000_000,
+            },
+        )
+        self.assertEqual(res["status"], "signed")
+        self.assertEqual(res["task_id"], "0x" + "55" * 32)
+        self.assertTrue(res["acceptance"]["accepted"])
+        self.assertEqual(len(res["signature"]), 64)
 
     async def test_warrant_evaluate_and_offer_insufficient_balance_no_automint(self):
         server = create_server(
