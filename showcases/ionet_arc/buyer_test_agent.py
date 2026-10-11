@@ -148,6 +148,8 @@ async def run_client(
                     {"customer_address": customer, "budget_cap_usd": str(max_budget_usdc)},
                 )
                 proposal = extract_result(res_prop)
+                if proposal.get("status") == "ERROR" or "task_id" not in proposal:
+                    sys.exit(f"Failed to propose deployment: {proposal.get('error', proposal)}")
                 print("Proposal received from server:")
                 print(f"  • Task ID:        {proposal['task_id']}")
                 print(f"  • Hardware:       {proposal['hardware_name']} (${proposal['price_per_hour_usd']:.4f}/hr)")
@@ -238,6 +240,8 @@ async def run_client(
                     },
                 )
                 settle_info = extract_result(res_settle)
+                if settle_info.get("status") == "ERROR":
+                    sys.exit(f"submit_acceptance failed: {settle_info.get('error')}")
                 print(f" TaskEscrow settled on-chain: tx {settle_info.get('settlement_transaction')}")
 
                 # Step 8: transcribe_audio
@@ -252,6 +256,8 @@ async def run_client(
                     },
                 )
                 trans_result = extract_result(res_trans)
+                if trans_result.get("status") == "ERROR":
+                    sys.exit(f"transcribe_audio failed: {trans_result.get('error')}")
                 elapsed = time.time() - start_t
 
                 print("\n" + "=" * 70)
