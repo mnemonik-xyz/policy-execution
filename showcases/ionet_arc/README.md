@@ -99,6 +99,106 @@ guardrail sidecar:
 
 ---
 
+## End-to-End Autonomous Lifecycle
+
+The sequence below illustrates the complete lifecycle between the **Buyer LLM Agent**, the local
+**Buyer MCP Guardrail**, the remote **Seller MCP Server**, and the on-chain **`TaskEscrow`**
+contract on Arc.
+
+The capability deliverable is the authenticated GPU worker session: the seller generates a secret
+`WARRANT_WORKER_TOKEN`, derives `deliverable_hash = sha256(WARRANT_WORKER_TOKEN)`, and provides it
+alongside `public_url`. Once the buyer agent verifies container `/health`, the buyer signs an
+`Acceptance` statement off-chain, enabling the seller to settle via RISC Zero zkVM on Arc:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Buyer as Buyer LLM Agent
+    participant BuyerMCP as Buyer MCP Server (Guardrail)
+    participant SellerMCP as Seller MCP Server (io.net)
+    participant Escrow as TaskEscrow (Arc)
+    participant Worker as Whisper Worker (io.net)
+    participant Prover as RISC Zero zkVM Prover
+
+    %% Phase 1: Hardware Discovery
+    rect rgb(240, 248, 255)
+    Note over Buyer,SellerMCP: Phase 1: Hardware Discovery & Selection
+    Buyer->>SellerMCP: list_suitable_hardware()
+    SellerMCP-->>Buyer: GPU candidates (RTX 4090, hourly rate, replicas)
+    Buyer->>Buyer: Selects suitable GPU for transcription (e.g. $0.35/hr)
+    end
+
+    %% Phase 2: Quotation & Terms
+    rect rgb(255, 250, 240)
+    Note over Buyer,SellerMCP: Phase 2: Quotation & Terms
+    Buyer->>SellerMCP: propose_deployment(hardware_id, duration_hours=1)
+    SellerMCP-->>Buyer: Proposal {task_id, amount, duration_hours, salt, recipient}
+    end
+
+    %% Phase 3: Policy Evaluation & Escrow Funding
+    rect rgb(240, 255, 240)
+    Note over Buyer,Escrow: Phase 3: Policy Evaluation & Escrow Funding
+    Buyer->>BuyerMCP: warrant_evaluate_and_offer(proposal)
+    BuyerMCP->>BuyerMCP: Checks budget ceiling and 1h duration limits
+    BuyerMCP->>BuyerMCP: Instantiates policy template (25m validity window, keys)
+    BuyerMCP->>BuyerMCP: Derives cryptographic policy_hash
+    BuyerMCP->>Escrow: approve(amount) + offer(task_id, policy_hash, accept_by=10m, settle_by=25m)
+    Escrow-->>BuyerMCP: Funds locked in State.Offered (tx hash)
+    BuyerMCP-->>Buyer: Offer confirmed {status: "APPROVED", policy, policy_hash}
+    end
+
+    %% Phase 4: Order Notification & Seller Acceptance
+    rect rgb(255, 245, 245)
+    Note over Buyer,Escrow: Phase 4: Order Notification & Seller Acceptance
+    Buyer->>SellerMCP: deploy_with_escrow(task_id, policy)
+    SellerMCP->>Escrow: Read tasks(task_id) -> verify policy_hash, amount, recipient
+    SellerMCP->>Escrow: accept(task_id) on-chain
+    Note over Escrow: State.Accepted: agreement committed, buyer cannot cancel
+    end
+
+    %% Phase 5: Container Launch & Capability Deliverable
+    rect rgb(250, 240, 255)
+    Note over SellerMCP,Worker: Phase 5: Container Launch & Capability Deliverable
+    SellerMCP->>SellerMCP: Generates random WARRANT_WORKER_TOKEN
+    SellerMCP->>SellerMCP: Derives deliverable_hash = sha256(WARRANT_WORKER_TOKEN)
+    SellerMCP->>Worker: Provisions GPU container on io.net (injects token env)
+    Worker-->>SellerMCP: Container online at public_url
+    SellerMCP-->>Buyer: Returns {public_url, worker_token, deliverable_hash}
+    end
+
+    %% Phase 6: Health Verification & Deliverable Sign-off
+    rect rgb(240, 255, 255)
+    Note over Buyer,BuyerMCP: Phase 6: Health Verification & Deliverable Sign-off
+    Buyer->>Worker: GET /health (Authorization: Bearer <worker_token>)
+    Worker-->>Buyer: 200 OK {status: "healthy", model: "whisper-large-v3"}
+    Buyer->>BuyerMCP: warrant_sign_acceptance(task_id, deliverable_hash, recipient, amount)
+    BuyerMCP->>BuyerMCP: Signs Acceptance {task_id, deliverable_hash, accepted: true}
+    BuyerMCP-->>Buyer: Signed Acceptance & ECDSA signature
+    Buyer->>SellerMCP: Submit Acceptance evidence to seller
+    end
+
+    %% Phase 7: zkVM Settlement
+    rect rgb(255, 255, 240)
+    Note over SellerMCP,Escrow: Phase 7: Zero-Knowledge Settlement
+    SellerMCP->>Prover: warrant-host prove(policy, vendor_credential, acceptance)
+    Prover->>Prover: Proves category 42, amount <= cap, and accepted == true
+    Prover-->>SellerMCP: Groth16 seal & 384-byte journal
+    SellerMCP->>Escrow: settle(seal, journal)
+    Escrow->>Escrow: Verifies Groth16 proof, marks State.Paid
+    Escrow-->>SellerMCP: Releases USDC to seller recipient
+    end
+
+    %% Phase 8: Workload Execution
+    rect rgb(245, 245, 245)
+    Note over Buyer,Worker: Phase 8: Workload Execution (1-Hour Direct Inference)
+    Buyer->>Worker: POST /job (audio_base64) with Bearer <worker_token>
+    Worker-->>Buyer: Transcription text and timestamped segments
+    Note over Buyer,Worker: Buyer streams audio directly to GPU for the rest of the 1-hour lease
+    end
+```
+
+---
+
 ## Exposed MCP Tools
 
 ### Buyer Warrant Guardrail Tools (`buyer_mcp_server.py`)
