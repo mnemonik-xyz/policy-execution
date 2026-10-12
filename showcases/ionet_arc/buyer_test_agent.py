@@ -375,7 +375,11 @@ async def run_client(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mcp-url", default="http://localhost:8000/mcp", help="MCP server streamable HTTP endpoint")
-    parser.add_argument("--rpc-url", default="http://127.0.0.1:8545", help="Ethereum / Arc JSON-RPC URL")
+    parser.add_argument(
+        "--rpc-url",
+        default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
+        help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
+    )
     parser.add_argument(
         "--audio",
         type=Path,
@@ -404,10 +408,15 @@ def main():
     if not args.audio.exists():
         sys.exit(f"Error: audio file '{args.audio}' does not exist.")
 
+    rpc_url = args.rpc_url
+    if not rpc_url:
+        manifest = load_manifest(args.manifest_path or DEFAULT_MANIFEST_PATH)
+        rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+
     asyncio.run(
         run_client(
             mcp_url=args.mcp_url,
-            rpc_url=args.rpc_url,
+            rpc_url=rpc_url,
             audio_path=args.audio,
             auth_user=args.auth_user,
             auth_pass=args.auth_pass,

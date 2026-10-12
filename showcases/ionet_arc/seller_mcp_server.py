@@ -1132,7 +1132,7 @@ class ServerConfig:
     port: int = 8000
     auth_user: str | None = None
     auth_pass: str | None = None
-    rpc_url: str = "http://127.0.0.1:8545"
+    rpc_url: str | None = None
     escrow_address: str | None = None
     token_address: str | None = None
     verifier_address: str | None = None
@@ -1158,6 +1158,8 @@ class ServerConfig:
             self.manifest_path = pathlib.Path(self.manifest_path)
 
         manifest = load_manifest(self.manifest_path)
+        if self.rpc_url is None:
+            self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
             self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
         if self.verifier_address is None:
@@ -1334,8 +1336,8 @@ def main():
     )
     parser.add_argument(
         "--rpc-url",
-        default=os.environ.get("WARRANT_RPC_URL", "http://127.0.0.1:8545"),
-        help="Ethereum / Arc JSON-RPC URL (default: http://127.0.0.1:8545)",
+        default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
+        help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
     )
     parser.add_argument(
         "--manifest",

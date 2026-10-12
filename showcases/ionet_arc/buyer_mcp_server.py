@@ -51,7 +51,7 @@ class BuyerWarrantService:
         state_dir: pathlib.Path,
         escrow_client: EscrowClient,
         max_budget_usd: float | None = None,
-        max_duration_hours: int = 1,
+        max_duration_hours: int | None = None,
         allowed_categories: list[int] | None = None,
         buyer_account: str | None = None,
         pinned_escrow: str | None = None,
@@ -67,7 +67,6 @@ class BuyerWarrantService:
         self.tasks_dir = self.state_dir / "tasks"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.escrow_client = escrow_client
-        self.max_duration_hours = int(max_duration_hours)
         self.allowed_categories = allowed_categories or [DEFAULT_CATEGORY]
         self.auto_mint = auto_mint
 
@@ -80,6 +79,14 @@ class BuyerWarrantService:
         )
 
         manifest = load_manifest(self.manifest_path)
+        if max_duration_hours is not None:
+            self.max_duration_hours = int(max_duration_hours)
+        else:
+            raw_duration = get_manifest_parameter(
+                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
+            )
+            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+
         if max_budget_usd is not None:
             self.max_budget_usd = float(max_budget_usd)
         else:
@@ -470,13 +477,13 @@ class ServerConfig:
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8001
-    rpc_url: str = "http://127.0.0.1:8545"
+    rpc_url: str | None = None
     escrow_address: str | None = None
     token_address: str | None = None
     verifier_address: str | None = None
     buyer_account: str | None = None
     max_budget_usd: float | None = None
-    max_duration_hours: int = 1
+    max_duration_hours: int | None = None
     allowed_categories: list[int] | None = None
     auto_mint: bool = False
     manifest_path: pathlib.Path | None = None
@@ -495,6 +502,8 @@ class ServerConfig:
             self.buyer_acceptance_key_path = pathlib.Path(self.buyer_acceptance_key_path)
 
         manifest = load_manifest(self.manifest_path)
+        if self.rpc_url is None:
+            self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
             self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
         if self.buyer_account is None:
@@ -512,6 +521,11 @@ class ServerConfig:
             else:
                 raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
                 self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
+        if self.max_duration_hours is None:
+            raw_duration = get_manifest_parameter(
+                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
+            )
+            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
 
 
 BuyerServerConfig = ServerConfig
@@ -650,8 +664,8 @@ def main():
     )
     parser.add_argument(
         "--rpc-url",
-        default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL", "http://127.0.0.1:8545")),
-        help="Ethereum / Arc JSON-RPC URL (default: http://127.0.0.1:8545)",
+        default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
+        help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
     )
     parser.add_argument(
         "--manifest",
@@ -659,12 +673,6 @@ def main():
         type=pathlib.Path,
         default=os.environ.get("WARRANT_MANIFEST"),
         help="Path to manifest.yaml config (default: showcases/ionet_arc/config/manifest.yaml)",
-    )
-    parser.add_argument(
-        "--max-duration-hours",
-        type=int,
-        default=int(os.environ.get("WARRANT_MAX_DURATION_HOURS", "1")),
-        help="Maximum allowable duration in hours (default: 1)",
     )
     parser.add_argument(
         "--auto-mint",
@@ -683,7 +691,6 @@ def main():
         host=args.host,
         port=args.port,
         rpc_url=args.rpc_url,
-        max_duration_hours=args.max_duration_hours,
         auto_mint=args.auto_mint,
         state_dir=pathlib.Path(args.state_dir),
         manifest_path=args.manifest_path,

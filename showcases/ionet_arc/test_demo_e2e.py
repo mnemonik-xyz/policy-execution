@@ -148,6 +148,7 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         cls.manifest_path = Path(cls.tmp_dir) / "manifest.yaml"
         cls.manifest_path.write_text(yaml.dump({
             "chain_id": 31337,
+            "rpc_url": cls.rpc_url,
             "escrow_address": cls.escrow_address,
             "token_address": cls.token_address,
             "verifier_address": cls.verifier_address,

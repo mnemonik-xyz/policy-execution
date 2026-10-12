@@ -239,9 +239,7 @@ Because the Buyer Guardrail manages local keys and spending limits, it runs loca
       "command": "/path/to/repo/.venv/bin/python",
       "args": [
         "-m", "showcases.ionet_arc.buyer_mcp_server",
-        "--transport", "stdio",
-        "--rpc-url", "https://rpc.testnet.arc.io",
-        "--max-duration-hours", "1"
+        "--transport", "stdio"
       ]
     },
     "seller-transcription-service": {
@@ -351,9 +349,9 @@ forge script script/Deploy.s.sol:Deploy \
 ## Running the Showcase
 
 Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their initial parameters
-(`escrow_address`, `verifier_address`, `token_address`, `seller_address`, and `buyer_address`)
-directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
-`--manifest <path>`).
+(`rpc_url`, `escrow_address`, `verifier_address`, `token_address`, `seller_address`, and
+`buyer_address`) directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
+`--manifest <path>`). You can still override `--rpc-url` via CLI arguments.
 
 ### 1. Run the Seller MCP Server
 
@@ -362,19 +360,16 @@ Start the Seller MCP daemon:
 ```sh
 # Live io.net Cloud mode:
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
-  --host 0.0.0.0 --port 8000 \
-  --rpc-url https://rpc.testnet.arc.io
+  --host 0.0.0.0 --port 8000
 
 # Local / remote SSH server mode (deploys container via SSH and Docker):
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
-  --rpc-url https://rpc.testnet.arc.io \
-  --local-server --ssh-host petertower --worker-url http://petertower:8080
+  --local-server --ssh-host petertower
 
 # Offline mock mode (no GPU/Docker or io.net API key required):
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
-  --rpc-url https://rpc.testnet.arc.io \
   --mock-ionet
 ```
 
@@ -388,6 +383,8 @@ Execution modes:
   external GPU hardware or io.net credentials. When `--rpc-url` targets local Anvil
   (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
+Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`.
+
 ### 2. Run the Buyer Warrant MCP Server
 
 Start the Buyer Warrant guardrail sidecar:
@@ -395,17 +392,15 @@ Start the Buyer Warrant guardrail sidecar:
 ```sh
 # Run over stdio (standard for desktop LLM agents):
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
-  --transport stdio \
-  --rpc-url https://rpc.testnet.arc.io
+  --transport stdio
 
 # Run over Streamable HTTP (e.g. port 8001):
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
   --transport http \
-  --host 127.0.0.1 --port 8001 \
-  --rpc-url https://rpc.testnet.arc.io
+  --host 127.0.0.1 --port 8001
 ```
 
-Optional CLI flags: `--manifest <path>`, `--max-duration-hours`, `--auto-mint`.
+Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`.
 
 ### 3. Run with an LLM Agent or Headless Test Runner
 
