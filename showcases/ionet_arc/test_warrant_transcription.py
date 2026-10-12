@@ -46,9 +46,46 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         }
         self.mock_escrow.settle_mock.return_value = {"transactionHash": "0x" + "aa" * 32}
 
-        # Create server with mock EscrowClient and mock_ionet=True
+        # Create valid stored test credential and signature matching the mock escrow scope
+        import yaml
+
+        from showcases.ionet_arc.escrow import address20, sign_vendor_credential
+
+        cred_obj = {
+            "scope": {
+                "chain_id": 31337,
+                "vault": list(address20(self.mock_escrow.escrow)),
+                "token": list(address20(self.mock_escrow.token)),
+            },
+            "recipient": list(address20(self.mock_escrow.server_account)),
+            "category": DEFAULT_CATEGORY,
+            "valid_after": int(time.time()) - 3600,
+            "valid_until": int(time.time()) + 86400,
+        }
+        sig_bytes = sign_vendor_credential(cred_obj)
+        self.cred_path = self.state_dir / "vendor_credential.yaml"
+        self.sig_path = self.state_dir / "vendor_signature.yaml"
+        self.cred_path.write_text(yaml.dump({
+            "scope": {
+                "chain_id": 31337,
+                "vault": self.mock_escrow.escrow,
+                "token": self.mock_escrow.token,
+            },
+            "recipient": self.mock_escrow.server_account,
+            "category": DEFAULT_CATEGORY,
+            "valid_after": cred_obj["valid_after"],
+            "valid_until": cred_obj["valid_until"],
+        }))
+        self.sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
+
+        # Create server with mock EscrowClient, mock_ionet=True, and stored credential paths
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
-            self.mcp = create_server(self.state_dir, mock_ionet=True)
+            self.mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                vendor_credential_path=self.cred_path,
+                vendor_signature_path=self.sig_path,
+            )
 
     async def call(self, tool_name: str, arguments: dict | None = None) -> dict:
         arguments = arguments or {}
@@ -318,6 +355,144 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
         self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
+
+    async def test_submit_acceptance_fails_when_vendor_credential_missing(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        sig = sign_acceptance(acceptance)
+
+        self.cred_path.unlink()
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
+        self.assertIn("Vendor credential file missing", str(ctx.exception))
+
+    async def test_submit_acceptance_fails_when_vendor_signature_missing(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        sig = sign_acceptance(acceptance)
+
+        self.sig_path.unlink()
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
+        self.assertIn("Vendor signature file missing", str(ctx.exception))
+
+    async def test_submit_acceptance_fails_when_vendor_credential_expired(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+
+        import yaml
+
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        sig = sign_acceptance(acceptance)
+
+        c_data = yaml.safe_load(self.cred_path.read_text())
+        c_data["valid_until"] = int(time.time()) - 100
+        self.cred_path.write_text(yaml.dump(c_data))
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
+        self.assertIn("expired", str(ctx.exception).lower())
+
+    async def test_submit_acceptance_fails_when_vendor_credential_scope_mismatches(self):
+        proposal = await self.call("propose_deployment")
+        task_id = proposal["task_id"]
+
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+
+        import yaml
+
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        sig = sign_acceptance(acceptance)
+
+        c_data = yaml.safe_load(self.cred_path.read_text())
+        c_data["scope"]["chain_id"] = 99999
+        self.cred_path.write_text(yaml.dump(c_data))
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
+        self.assertIn("mismatch", str(ctx.exception).lower())
 
     async def test_deploy_with_escrow_fails_if_container_provisioning_fails(self):
         proposal = await self.call("propose_deployment")

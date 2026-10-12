@@ -48,7 +48,6 @@ from showcases.ionet_arc.escrow import (
     evaluate_authorization,
     hash_policy,
     should_trust_env,
-    sign_vendor_credential,
 )
 from showcases.ionet_arc.worker import Worker, handler
 
@@ -243,6 +242,8 @@ class WarrantTranscriptionService:
         local_server: bool = False,
         ssh_host: str = "localhost",
         worker_url: str | None = None,
+        vendor_credential_path: pathlib.Path | None = None,
+        vendor_signature_path: pathlib.Path | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +256,8 @@ class WarrantTranscriptionService:
         self.local_server = local_server
         self.ssh_host = ssh_host
         self.worker_url = worker_url
+        self.vendor_credential_path = pathlib.Path(vendor_credential_path) if vendor_credential_path else None
+        self.vendor_signature_path = pathlib.Path(vendor_signature_path) if vendor_signature_path else None
         self.local_mock_workers: dict[str, LocalMockWorker] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
@@ -937,11 +940,35 @@ class WarrantTranscriptionService:
         }
 
     def _resolve_vendor_credential(self, session: dict) -> tuple[dict, list[int]]:
-        """Resolve VendorCredential and its 64-byte signature matching session scope and recipient."""
+        """Resolve stored VendorCredential and its 64-byte signature matching session scope and recipient."""
         import yaml
 
-        cred_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_credential.yaml"
-        sig_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_signature.yaml"
+        cred_path = self.vendor_credential_path or (
+            REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_credential.yaml"
+        )
+        sig_path = self.vendor_signature_path or (
+            REPO_ROOT / "showcases" / "ionet_arc" / "config" / "vendor_signature.yaml"
+        )
+
+        if not cred_path.exists():
+            raise ToolError(f"Vendor credential file missing: {cred_path}")
+        if not sig_path.exists():
+            raise ToolError(f"Vendor signature file missing: {sig_path}")
+
+        try:
+            c_yaml = yaml.safe_load(cred_path.read_text())
+        except Exception as e:
+            raise ToolError(f"Failed to parse vendor credential at {cred_path}: {e}") from e
+
+        try:
+            s_yaml = yaml.safe_load(sig_path.read_text())
+        except Exception as e:
+            raise ToolError(f"Failed to parse vendor signature at {sig_path}: {e}") from e
+
+        if not isinstance(c_yaml, dict):
+            raise ToolError(f"Invalid vendor credential format in {cred_path}")
+        if not isinstance(s_yaml, dict) or "signature" not in s_yaml:
+            raise ToolError(f"Invalid vendor signature format in {sig_path}")
 
         now = int(time.time())
         scope = {
@@ -951,40 +978,43 @@ class WarrantTranscriptionService:
         }
         recipient = list(address20(session["recipient"]))
 
-        if cred_path.exists() and sig_path.exists():
-            try:
-                c_yaml = yaml.safe_load(cred_path.read_text())
-                s_yaml = yaml.safe_load(sig_path.read_text())
-                c_scope = c_yaml.get("scope", {})
-                if (
-                    int(c_scope.get("chain_id", 0)) == scope["chain_id"]
-                    and address20(c_scope.get("vault", "")) == address20(session["escrow_address"])
-                    and address20(c_scope.get("token", "")) == address20(session["token_address"])
-                    and address20(c_yaml.get("recipient", "")) == address20(session["recipient"])
-                    and c_yaml.get("valid_after", 0) <= now <= c_yaml.get("valid_until", 0)
-                ):
-                    cred_obj = {
-                        "scope": scope,
-                        "recipient": recipient,
-                        "category": int(c_yaml.get("category", DEFAULT_CATEGORY)),
-                        "valid_after": int(c_yaml["valid_after"]),
-                        "valid_until": int(c_yaml["valid_until"]),
-                    }
-                    raw_sig = s_yaml["signature"].replace("0x", "")
-                    sig_bytes = list(bytes.fromhex(raw_sig))
-                    return cred_obj, sig_bytes
-            except Exception:
-                pass
+        c_scope = c_yaml.get("scope", {})
+        if int(c_scope.get("chain_id", 0)) != scope["chain_id"]:
+            raise ToolError(
+                f"Vendor credential chain_id mismatch: expected {scope['chain_id']}, got {c_scope.get('chain_id')}"
+            )
+        if address20(c_scope.get("vault", "")) != address20(session["escrow_address"]):
+            raise ToolError(
+                f"Vendor credential vault mismatch: expected {session['escrow_address']}, got {c_scope.get('vault')}"
+            )
+        if address20(c_scope.get("token", "")) != address20(session["token_address"]):
+            raise ToolError(
+                f"Vendor credential token mismatch: expected {session['token_address']}, got {c_scope.get('token')}"
+            )
+        if address20(c_yaml.get("recipient", "")) != address20(session["recipient"]):
+            raise ToolError(
+                f"Vendor credential recipient mismatch: expected {session['recipient']}, got {c_yaml.get('recipient')}"
+            )
 
-        # Dynamically generate and sign vendor credential using registry.key
+        valid_after = int(c_yaml.get("valid_after", 0))
+        valid_until = int(c_yaml.get("valid_until", 0))
+        if now < valid_after:
+            raise ToolError(f"Vendor credential is not yet valid (valid_after: {valid_after}, current: {now})")
+        if now > valid_until:
+            raise ToolError(f"Vendor credential has expired (valid_until: {valid_until}, current: {now})")
+
+        raw_sig = s_yaml["signature"].replace("0x", "")
+        sig_bytes = list(bytes.fromhex(raw_sig))
+        if len(sig_bytes) != 64:
+            raise ToolError(f"Vendor signature length mismatch: expected 64 bytes, got {len(sig_bytes)}")
+
         cred_obj = {
             "scope": scope,
             "recipient": recipient,
-            "category": DEFAULT_CATEGORY,
-            "valid_after": now - 3600,
-            "valid_until": now + 365 * 86400,
+            "category": int(c_yaml.get("category", DEFAULT_CATEGORY)),
+            "valid_after": valid_after,
+            "valid_until": valid_until,
         }
-        sig_bytes = sign_vendor_credential(cred_obj)
         return cred_obj, sig_bytes
 
     async def submit_acceptance(
@@ -1102,10 +1132,16 @@ class ServerConfig:
     local_server: bool = False
     ssh_host: str = "localhost"
     worker_url: str | None = None
+    vendor_credential_path: pathlib.Path | None = None
+    vendor_signature_path: pathlib.Path | None = None
 
     def __post_init__(self):
         if isinstance(self.state_dir, str):
             self.state_dir = pathlib.Path(self.state_dir)
+        if isinstance(self.vendor_credential_path, str):
+            self.vendor_credential_path = pathlib.Path(self.vendor_credential_path)
+        if isinstance(self.vendor_signature_path, str):
+            self.vendor_signature_path = pathlib.Path(self.vendor_signature_path)
 
 
 SellerServerConfig = ServerConfig
@@ -1149,6 +1185,8 @@ def create_server(
         local_server=cfg.local_server,
         ssh_host=cfg.ssh_host,
         worker_url=cfg.worker_url,
+        vendor_credential_path=cfg.vendor_credential_path,
+        vendor_signature_path=cfg.vendor_signature_path,
     )
 
     server.tool(
@@ -1309,6 +1347,20 @@ def main():
         "--worker-url",
         default=os.environ.get("WORKER_URL"),
         help="HTTP URL for the deployed worker (default: http://<ssh-host>:8080)",
+    )
+    parser.add_argument(
+        "--vendor-credential",
+        dest="vendor_credential_path",
+        type=pathlib.Path,
+        default=os.environ.get("WARRANT_VENDOR_CREDENTIAL"),
+        help="Path to vendor_credential.yaml (default: showcases/ionet_arc/config/vendor_credential.yaml)",
+    )
+    parser.add_argument(
+        "--vendor-signature",
+        dest="vendor_signature_path",
+        type=pathlib.Path,
+        default=os.environ.get("WARRANT_VENDOR_SIGNATURE"),
+        help="Path to vendor_signature.yaml (default: showcases/ionet_arc/config/vendor_signature.yaml)",
     )
     args = parser.parse_args()
 

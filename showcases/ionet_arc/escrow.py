@@ -42,8 +42,10 @@ __all__ = [
     "find_binary",
     "find_warrant_binary",
     "hash_policy",
+    "parse_public_key",
     "should_trust_env",
     "sign_acceptance",
+    "sign_vendor_credential",
     "to_addr_str",
 ]
 
@@ -231,6 +233,74 @@ def find_warrant_binary(name: str) -> Path:
     raise FileNotFoundError(f"Could not find compiled binary '{name}'. Run 'cargo build --release -p warrant-host'.")
 
 
+def parse_public_key(key: list[int] | str | bytes) -> list[int]:
+    """Parse 33-byte compressed secp256k1 public key from hex string, bytes, or int list."""
+    if isinstance(key, str):
+        raw = key.strip().lower()
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        b = bytes.fromhex(raw)
+    elif isinstance(key, (bytes, bytearray, list)):
+        b = bytes(key)
+    else:
+        raise TypeError(f"Unsupported public key type: {type(key)}")
+
+    if len(b) != 33:
+        raise ValueError(f"Expected 33-byte compressed public key, got {len(b)} bytes")
+    return list(b)
+
+
+def _resolve_authority_public_key(
+    explicit_key: list[int] | str | None,
+    key_name: str,
+    manifest: dict,
+    manifest_path: Path | None = None,
+) -> list[int]:
+    """Resolve a 33-byte authority public key from argument, public_keys.yaml, or manifest."""
+    if explicit_key is not None:
+        return parse_public_key(explicit_key)
+
+    # 1. Check public_keys file referenced in manifest.public_files.public_keys
+    pub_file_rel = manifest.get("public_files", {}).get("public_keys")
+    candidates: list[Path] = []
+    if pub_file_rel:
+        p = Path(pub_file_rel)
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            candidates.append(REPO_ROOT / p)
+            if manifest_path:
+                candidates.append(manifest_path.parent / p)
+                candidates.append(manifest_path.parent / p.name)
+    elif manifest_path:
+        candidates.append(manifest_path.parent / "public_keys.yaml")
+    else:
+        candidates.append(REPO_ROOT / "showcases" / "ionet_arc" / "config" / "public_keys.yaml")
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            try:
+                data = yaml.safe_load(candidate.read_text()) or {}
+                if isinstance(data, dict) and key_name in data:
+                    return parse_public_key(data[key_name])
+            except Exception:
+                pass
+
+    # 2. Check inline public_keys in manifest (for backwards compatibility / inline test fixtures)
+    if key_name in manifest.get("public_keys", {}):
+        return parse_public_key(manifest["public_keys"][key_name])
+
+    # 3. Check public_key_files in manifest
+    if key_name in manifest.get("public_key_files", {}):
+        pub_path = REPO_ROOT / manifest["public_key_files"][key_name]
+        if pub_path.exists():
+            return parse_public_key(pub_path.read_text().strip())
+
+    raise FileNotFoundError(
+        f"Authority public key '{key_name}' missing: not provided in arguments or public_keys.yaml"
+    )
+
+
 def compile_buyer_policy(
     template_path: Path | None = None,
     manifest_path: Path | None = None,
@@ -240,6 +310,8 @@ def compile_buyer_policy(
     max_amount: int | None = None,
     valid_after_buffer: int = 300,
     validity_seconds: int = 900,
+    registry_public_key: list[int] | str | None = None,
+    acceptance_public_key: list[int] | str | None = None,
 ) -> tuple[dict, str]:
     """Compile buyer policy template into concrete Policy and compute its cryptographic policy_hash."""
     manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
@@ -257,34 +329,11 @@ def compile_buyer_policy(
     if not escrow_address or not token_address:
         raise ValueError("escrow_address and token_address must be specified")
 
-    evidence_bin = find_warrant_binary("warrant-evidence")
-
-    reg_key_rel = manifest.get("private_key_files", {}).get("registry_key", "showcases/ionet_arc/.keys/registry.key")
-    acc_key_rel = manifest.get("private_key_files", {}).get(
-        "buyer_acceptance_key", "showcases/ionet_arc/.keys/buyer_acceptance.key"
+    reg_pub = _resolve_authority_public_key(
+        registry_public_key, "registry_key", manifest, manifest_path=manifest_path
     )
-
-    reg_key_path = REPO_ROOT / reg_key_rel
-    acc_key_path = REPO_ROOT / acc_key_rel
-
-    if not reg_key_path.exists() or not acc_key_path.exists():
-        raise FileNotFoundError(f"Authority keys missing: {reg_key_path} or {acc_key_path}")
-
-    reg_pub = json.loads(
-        subprocess.run(
-            [str(evidence_bin), "public-key", str(reg_key_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    )
-    acc_pub = json.loads(
-        subprocess.run(
-            [str(evidence_bin), "public-key", str(acc_key_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+    acc_pub = _resolve_authority_public_key(
+        acceptance_public_key, "buyer_acceptance_key", manifest, manifest_path=manifest_path
     )
 
     now = int(time.time())
@@ -789,59 +838,25 @@ def ensure_policy_hash(
     categories: list[int] | None = None,
     valid_after: int = 1000,
     valid_until: int = 2_000_000_000,
+    manifest_path: Path | None = None,
+    template_path: Path | None = None,
 ) -> str:
-    """Instantiate and hash policy for this scope."""
-    manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
-    template_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
-    if manifest_path.exists() and template_path.exists():
-        try:
-            _, pol_hash = compile_buyer_policy(
-                template_path=template_path,
-                manifest_path=manifest_path,
-                chain_id=chain_id,
-                escrow_address=escrow_address,
-                token_address=token_address,
-                max_amount=max_amount,
-            )
-            return pol_hash
-        except Exception:
-            pass
+    """Instantiate and hash policy for this scope, failing loudly if configs or keys are missing."""
+    manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
+    template_path = template_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml")
 
-    # Fallback to templates/example-parameters.json if config doesn't exist
-    params_template = REPO_ROOT / "templates" / "example-parameters.json"
-    template_file = REPO_ROOT / "templates" / "accepted-contractor-v1.json"
-    policy_binary = find_warrant_binary("warrant-policy")
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+    if not template_path.exists():
+        raise FileNotFoundError(f"Policy template file not found: {template_path}")
 
-    escrow_bytes = list(address20(escrow_address))
-    token_bytes = list(address20(token_address))
+    _, pol_hash = compile_buyer_policy(
+        template_path=template_path,
+        manifest_path=manifest_path,
+        chain_id=chain_id,
+        escrow_address=escrow_address,
+        token_address=token_address,
+        max_amount=max_amount,
+    )
+    return pol_hash
 
-    params_obj = json.loads(params_template.read_text())
-    params_obj["policy"]["scope"] = {
-        "chain_id": chain_id,
-        "vault": escrow_bytes,
-        "token": token_bytes,
-    }
-    params_obj["policy"]["valid_after"] = valid_after
-    params_obj["policy"]["valid_until"] = valid_until
-    params_obj["bindings"] = {
-        "max_amount": max_amount,
-        "categories": categories or [DEFAULT_CATEGORY],
-    }
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp = Path(tmp_dir)
-        params_path = tmp / "params.json"
-        policy_path = tmp / "policy.json"
-        params_path.write_text(json.dumps(params_obj, indent=2))
-        subprocess.run(
-            [str(policy_binary), "instantiate", str(template_file), str(params_path), str(policy_path)],
-            check=True,
-            capture_output=True,
-        )
-        res = subprocess.run(
-            [str(policy_binary), "hash", str(policy_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return res.stdout.strip()

@@ -9,7 +9,10 @@ from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 from showcases.ionet_arc.escrow import (
     EscrowClient,
     EthRpc,
+    compile_buyer_policy,
     encode_journal,
+    ensure_policy_hash,
+    parse_public_key,
     should_trust_env,
 )
 
@@ -271,6 +274,143 @@ class EscrowClientTests(unittest.TestCase):
         self.mock_rpc.rpc.return_value = "0x" + encode(["bytes32"], [expected_task_id]).hex()
         res = asyncio.run(_run())
         self.assertEqual(res, "0x" + "77" * 32)
+
+    def test_parse_public_key_formats(self):
+        valid_hex = "0x03" + "aa" * 32
+        parsed1 = parse_public_key(valid_hex)
+        self.assertEqual(len(parsed1), 33)
+        self.assertEqual(parsed1[0], 3)
+
+        parsed2 = parse_public_key(bytes.fromhex("02" + "bb" * 32))
+        self.assertEqual(len(parsed2), 33)
+        self.assertEqual(parsed2[0], 2)
+
+        with self.assertRaises(ValueError):
+            parse_public_key("0x03" + "aa" * 31)  # Invalid length (32 bytes)
+
+    def test_compile_buyer_policy_with_manifest_public_keys(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            man_path = tmp / "manifest.yaml"
+            tpl_path = tmp / "template.yaml"
+
+            man_path.write_text(yaml.dump({
+                "chain_id": 31337,
+                "escrow_address": "0x" + "11" * 20,
+                "token_address": "0x" + "22" * 20,
+                "category": 42,
+                "max_amount": 1_000_000,
+                "public_keys": {
+                    "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
+                    "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
+                },
+            }))
+            tpl_path.write_text(yaml.dump({
+                "version": 1,
+                "rule": {"all": ["accepted"]},
+            }))
+
+            # Notice: no private keys exist in tmp_dir!
+            policy, pol_hash = compile_buyer_policy(
+                template_path=tpl_path,
+                manifest_path=man_path,
+            )
+            self.assertEqual(
+                policy["registry_key"],
+                parse_public_key("0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5"),
+            )
+            self.assertEqual(
+                policy["acceptance_key"],
+                parse_public_key("0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57"),
+            )
+            self.assertTrue(pol_hash.startswith("0x"))
+
+    def test_compile_buyer_policy_with_public_keys_yaml(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            man_path = tmp / "manifest.yaml"
+            tpl_path = tmp / "template.yaml"
+            pub_path = tmp / "public_keys.yaml"
+
+            man_path.write_text(yaml.dump({
+                "chain_id": 31337,
+                "escrow_address": "0x" + "11" * 20,
+                "token_address": "0x" + "22" * 20,
+                "category": 42,
+                "max_amount": 1_000_000,
+                "public_files": {
+                    "public_keys": str(pub_path),
+                },
+            }))
+            pub_path.write_text(yaml.dump({
+                "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
+                "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
+            }))
+            tpl_path.write_text(yaml.dump({
+                "version": 1,
+                "rule": {"all": ["accepted"]},
+            }))
+
+            policy, pol_hash = compile_buyer_policy(
+                template_path=tpl_path,
+                manifest_path=man_path,
+            )
+            self.assertEqual(
+                policy["registry_key"],
+                parse_public_key("0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5"),
+            )
+            self.assertEqual(
+                policy["acceptance_key"],
+                parse_public_key("0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57"),
+            )
+            self.assertTrue(pol_hash.startswith("0x"))
+
+    def test_compile_buyer_policy_fails_loudly_when_keys_missing(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            man_path = tmp / "manifest.yaml"
+            tpl_path = tmp / "template.yaml"
+
+            man_path.write_text(yaml.dump({
+                "chain_id": 31337,
+                "escrow_address": "0x" + "11" * 20,
+                "token_address": "0x" + "22" * 20,
+                # No public_keys or private_keys
+            }))
+            tpl_path.write_text(yaml.dump({"version": 1}))
+
+            with self.assertRaises(FileNotFoundError) as ctx:
+                compile_buyer_policy(
+                    template_path=tpl_path,
+                    manifest_path=man_path,
+                )
+            self.assertIn("registry_key' missing", str(ctx.exception))
+
+    def test_ensure_policy_hash_fails_loudly_on_missing_config(self):
+        from pathlib import Path
+        with self.assertRaises(FileNotFoundError):
+            ensure_policy_hash(
+                escrow_address="0x" + "11" * 20,
+                token_address="0x" + "22" * 20,
+                chain_id=31337,
+                max_amount=1_000_000,
+                manifest_path=Path("/nonexistent/manifest.yaml"),
+            )
 
 
 if __name__ == "__main__":

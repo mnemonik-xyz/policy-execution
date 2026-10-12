@@ -114,6 +114,38 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         cls.test_audio = Path(cls.tmp_dir) / "test_sample.mp3"
         cls.test_audio.write_bytes(b"mock sample audio bytes for autonomous transcription pilot")
 
+        import yaml
+
+        from showcases.ionet_arc.escrow import address20, sign_vendor_credential
+
+        now = int(time.time())
+        cred_obj = {
+            "scope": {
+                "chain_id": 31337,
+                "vault": list(address20(cls.escrow_address)),
+                "token": list(address20(cls.token_address)),
+            },
+            "recipient": list(address20(cls.server_account)),
+            "category": 42,
+            "valid_after": now - 3600,
+            "valid_until": now + 86400,
+        }
+        sig_bytes = sign_vendor_credential(cred_obj)
+        cls.vendor_cred_path = Path(cls.tmp_dir) / "vendor_credential.yaml"
+        cls.vendor_sig_path = Path(cls.tmp_dir) / "vendor_signature.yaml"
+        cls.vendor_cred_path.write_text(yaml.dump({
+            "scope": {
+                "chain_id": 31337,
+                "vault": cls.escrow_address,
+                "token": cls.token_address,
+            },
+            "recipient": cls.server_account,
+            "category": 42,
+            "valid_after": cred_obj["valid_after"],
+            "valid_until": cred_obj["valid_until"],
+        }))
+        cls.vendor_sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
+
         cmd = [
             str(PYTHON),
             str(ROOT / "showcases" / "ionet_arc" / "seller_mcp_server.py"),
@@ -133,6 +165,10 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.verifier_address,
             "--server-account",
             cls.server_account,
+            "--vendor-credential",
+            str(cls.vendor_cred_path),
+            "--vendor-signature",
+            str(cls.vendor_sig_path),
             "--mock-ionet",
         ]
         env = _clean_env()

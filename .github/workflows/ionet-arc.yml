@@ -49,7 +49,7 @@ jobs:
       - name: Lint Python sources
         run: ruff check showcases
       - name: Prepare test authority keys and credentials
-        run: python showcases/ionet_arc/sign_vendor.py
+        run: python showcases/ionet_arc/init.py
       - name: Run io.net Arc showcase test suite
         run: python -m unittest discover showcases/ionet_arc -v
       - name: Check CLI imports
