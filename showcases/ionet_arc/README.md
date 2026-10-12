@@ -209,60 +209,20 @@ sequenceDiagram
 
 ## Exposed MCP Tools
 
-### Buyer Warrant Guardrail Tools (`buyer_mcp_server.py`)
+The dual-MCP architecture separates the remote Seller compute tools from the local Buyer
+guardrail sidecar tools:
 
-- **`warrant_get_policy`**:
-  Inspect local policy constraints: budget cap, max duration, allowed categories, buyer address,
-  and pinned escrow/token contracts.
+* **Buyer Guardrail (`buyer-warrant-guardrail`)**: Enforces local budget caps, duration limits,
+  and category whitelists, independently compiles policy hashes, submits `TaskEscrow.offer()`,
+  and signs deliverable acceptance receipts (`buyer_acceptance.key`).
+* **Seller Service (`seller-mcp-server`)**: Discovers io.net GPU hardware, calculates duration
+  quotes, provisions containers, evaluates authorization off-chain via native Warrant, settles
+  payment on Arc, and handles Whisper audio transcription.
 
-- **`warrant_evaluate_and_offer`**:
-  Arguments: `proposal` (or unpacked task terms: `task_id`, `amount`, `amount_usd`, `salt`,
-  `recipient`, `policy_hash`, `duration_hours`, etc.).
-  Validates that cost $\le$ max budget, duration $\le$ max duration, category is permitted,
-  verifies `task_id` matches derived `taskIdFor`, and independently derives/verifies the
-  `warrant-policy` hash. Approves ERC-20 token allowance and submits `TaskEscrow.offer()` on-chain.
+Detailed tool specifications, argument schemas, verified return structures, and agent prompt
+guidelines are maintained in the agent skill definition:
 
-- **`warrant_sign_acceptance`**:
-  Arguments: `task_id`, `deliverable_hash`, `recipient`, `amount`.
-  Signs an off-chain Acceptance deliverable receipt for an offered TaskEscrow task using the
-  buyer's private acceptance key (`buyer_acceptance.key`).
-
-- **`warrant_check_escrow_status`**:
-  Arguments: `task_id`.
-  Queries on-chain `TaskEscrow` state (`Missing`, `Offered`, `Accepted`, `Paid`, `Refunded`).
-
-### Seller Tools (`seller_mcp_server.py`)
-
-- **`list_suitable_hardware`**:
-  Discovers available single-GPU options on io.net suitable for Whisper inference, sorted by
-  price ascending.
-
-- **`propose_deployment`**:
-  Arguments: `budget_cap_usd`, `customer_address`, optional `hardware_id`, optional
-  `duration_hours`. Calculates duration cost from real hardware hourly rates, validates budget
-  ceiling, generates unique `task_id`, salt, policy hash, and returns formal escrow terms.
-
-- **`deploy_with_escrow`**:
-  Arguments: `task_id`, optional `policy`.
-  Verifies on-chain deposit via `TaskEscrow`, accepts task on-chain (`State.Accepted`) to commit
-  terms, generates `WARRANT_WORKER_TOKEN` and deliverable hash, launches container provisioning
-  in background, and returns `status: "provisioning"`.
-
-- **`get_deployment_status`**:
-  Arguments: optional `task_id`.
-  Inspects provisioning status (`provisioning`, `ready`, or `failed`), worker health, public URL,
-  worker token, remaining duration in 1h window, and settlement transaction hash.
-
-- **`submit_acceptance`**:
-  Arguments: `task_id`, `acceptance`, `signature`.
-  Verifies buyer-signed Acceptance evidence off-chain via native Warrant
-  (`warrant-host evaluate`), approves the 384-byte journal on `JournalVerifier`, and settles
-  payment on `TaskEscrow` on-chain.
-
-- **`transcribe_audio`**:
-  Arguments: `audio_base64` (base64-encoded audio bytes), optional `language`, optional `task_id`.
-  Transcribes audio on the active 1-hour worker and returns text plus timestamped segments.
-  Optionally provide `task_id` to route to a specific deployment session.
+👉 **[skills/ionet/SKILL.md](skills/ionet/SKILL.md)**
 
 ---
 
