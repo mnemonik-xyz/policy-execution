@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import atexit
 import base64
+import contextlib
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import secrets
@@ -19,18 +21,24 @@ from decimal import Decimal, InvalidOperation
 from http.server import ThreadingHTTPServer
 
 # Ensure repository root is on sys.path
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
-import contextlib
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("WARRANT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
-import httpx2
-import uvicorn
-from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.transport_security import TransportSecuritySettings
-from starlette.responses import Response
+import httpx2  # noqa: E402
+import uvicorn  # noqa: E402
+from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+from starlette.responses import Response  # noqa: E402
 
-from showcases.ionet_arc.adapter import (
+from showcases.ionet_arc.adapter import (  # noqa: E402
     PilotError,
     connected,
     deploy,
@@ -38,11 +46,10 @@ from showcases.ionet_arc.adapter import (
     save,
     validate_deployment,
 )
-from showcases.ionet_arc.escrow import (
+from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
-    REPO_ROOT,
     EscrowClient,
     address20,
     bytes32,
@@ -52,7 +59,7 @@ from showcases.ionet_arc.escrow import (
     load_manifest,
     should_trust_env,
 )
-from showcases.ionet_arc.worker import Worker, handler
+from showcases.ionet_arc.worker import Worker, handler  # noqa: E402
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/warrant-transcription:pilot"
 
@@ -303,10 +310,13 @@ class WarrantTranscriptionService:
                 )
 
     async def list_suitable_hardware(self) -> list[dict]:
+        logger.info("Tool called: list_suitable_hardware (use_mock_ionet=%s)", self.use_mock_ionet)
         try:
             if self.use_mock_ionet:
+                logger.info("Loading cached hardware configurations")
                 raw_items = load_cached_hardware()
             else:
+                logger.info("Calling io.net CaaS API to list available hardware")
 
                 async def op(cloud):
                     res = await cloud.call("caas_get_hardware_ids", {})
@@ -315,9 +325,16 @@ class WarrantTranscriptionService:
 
                 raw_items = await connected(op)
 
+            logger.info("Filtering %d raw hardware options for Whisper transcription", len(raw_items))
             filtered = filter_suitable_gpus(raw_items)
+            candidate_summary = [
+                {"id": hw["hardware_id"], "name": hw["hardware_name"], "price_hr": hw["price_per_hour_usd"]}
+                for hw in filtered
+            ]
+            logger.info("list_suitable_hardware returning %d suitable GPUs: %s", len(filtered), candidate_summary)
             return filtered
         except Exception as exc:
+            logger.error("list_suitable_hardware failed: %s", exc)
             raise safe_tool_error(exc) from None
 
     def _select_hardware(self, candidates: list[dict], hardware_id: str | int | None) -> dict:
@@ -339,9 +356,7 @@ class WarrantTranscriptionService:
             customer_address = self.buyer_account
 
         if not customer_address:
-            raise ToolError(
-                "Customer address was not provided and is not configured in config/manifest.yaml."
-            )
+            raise ToolError("Customer address was not provided and is not configured in config/manifest.yaml.")
 
         if not escrow_client.server_account:
             manifest = load_manifest(self.manifest_path)
@@ -352,9 +367,7 @@ class WarrantTranscriptionService:
                 )
 
         if not escrow_client.server_account:
-            raise ToolError(
-                "Server payout account is not configured in config/manifest.yaml."
-            )
+            raise ToolError("Server payout account is not configured in config/manifest.yaml.")
 
         return customer_address, chain_id
 
@@ -393,20 +406,40 @@ class WarrantTranscriptionService:
         duration_hours: int = 1,
         budget_cap_usd: str | float | None = "1.00",
     ) -> dict:
+        logger.info(
+            "Tool called: propose_deployment with hardware_id=%s, customer_address=%s, location_id=%s, "
+            "duration_hours=%s, budget_cap_usd=%s",
+            hardware_id,
+            customer_address,
+            location_id,
+            duration_hours,
+            budget_cap_usd,
+        )
         try:
             if duration_hours <= 0:
+                logger.warning("Invalid duration_hours: %s", duration_hours)
                 raise ToolError(f"duration_hours must be at least 1, got {duration_hours}")
 
+            logger.info("Querying suitable hardware candidates for proposal...")
             candidates = await self.list_suitable_hardware()
             if not candidates:
+                logger.warning("No suitable hardware candidates found")
                 raise ToolError("No available suitable GPUs found.")
 
             selected_hw = self._select_hardware(candidates, hardware_id)
+            logger.info(
+                "Selected hardware '%s' (id=%s, price=$%s/hr, location=%s)",
+                selected_hw["hardware_name"],
+                selected_hw["hardware_id"],
+                selected_hw["price_per_hour_usd"],
+                selected_hw.get("location"),
+            )
             customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
             self._ensure_escrow_contracts(chain_id)
 
             salt = "0x" + secrets.token_hex(32)
             task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
+            logger.info("Derived taskIdFor(%s, salt=%s): %s", customer_address, salt, task_id)
 
             # Dynamic pricing based on real hardware cost and duration
             price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
@@ -417,11 +450,13 @@ class WarrantTranscriptionService:
                 try:
                     cap = Decimal(str(budget_cap_usd))
                     if cost_usd > cap:
+                        logger.warning("Hardware cost $%.2f exceeds budget cap $%.2f", cost_usd, cap)
                         raise ToolError(
                             f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
                             f"exceeds budget cap of ${cap:.2f}."
                         )
                 except (ValueError, InvalidOperation):
+                    logger.warning("Invalid budget_cap_usd: %s", budget_cap_usd)
                     raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}") from None
 
             token_amount = int(cost_usd.quantize(Decimal("0.000001")) * Decimal(1_000_000))
@@ -466,8 +501,18 @@ class WarrantTranscriptionService:
 
             prop_path = self.proposals_dir / f"{task_id}.json"
             save(prop_path, proposal)
+            logger.info("Saved proposal record to %s", prop_path)
+            logger.info(
+                "propose_deployment returning: task_id=%s, amount=%d ($%s), recipient=%s, escrow=%s",
+                task_id,
+                token_amount,
+                amount_usd,
+                proposal["recipient"],
+                proposal["escrow_address"],
+            )
             return proposal
         except Exception as exc:
+            logger.error("propose_deployment failed: %s", exc)
             raise safe_tool_error(exc) from None
 
     async def _verify_task_offered(self, task_id: str, proposal: dict) -> dict:
@@ -649,6 +694,11 @@ class WarrantTranscriptionService:
         deployment_id: str,
         worker_token: str,
     ):
+        logger.info(
+            "Starting background container provisioning for task_id=%s, deployment_id=%s",
+            task_id,
+            deployment_id,
+        )
         try:
             public_url = await self._provision_container(proposal, deployment_id, worker_token)
             now = int(time.time())
@@ -659,7 +709,9 @@ class WarrantTranscriptionService:
             session["expires_at"] = now + proposal.get("duration_hours", 1) * 3600
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
+            logger.info("Container provisioning complete for task_id=%s: public_url=%s", task_id, public_url)
         except Exception as exc:
+            logger.error("Container provisioning failed for task_id=%s: %s", task_id, exc)
             session = self._lookup_session(task_id) or {}
             session["status"] = "failed"
             session["error"] = str(exc)
@@ -667,25 +719,34 @@ class WarrantTranscriptionService:
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
     async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
+        logger.info("Tool called: deploy_with_escrow with task_id=%s", task_id)
         try:
             prop_path = self.proposals_dir / f"{task_id}.json"
             if not prop_path.exists():
+                logger.warning("No proposal record found for task_id '%s' at %s", task_id, prop_path)
                 raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
             proposal = read_json(prop_path)
             target_policy = policy or proposal.get("policy")
             if not target_policy:
-                raise ToolError(
-                    f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'."
-                )
+                logger.warning("Buyer policy must be provided for task '%s'", task_id)
+                raise ToolError(f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'.")
 
             # 1. Verify on-chain escrow state and commercial terms
+            logger.info("Verifying on-chain TaskEscrow offer for task_id=%s", task_id)
             task_data = await self._verify_task_offered(task_id, proposal)
 
             # 2. Hash policy received from buyer and verify against on-chain policyHash
+            logger.info("Verifying buyer policy hash against on-chain policyHash for task_id=%s", task_id)
             computed_policy_hash = await asyncio.to_thread(hash_policy, target_policy)
             onchain_policy_hash = str(task_data.get("policy_hash", ""))
             if onchain_policy_hash.lower() != computed_policy_hash.lower():
+                logger.warning(
+                    "Policy hash mismatch for task_id=%s: onchain=%s, computed=%s",
+                    task_id,
+                    onchain_policy_hash,
+                    computed_policy_hash,
+                )
                 raise ToolError(
                     f"On-chain policyHash ({onchain_policy_hash}) does not match "
                     f"provided policy hash ({computed_policy_hash})."
@@ -698,12 +759,19 @@ class WarrantTranscriptionService:
             now = int(time.time())
 
             # 3. Accept task on-chain first to commit agreement before spinning up hardware
+            logger.info("Accepting task_id=%s on-chain in TaskEscrow", task_id)
             await self._accept_task(task_id, proposal, task_data.get("state"))
 
             # 3. Generate capability token and deliverable hash
             worker_token = secrets.token_hex(24)
             deliverable_hash = "0x" + hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
             deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
+            logger.info(
+                "Generated worker_token, deliverable_hash=%s, deployment_id=%s for task_id=%s",
+                deliverable_hash,
+                deployment_id,
+                task_id,
+            )
 
             # 4. Save active deployment session (provisioning)
             session = {
@@ -730,6 +798,7 @@ class WarrantTranscriptionService:
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
             # 5. Spawn background provisioning
+            logger.info("Spawning background container provisioning for deployment_id=%s", deployment_id)
             bg_task = asyncio.create_task(self._provision_container_bg(task_id, proposal, deployment_id, worker_token))
             self._bg_tasks.add(bg_task)
             bg_task.add_done_callback(self._bg_tasks.discard)
@@ -740,7 +809,7 @@ class WarrantTranscriptionService:
             curr = self._lookup_session(task_id) or session
             curr_status = curr.get("status", "provisioning")
 
-            return {
+            result = {
                 "status": curr_status,
                 "task_id": task_id,
                 "deployment_id": deployment_id,
@@ -753,7 +822,16 @@ class WarrantTranscriptionService:
                     else "Container is ready. Verify /health and submit signed acceptance."
                 ),
             }
+            logger.info(
+                "deploy_with_escrow returning: status=%s, task_id=%s, deployment_id=%s, public_url=%s",
+                result["status"],
+                result["task_id"],
+                result["deployment_id"],
+                result["public_url"],
+            )
+            return result
         except Exception as exc:
+            logger.error("deploy_with_escrow failed for task_id=%s: %s", task_id, exc)
             raise safe_tool_error(exc) from None
 
     @staticmethod
@@ -857,16 +935,25 @@ class WarrantTranscriptionService:
         language: str | None = None,
         task_id: str | None = None,
     ) -> dict:
+        logger.info(
+            "Tool called: transcribe_audio with audio length=%d base64 chars, language=%s, task_id=%s",
+            len(audio_base64) if audio_base64 else 0,
+            language,
+            task_id,
+        )
         try:
             session = self._active_session(task_id)
             public_url = session["public_url"]
             worker_token = session.get("worker_token")
+            logger.info("Found active session for task_id=%s: worker public_url=%s", session.get("task_id"), public_url)
 
             try:
                 audio_bytes = base64.b64decode(audio_base64, validate=True)
             except ValueError as exc:
+                logger.warning("Invalid base64 payload provided to transcribe_audio")
                 raise ToolError("audio_base64 is not valid base64.") from exc
             if len(audio_bytes) == 0:
+                logger.warning("Empty audio payload provided to transcribe_audio")
                 raise ToolError("Audio file is empty.")
 
             worker_base = public_url.rstrip("/")
@@ -882,29 +969,54 @@ class WarrantTranscriptionService:
             }
 
             trust_env = should_trust_env(worker_base)
+            logger.info(
+                "Submitting audio (%d bytes, sha256=%s) to worker endpoint %s",
+                len(audio_bytes),
+                audio_sha256,
+                req_url,
+            )
 
             try:
                 async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
                     resp = await client.post(req_url, content=audio_bytes, headers=headers)
                     if resp.is_error:
+                        logger.error("Worker rejected upload HTTP %d: %s", resp.status_code, resp.text)
                         raise ToolError(f"Worker rejected upload with HTTP {resp.status_code}: {resp.text}")
                     resp_data = resp.json()
                     job_id = resp_data.get("job_id")
                     if not job_id:
+                        logger.error("Unexpected worker response: %s", resp_data)
                         raise ToolError(f"Unexpected worker response: {resp_data}")
 
+                    logger.info("Worker accepted job (job_id=%s). Polling for transcription completion...", job_id)
                     poll_url = f"{worker_base}/job/{job_id}"
                     poll_headers = {"Authorization": f"Bearer {worker_token}"}
-                    return await self._poll_transcription(client, poll_url, poll_headers, job_id)
+                    result = await self._poll_transcription(client, poll_url, poll_headers, job_id)
+                    text = result.get("text", "")
+                    text_preview = (text[:80] + "...") if len(text) > 80 else text
+                    logger.info(
+                        "transcribe_audio returning: job_id=%s, status=%s, language=%s, "
+                        "text_preview=%r, elapsed_seconds=%s",
+                        result.get("job_id"),
+                        result.get("status"),
+                        result.get("language"),
+                        text_preview,
+                        result.get("elapsed_seconds"),
+                    )
+                    return result
             except (httpx2.HTTPError, OSError) as net_err:
+                logger.error("Worker connection failed during transcribe_audio: %s", net_err)
                 raise ToolError(f"Worker connection failed: {net_err}") from net_err
         except Exception as exc:
+            logger.error("transcribe_audio failed: %s", exc)
             raise safe_tool_error(exc) from None
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
+        logger.info("Tool called: get_deployment_status with task_id=%s", task_id)
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
+            logger.info("get_deployment_status returning: active=False, status=missing (%s)", msg)
             return {"active": False, "status": "missing", "message": msg}
 
         status = session.get("status", "ready")
@@ -912,7 +1024,7 @@ class WarrantTranscriptionService:
 
         if status == "provisioning":
             elapsed = int(now - session.get("started_at", now))
-            return {
+            res = {
                 "active": False,
                 "status": "provisioning",
                 "task_id": session.get("task_id"),
@@ -921,9 +1033,11 @@ class WarrantTranscriptionService:
                 "elapsed_seconds": elapsed,
                 "message": f"Container is provisioning ({elapsed}s elapsed). Please continue polling.",
             }
+            logger.info("get_deployment_status returning: status=provisioning, elapsed_seconds=%d", elapsed)
+            return res
 
         if status == "failed":
-            return {
+            res = {
                 "active": False,
                 "status": "failed",
                 "task_id": session.get("task_id"),
@@ -931,10 +1045,12 @@ class WarrantTranscriptionService:
                 "error": session.get("error"),
                 "message": f"Container provisioning failed: {session.get('error')}",
             }
+            logger.info("get_deployment_status returning: status=failed, error=%s", session.get("error"))
+            return res
 
         remaining = max(0, int(session.get("expires_at", 0) - now))
         is_expired = remaining == 0
-        return {
+        res = {
             "active": not is_expired,
             "status": status,
             "task_id": session.get("task_id"),
@@ -947,6 +1063,15 @@ class WarrantTranscriptionService:
             "is_expired": is_expired,
             "settlement_transaction": session.get("settlement_tx"),
         }
+        logger.info(
+            "get_deployment_status returning: status=%s, active=%s, task_id=%s, remaining_seconds=%d, public_url=%s",
+            res["status"],
+            res["active"],
+            res["task_id"],
+            remaining,
+            res["public_url"],
+        )
+        return res
 
     def _resolve_vendor_credential(self, session: dict) -> tuple[dict, list[int]]:
         """Resolve stored VendorCredential and its 64-byte signature matching session scope and recipient."""
@@ -1033,24 +1158,31 @@ class WarrantTranscriptionService:
         signature: list[int] | str,
     ) -> dict:
         """Verify buyer acceptance evidence off-chain, approve journal, and settle TaskEscrow on-chain."""
+        sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
+        logger.info("Tool called: submit_acceptance with task_id=%s, signature_length=%d", task_id, sig_len)
         try:
             session = self._lookup_session(task_id)
             if not session:
+                logger.warning("No deployment session found for task '%s'", task_id)
                 raise ToolError(f"No deployment session found for task '{task_id}'.")
 
             if session.get("status") == "settled" and session.get("settlement_tx"):
-                return {
+                res = {
                     "status": "settled",
                     "task_id": task_id,
                     "settlement_transaction": session.get("settlement_tx"),
                     "message": "Task is already settled.",
                 }
+                logger.info("submit_acceptance returning: task already settled (tx=%s)", session.get("settlement_tx"))
+                return res
 
             expected_deliv = session.get("deliverable_hash")
             acc_deliv = acceptance.get("deliverable_hash")
             acc_deliv_hex = "0x" + bytes(acc_deliv).hex() if isinstance(acc_deliv, list) else str(acc_deliv).lower()
 
+            logger.info("Verifying deliverable hash match: expected=%s, acceptance=%s", expected_deliv, acc_deliv_hex)
             if expected_deliv and acc_deliv_hex != expected_deliv.lower():
+                logger.warning("Deliverable hash mismatch: provided %s != worker %s", acc_deliv_hex, expected_deliv)
                 raise ToolError(
                     f"Deliverable hash mismatch: acceptance provided {acc_deliv_hex} "
                     f"but worker generated {expected_deliv}"
@@ -1059,6 +1191,7 @@ class WarrantTranscriptionService:
             # Resolve policy
             policy = session.get("policy")
             if not policy:
+                logger.warning("No policy associated with deployment session for task '%s'", task_id)
                 raise ToolError(f"No policy associated with deployment session for task '{task_id}'.")
 
             # Build Request struct
@@ -1082,6 +1215,7 @@ class WarrantTranscriptionService:
                 acc_sig_bytes = list(signature)
 
             # Resolve VendorCredential and sign
+            logger.info("Resolving vendor credential and signature for task_id=%s", task_id)
             v_cred, v_sig = self._resolve_vendor_credential(session)
 
             evidence = {
@@ -1092,21 +1226,27 @@ class WarrantTranscriptionService:
             }
 
             # Execute real native off-chain policy evaluation (<10ms)
+            logger.info("Evaluating off-chain Warrant authorization policy for task_id=%s", task_id)
             try:
                 _auth, journal_bytes = await asyncio.to_thread(evaluate_authorization, policy, request, evidence)
+                logger.info("Off-chain authorization verified successfully (journal=%d bytes)", len(journal_bytes))
             except Exception as e:
+                logger.error("Off-chain Warrant authorization evaluation failed: %s", e)
                 raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
 
             # Settle on-chain via TaskEscrow (Option B: JournalVerifier approves digest, settles with mock seal)
             settlement_tx = None
             try:
+                logger.info("Settling TaskEscrow on-chain via settle_mock with journal digest")
                 settle_res = await asyncio.to_thread(
                     self.escrow_client.settle_mock,
                     journal_bytes,
                     sender=session.get("recipient") or self.escrow_client.server_account,
                 )
                 settlement_tx = settle_res.get("transactionHash")
+                logger.info("TaskEscrow settled on-chain in tx %s", settlement_tx)
             except Exception as err:
+                logger.error("Escrow settlement failed on-chain: %s", err)
                 raise ToolError(f"Escrow settlement failed on-chain: {err}") from err
 
             session["status"] = "settled"
@@ -1115,13 +1255,21 @@ class WarrantTranscriptionService:
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
-            return {
+            res = {
                 "status": "settled",
                 "task_id": task_id,
                 "settlement_transaction": settlement_tx,
                 "message": "Authorization successfully verified off-chain and TaskEscrow settled on-chain.",
             }
+            logger.info(
+                "submit_acceptance returning: status=%s, task_id=%s, tx=%s",
+                res["status"],
+                res["task_id"],
+                settlement_tx,
+            )
+            return res
         except Exception as exc:
+            logger.error("submit_acceptance failed: %s", exc)
             raise safe_tool_error(exc) from None
 
 

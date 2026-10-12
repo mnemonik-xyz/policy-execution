@@ -13,6 +13,7 @@ Supports stdio (standard for desktop LLM agents) and Streamable HTTP transports.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -23,6 +24,13 @@ from decimal import Decimal
 # Ensure repository root is on sys.path
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("WARRANT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
 import uvicorn  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
@@ -127,8 +135,11 @@ class BuyerWarrantService:
 
     async def warrant_get_policy(self) -> dict:
         """Inspect the buyer's local Warrant policy constraints."""
-        return {
-            "buyer_account": self._resolve_buyer_account(),
+        logger.info("Tool called: warrant_get_policy")
+        account = self._resolve_buyer_account()
+        logger.info("Inspecting buyer Warrant policy constraints for buyer_account=%s", account)
+        policy = {
+            "buyer_account": account,
             "max_budget_usd": self.max_budget_usd,
             "max_duration_hours": self.max_duration_hours,
             "allowed_categories": self.allowed_categories,
@@ -138,6 +149,8 @@ class BuyerWarrantService:
             "verifier_address": self.verifier_address or self.escrow_client.verifier,
             "auto_mint": self.auto_mint,
         }
+        logger.info("warrant_get_policy returning: %s", policy)
+        return policy
 
     def _validate_proposal_terms(
         self,
@@ -150,39 +163,80 @@ class BuyerWarrantService:
         chain_id: int,
     ):
         if cost_usd > self.max_budget_usd:
+            logger.warning(
+                "Policy rejection: proposed cost $%.4f exceeds max budget cap $%.4f",
+                cost_usd,
+                self.max_budget_usd,
+            )
             raise ToolError(
                 f"Policy rejection: proposed cost ${cost_usd:.4f} exceeds max budget cap ${self.max_budget_usd:.4f}"
             )
         max_atomic = round(self.max_budget_usd * 1_000_000)
         if atomic_amount > max_atomic:
+            logger.warning(
+                "Policy rejection: proposed amount %d exceeds budget limit %d",
+                atomic_amount,
+                max_atomic,
+            )
             raise ToolError(
                 f"Policy rejection: proposed amount {atomic_amount} atomic units exceeds budget limit {max_atomic}"
             )
         expected_atomic = round(cost_usd * 1_000_000)
         if abs(atomic_amount - expected_atomic) > 1:
+            logger.warning(
+                "Policy rejection: atomic amount %d does not match amount_usd $%.4f",
+                atomic_amount,
+                cost_usd,
+            )
             raise ToolError(
                 f"Policy rejection: atomic amount {atomic_amount} does not match amount_usd ${cost_usd:.4f}"
             )
         if duration_hours is None or duration_hours <= 0:
+            logger.warning("Policy rejection: duration_hours is required and must be at least 1")
             raise ToolError("Policy rejection: duration_hours is required and must be at least 1")
         if duration_hours > self.max_duration_hours:
+            logger.warning(
+                "Policy rejection: proposed duration %dh exceeds max duration %dh",
+                duration_hours,
+                self.max_duration_hours,
+            )
             raise ToolError(
                 f"Policy rejection: proposed duration {duration_hours}h exceeds max duration {self.max_duration_hours}h"
             )
         if category not in self.allowed_categories:
+            logger.warning(
+                "Policy rejection: category %s not in allowed %s",
+                category,
+                self.allowed_categories,
+            )
             raise ToolError(
                 f"Policy rejection: category {category} is not in allowed categories {self.allowed_categories}"
             )
         if self.pinned_escrow and escrow_addr.lower() != self.pinned_escrow.lower():
+            logger.warning(
+                "Policy rejection: escrow address %s != pinned %s",
+                escrow_addr,
+                self.pinned_escrow,
+            )
             raise ToolError(
                 f"Policy rejection: escrow address {escrow_addr} does not match pinned escrow {self.pinned_escrow}"
             )
         if self.pinned_token and token_addr.lower() != self.pinned_token.lower():
+            logger.warning(
+                "Policy rejection: token address %s != pinned %s",
+                token_addr,
+                self.pinned_token,
+            )
             raise ToolError(
                 f"Policy rejection: token address {token_addr} does not match pinned token {self.pinned_token}"
             )
         active_chain = self._resolve_chain_id()
         if chain_id != active_chain:
+            logger.warning(
+                "Policy rejection: proposed chain_id %s != active chain_id %s",
+                chain_id,
+                active_chain,
+            )
             raise ToolError(
                 f"Policy rejection: proposed chain_id {chain_id} does not match RPC chain_id {active_chain}"
             )
@@ -200,28 +254,43 @@ class BuyerWarrantService:
         validity_seconds: int = 900,
     ) -> dict:
         buyer_account = buyer_account or self._resolve_buyer_account()
+        logger.info(
+            "Funding TaskEscrow on-chain: escrow=%s, token=%s, amount=%d, buyer=%s, recipient=%s",
+            escrow_addr,
+            token_addr,
+            atomic_amount,
+            buyer_account,
+            recipient,
+        )
         self.escrow_client.escrow = escrow_addr
         self.escrow_client.token = token_addr
 
         try:
             balance = self.escrow_client.token_balance(buyer_account)
+            logger.info("Checked token balance for %s: %d (required=%d)", buyer_account, balance, atomic_amount)
         except Exception as e:
+            logger.error("Failed to query token balance for %s: %s", buyer_account, e)
             raise ToolError(f"Failed to query token balance for {buyer_account}: {e}") from e
 
         if balance < atomic_amount:
             if self.auto_mint:
                 try:
+                    logger.info("Auto-minting %d tokens for buyer %s", atomic_amount * 2, buyer_account)
                     self.escrow_client.mint_token(buyer_account, atomic_amount * 2, sender=buyer_account)
                 except Exception as e:
+                    logger.error("Auto-mint failed: %s", e)
                     raise ToolError(
                         f"Insufficient balance ({balance} < {atomic_amount}) and auto-mint failed: {e}"
                     ) from e
             else:
+                logger.warning("Insufficient balance: %d < %d for buyer %s", balance, atomic_amount, buyer_account)
                 raise ToolError(f"Insufficient token balance ({balance} < {atomic_amount}) for buyer {buyer_account}.")
 
         try:
+            logger.info("Approving %d tokens for escrow contract %s", atomic_amount, escrow_addr)
             self.escrow_client.approve_token(escrow_addr, atomic_amount, sender=buyer_account)
         except Exception as e:
+            logger.error("Failed to approve TaskEscrow token allowance: %s", e)
             raise ToolError(f"Failed to approve TaskEscrow token allowance: {e}") from e
 
         now = int(time.time())
@@ -229,6 +298,15 @@ class BuyerWarrantService:
         settle_by = now + validity_seconds
 
         try:
+            logger.info(
+                "Calling TaskEscrow.offer() on-chain: salt=%s, recipient=%s, policy_hash=%s, "
+                "accept_by=%d, settle_by=%d",
+                salt,
+                recipient,
+                policy_hash,
+                accept_by,
+                settle_by,
+            )
             receipt = self.escrow_client.offer(
                 salt=salt,
                 recipient=recipient,
@@ -239,7 +317,9 @@ class BuyerWarrantService:
                 settle_by=settle_by,
                 sender=buyer_account,
             )
+            logger.info("TaskEscrow.offer() confirmed on-chain in tx %s", receipt.get("transactionHash"))
         except Exception as e:
+            logger.error("TaskEscrow.offer() reverted on-chain: %s", e)
             raise ToolError(f"TaskEscrow.offer() reverted on-chain: {e}") from e
 
         return {
@@ -265,6 +345,27 @@ class BuyerWarrantService:
         chain_id: int | None = None,
     ) -> dict:
         """Evaluate proposal against local constraints, stamp concrete policy, and fund TaskEscrow on-chain."""
+        prop = proposal if isinstance(proposal, dict) else {}
+        effective_task_id = task_id or prop.get("task_id")
+        effective_amount = amount if amount is not None else prop.get("amount")
+        effective_amount_usd = amount_usd if amount_usd is not None else prop.get("amount_usd")
+        effective_salt = salt or prop.get("salt")
+        effective_recipient = recipient or prop.get("recipient")
+        effective_category = prop.get("category", category) if category == DEFAULT_CATEGORY else category
+        effective_duration = prop.get("duration_hours", duration_hours) if duration_hours == 1 else duration_hours
+
+        logger.info(
+            "Tool called: warrant_evaluate_and_offer with task_id=%s, amount=%s, amount_usd=%s, "
+            "salt=%s, recipient=%s, category=%s, duration_hours=%s",
+            effective_task_id,
+            effective_amount,
+            effective_amount_usd,
+            effective_salt,
+            effective_recipient,
+            effective_category,
+            effective_duration,
+        )
+
         if proposal and isinstance(proposal, dict):
             task_id = proposal.get("task_id", task_id)
             amount = proposal.get("amount", amount)
@@ -298,12 +399,21 @@ class BuyerWarrantService:
         if not token_addr:
             missing.append("token_address")
         if missing:
+            logger.warning("Missing required proposal fields: %s", ", ".join(missing))
             raise ToolError(f"Missing required proposal fields: {', '.join(missing)}")
 
         cost_usd = float(Decimal(str(amount_usd)))
         atomic_amount = int(amount)
         duration = int(duration_hours) if duration_hours is not None else None
 
+        logger.info(
+            "Validating proposal terms for task_id=%s: cost_usd=%.4f, atomic_amount=%d, duration=%sh, category=%s",
+            task_id,
+            cost_usd,
+            atomic_amount,
+            duration,
+            category,
+        )
         self._validate_proposal_terms(
             cost_usd=cost_usd,
             atomic_amount=atomic_amount,
@@ -318,10 +428,13 @@ class BuyerWarrantService:
         self.escrow_client.escrow = escrow_addr
         try:
             expected_task_id = await asyncio.to_thread(self.escrow_client.task_id_for, buyer_account, salt)
+            logger.info("Derived expected taskIdFor(%s, %s): %s", buyer_account, salt, expected_task_id)
         except Exception as e:
+            logger.error("Failed to derive taskIdFor(%s, %s): %s", buyer_account, salt, e)
             raise ToolError(f"Failed to derive taskIdFor({buyer_account}, {salt}): {e}") from e
 
         if str(task_id).lower() != str(expected_task_id).lower():
+            logger.warning("Proposed task_id '%s' != derived taskIdFor '%s'", task_id, expected_task_id)
             raise ToolError(
                 f"Policy rejection: proposed task_id '{task_id}' does not match "
                 f"derived taskIdFor('{buyer_account}', '{salt}'): '{expected_task_id}'"
@@ -329,6 +442,7 @@ class BuyerWarrantService:
 
         # Compile buyer policy template into concrete Policy and cryptographic policy_hash
         try:
+            logger.info("Compiling buyer policy template for task_id=%s with max_amount=%d", task_id, atomic_amount)
             concrete_policy, derived_policy_hash = await asyncio.to_thread(
                 compile_buyer_policy,
                 template_path=self.template_path,
@@ -338,7 +452,9 @@ class BuyerWarrantService:
                 token_address=token_addr,
                 max_amount=atomic_amount,
             )
+            logger.info("Buyer policy template compiled successfully, policy_hash=%s", derived_policy_hash)
         except Exception as e:
+            logger.error("Failed to compile buyer policy template: %s", e)
             raise ToolError(f"Failed to compile buyer policy template: {e}") from e
 
         funded = await asyncio.to_thread(
@@ -372,8 +488,9 @@ class BuyerWarrantService:
             "transaction_hash": funded["receipt"].get("transactionHash"),
         }
         (self.tasks_dir / f"{task_id}.json").write_text(json.dumps(task_record, indent=2))
+        logger.info("Saved task record to %s", self.tasks_dir / f"{task_id}.json")
 
-        return {
+        result = {
             "status": "APPROVED",
             "task_id": task_id,
             "transaction_hash": funded["receipt"].get("transactionHash"),
@@ -390,6 +507,15 @@ class BuyerWarrantService:
             "settle_by": funded["settle_by"],
             "message": "TaskEscrow successfully funded on-chain. Deliverable is committed.",
         }
+        logger.info(
+            "warrant_evaluate_and_offer returning: status=%s, task_id=%s, tx=%s, amount=%d ($%s)",
+            result["status"],
+            result["task_id"],
+            result["transaction_hash"],
+            result["amount"],
+            result["amount_usd"],
+        )
+        return result
 
     async def warrant_sign_acceptance(
         self,
@@ -399,8 +525,16 @@ class BuyerWarrantService:
         amount: int | str,
     ) -> dict:
         """Sign Acceptance statement with buyer authority key after verifying deliverable health."""
+        logger.info(
+            "Tool called: warrant_sign_acceptance with task_id=%s, deliverable_hash=%s, recipient=%s, amount=%s",
+            task_id,
+            deliverable_hash,
+            recipient,
+            amount,
+        )
         task_path = self.tasks_dir / f"{task_id}.json"
         if not task_path.exists():
+            logger.warning("Task '%s' not found in buyer state at %s", task_id, task_path)
             raise ToolError(f"Task '{task_id}' not found in buyer state. Offer must be created first.")
 
         task_data = json.loads(task_path.read_text())
@@ -408,14 +542,21 @@ class BuyerWarrantService:
 
         atomic_amount = int(amount)
         if atomic_amount != int(task_data.get("amount", 0)):
+            logger.warning("Acceptance amount %d != offered task amount %s", atomic_amount, task_data.get("amount"))
             raise ToolError(
                 f"Acceptance amount {atomic_amount} does not match offered task amount {task_data.get('amount')}"
             )
         if recipient.lower() != str(task_data.get("recipient", "")).lower():
+            logger.warning(
+                "Acceptance recipient %s != offered task recipient %s",
+                recipient,
+                task_data.get("recipient"),
+            )
             raise ToolError(
                 f"Acceptance recipient {recipient} does not match offered task recipient {task_data.get('recipient')}"
             )
 
+        logger.info("Constructing Acceptance statement for task_id=%s, deliverable_hash=%s", task_id, deliverable_hash)
         scope = policy.get("scope") or {
             "chain_id": self._resolve_chain_id(),
             "vault": list(address20(self.pinned_escrow or self.escrow_client.escrow)),
@@ -434,27 +575,43 @@ class BuyerWarrantService:
         }
 
         try:
+            logger.info("Signing Acceptance statement with buyer key at %s", self.buyer_acceptance_key_path)
             sig_bytes = await asyncio.to_thread(
                 sign_acceptance,
                 acceptance,
                 key_path=self.buyer_acceptance_key_path,
             )
+            logger.info("Acceptance signature generated successfully (%d bytes)", len(sig_bytes))
         except Exception as e:
+            logger.error("Failed to sign acceptance evidence: %s", e)
             raise ToolError(f"Failed to sign acceptance evidence: {e}") from e
 
-        return {
+        result = {
             "status": "signed",
             "task_id": task_id,
             "acceptance": acceptance,
             "signature": sig_bytes,
             "message": "Deliverable acceptance signed. Submit this evidence to the compute seller for settlement.",
         }
+        logger.info(
+            "warrant_sign_acceptance returning: status=%s, task_id=%s, signature_len=%d",
+            result["status"],
+            result["task_id"],
+            len(sig_bytes),
+        )
+        return result
 
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
         """Query TaskEscrow state on-chain for a task ID."""
+        logger.info("Tool called: warrant_check_escrow_status with task_id=%s", task_id)
         try:
+            logger.info(
+                "Querying on-chain TaskEscrow state for task_id=%s (escrow=%s)",
+                task_id,
+                self.escrow_client.escrow,
+            )
             task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
-            return {
+            result = {
                 "task_id": task_id,
                 "state": task_data.get("state"),
                 "state_idx": task_data.get("state_idx"),
@@ -467,7 +624,10 @@ class BuyerWarrantService:
                 "settle_by": task_data.get("settle_by"),
                 "escrow_address": self.escrow_client.escrow,
             }
+            logger.info("warrant_check_escrow_status returning: %s", result)
+            return result
         except Exception as e:
+            logger.error("Failed to query escrow status for task '%s': %s", task_id, e)
             raise ToolError(f"Failed to query escrow status for task '{task_id}': {e}") from e
 
 
