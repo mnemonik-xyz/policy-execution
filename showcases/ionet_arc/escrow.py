@@ -20,7 +20,7 @@ from pathlib import Path
 import yaml
 from eth_abi import decode, encode
 from eth_account import Account
-from eth_utils import function_signature_to_4byte_selector, to_checksum_address
+from eth_utils import function_signature_to_4byte_selector, keccak, to_checksum_address
 
 from .adapter import canonical, digest
 
@@ -37,6 +37,7 @@ __all__ = [
     "bytes32",
     "canonical",
     "compile_buyer_policy",
+    "compute_task_id",
     "digest",
     "encode_journal",
     "ensure_policy_hash",
@@ -201,9 +202,22 @@ class EthRpc:
 
     def rpc(self, method: str, params: list | None = None) -> any:
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
-        req = urllib.request.Request(self.rpc_url, payload, {"Content-Type": "application/json"})
-        with self._opener.open(req, timeout=15) as resp:
-            data = json.load(resp)
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; WarrantClient/1.0; +https://mnemonik.xyz)",
+        }
+        req = urllib.request.Request(self.rpc_url, payload, headers)
+        try:
+            with self._opener.open(req, timeout=15) as resp:
+                data = json.load(resp)
+        except urllib.error.HTTPError as err:
+            body = ""
+            with contextlib.suppress(Exception):
+                body = err.read().decode("utf-8", errors="replace").strip()
+            msg = f"RPC HTTP {err.code} ({err.reason}) calling {method} on {self.rpc_url}"
+            if body:
+                msg += f": {body}"
+            raise RuntimeError(msg) from err
         if "error" in data:
             raise RuntimeError(f"RPC error {method}: {data['error']}")
         if "result" not in data:
@@ -508,6 +522,15 @@ def evaluate_authorization(policy: dict, request: dict, evidence: dict) -> tuple
     return auth, journal_bytes
 
 
+def compute_task_id(chain_id: int, escrow_address: str, customer_address: str, salt: str | bytes) -> str:
+    """Derive deterministic TaskEscrow task_id matching keccak256(abi.encode(chain_id, escrow, customer, salt))."""
+    encoded = encode(
+        ["uint256", "address", "address", "bytes32"],
+        [int(chain_id), to_checksum_address(escrow_address), to_checksum_address(customer_address), bytes32(salt)],
+    )
+    return "0x" + keccak(encoded).hex()
+
+
 class EscrowClient:
     """Interface to query and settle TaskEscrow on-chain using eth-abi and eth-account."""
 
@@ -613,7 +636,7 @@ class EscrowClient:
         raise TimeoutError(f"Transaction receipt timeout for {tx_hash}")
 
     def task_id_for(self, customer: str, salt: str) -> str:
-        """Call TaskEscrow.taskIdFor(customer, salt) with result caching."""
+        """Call TaskEscrow.taskIdFor(customer, salt) with result caching and offline fallback."""
         cache_key = (
             to_checksum_address(self.escrow) if self.escrow else "",
             to_checksum_address(customer),
@@ -622,14 +645,24 @@ class EscrowClient:
         if cache_key in self._task_id_cache:
             return self._task_id_cache[cache_key]
 
-        res = self.call_contract(
-            self.escrow,
-            "taskIdFor(address,bytes32)",
-            ["address", "bytes32"],
-            [cache_key[1], cache_key[2]],
-            ["bytes32"],
-        )
-        tid = "0x" + res[0].hex()
+        try:
+            res = self.call_contract(
+                self.escrow,
+                "taskIdFor(address,bytes32)",
+                ["address", "bytes32"],
+                [cache_key[1], cache_key[2]],
+                ["bytes32"],
+            )
+            tid = "0x" + res[0].hex()
+        except Exception:
+            if self.escrow:
+                try:
+                    chain_id = self.rpc.chain_id()
+                except Exception:
+                    chain_id = DEFAULT_CHAIN_ID
+                tid = compute_task_id(chain_id, self.escrow, customer, salt)
+            else:
+                raise
         self._task_id_cache[cache_key] = tid
         return tid
 

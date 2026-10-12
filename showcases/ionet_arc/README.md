@@ -394,10 +394,9 @@ Start the Buyer Warrant guardrail sidecar:
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
   --transport stdio
 
-# Run over Streamable HTTP (e.g. port 8001):
+# Run over Streamable HTTP (default localhost:8001):
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
-  --transport http \
-  --host 127.0.0.1 --port 8001
+  --transport streamable-http
 ```
 
 Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`.

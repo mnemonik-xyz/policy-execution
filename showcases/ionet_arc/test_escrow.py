@@ -10,6 +10,7 @@ from showcases.ionet_arc.escrow import (
     EscrowClient,
     EthRpc,
     compile_buyer_policy,
+    compute_task_id,
     encode_journal,
     ensure_policy_hash,
     parse_public_key,
@@ -116,6 +117,50 @@ class EscrowClientTests(unittest.TestCase):
         res_cached = self.client.task_id_for(customer, salt)
         self.assertEqual(res_cached, "0x" + "77" * 32)
         self.assertEqual(self.mock_rpc.rpc.call_count, 1)
+
+    def test_compute_task_id_deterministic(self):
+        customer = "0x" + "aa" * 20
+        salt = "0x" + "bb" * 32
+        chain_id = 31337
+        escrow = "0x" + "11" * 20
+        tid = compute_task_id(chain_id, escrow, customer, salt)
+        self.assertTrue(tid.startswith("0x"))
+        self.assertEqual(len(tid), 66)
+        # Verify determinism
+        self.assertEqual(tid, compute_task_id(chain_id, escrow, customer, salt))
+
+    def test_task_id_for_fallback_on_rpc_failure(self):
+        customer = "0x" + "aa" * 20
+        salt = "0x" + "cc" * 32
+        self.mock_rpc.rpc.side_effect = RuntimeError("RPC unreachable")
+        self.mock_rpc.chain_id.return_value = 31337
+
+        tid = self.client.task_id_for(customer, salt)
+        expected = compute_task_id(31337, self.client.escrow, customer, salt)
+        self.assertEqual(tid, expected)
+
+    def test_eth_rpc_user_agent_header(self):
+        import io
+        from unittest.mock import MagicMock
+
+        rpc = EthRpc("http://127.0.0.1:8545")
+        mock_resp = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":"0x1"}')
+        captured_req = []
+
+        def mock_open(req, timeout=15):
+            captured_req.append(req)
+            return mock_resp
+
+        mock_opener = MagicMock()
+        mock_opener.open.side_effect = mock_open
+        rpc._opener = mock_opener
+
+        res = rpc.rpc("eth_blockNumber")
+        self.assertEqual(res, "0x1")
+        self.assertEqual(len(captured_req), 1)
+        req = captured_req[0]
+        self.assertIn("User-agent", req.headers)
+        self.assertIn("WarrantClient", req.headers["User-agent"])
 
     def test_send_transaction_unlocked_mode(self):
         from_account = "0x" + "aa" * 20

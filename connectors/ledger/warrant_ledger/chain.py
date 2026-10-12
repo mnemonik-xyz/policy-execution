@@ -31,7 +31,11 @@ class Rpc:
 
     def call(self, method, params=()):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(self.url, body, {"Content-Type": "application/json"})
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; WarrantClient/1.0; +https://mnemonik.xyz)",
+        }
+        req = urllib.request.Request(self.url, body, headers)
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             response = json.load(r)
         if "error" in response:
