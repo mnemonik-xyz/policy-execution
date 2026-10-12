@@ -639,8 +639,8 @@ class EscrowClient:
                         f"Failed to send transaction from {from_addr} on {self.rpc_url}: "
                         f"RPC node does not support eth_sendTransaction (-32601) and no private key "
                         f"was configured to sign the transaction locally. Configure a private key via "
-                        f"manifest.yaml private_key_files, environment variable (WARRANT_PRIVATE_KEY or "
-                        f"WARRANT_BUYER_KEY), or CLI flag (--private-key)."
+                        f"manifest.yaml private_key_files, environment variable (WARRANT_PRIVATE_KEY, "
+                        f"WARRANT_BUYER_KEY, or WARRANT_SELLER_KEY), or CLI flag (--private-key)."
                     ) from e
                 raise
 

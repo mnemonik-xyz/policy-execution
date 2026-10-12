@@ -383,7 +383,15 @@ Execution modes:
   external GPU hardware or io.net credentials. When `--rpc-url` targets local Anvil
   (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
-Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`.
+On live networks like Arc Testnet, the seller agent signs `TaskEscrow.accept()` and
+`TaskEscrow.settle()` on-chain. Configure the seller private key via any of:
+- File: save to `showcases/ionet_arc/.keys/seller.key` (or reference in `manifest.yaml`
+  under `private_key_files.seller_key`)
+- Environment variable: `export WARRANT_SELLER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- CLI flag: `--private-key 0x...` or `--key-file <path>`
+
+Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`,
+`--private-key <hex>`, `--key-file <path>`.
 
 ### 2. Run the Buyer Warrant MCP Server
 
