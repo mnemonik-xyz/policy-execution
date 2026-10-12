@@ -360,15 +360,33 @@ directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
 Start the Seller MCP daemon:
 
 ```sh
+# Live io.net Cloud mode:
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
   --rpc-url https://rpc.testnet.arc.io
+
+# Local / remote SSH server mode (deploys container via SSH and Docker):
+.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
+  --host 0.0.0.0 --port 8000 \
+  --rpc-url https://rpc.testnet.arc.io \
+  --local-server --ssh-host petertower --worker-url http://petertower:8080
+
+# Offline mock mode (no GPU/Docker or io.net API key required):
+.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
+  --host 0.0.0.0 --port 8000 \
+  --rpc-url https://rpc.testnet.arc.io \
+  --mock-ionet
 ```
 
-Optional CLI flags: `--manifest <path>`, `--server-account`, `--mock-ionet`, `--local-server`.
-
-Add `--mock-ionet` for offline local testing without an io.net API key. When `--rpc-url` targets
-local Anvil (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
+Execution modes:
+- **Live io.net Cloud (default)**: Uses io.net CaaS API credentials (`IONET_API_KEY`) to deploy
+  GPU instances dynamically.
+- **Local / Remote Server (`--local-server`)**: Deploys the Whisper container via SSH to a GPU
+  server (`docker run --gpus all -p 8080:8080`). Accepts `--ssh-host <host>` (default: `localhost`)
+  and `--worker-url <url>` (default: `http://<ssh-host>:8080`).
+- **Offline Mock (`--mock-ionet`)**: Runs an in-process mock worker for offline testing without
+  external GPU hardware or io.net credentials. When `--rpc-url` targets local Anvil
+  (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
 ### 2. Run the Buyer Warrant MCP Server
 
