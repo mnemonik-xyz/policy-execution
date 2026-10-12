@@ -14,6 +14,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from decimal import Decimal
 from pathlib import Path
 
 import yaml
@@ -356,7 +357,13 @@ def compile_buyer_policy(
     chain_id = chain_id or manifest.get("chain_id", DEFAULT_CHAIN_ID)
     escrow_address = escrow_address or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
     token_address = token_address or get_manifest_parameter(manifest, "token_address", "token-address")
-    max_amount = max_amount or manifest.get("max_amount", 2_000_000)
+    if max_amount is None:
+        raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+        if raw_budget is not None:
+            max_amount = int(Decimal(str(raw_budget)) * Decimal(1_000_000))
+        else:
+            raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
+            max_amount = int(raw_amount) if raw_amount is not None else 2_000_000
     validity_seconds = int(manifest.get("validity_seconds", validity_seconds))
 
     if not escrow_address or not token_address:

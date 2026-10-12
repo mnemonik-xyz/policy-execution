@@ -9,7 +9,6 @@ seller_address: '0x9F188809b2ba2e29653693C4069c212a95C1B8c4'  # io.net seller pa
 buyer_address: '0x9793Dd93D46F153a2A879165cd163A01b54d8A00'  # The client agent's wallet
 category: 42  # Accredited GPU Whisper transcription service
 max_budget_usd: 2.00  # $2.00 maximum budget per proposal
-max_amount: 2000000  # 2.00 USDC spending cap in atomic units
 duration_hours: 1  # GPU container lease duration
 validity_seconds: 900  # 15 minutes per-request escrow settlement deadline
 vendor_validity_days: 365  # 1-year Registry Authority credential lifetime

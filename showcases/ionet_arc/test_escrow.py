@@ -375,6 +375,36 @@ class EscrowClientTests(unittest.TestCase):
             )
             self.assertTrue(pol_hash.startswith("0x"))
 
+    def test_compile_buyer_policy_derives_max_amount_from_max_budget_usd(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            man_path = tmp / "manifest.yaml"
+            tpl_path = tmp / "template.yaml"
+
+            man_path.write_text(yaml.dump({
+                "chain_id": 31337,
+                "escrow_address": "0x" + "11" * 20,
+                "token_address": "0x" + "22" * 20,
+                "category": 42,
+                "max_budget_usd": 2.50,
+                "public_keys": {
+                    "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
+                    "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
+                },
+            }))
+            tpl_path.write_text(yaml.dump({"version": 1}))
+
+            policy, _ = compile_buyer_policy(
+                template_path=tpl_path,
+                manifest_path=man_path,
+            )
+            self.assertEqual(policy["rule"]["all"][1], {"amount_at_most": 2_500_000})
+
     def test_compile_buyer_policy_fails_loudly_when_keys_missing(self):
         import tempfile
         from pathlib import Path
