@@ -1,9 +1,10 @@
-name: io.net Arc pilot
+name: io.net Arc showcase
 
 on:
   pull_request:
     paths:
       - 'showcases/ionet_arc/**'
+      - 'contracts/**'
       - 'scripts/ionet-showcase.py'
       - '.github/workflows/ionet-arc.yml'
   workflow_dispatch:
@@ -11,17 +12,48 @@ on:
 permissions:
   contents: read
 
+env:
+  RISC0_BUILD_LOCKED: "1"
+  RAYON_NUM_THREADS: "4"
+  WARRANT_SEGMENT_PO2: "18"
+  RUSTUP_TOOLCHAIN: "1.98.1"
+
 jobs:
-  offline-integration:
+  showcase:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r showcases/ionet_arc/requirements.txt
-      - name: Exercise budgets, recovery, payment validation, and HTTP worker
-        run: python -m unittest showcases.ionet_arc.test_pilot -v
+      - run: pip install -r showcases/ionet_arc/requirements-dev.txt
+      - name: Install pinned Rust and prover
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          curl -fsSL https://risczero.com/install -o /tmp/rzup-install.sh
+          bash /tmp/rzup-install.sh
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust 1.88.0
+          "$HOME/.risc0/bin/rzup" install r0vm 3.0.5
+      - name: Build Warrant host and CLI binaries
+        run: cargo build --release --locked -p warrant-host
+      - name: Install Foundry and contract dependencies
+        run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
+          curl -fsSL https://foundry.paradigm.xyz -o /tmp/foundry-install.sh
+          bash /tmp/foundry-install.sh
+          "$HOME/.foundry/bin/foundryup" --install v1.8.4
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          npm ci --prefix contracts --ignore-scripts
+      - name: Lint Python sources
+        run: ruff check showcases
+      - name: Prepare test authority keys and credentials
+        run: python showcases/ionet_arc/init.py
+      - name: Run io.net Arc showcase test suite
+        run: python -m unittest discover showcases/ionet_arc -v
       - name: Check CLI imports
-        run: python scripts/ionet-showcase.py --help
+        run: |
+          python scripts/ionet-showcase.py --help
+          python -m showcases.ionet_arc.seller_mcp_server --help
+          python -m showcases.ionet_arc.buyer_test_agent --help

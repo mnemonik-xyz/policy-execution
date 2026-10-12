@@ -1,0 +1,2 @@
+# 64-byte ECDSA signature of vendor_credential.yaml signed by registry.key.
+signature: '0xa35aaa3db4210c15ac94bc0a65b92caf55778e6ff91f678878cc0b384689cd9479b639a432cdda86546048a27bd2adaa014e1fdf1aeebb04d786c8bfde92883f'
