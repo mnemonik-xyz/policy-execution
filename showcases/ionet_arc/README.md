@@ -6,8 +6,8 @@ on-chain escrow settlement on Arc (chain ID `5042002`) using the Warrant policy 
 An autonomous buyer LLM agent interacts with an io.net GPU compute seller MCP server. A local
 Buyer Warrant MCP guardrail verifies policy rules (budget cap, lease duration, deterministic
 policy hash) before funding `TaskEscrow` on Arc. Once escrow is funded, the seller provisions a
-`faster-whisper` transcription worker container on io.net, settles the escrow on-chain, and
-transcribes audio submitted by the buyer.
+`faster-whisper` transcription worker container on io.net, settles escrow upon buyer acceptance
+verification, and transcribes audio submitted by the buyer.
 
 > [!IMPORTANT]
 > For the manual CLI deployment runbook without MCP, see [README.dev.md](README.dev.md).

@@ -449,9 +449,11 @@ class WarrantTranscriptionService:
                 "proposed_at": int(time.time()),
                 "instructions": (
                     "Verify this proposal against your Warrant policy (max budget, category, duration).\n"
-                    "Then call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
+                    "Call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
                     "acceptBy, settleBy) on-chain.\n"
-                    "Once confirmed on-chain, call deploy_with_escrow(task_id, policy)."
+                    "Call deploy_with_escrow(task_id, policy) to commit agreement and begin provisioning.\n"
+                    "Poll get_deployment_status until ready, verify container /health, and sign Acceptance evidence.\n"
+                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then call transcribe_audio."
                 ),
             }
 
@@ -1202,15 +1204,15 @@ def create_server(
         description=(
             "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
-            "and returns concrete TaskEscrow payment terms (taskId, salt, policyHash, amount, recipient)."
+            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
         ),
     )(service.propose_deployment)
 
     server.tool(
         name="deploy_with_escrow",
         description=(
-            "Verify on-chain escrow funding for the proposed task, accept it, provision the io.net container "
-            "for 1 hour duration, settle the escrow deliverable, and activate the transcription service.\n"
+            "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision "
+            "the io.net container in the background for 1 hour duration.\n"
             "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
         ),
     )(service.deploy_with_escrow)

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Autonomous User Agent client for Warrant io.net transcription showcase.
 
-Demonstrates the 4-step Warrant lifecycle:
+Demonstrates the capability-based two-step escrow lifecycle:
 1. Query available hardware via list_suitable_hardware.
 2. Request a deployment proposal via propose_deployment.
 3. Validate proposal against local Warrant policy and fund TaskEscrow on-chain.
-4. Call deploy_with_escrow to provision the container and settle the escrow deliverable.
-5. Call transcribe_audio on given audio file (adv.mp3) and print the transcript.
+4. Call deploy_with_escrow to accept the task and begin background provisioning.
+5. Poll get_deployment_status until the worker container is ready.
+6. Verify container health endpoint (/health) with worker bearer token.
+7. Sign Acceptance evidence and call submit_acceptance to settle TaskEscrow on-chain.
+8. Call transcribe_audio on given audio file (adv.mp3) and print the transcript.
+9. Inspect final deployment status via get_deployment_status.
 """
 
 import argparse
