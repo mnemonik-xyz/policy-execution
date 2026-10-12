@@ -261,7 +261,9 @@ the local Warrant tool for policy check and escrow funding, deploy, and transcri
 
 ---
 
-## Arc and USDC Parameters
+## Arc and Showcase Parameters
+
+### 1. Network Parameters
 
 Official network parameters for Arc:
 
@@ -275,6 +277,26 @@ Official network parameters for Arc:
 
 Native and ERC-20 USDC share a unified balance on Arc. Warrant token amounts use six-decimal
 integer units ($1.00 \text{ USDC} = 1\,000\,000$ atomic units), reserving native USDC for gas fees.
+
+### 2. Showcase Contract & Wallet Addresses
+
+The showcase contracts and demo participant addresses are defined in
+[`config/manifest.yaml`](config/manifest.yaml):
+
+| Role / Contract | Address | Description |
+| --- | --- | --- |
+| **TaskEscrow** | `0xBeD9B731D9C912541FF083AE41607016BFe93b70` | Escrow contract on Arc |
+| **JournalVerifier** | `0xDbefc776e18e34049cAaec736b47122f0583F345` | Digest verifier on Arc |
+| **USDC Token** | `0x3600000000000000000000000000000000000000` | Arc USDC token |
+| **Seller** | `0x9F188809b2ba2e29653693C4069c212a95C1B8c4` | io.net payout wallet |
+| **Buyer** | `0x9793Dd93D46F153a2A879165cd163A01b54d8A00` | Escrow funder wallet |
+
+- **Buyer Address (`buyer_address` / `buyer_account`)**: The buyer agent's funded wallet. It
+  approves USDC allowance and calls `TaskEscrow.offer()` to fund deposits. This address is
+  cryptographically bound into each unique task identifier (`taskId = hash(customer, salt)`).
+- **Seller Address (`seller_address` / `server_account`)**: The compute seller's payout wallet
+  (io.net service provider). Certified by Registry Authority credentials to receive settlements
+  for GPU Whisper transcription (category 42), and receives USDC upon escrow settlement.
 
 ---
 
@@ -329,19 +351,22 @@ forge script script/Deploy.s.sol:Deploy \
 
 ## Running the Showcase
 
+Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their initial parameters
+(`escrow_address`, `verifier_address`, `token_address`, `seller_address`, and `buyer_address`)
+directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
+`--manifest <path>`).
+
 ### 1. Run the Seller MCP Server
 
-Start the Seller MCP daemon configured with your Arc Testnet contract addresses:
+Start the Seller MCP daemon:
 
 ```sh
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
-  --rpc-url https://rpc.testnet.arc.io \
-  --escrow-address <DEPLOYED_TASK_ESCROW> \
-  --token-address 0x3600000000000000000000000000000000000000 \
-  --verifier-address <DEPLOYED_VERIFIER> \
-  --server-account <SERVER_RECIPIENT_ADDRESS>
+  --rpc-url https://rpc.testnet.arc.io
 ```
+
+Optional CLI flags: `--manifest <path>`, `--server-account`, `--mock-ionet`, `--local-server`.
 
 Add `--mock-ionet` for offline local testing without an io.net API key. When `--rpc-url` targets
 local Anvil (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
@@ -355,9 +380,6 @@ Start the Buyer Warrant guardrail sidecar:
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
   --transport stdio \
   --rpc-url https://rpc.testnet.arc.io \
-  --escrow-address <DEPLOYED_TASK_ESCROW> \
-  --token-address 0x3600000000000000000000000000000000000000 \
-  --buyer-account <BUYER_WALLET_ADDRESS> \
   --max-budget-usd 2.00
 
 # Run over Streamable HTTP (e.g. port 8001):
@@ -365,11 +387,10 @@ Start the Buyer Warrant guardrail sidecar:
   --transport http \
   --host 127.0.0.1 --port 8001 \
   --rpc-url https://rpc.testnet.arc.io \
-  --escrow-address <DEPLOYED_TASK_ESCROW> \
-  --token-address 0x3600000000000000000000000000000000000000 \
-  --buyer-account <BUYER_WALLET_ADDRESS> \
   --max-budget-usd 2.00
 ```
+
+Optional CLI flags: `--manifest <path>`, `--max-budget-usd`, `--max-duration-hours`, `--auto-mint`.
 
 ### 3. Run with an LLM Agent or Headless Test Runner
 

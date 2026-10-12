@@ -32,10 +32,13 @@ from mcp.server.transport_security import TransportSecuritySettings  # noqa: E40
 from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
+    DEFAULT_MANIFEST_PATH,
     EscrowClient,
     address20,
     bytes32,
     compile_buyer_policy,
+    get_manifest_parameter,
+    load_manifest,
     sign_acceptance,
 )
 
@@ -53,6 +56,7 @@ class BuyerWarrantService:
         buyer_account: str | None = None,
         pinned_escrow: str | None = None,
         pinned_token: str | None = None,
+        verifier_address: str | None = None,
         auto_mint: bool = False,
         manifest_path: pathlib.Path | None = None,
         template_path: pathlib.Path | None = None,
@@ -66,12 +70,9 @@ class BuyerWarrantService:
         self.max_budget_usd = float(max_budget_usd)
         self.max_duration_hours = int(max_duration_hours)
         self.allowed_categories = allowed_categories or [DEFAULT_CATEGORY]
-        self.buyer_account = buyer_account
-        self.pinned_escrow = pinned_escrow
-        self.pinned_token = pinned_token
         self.auto_mint = auto_mint
 
-        self.manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
+        self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
         self.template_path = template_path or (
             REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
         )
@@ -79,21 +80,24 @@ class BuyerWarrantService:
             REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
         )
 
-        # Pin addresses from manifest if not provided and chain matches
-        if self.manifest_path.exists():
-            try:
-                import yaml
+        manifest = load_manifest(self.manifest_path)
+        self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+        self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address", "token-address")
+        self.buyer_account = buyer_account or get_manifest_parameter(
+            manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
+        )
+        self.verifier_address = verifier_address or get_manifest_parameter(
+            manifest, "verifier_address", "verifier-address"
+        )
 
-                manifest = yaml.safe_load(self.manifest_path.read_text()) or {}
-                manifest_chain = manifest.get("chain_id")
-                active_chain = self._resolve_chain_id()
-                if manifest_chain is None or manifest_chain == active_chain:
-                    if not self.pinned_escrow and manifest.get("escrow_address"):
-                        self.pinned_escrow = manifest["escrow_address"]
-                    if not self.pinned_token and manifest.get("token_address"):
-                        self.pinned_token = manifest["token_address"]
-            except Exception:
-                pass
+        if not self.escrow_client.escrow and self.pinned_escrow:
+            self.escrow_client.escrow = self.pinned_escrow
+        if not self.escrow_client.token and self.pinned_token:
+            self.escrow_client.token = self.pinned_token
+        if not self.escrow_client.verifier and self.verifier_address:
+            self.escrow_client.verifier = self.verifier_address
+        if not self.escrow_client.server_account and self.buyer_account:
+            self.escrow_client.server_account = self.buyer_account
 
     def _resolve_buyer_account(self) -> str:
         if self.buyer_account:
@@ -123,6 +127,7 @@ class BuyerWarrantService:
             "chain_id": self._resolve_chain_id(),
             "escrow_address": self.pinned_escrow or self.escrow_client.escrow,
             "token_address": self.pinned_token or self.escrow_client.token,
+            "verifier_address": self.verifier_address or self.escrow_client.verifier,
             "auto_mint": self.auto_mint,
         }
 
@@ -467,6 +472,7 @@ class ServerConfig:
     rpc_url: str = "http://127.0.0.1:8545"
     escrow_address: str | None = None
     token_address: str | None = None
+    verifier_address: str | None = None
     buyer_account: str | None = None
     max_budget_usd: float = 2.00
     max_duration_hours: int = 1
@@ -480,6 +486,24 @@ class ServerConfig:
     def __post_init__(self):
         if isinstance(self.state_dir, str):
             self.state_dir = pathlib.Path(self.state_dir)
+        if isinstance(self.manifest_path, str):
+            self.manifest_path = pathlib.Path(self.manifest_path)
+        if isinstance(self.template_path, str):
+            self.template_path = pathlib.Path(self.template_path)
+        if isinstance(self.buyer_acceptance_key_path, str):
+            self.buyer_acceptance_key_path = pathlib.Path(self.buyer_acceptance_key_path)
+
+        manifest = load_manifest(self.manifest_path)
+        if self.escrow_address is None:
+            self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+        if self.buyer_account is None:
+            self.buyer_account = get_manifest_parameter(
+                manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
+            )
+        if self.verifier_address is None:
+            self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+        if self.token_address is None:
+            self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
 
 
 BuyerServerConfig = ServerConfig
@@ -508,6 +532,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
         rpc_url=cfg.rpc_url,
         escrow_address=cfg.escrow_address,
         token_address=cfg.token_address,
+        verifier_address=cfg.verifier_address,
         server_account=cfg.buyer_account,
     )
 
@@ -520,6 +545,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
         buyer_account=cfg.buyer_account,
         pinned_escrow=cfg.escrow_address,
         pinned_token=cfg.token_address,
+        verifier_address=cfg.verifier_address,
         auto_mint=cfg.auto_mint,
         manifest_path=cfg.manifest_path,
         template_path=cfg.template_path,
@@ -620,19 +646,11 @@ def main():
         help="Ethereum / Arc JSON-RPC URL (default: http://127.0.0.1:8545)",
     )
     parser.add_argument(
-        "--escrow-address",
-        default=os.environ.get("WARRANT_ESCROW", os.environ.get("ESCROW_CONTRACT_ADDRESS")),
-        help="TaskEscrow contract address to enforce",
-    )
-    parser.add_argument(
-        "--token-address",
-        default=os.environ.get("WARRANT_TOKEN", os.environ.get("TOKEN_CONTRACT_ADDRESS")),
-        help="ERC-20 payment token address to enforce",
-    )
-    parser.add_argument(
-        "--buyer-account",
-        default=os.environ.get("WARRANT_BUYER_ACCOUNT", os.environ.get("BUYER_ACCOUNT")),
-        help="Buyer wallet address (default: auto-detected from eth_accounts[0])",
+        "--manifest",
+        dest="manifest_path",
+        type=pathlib.Path,
+        default=os.environ.get("WARRANT_MANIFEST"),
+        help="Path to manifest.yaml config (default: showcases/ionet_arc/config/manifest.yaml)",
     )
     parser.add_argument(
         "--max-budget-usd",
@@ -663,13 +681,11 @@ def main():
         host=args.host,
         port=args.port,
         rpc_url=args.rpc_url,
-        escrow_address=args.escrow_address,
-        token_address=args.token_address,
-        buyer_account=args.buyer_account,
         max_budget_usd=args.max_budget_usd,
         max_duration_hours=args.max_duration_hours,
         auto_mint=args.auto_mint,
         state_dir=pathlib.Path(args.state_dir),
+        manifest_path=args.manifest_path,
     )
     run_server(config)
 

@@ -41,12 +41,15 @@ from showcases.ionet_arc.adapter import (
 from showcases.ionet_arc.escrow import (
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
+    DEFAULT_MANIFEST_PATH,
     REPO_ROOT,
     EscrowClient,
     address20,
     bytes32,
     evaluate_authorization,
+    get_manifest_parameter,
     hash_policy,
+    load_manifest,
     should_trust_env,
 )
 from showcases.ionet_arc.worker import Worker, handler
@@ -244,6 +247,8 @@ class WarrantTranscriptionService:
         worker_url: str | None = None,
         vendor_credential_path: pathlib.Path | None = None,
         vendor_signature_path: pathlib.Path | None = None,
+        buyer_account: str | None = None,
+        manifest_path: pathlib.Path | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +263,23 @@ class WarrantTranscriptionService:
         self.worker_url = worker_url
         self.vendor_credential_path = pathlib.Path(vendor_credential_path) if vendor_credential_path else None
         self.vendor_signature_path = pathlib.Path(vendor_signature_path) if vendor_signature_path else None
+        self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
+
+        manifest = load_manifest(self.manifest_path)
+        self.buyer_account = buyer_account or get_manifest_parameter(
+            manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
+        )
+        if not self.escrow_client.escrow:
+            self.escrow_client.escrow = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+        if not self.escrow_client.token:
+            self.escrow_client.token = get_manifest_parameter(manifest, "token_address", "token-address")
+        if not self.escrow_client.verifier:
+            self.escrow_client.verifier = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+        if not self.escrow_client.server_account:
+            self.escrow_client.server_account = get_manifest_parameter(
+                manifest, "seller_address", "seller-address", "server_account", "server-account"
+            )
+
         self.local_mock_workers: dict[str, LocalMockWorker] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
@@ -314,6 +336,9 @@ class WarrantTranscriptionService:
             chain_id = DEFAULT_CHAIN_ID
 
         if not customer_address:
+            customer_address = self.buyer_account
+
+        if not customer_address:
             try:
                 accounts = await asyncio.to_thread(escrow_client.rpc.accounts)
                 customer_address = accounts[0] if accounts else None
@@ -333,16 +358,12 @@ class WarrantTranscriptionService:
                 pass
 
         if not escrow_client.server_account:
-            manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
-            if manifest_path.exists():
-                try:
-                    import yaml
-
-                    m = yaml.safe_load(manifest_path.read_text()) or {}
-                    if m.get("chain_id") == chain_id:
-                        escrow_client.server_account = m.get("seller_address")
-                except Exception:
-                    pass
+            manifest = load_manifest(self.manifest_path)
+            manifest_chain = manifest.get("chain_id")
+            if manifest_chain is None or manifest_chain == chain_id:
+                escrow_client.server_account = get_manifest_parameter(
+                    manifest, "seller_address", "seller-address", "server_account", "server-account"
+                )
 
         if not escrow_client.server_account:
             raise ToolError(
@@ -353,29 +374,29 @@ class WarrantTranscriptionService:
 
     def _ensure_escrow_contracts(self, chain_id: int):
         escrow_client = self.escrow_client
-        if not escrow_client.escrow or not escrow_client.token:
-            manifest_path = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
-            if manifest_path.exists():
-                try:
-                    import yaml
-
-                    m = yaml.safe_load(manifest_path.read_text()) or {}
-                    if m.get("chain_id") == chain_id:
-                        escrow_client.escrow = escrow_client.escrow or m.get("escrow_address")
-                        escrow_client.token = escrow_client.token or m.get("token_address")
-                        escrow_client.verifier = escrow_client.verifier or m.get("verifier_address")
-                except Exception:
-                    pass
+        if not escrow_client.escrow or not escrow_client.token or not escrow_client.verifier:
+            manifest = load_manifest(self.manifest_path)
+            manifest_chain = manifest.get("chain_id")
+            if manifest_chain is None or manifest_chain == chain_id:
+                escrow_client.escrow = escrow_client.escrow or get_manifest_parameter(
+                    manifest, "escrow_address", "escrow-address"
+                )
+                escrow_client.token = escrow_client.token or get_manifest_parameter(
+                    manifest, "token_address", "token-address"
+                )
+                escrow_client.verifier = escrow_client.verifier or get_manifest_parameter(
+                    manifest, "verifier_address", "verifier-address"
+                )
 
         if not escrow_client.escrow:
             raise ToolError(
                 f"TaskEscrow address is not configured for chain {chain_id}. "
-                "Provide --escrow-address or specify in config/manifest.yaml."
+                "Specify escrow_address in config/manifest.yaml."
             )
         if not escrow_client.token:
             raise ToolError(
                 f"Payment token address is not configured for chain {chain_id}. "
-                "Provide --token-address or specify in config/manifest.yaml."
+                "Specify token_address in config/manifest.yaml."
             )
 
     async def propose_deployment(
@@ -1130,12 +1151,15 @@ class ServerConfig:
     token_address: str | None = None
     verifier_address: str | None = None
     server_account: str | None = None
+    buyer_account: str | None = None
     mock_ionet: bool = False
     local_server: bool = False
     ssh_host: str = "localhost"
     worker_url: str | None = None
     vendor_credential_path: pathlib.Path | None = None
     vendor_signature_path: pathlib.Path | None = None
+    manifest_path: pathlib.Path | None = None
+    escrow_client: EscrowClient | None = None
 
     def __post_init__(self):
         if isinstance(self.state_dir, str):
@@ -1144,6 +1168,24 @@ class ServerConfig:
             self.vendor_credential_path = pathlib.Path(self.vendor_credential_path)
         if isinstance(self.vendor_signature_path, str):
             self.vendor_signature_path = pathlib.Path(self.vendor_signature_path)
+        if isinstance(self.manifest_path, str):
+            self.manifest_path = pathlib.Path(self.manifest_path)
+
+        manifest = load_manifest(self.manifest_path)
+        if self.escrow_address is None:
+            self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+        if self.verifier_address is None:
+            self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+        if self.buyer_account is None:
+            self.buyer_account = get_manifest_parameter(
+                manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
+            )
+        if self.token_address is None:
+            self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
+        if self.server_account is None:
+            self.server_account = get_manifest_parameter(
+                manifest, "seller_address", "seller-address", "server_account", "server-account"
+            )
 
 
 SellerServerConfig = ServerConfig
@@ -1172,7 +1214,7 @@ def create_server(
     has_ionet_key = bool(os.environ.get("IO_NET_API_KEY"))
     use_mock_ionet = cfg.mock_ionet or not has_ionet_key
 
-    escrow_client = EscrowClient(
+    escrow_client = cfg.escrow_client or EscrowClient(
         rpc_url=cfg.rpc_url,
         escrow_address=cfg.escrow_address,
         token_address=cfg.token_address,
@@ -1189,6 +1231,8 @@ def create_server(
         worker_url=cfg.worker_url,
         vendor_credential_path=cfg.vendor_credential_path,
         vendor_signature_path=cfg.vendor_signature_path,
+        buyer_account=cfg.buyer_account,
+        manifest_path=cfg.manifest_path,
     )
 
     server.tool(
@@ -1308,19 +1352,11 @@ def main():
         help="Ethereum / Arc JSON-RPC URL (default: http://127.0.0.1:8545)",
     )
     parser.add_argument(
-        "--escrow-address",
-        default=os.environ.get("WARRANT_ESCROW"),
-        help="TaskEscrow contract address",
-    )
-    parser.add_argument(
-        "--token-address",
-        default=os.environ.get("WARRANT_TOKEN"),
-        help="Payment token contract address (e.g. USDC)",
-    )
-    parser.add_argument(
-        "--verifier-address",
-        default=os.environ.get("WARRANT_VERIFIER"),
-        help="zkVM / Journal verifier contract address",
+        "--manifest",
+        dest="manifest_path",
+        type=pathlib.Path,
+        default=os.environ.get("WARRANT_MANIFEST"),
+        help="Path to manifest.yaml config (default: showcases/ionet_arc/config/manifest.yaml)",
     )
     parser.add_argument(
         "--server-account",

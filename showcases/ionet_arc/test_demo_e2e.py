@@ -145,6 +145,15 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             "valid_until": cred_obj["valid_until"],
         }))
         cls.vendor_sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
+        cls.manifest_path = Path(cls.tmp_dir) / "manifest.yaml"
+        cls.manifest_path.write_text(yaml.dump({
+            "chain_id": 31337,
+            "escrow_address": cls.escrow_address,
+            "token_address": cls.token_address,
+            "verifier_address": cls.verifier_address,
+            "seller_address": cls.server_account,
+            "buyer_address": cls.customer_account,
+        }))
 
         cmd = [
             str(PYTHON),
@@ -157,12 +166,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.tmp_dir,
             "--rpc-url",
             cls.rpc_url,
-            "--escrow-address",
-            cls.escrow_address,
-            "--token-address",
-            cls.token_address,
-            "--verifier-address",
-            cls.verifier_address,
+            "--manifest",
+            str(cls.manifest_path),
             "--server-account",
             cls.server_account,
             "--vendor-credential",
@@ -197,12 +202,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             str(Path(cls.tmp_dir) / "buyer_state"),
             "--rpc-url",
             cls.rpc_url,
-            "--escrow-address",
-            cls.escrow_address,
-            "--token-address",
-            cls.token_address,
-            "--buyer-account",
-            cls.customer_account,
+            "--manifest",
+            str(cls.manifest_path),
             "--auto-mint",
         ]
         cls.buyer_proc = subprocess.Popen(buyer_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

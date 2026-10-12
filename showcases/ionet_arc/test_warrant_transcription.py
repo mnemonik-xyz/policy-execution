@@ -716,6 +716,51 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             app = create_app(config)
             self.assertIsNotNone(app)
 
+    def test_read_initial_parameters_from_manifest(self):
+        config = ServerConfig(state_dir=self.state_dir)
+        self.assertEqual(config.escrow_address, "0xBeD9B731D9C912541FF083AE41607016BFe93b70")
+        self.assertEqual(config.verifier_address, "0xDbefc776e18e34049cAaec736b47122f0583F345")
+        self.assertEqual(config.buyer_account, "0x9793Dd93D46F153a2A879165cd163A01b54d8A00")
+
+    def test_read_initial_parameters_from_custom_manifest_kebab_case(self):
+        import yaml
+
+        custom_manifest = Path(self.state_dir) / "custom_manifest.yaml"
+        custom_manifest.write_text(yaml.dump({
+            "escrow-address": "0x" + "12" * 20,
+            "verifier-address": "0x" + "34" * 20,
+            "buyer-account": "0x" + "56" * 20,
+        }))
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
+        self.assertEqual(config.escrow_address, "0x" + "12" * 20)
+        self.assertEqual(config.verifier_address, "0x" + "34" * 20)
+        self.assertEqual(config.buyer_account, "0x" + "56" * 20)
+
+    def test_explicit_parameters_override_manifest(self):
+        config = ServerConfig(
+            state_dir=self.state_dir,
+            escrow_address="0x" + "99" * 20,
+            verifier_address="0x" + "88" * 20,
+            buyer_account="0x" + "77" * 20,
+        )
+        self.assertEqual(config.escrow_address, "0x" + "99" * 20)
+        self.assertEqual(config.verifier_address, "0x" + "88" * 20)
+        self.assertEqual(config.buyer_account, "0x" + "77" * 20)
+
+    async def test_propose_deployment_uses_configured_buyer_account(self):
+        custom_buyer = "0x" + "77" * 20
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            local_mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                buyer_account=custom_buyer,
+                vendor_credential_path=self.cred_path,
+                vendor_signature_path=self.sig_path,
+            )
+        res = await local_mcp.call_tool("propose_deployment", {})
+        proposal = json.loads(res.content[0].text)
+        self.assertEqual(proposal["customer"], custom_buyer)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from .adapter import canonical, digest
 __all__ = [
     "DEFAULT_CATEGORY",
     "DEFAULT_CHAIN_ID",
+    "DEFAULT_MANIFEST_PATH",
     "MOCK_IMAGE_ID",
     "MOCK_SEAL",
     "REPO_ROOT",
@@ -41,7 +42,9 @@ __all__ = [
     "evaluate_authorization",
     "find_binary",
     "find_warrant_binary",
+    "get_manifest_parameter",
     "hash_policy",
+    "load_manifest",
     "parse_public_key",
     "should_trust_env",
     "sign_acceptance",
@@ -54,6 +57,36 @@ DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 42
 MOCK_SEAL = "0xabcd"
 MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
+DEFAULT_MANIFEST_PATH = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+
+
+def load_manifest(manifest_path: Path | str | None = None) -> dict:
+    """Load configuration dictionary from manifest.yaml."""
+    path = Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
+    if not path.is_absolute():
+        if (REPO_ROOT / path).exists():
+            path = REPO_ROOT / path
+        elif (Path.cwd() / path).exists():
+            path = Path.cwd() / path
+    if path.exists():
+        try:
+            data = yaml.safe_load(path.read_text())
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def get_manifest_parameter(manifest: dict, *keys: str):
+    """Retrieve first matching parameter from manifest supporting snake_case and kebab-case."""
+    for k in keys:
+        if k in manifest and manifest[k] is not None:
+            return manifest[k]
+        k_alt = k.replace("_", "-") if "_" in k else k.replace("-", "_")
+        if k_alt in manifest and manifest[k_alt] is not None:
+            return manifest[k_alt]
+    return None
 
 
 def should_trust_env(url_or_hostname: str | None) -> bool:
@@ -314,15 +347,15 @@ def compile_buyer_policy(
     acceptance_public_key: list[int] | str | None = None,
 ) -> tuple[dict, str]:
     """Compile buyer policy template into concrete Policy and compute its cryptographic policy_hash."""
-    manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
+    manifest_path = manifest_path or DEFAULT_MANIFEST_PATH
     template_path = template_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml")
 
-    manifest = yaml.safe_load(manifest_path.read_text()) if manifest_path.exists() else {}
+    manifest = load_manifest(manifest_path)
     template = yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
 
     chain_id = chain_id or manifest.get("chain_id", DEFAULT_CHAIN_ID)
-    escrow_address = escrow_address or manifest.get("escrow_address")
-    token_address = token_address or manifest.get("token_address")
+    escrow_address = escrow_address or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+    token_address = token_address or get_manifest_parameter(manifest, "token_address", "token-address")
     max_amount = max_amount or manifest.get("max_amount", 2_000_000)
     validity_seconds = int(manifest.get("validity_seconds", validity_seconds))
 
