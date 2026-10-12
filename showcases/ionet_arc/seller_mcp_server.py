@@ -45,9 +45,8 @@ from showcases.ionet_arc.escrow import (
     EscrowClient,
     address20,
     bytes32,
-    compile_buyer_policy,
-    ensure_policy_hash,
     evaluate_authorization,
+    hash_policy,
     should_trust_env,
     sign_vendor_credential,
 )
@@ -422,15 +421,6 @@ class WarrantTranscriptionService:
                 else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
             )
 
-            policy_hash = await asyncio.to_thread(
-                ensure_policy_hash,
-                self.escrow_client.escrow,
-                self.escrow_client.token,
-                chain_id,
-                token_amount,
-                self.state_dir,
-            )
-
             proposal = {
                 "status": "proposed",
                 "task_id": task_id,
@@ -441,7 +431,6 @@ class WarrantTranscriptionService:
                 "token_address": self.escrow_client.token,
                 "verifier_address": self.escrow_client.verifier,
                 "chain_id": chain_id,
-                "policy_hash": policy_hash,
                 "policy_version": 1,
                 "category": DEFAULT_CATEGORY,
                 "amount": token_amount,
@@ -459,7 +448,7 @@ class WarrantTranscriptionService:
                     "Verify this proposal against your Warrant policy (max budget, category, duration).\n"
                     "Then call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
                     "acceptBy, settleBy) on-chain.\n"
-                    "Once confirmed on-chain, call deploy_with_escrow(task_id)."
+                    "Once confirmed on-chain, call deploy_with_escrow(task_id, policy)."
                 ),
             }
 
@@ -489,8 +478,8 @@ class WarrantTranscriptionService:
             raise ToolError(
                 f"On-chain amount ({task_data.get('amount')}) does not match proposal ({proposal.get('amount')})."
             )
-        for key, label in (("recipient", "recipient"), ("policy_hash", "policyHash"), ("customer", "customer")):
-            if task_data.get(key) and str(task_data[key]).lower() != str(proposal.get(key, "")).lower():
+        for key, label in (("recipient", "recipient"), ("customer", "customer")):
+            if task_data.get(key) and proposal.get(key) and str(task_data[key]).lower() != str(proposal[key]).lower():
                 raise ToolError(
                     f"On-chain {label} ({task_data.get(key)}) does not match proposal ({proposal.get(key)})."
                 )
@@ -672,16 +661,31 @@ class WarrantTranscriptionService:
                 raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
             proposal = read_json(prop_path)
-            if policy:
-                proposal["policy"] = policy
-                save(prop_path, proposal)
+            target_policy = policy or proposal.get("policy")
+            if not target_policy:
+                raise ToolError(
+                    f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'."
+                )
+
+            # 1. Verify on-chain escrow state and commercial terms
+            task_data = await self._verify_task_offered(task_id, proposal)
+
+            # 2. Hash policy received from buyer and verify against on-chain policyHash
+            computed_policy_hash = await asyncio.to_thread(hash_policy, target_policy)
+            onchain_policy_hash = str(task_data.get("policy_hash", ""))
+            if onchain_policy_hash.lower() != computed_policy_hash.lower():
+                raise ToolError(
+                    f"On-chain policyHash ({onchain_policy_hash}) does not match "
+                    f"provided policy hash ({computed_policy_hash})."
+                )
+
+            proposal["policy"] = target_policy
+            proposal["policy_hash"] = computed_policy_hash
+            save(prop_path, proposal)
 
             now = int(time.time())
 
-            # 1. Verify on-chain escrow state and terms
-            task_data = await self._verify_task_offered(task_id, proposal)
-
-            # 2. Accept task on-chain first to commit agreement before spinning up hardware
+            # 3. Accept task on-chain first to commit agreement before spinning up hardware
             await self._accept_task(task_id, proposal, task_data.get("state"))
 
             # 3. Generate capability token and deliverable hash
@@ -1016,12 +1020,7 @@ class WarrantTranscriptionService:
             # Resolve policy
             policy = session.get("policy")
             if not policy:
-                policy, _ = compile_buyer_policy(
-                    chain_id=session["chain_id"],
-                    escrow_address=session["escrow_address"],
-                    token_address=session["token_address"],
-                    max_amount=session["amount"],
-                )
+                raise ToolError(f"No policy associated with deployment session for task '{task_id}'.")
 
             # Build Request struct
             request = {

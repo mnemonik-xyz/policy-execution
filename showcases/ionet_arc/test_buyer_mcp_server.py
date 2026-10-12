@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 from mcp.server.mcpserver.exceptions import ToolError
 
 from showcases.ionet_arc.buyer_mcp_server import BuyerServerConfig, ServerConfig, create_app, create_server
-from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, ensure_policy_hash
+from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
 
 
 class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
@@ -73,15 +73,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(policy["auto_mint"])
 
     async def test_warrant_evaluate_and_offer_success(self):
-        expected_hash = ensure_policy_hash(
-            escrow_address=self.mock_escrow.escrow,
-            token_address=self.mock_escrow.token,
-            chain_id=31337,
-            max_amount=100_000_000,
-            state_dir=self.state_dir,
-            categories=[DEFAULT_CATEGORY],
-        )
-
         proposal = {
             "task_id": "0x" + "55" * 32,
             "amount": 1_000_000,
@@ -89,7 +80,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "duration_hours": 1,
             "salt": "0x" + "66" * 32,
             "recipient": "0x" + "44" * 20,
-            "policy_hash": expected_hash,
             "policy_version": 1,
             "category": DEFAULT_CATEGORY,
             "escrow_address": self.mock_escrow.escrow,
@@ -102,7 +92,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["transaction_hash"], "0x" + "02" * 32)
         self.assertEqual(res["customer"], "0x" + "aa" * 20)
         self.assertEqual(res["amount"], 1_000_000)
-        self.assertEqual(res["policy_hash"], expected_hash)
+        self.assertTrue(res["policy_hash"].startswith("0x"))
 
         self.mock_escrow.approve_token.assert_called_once()
         self.mock_escrow.offer.assert_called_once()
@@ -168,7 +158,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
         self.assertIn("does not match pinned escrow", str(ctx.exception))
 
-    async def test_warrant_evaluate_and_offer_policy_hash_mismatch(self):
+    async def test_warrant_evaluate_and_offer_without_policy_hash(self):
         proposal = {
             "task_id": "0x" + "55" * 32,
             "amount": 1_000_000,
@@ -176,26 +166,16 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "duration_hours": 1,
             "salt": "0x" + "66" * 32,
             "recipient": "0x" + "44" * 20,
-            "policy_hash": "0x" + "bad" * 21,
             "escrow_address": self.mock_escrow.escrow,
             "token_address": self.mock_escrow.token,
         }
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
-        self.assertIn("Policy hash mismatch", str(ctx.exception))
+        res = await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+        self.assertEqual(res["status"], "APPROVED")
+        self.assertTrue(res["policy_hash"].startswith("0x"))
 
     async def test_warrant_evaluate_and_offer_auto_mint_on_low_balance(self):
         self.mock_escrow.token_balance.return_value = 100  # Insufficient
 
-        expected_hash = ensure_policy_hash(
-            escrow_address=self.mock_escrow.escrow,
-            token_address=self.mock_escrow.token,
-            chain_id=31337,
-            max_amount=100_000_000,
-            state_dir=self.state_dir,
-            categories=[DEFAULT_CATEGORY],
-        )
-
         proposal = {
             "task_id": "0x" + "55" * 32,
             "amount": 1_000_000,
@@ -203,7 +183,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "duration_hours": 1,
             "salt": "0x" + "66" * 32,
             "recipient": "0x" + "44" * 20,
-            "policy_hash": expected_hash,
             "escrow_address": self.mock_escrow.escrow,
             "token_address": self.mock_escrow.token,
         }
@@ -253,15 +232,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.mock_escrow.token_balance.return_value = 100
 
-        expected_hash = ensure_policy_hash(
-            escrow_address=self.mock_escrow.escrow,
-            token_address=self.mock_escrow.token,
-            chain_id=31337,
-            max_amount=100_000_000,
-            state_dir=self.state_dir,
-            categories=[DEFAULT_CATEGORY],
-        )
-
         proposal = {
             "task_id": "0x" + "55" * 32,
             "amount": 1_000_000,
@@ -269,7 +239,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "duration_hours": 1,
             "salt": "0x" + "66" * 32,
             "recipient": "0x" + "44" * 20,
-            "policy_hash": expected_hash,
             "escrow_address": self.mock_escrow.escrow,
             "token_address": self.mock_escrow.token,
         }
@@ -279,14 +248,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Insufficient token balance", str(ctx.exception))
 
     async def test_warrant_evaluate_and_offer_task_id_mismatch(self):
-        expected_hash = ensure_policy_hash(
-            escrow_address=self.mock_escrow.escrow,
-            token_address=self.mock_escrow.token,
-            chain_id=31337,
-            max_amount=100_000_000,
-            state_dir=self.state_dir,
-            categories=[DEFAULT_CATEGORY],
-        )
         proposal = {
             "task_id": "0x" + "99" * 32,
             "amount": 1_000_000,
@@ -294,7 +255,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "duration_hours": 1,
             "salt": "0x" + "66" * 32,
             "recipient": "0x" + "44" * 20,
-            "policy_hash": expected_hash,
             "policy_version": 1,
             "category": DEFAULT_CATEGORY,
             "escrow_address": self.mock_escrow.escrow,

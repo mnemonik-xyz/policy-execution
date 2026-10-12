@@ -52,7 +52,7 @@ the cryptographic `warrant-policy` hash, approves ERC-20 token allowance, and su
 - Arguments:
   - `proposal` (object, required): Full proposal object returned from `propose_deployment`.
     Alternatively accepts unpacked fields (`task_id`, `amount`, `amount_usd`, `salt`, `recipient`,
-    `policy_hash`, `duration_hours`, `category`, `escrow_address`, `token_address`).
+    `duration_hours`, `category`, `escrow_address`, `token_address`).
 - Returns:
   - `status`: `"APPROVED"` on success (raises `ToolError` on policy violation).
   - `task_id`, `transaction_hash`, `customer`, `recipient`, `amount`, `amount_usd`, `policy`,
@@ -98,16 +98,16 @@ calculated from actual hardware hourly pricing and duration.
   - `duration_hours` (optional int): Deployment duration in hours (default: `1`).
   - `location_id` (optional string): Region identifier (default: `"US"`).
 - Returns: `status` (`"proposed"`), `task_id`, `salt`, `customer`, `recipient`, `amount`,
-  `amount_usd`, `duration_hours`, `policy_hash`, `escrow_address`, `token_address`,
-  `verifier_address`, `chain_id`.
+  `amount_usd`, `duration_hours`, `escrow_address`, `token_address`, `verifier_address`,
+  `chain_id`.
 
 #### 3. `deploy_with_escrow`
-Verifies on-chain escrow deposit, commits the agreement on-chain via `TaskEscrow.accept()`,
-generates `WARRANT_WORKER_TOKEN` and deliverable hash, launches background container provisioning,
-and returns initial session state.
+Verifies on-chain escrow deposit, validates that the buyer policy hashes to the on-chain
+`policyHash`, commits agreement via `TaskEscrow.accept()`, generates `WARRANT_WORKER_TOKEN` and
+deliverable hash, launches background container provisioning, and returns initial session state.
 - Arguments:
   - `task_id` (string, required): Task ID from `propose_deployment`.
-  - `policy` (optional object): Concrete buyer policy stamped by buyer guardrail.
+  - `policy` (object, required): Concrete buyer policy stamped by buyer guardrail.
 - Returns: `status` (`"provisioning"` or `"ready"`), `task_id`, `deployment_id`, `public_url`,
   `deliverable_hash`, `message`.
 

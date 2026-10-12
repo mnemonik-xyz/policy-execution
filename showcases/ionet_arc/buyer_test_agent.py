@@ -155,7 +155,6 @@ async def run_client(
                 print(f"  • Hardware:       {proposal['hardware_name']} (${proposal['price_per_hour_usd']:.4f}/hr)")
                 print(f"  • Duration:       {proposal['duration_hours']} hour")
                 print(f"  • Escrow amount:  {proposal['amount']} atomic units (${proposal['amount_usd']} USDC)")
-                print(f"  • Policy hash:    {proposal['policy_hash']}")
                 print(f"  • TaskEscrow:     {proposal['escrow_address']}")
 
                 # Step 3: Policy Verification & Escrow Payment
@@ -178,6 +177,7 @@ async def run_client(
                     sys.exit(f"Policy evaluation or escrow funding failed: {offer_res}")
 
                 print(f" Policy evaluation: {offer_res.get('status', 'APPROVED')}")
+                print(f" Policy hash:       {offer_res.get('policy_hash')}")
                 print(f" TaskEscrow funded on-chain: tx {offer_res.get('transaction_hash')}")
 
                 # Step 4: deploy_with_escrow

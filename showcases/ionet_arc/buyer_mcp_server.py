@@ -248,7 +248,6 @@ class BuyerWarrantService:
         token_address: str | None = None,
         category: int = DEFAULT_CATEGORY,
         duration_hours: int | None = 1,
-        policy_hash: str | None = None,
         policy_version: int = 1,
         chain_id: int | None = None,
     ) -> dict:
@@ -263,7 +262,6 @@ class BuyerWarrantService:
             token_address = proposal.get("token_address", token_address)
             category = proposal.get("category", category)
             duration_hours = proposal.get("duration_hours", duration_hours)
-            policy_hash = proposal.get("policy_hash", policy_hash)
             policy_version = proposal.get("policy_version", policy_version)
             chain_id = proposal.get("chain_id", chain_id)
 
@@ -329,12 +327,6 @@ class BuyerWarrantService:
             )
         except Exception as e:
             raise ToolError(f"Failed to compile buyer policy template: {e}") from e
-
-        if policy_hash and policy_hash.lower() != derived_policy_hash.lower():
-            raise ToolError(
-                f"Policy hash mismatch: proposal claimed {policy_hash} "
-                f"but locally compiled policy hash is {derived_policy_hash}"
-            )
 
         funded = await asyncio.to_thread(
             self._fund_escrow,

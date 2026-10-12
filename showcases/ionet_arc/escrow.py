@@ -41,6 +41,7 @@ __all__ = [
     "evaluate_authorization",
     "find_binary",
     "find_warrant_binary",
+    "hash_policy",
     "should_trust_env",
     "sign_acceptance",
     "to_addr_str",
@@ -257,7 +258,6 @@ def compile_buyer_policy(
         raise ValueError("escrow_address and token_address must be specified")
 
     evidence_bin = find_warrant_binary("warrant-evidence")
-    policy_bin = find_warrant_binary("warrant-policy")
 
     reg_key_rel = manifest.get("private_key_files", {}).get("registry_key", "showcases/ionet_arc/.keys/registry.key")
     acc_key_rel = manifest.get("private_key_files", {}).get(
@@ -314,17 +314,21 @@ def compile_buyer_policy(
         "rule": rule,
     }
 
+    return policy, hash_policy(policy)
+
+
+def hash_policy(policy: dict) -> str:
+    """Compute cryptographic policy_hash of a Policy dict using warrant-policy."""
+    policy_bin = find_warrant_binary("warrant-policy")
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(policy, f)
         temp_file = Path(f.name)
 
     try:
         res = subprocess.run([str(policy_bin), "hash", str(temp_file)], capture_output=True, text=True, check=True)
-        policy_hash = res.stdout.strip()
+        return res.stdout.strip()
     finally:
         temp_file.unlink(missing_ok=True)
-
-    return policy, policy_hash
 
 
 def sign_acceptance(acceptance: dict, key_path: Path | None = None) -> list[int]:

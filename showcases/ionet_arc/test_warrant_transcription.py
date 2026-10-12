@@ -3,13 +3,14 @@
 import base64
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
+from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, compile_buyer_policy
 from showcases.ionet_arc.seller_mcp_server import (
     SellerServerConfig,
     ServerConfig,
@@ -53,6 +54,24 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         arguments = arguments or {}
         res = await self.mcp.call_tool(tool_name, arguments)
         return json.loads(res.content[0].text)
+
+    def _create_mock_offered_task(self, proposal: dict) -> tuple[dict, dict]:
+        buyer_policy, policy_hash = compile_buyer_policy(
+            chain_id=proposal["chain_id"],
+            escrow_address=proposal["escrow_address"],
+            token_address=proposal["token_address"],
+            max_amount=proposal["amount"],
+        )
+        task_data = {
+            "task_id": proposal["task_id"],
+            "state": "Offered",
+            "amount": proposal["amount"],
+            "recipient": proposal["recipient"],
+            "policy_hash": policy_hash,
+            "customer": proposal["customer"],
+            "settle_by": int(time.time()) + 86400,
+        }
+        return buyer_policy, task_data
 
     def test_filter_suitable_gpus_sorting_and_constraints(self):
         sample_hardware = [
@@ -117,7 +136,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["category"], DEFAULT_CATEGORY)
         self.assertTrue(proposal["task_id"].startswith("0x"))
         self.assertTrue(proposal["salt"].startswith("0x"))
-        self.assertTrue(proposal["policy_hash"].startswith("0x"))
+        self.assertNotIn("policy_hash", proposal)
         self.assertIn("TaskEscrow.offer", proposal["instructions"])
 
     async def test_propose_deployment_calculates_real_hardware_pricing(self):
@@ -167,8 +186,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         # Mock that task is Missing on-chain
         self.mock_escrow.get_task.return_value = {"task_id": task_id, "state": "Missing"}
 
+        buyer_policy, _ = self._create_mock_offered_task(proposal)
+
         with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": task_id})
+            await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
         self.assertIn("has not been offered on TaskEscrow", str(ctx.exception))
 
     async def test_end_to_end_propose_deploy_and_transcribe(self):
@@ -177,20 +198,11 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         task_id = proposal["task_id"]
 
         # 2. Simulate task Offered on-chain with matching terms
-        import time
-
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": proposal["amount"],
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
 
         # 3. Deploy with escrow
-        dep_result = await self.call("deploy_with_escrow", {"task_id": task_id})
+        dep_result = await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
         self.assertIn(dep_result["status"], ("provisioning", "ready"))
         self.assertEqual(dep_result["task_id"], task_id)
 
@@ -219,8 +231,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "recipient": list(address20(proposal["recipient"])),
             "amount": proposal["amount"],
             "accepted": True,
-            "valid_after": int(time.time()) - 300,
-            "valid_until": int(time.time()) + 900,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
         }
         sig = sign_acceptance(acceptance)
         settle_res = await self.call(
@@ -246,44 +258,42 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_deploy_with_escrow_fails_on_terms_mismatch(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
-        import time
+
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
 
         # Amount mismatch
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": 999,
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
+        task_data["amount"] = 999
+        self.mock_escrow.get_task.return_value = task_data
         with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": task_id})
+            await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
         self.assertIn("does not match proposal", str(ctx.exception))
 
         # Recipient mismatch
-        self.mock_escrow.get_task.return_value["amount"] = proposal["amount"]
-        self.mock_escrow.get_task.return_value["recipient"] = "0x" + "99" * 20
+        task_data["amount"] = proposal["amount"]
+        task_data["recipient"] = "0x" + "99" * 20
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        self.assertIn("does not match proposal", str(ctx.exception))
+
+        # Policy hash mismatch
+        task_data["recipient"] = proposal["recipient"]
+        task_data["policy_hash"] = "0x" + "aa" * 32
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        self.assertIn("does not match", str(ctx.exception))
+
+        # Missing policy
         with self.assertRaises(ToolError) as ctx:
             await self.call("deploy_with_escrow", {"task_id": task_id})
-        self.assertIn("does not match proposal", str(ctx.exception))
+        self.assertIn("policy", str(ctx.exception).lower())
 
     async def test_submit_acceptance_fails_if_settlement_reverts(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
-        import time
 
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": proposal["amount"],
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
-        await self.call("deploy_with_escrow", {"task_id": task_id})
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
         status = await self.call("get_deployment_status", {"task_id": task_id})
 
         from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
@@ -299,8 +309,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "recipient": list(address20(proposal["recipient"])),
             "amount": proposal["amount"],
             "accepted": True,
-            "valid_after": int(time.time()) - 300,
-            "valid_until": int(time.time()) + 900,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
         }
         sig = sign_acceptance(acceptance)
 
@@ -312,24 +322,16 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_deploy_with_escrow_fails_if_container_provisioning_fails(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
-        import time
 
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": proposal["amount"],
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
 
         with patch.object(
             self.mcp._tool_manager._tools["deploy_with_escrow"].fn.__self__,
             "_provision_container",
             side_effect=ToolError("Container failed to start"),
         ):
-            dep_res = await self.call("deploy_with_escrow", {"task_id": task_id})
+            dep_res = await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
             self.assertIn(dep_res["status"], ("provisioning", "failed"))
             import asyncio
 
@@ -354,17 +356,9 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         proposal = await local_call("propose_deployment")
         task_id = proposal["task_id"]
-        import time
 
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": proposal["amount"],
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
 
         # Mock subprocess.run for ssh docker calls
         mock_run_results = [
@@ -373,11 +367,19 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ]
         mock_health_resp = MagicMock(status_code=200)
 
+        import subprocess as real_subprocess
+        real_run = real_subprocess.run
+
+        def mock_ssh_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "ssh":
+                return mock_run_results.pop(0) if mock_run_results else MagicMock(returncode=0)
+            return real_run(cmd, *args, **kwargs)
+
         with (
-            patch("subprocess.run", side_effect=mock_run_results) as mock_subproc,
+            patch("subprocess.run", side_effect=mock_ssh_run) as mock_subproc,
             patch("httpx2.AsyncClient.get", return_value=mock_health_resp),
         ):
-            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
+            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
             self.assertIn(dep_res["status"], ("provisioning", "ready"))
 
             import asyncio
@@ -391,15 +393,17 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(stat["status"], "ready")
             self.assertEqual(stat["public_url"], "http://petertower:8080")
-            self.assertEqual(mock_subproc.call_count, 2)
+
+            ssh_calls = [c for c in mock_subproc.call_args_list if c[0][0][0] == "ssh"]
+            self.assertEqual(len(ssh_calls), 2)
 
             # Check first call: docker rm -f
-            first_cmd = mock_subproc.call_args_list[0][0][0]
+            first_cmd = ssh_calls[0][0][0]
             self.assertEqual(first_cmd[:5], ["ssh", "petertower", "docker", "rm", "-f"])
             self.assertEqual(first_cmd[5], "warrant-transcription")
 
             # Check second call: docker run
-            second_cmd = mock_subproc.call_args_list[1][0][0]
+            second_cmd = ssh_calls[1][0][0]
             second_bin = second_cmd[:5]
             self.assertEqual(second_bin, ["ssh", "petertower", "docker", "run", "-d"])
             self.assertIn("--gpus", second_cmd)
@@ -410,6 +414,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             # Check teardown logic
             service = local_mcp._tool_manager._tools["deploy_with_escrow"].fn.__self__
             mock_subproc.reset_mock()
+            mock_subproc.side_effect = None
             mock_subproc.return_value = MagicMock(returncode=0)
             service._cleanup_ssh_container()
             mock_subproc.assert_called_once()
@@ -431,25 +436,25 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         proposal = await local_call("propose_deployment")
         task_id = proposal["task_id"]
-        import time
 
-        self.mock_escrow.get_task.return_value = {
-            "task_id": task_id,
-            "state": "Offered",
-            "amount": proposal["amount"],
-            "recipient": proposal["recipient"],
-            "policy_hash": proposal["policy_hash"],
-            "customer": proposal["customer"],
-            "settle_by": int(time.time()) + 86400,
-        }
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
 
         mock_run_results = [
             MagicMock(returncode=0),  # rm -f
             MagicMock(returncode=1, stderr="docker: permission denied"),  # run failure
         ]
 
-        with patch("subprocess.run", side_effect=mock_run_results):
-            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id})
+        import subprocess as real_subprocess
+        real_run = real_subprocess.run
+
+        def mock_ssh_fail_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "ssh":
+                return mock_run_results.pop(0) if mock_run_results else MagicMock(returncode=0)
+            return real_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_ssh_fail_run):
+            dep_res = await local_call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
             self.assertIn(dep_res["status"], ("provisioning", "failed"))
             import asyncio
 
@@ -464,8 +469,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("docker: permission denied", stat["error"])
 
     async def test_multi_session_concurrency_and_routing(self):
-        import time
-
         self.mock_escrow.task_id_for.side_effect = lambda customer, salt: f"0x{int(salt, 16):064x}"
 
         # Generate proposal 1
@@ -477,24 +480,18 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         t2 = p2["task_id"]
         self.assertNotEqual(t1, t2)
 
+        policy1, task_data1 = self._create_mock_offered_task(p1)
+        policy2, task_data2 = self._create_mock_offered_task(p2)
+
         def mock_get_task(task_id):
-            prop = p1 if task_id == t1 else p2
-            return {
-                "task_id": task_id,
-                "state": "Offered",
-                "amount": prop["amount"],
-                "recipient": prop["recipient"],
-                "policy_hash": prop["policy_hash"],
-                "customer": prop["customer"],
-                "settle_by": int(time.time()) + 86400,
-            }
+            return task_data1 if task_id == t1 else task_data2
 
         self.mock_escrow.get_task.side_effect = mock_get_task
 
         # Deploy both tasks
-        res1 = await self.call("deploy_with_escrow", {"task_id": t1})
+        res1 = await self.call("deploy_with_escrow", {"task_id": t1, "policy": policy1})
         self.assertIn(res1["status"], ("provisioning", "ready"))
-        res2 = await self.call("deploy_with_escrow", {"task_id": t2})
+        res2 = await self.call("deploy_with_escrow", {"task_id": t2, "policy": policy2})
         self.assertIn(res2["status"], ("provisioning", "ready"))
 
         # Check status individually by task_id
