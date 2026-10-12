@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, compile_buyer_policy
@@ -760,6 +761,46 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         res = await local_mcp.call_tool("propose_deployment", {})
         proposal = json.loads(res.content[0].text)
         self.assertEqual(proposal["customer"], custom_buyer)
+
+    async def test_propose_deployment_fails_when_customer_address_unconfigured(self):
+        empty_manifest = Path(self.state_dir) / "empty_manifest.yaml"
+        empty_manifest.write_text(yaml.dump({}))
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            local_mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                vendor_credential_path=self.cred_path,
+                vendor_signature_path=self.sig_path,
+                manifest_path=empty_manifest,
+            )
+        with self.assertRaises(ToolError) as ctx:
+            await local_mcp.call_tool("propose_deployment", {})
+        self.assertIn(
+            "Customer address was not provided and is not configured in config/manifest.yaml",
+            str(ctx.exception),
+        )
+
+    async def test_propose_deployment_fails_when_server_account_unconfigured(self):
+        empty_manifest = Path(self.state_dir) / "empty_manifest.yaml"
+        empty_manifest.write_text(yaml.dump({}))
+        mock_client = MagicMock()
+        mock_client.server_account = None
+        mock_client.rpc.chain_id.return_value = 31337
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=mock_client):
+            local_mcp = create_server(
+                self.state_dir,
+                mock_ionet=True,
+                vendor_credential_path=self.cred_path,
+                vendor_signature_path=self.sig_path,
+                manifest_path=empty_manifest,
+                escrow_client=mock_client,
+            )
+        with self.assertRaises(ToolError) as ctx:
+            await local_mcp.call_tool("propose_deployment", {"customer_address": "0x" + "aa" * 20})
+        self.assertIn(
+            "Server payout account is not configured in config/manifest.yaml",
+            str(ctx.exception),
+        )
 
 
 if __name__ == "__main__":

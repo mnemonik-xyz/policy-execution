@@ -241,7 +241,6 @@ Because the Buyer Guardrail manages local keys and spending limits, it runs loca
         "-m", "showcases.ionet_arc.buyer_mcp_server",
         "--transport", "stdio",
         "--rpc-url", "https://rpc.testnet.arc.io",
-        "--max-budget-usd", "2.00",
         "--max-duration-hours", "1"
       ]
     },
@@ -379,18 +378,16 @@ Start the Buyer Warrant guardrail sidecar:
 # Run over stdio (standard for desktop LLM agents):
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
   --transport stdio \
-  --rpc-url https://rpc.testnet.arc.io \
-  --max-budget-usd 2.00
+  --rpc-url https://rpc.testnet.arc.io
 
 # Run over Streamable HTTP (e.g. port 8001):
 .venv/bin/python -m showcases.ionet_arc.buyer_mcp_server \
   --transport http \
   --host 127.0.0.1 --port 8001 \
-  --rpc-url https://rpc.testnet.arc.io \
-  --max-budget-usd 2.00
+  --rpc-url https://rpc.testnet.arc.io
 ```
 
-Optional CLI flags: `--manifest <path>`, `--max-budget-usd`, `--max-duration-hours`, `--auto-mint`.
+Optional CLI flags: `--manifest <path>`, `--max-duration-hours`, `--auto-mint`.
 
 ### 3. Run with an LLM Agent or Headless Test Runner
 

@@ -339,23 +339,9 @@ class WarrantTranscriptionService:
             customer_address = self.buyer_account
 
         if not customer_address:
-            try:
-                accounts = await asyncio.to_thread(escrow_client.rpc.accounts)
-                customer_address = accounts[0] if accounts else None
-            except Exception:
-                customer_address = None
-
-        if not customer_address:
             raise ToolError(
-                "Customer address was not provided and no unlocked accounts were returned by RPC."
+                "Customer address was not provided and is not configured in config/manifest.yaml."
             )
-
-        if not escrow_client.server_account:
-            try:
-                accounts = await asyncio.to_thread(escrow_client.rpc.accounts)
-                escrow_client.server_account = accounts[1] if len(accounts) > 1 else (accounts[0] if accounts else None)
-            except Exception:
-                pass
 
         if not escrow_client.server_account:
             manifest = load_manifest(self.manifest_path)
@@ -367,7 +353,7 @@ class WarrantTranscriptionService:
 
         if not escrow_client.server_account:
             raise ToolError(
-                "Server payout account is not configured and no unlocked accounts were returned by RPC."
+                "Server payout account is not configured in config/manifest.yaml."
             )
 
         return customer_address, chain_id

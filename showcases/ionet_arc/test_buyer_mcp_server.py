@@ -302,6 +302,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.escrow_address, "0xBeD9B731D9C912541FF083AE41607016BFe93b70")
         self.assertEqual(config.verifier_address, "0xDbefc776e18e34049cAaec736b47122f0583F345")
         self.assertEqual(config.buyer_account, "0x9793Dd93D46F153a2A879165cd163A01b54d8A00")
+        self.assertEqual(config.max_budget_usd, 2.00)
 
     def test_read_initial_parameters_from_custom_manifest_kebab_case(self):
         custom_manifest = Path(self.state_dir) / "custom_manifest.yaml"
@@ -309,11 +310,21 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "escrow-address": "0x" + "12" * 20,
             "verifier-address": "0x" + "34" * 20,
             "buyer-account": "0x" + "56" * 20,
+            "max-budget-usd": 4.50,
         }))
         config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
         self.assertEqual(config.escrow_address, "0x" + "12" * 20)
         self.assertEqual(config.verifier_address, "0x" + "34" * 20)
         self.assertEqual(config.buyer_account, "0x" + "56" * 20)
+        self.assertEqual(config.max_budget_usd, 4.50)
+
+    def test_read_max_budget_derived_from_max_amount(self):
+        custom_manifest = Path(self.state_dir) / "custom_manifest_amount.yaml"
+        custom_manifest.write_text(yaml.dump({
+            "max_amount": 3_500_000,
+        }))
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
+        self.assertEqual(config.max_budget_usd, 3.50)
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
@@ -325,6 +336,21 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.escrow_address, "0x" + "99" * 20)
         self.assertEqual(config.verifier_address, "0x" + "88" * 20)
         self.assertEqual(config.buyer_account, "0x" + "77" * 20)
+
+    def test_resolve_buyer_account_fails_when_unconfigured(self):
+        empty_manifest = Path(self.state_dir) / "empty_manifest.yaml"
+        empty_manifest.write_text(yaml.dump({}))
+        from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService
+
+        service = BuyerWarrantService(
+            state_dir=self.state_dir,
+            escrow_client=self.mock_escrow,
+            manifest_path=empty_manifest,
+        )
+        service.buyer_account = None
+        with self.assertRaises(ToolError) as ctx:
+            service._resolve_buyer_account()
+        self.assertIn("Buyer account is not configured in config/manifest.yaml", str(ctx.exception))
 
 
 if __name__ == "__main__":

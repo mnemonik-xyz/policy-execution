@@ -153,6 +153,9 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             "verifier_address": cls.verifier_address,
             "seller_address": cls.server_account,
             "buyer_address": cls.customer_account,
+            "public_files": {
+                "public_keys": "showcases/ionet_arc/config/public_keys.yaml",
+            },
         }))
 
         cmd = [
@@ -238,6 +241,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             self.buyer_mcp_url,
             "--rpc-url",
             self.rpc_url,
+            "--manifest",
+            str(self.manifest_path),
             "--audio",
             str(self.test_audio),
         ]
@@ -262,6 +267,8 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             self.mcp_url,
             "--rpc-url",
             self.rpc_url,
+            "--manifest",
+            str(self.manifest_path),
             "--audio",
             str(self.test_audio),
         ]

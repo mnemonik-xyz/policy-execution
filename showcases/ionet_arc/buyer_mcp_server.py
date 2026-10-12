@@ -50,7 +50,7 @@ class BuyerWarrantService:
         self,
         state_dir: pathlib.Path,
         escrow_client: EscrowClient,
-        max_budget_usd: float = 2.00,
+        max_budget_usd: float | None = None,
         max_duration_hours: int = 1,
         allowed_categories: list[int] | None = None,
         buyer_account: str | None = None,
@@ -67,7 +67,6 @@ class BuyerWarrantService:
         self.tasks_dir = self.state_dir / "tasks"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.escrow_client = escrow_client
-        self.max_budget_usd = float(max_budget_usd)
         self.max_duration_hours = int(max_duration_hours)
         self.allowed_categories = allowed_categories or [DEFAULT_CATEGORY]
         self.auto_mint = auto_mint
@@ -81,6 +80,15 @@ class BuyerWarrantService:
         )
 
         manifest = load_manifest(self.manifest_path)
+        if max_budget_usd is not None:
+            self.max_budget_usd = float(max_budget_usd)
+        else:
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            if raw_budget is not None:
+                self.max_budget_usd = float(raw_budget)
+            else:
+                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
+                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
         self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
         self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address", "token-address")
         self.buyer_account = buyer_account or get_manifest_parameter(
@@ -102,14 +110,7 @@ class BuyerWarrantService:
     def _resolve_buyer_account(self) -> str:
         if self.buyer_account:
             return self.buyer_account
-        try:
-            accounts = self.escrow_client.rpc.accounts()
-            if accounts:
-                self.buyer_account = accounts[0]
-                return self.buyer_account
-        except Exception:
-            pass
-        raise ToolError("Buyer account is not configured and no unlocked accounts were returned by RPC.")
+        raise ToolError("Buyer account is not configured in config/manifest.yaml.")
 
     def _resolve_chain_id(self) -> int:
         try:
@@ -474,7 +475,7 @@ class ServerConfig:
     token_address: str | None = None
     verifier_address: str | None = None
     buyer_account: str | None = None
-    max_budget_usd: float = 2.00
+    max_budget_usd: float | None = None
     max_duration_hours: int = 1
     allowed_categories: list[int] | None = None
     auto_mint: bool = False
@@ -504,6 +505,13 @@ class ServerConfig:
             self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
         if self.token_address is None:
             self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
+        if self.max_budget_usd is None:
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            if raw_budget is not None:
+                self.max_budget_usd = float(raw_budget)
+            else:
+                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
+                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
 
 
 BuyerServerConfig = ServerConfig
@@ -653,12 +661,6 @@ def main():
         help="Path to manifest.yaml config (default: showcases/ionet_arc/config/manifest.yaml)",
     )
     parser.add_argument(
-        "--max-budget-usd",
-        type=float,
-        default=float(os.environ.get("WARRANT_MAX_BUDGET_USD", "2.00")),
-        help="Maximum allowable budget per proposal in USD (default: 2.00)",
-    )
-    parser.add_argument(
         "--max-duration-hours",
         type=int,
         default=int(os.environ.get("WARRANT_MAX_DURATION_HOURS", "1")),
@@ -681,7 +683,6 @@ def main():
         host=args.host,
         port=args.port,
         rpc_url=args.rpc_url,
-        max_budget_usd=args.max_budget_usd,
         max_duration_hours=args.max_duration_hours,
         auto_mint=args.auto_mint,
         state_dir=pathlib.Path(args.state_dir),

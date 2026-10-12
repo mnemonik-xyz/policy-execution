@@ -30,7 +30,14 @@ from mcp import ClientSession  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
 from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService  # noqa: E402
-from showcases.ionet_arc.escrow import EscrowClient, EthRpc, should_trust_env  # noqa: E402
+from showcases.ionet_arc.escrow import (  # noqa: E402
+    DEFAULT_MANIFEST_PATH,
+    EscrowClient,
+    EthRpc,
+    get_manifest_parameter,
+    load_manifest,
+    should_trust_env,
+)
 
 
 def extract_result(res):
@@ -49,6 +56,15 @@ def extract_result(res):
             return sc["result"]
         return sc
     return {}
+
+
+async def get_policy_via_buyer_mcp(buyer_mcp_url: str) -> dict:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(buyer_mcp_url)) as http_client:
+        async with streamable_http_client(buyer_mcp_url, http_client=http_client) as (r, w):
+            async with ClientSession(r, w, read_timeout_seconds=60) as session:
+                await session.initialize()
+                res = await session.call_tool("warrant_get_policy", {})
+                return extract_result(res)
 
 
 async def fund_via_buyer_mcp(buyer_mcp_url: str, proposal: dict) -> dict:
@@ -98,6 +114,89 @@ async def poll_deployment_ready(session: ClientSession, task_id: str, max_polls:
     sys.exit("Timeout waiting for deployment to become ready.")
 
 
+def _resolve_agent_wallets(rpc_url: str, manifest_path: Path | None = None) -> tuple[str, str | None]:
+    m_path = manifest_path or (
+        Path(os.environ["WARRANT_MANIFEST"]) if "WARRANT_MANIFEST" in os.environ else DEFAULT_MANIFEST_PATH
+    )
+    manifest = load_manifest(m_path)
+    customer = get_manifest_parameter(manifest, "buyer_address", "buyer-address", "buyer_account", "buyer-account")
+    agent = get_manifest_parameter(manifest, "seller_address", "seller-address", "server_account", "server-account")
+
+    if not customer or not agent:
+        try:
+            accounts = EthRpc(rpc_url).accounts()
+        except Exception:
+            accounts = []
+        if not customer and accounts:
+            customer = accounts[0]
+        if not agent and accounts:
+            agent = accounts[1] if len(accounts) > 1 else accounts[0]
+
+    if not customer:
+        sys.exit("Error: Customer wallet not configured in manifest.yaml and no unlocked accounts returned by RPC.")
+
+    return customer, agent
+
+
+async def _resolve_buyer_account(
+    rpc_url: str, manifest_path: Path | None, buyer_mcp_url: str | None
+) -> tuple[str, str | None]:
+    customer, agent = _resolve_agent_wallets(rpc_url, manifest_path)
+    if buyer_mcp_url:
+        policy_info = await get_policy_via_buyer_mcp(buyer_mcp_url)
+        if policy_info.get("buyer_account"):
+            customer = policy_info["buyer_account"]
+    return customer, agent
+
+
+async def _evaluate_and_fund_proposal(
+    buyer_mcp_url: str | None,
+    proposal: dict,
+    rpc_url: str,
+    customer: str,
+    max_budget_usdc: float,
+    manifest_path: Path | None,
+) -> tuple[dict, BuyerWarrantService | None]:
+    if buyer_mcp_url:
+        print(f"\n[Step 3] Delegating proposal evaluation to Buyer Warrant MCP ({buyer_mcp_url})...")
+        offer_res = await fund_via_buyer_mcp(buyer_mcp_url, proposal)
+        return offer_res, None
+
+    print("\n[Step 3] Verifying proposal against local Warrant policy...")
+    service = BuyerWarrantService(
+        state_dir=ROOT / "artifacts" / "buyer_state",
+        escrow_client=EscrowClient(rpc_url=rpc_url, server_account=customer),
+        max_budget_usd=max_budget_usdc,
+        buyer_account=customer,
+        auto_mint=True,
+        manifest_path=manifest_path,
+    )
+    offer_res = await service.warrant_evaluate_and_offer(proposal)
+    return offer_res, service
+
+
+async def _sign_acceptance(
+    buyer_mcp_url: str | None,
+    service: BuyerWarrantService | None,
+    proposal: dict,
+    deliverable_hash: str,
+) -> dict:
+    if buyer_mcp_url:
+        return await sign_acceptance_via_buyer_mcp(
+            buyer_mcp_url=buyer_mcp_url,
+            task_id=proposal["task_id"],
+            deliverable_hash=deliverable_hash,
+            recipient=proposal["recipient"],
+            amount=proposal["amount"],
+        )
+    return await service.warrant_sign_acceptance(
+        task_id=proposal["task_id"],
+        deliverable_hash=deliverable_hash,
+        recipient=proposal["recipient"],
+        amount=proposal["amount"],
+    )
+
+
 async def run_client(
     mcp_url: str,
     rpc_url: str,
@@ -106,15 +205,14 @@ async def run_client(
     auth_pass: str | None = None,
     max_budget_usdc: float = 1.00,
     buyer_mcp_url: str | None = None,
+    manifest_path: Path | None = None,
 ):
     print("=" * 70)
     print("  WARRANT AUTONOMOUS TRANSCRIPTION AGENT")
     print("=" * 70)
 
     # 1. Inspect on-chain environment
-    accounts = EthRpc(rpc_url).accounts()
-    customer = accounts[0]
-    agent = accounts[1] if len(accounts) > 1 else accounts[0]
+    customer, agent = await _resolve_buyer_account(rpc_url, manifest_path, buyer_mcp_url)
     print(f"Customer wallet: {customer}")
     print(f"Agent wallet:    {agent}")
     print(f"Audio file:      {audio_path} ({audio_path.stat().st_size} bytes)")
@@ -162,20 +260,14 @@ async def run_client(
                 print(f"  • TaskEscrow:     {proposal['escrow_address']}")
 
                 # Step 3: Policy Verification & Escrow Payment
-                service = None
-                if buyer_mcp_url:
-                    print(f"\n[Step 3] Delegating proposal evaluation to Buyer Warrant MCP ({buyer_mcp_url})...")
-                    offer_res = await fund_via_buyer_mcp(buyer_mcp_url, proposal)
-                else:
-                    print("\n[Step 3] Verifying proposal against local Warrant policy...")
-                    service = BuyerWarrantService(
-                        state_dir=ROOT / "artifacts" / "buyer_state",
-                        escrow_client=EscrowClient(rpc_url=rpc_url, server_account=customer),
-                        max_budget_usd=max_budget_usdc,
-                        buyer_account=customer,
-                        auto_mint=True,
-                    )
-                    offer_res = await service.warrant_evaluate_and_offer(proposal)
+                offer_res, service = await _evaluate_and_fund_proposal(
+                    buyer_mcp_url=buyer_mcp_url,
+                    proposal=proposal,
+                    rpc_url=rpc_url,
+                    customer=customer,
+                    max_budget_usdc=max_budget_usdc,
+                    manifest_path=manifest_path,
+                )
 
                 if offer_res.get("status") != "APPROVED":
                     sys.exit(f"Policy evaluation or escrow funding failed: {offer_res}")
@@ -218,21 +310,12 @@ async def run_client(
 
                 # Step 7: Deliverable sign-off & Escrow settlement
                 print("\n[Step 7] Signing Acceptance and submitting evidence for escrow settlement...")
-                if buyer_mcp_url:
-                    sign_res = await sign_acceptance_via_buyer_mcp(
-                        buyer_mcp_url=buyer_mcp_url,
-                        task_id=proposal["task_id"],
-                        deliverable_hash=deliverable_hash,
-                        recipient=proposal["recipient"],
-                        amount=proposal["amount"],
-                    )
-                else:
-                    sign_res = await service.warrant_sign_acceptance(
-                        task_id=proposal["task_id"],
-                        deliverable_hash=deliverable_hash,
-                        recipient=proposal["recipient"],
-                        amount=proposal["amount"],
-                    )
+                sign_res = await _sign_acceptance(
+                    buyer_mcp_url=buyer_mcp_url,
+                    service=service,
+                    proposal=proposal,
+                    deliverable_hash=deliverable_hash,
+                )
                 print(f" Acceptance signed: status={sign_res.get('status')}")
 
                 res_settle = await session.call_tool(
@@ -307,6 +390,13 @@ def main():
         default=os.environ.get("BUYER_MCP_URL"),
         help="Optional Buyer Warrant MCP server streamable HTTP endpoint",
     )
+    parser.add_argument(
+        "--manifest",
+        dest="manifest_path",
+        type=Path,
+        default=os.environ.get("WARRANT_MANIFEST"),
+        help="Optional path to manifest.yaml config",
+    )
     args = parser.parse_args()
 
     if not args.audio:
@@ -323,6 +413,7 @@ def main():
             auth_pass=args.auth_pass,
             max_budget_usdc=args.max_budget,
             buyer_mcp_url=args.buyer_mcp_url,
+            manifest_path=args.manifest_path,
         )
     )
 
