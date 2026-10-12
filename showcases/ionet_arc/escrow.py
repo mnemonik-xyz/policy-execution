@@ -577,11 +577,23 @@ class EscrowClient:
         to_addr = to_checksum_address(to_address)
         from_addr = to_checksum_address(from_account)
         pk = self.private_keys.get(from_addr.lower())
-        if not pk and os.environ.get("WARRANT_PRIVATE_KEY"):
-            candidate_pk = os.environ.get("WARRANT_PRIVATE_KEY")
-            acc = Account.from_key(candidate_pk)
-            if acc.address.lower() == from_addr.lower():
-                pk = candidate_pk
+        if not pk:
+            for env_var in (
+                "WARRANT_PRIVATE_KEY",
+                "WARRANT_BUYER_KEY",
+                "WARRANT_SELLER_KEY",
+                "BUYER_PRIVATE_KEY",
+                "SELLER_PRIVATE_KEY",
+            ):
+                candidate_pk = os.environ.get(env_var)
+                if candidate_pk:
+                    try:
+                        acc = Account.from_key(candidate_pk)
+                        if acc.address.lower() == from_addr.lower():
+                            pk = candidate_pk
+                            break
+                    except Exception:
+                        pass
 
         if pk:
             acc = Account.from_key(pk)
@@ -618,7 +630,19 @@ class EscrowClient:
                 "to": to_addr,
                 "data": "0x" + calldata.hex(),
             }
-            tx_hash = self.rpc.rpc("eth_sendTransaction", [tx_params])
+            try:
+                tx_hash = self.rpc.rpc("eth_sendTransaction", [tx_params])
+            except Exception as e:
+                err_str = str(e)
+                if "-32601" in err_str or "not supported" in err_str or "unsupported" in err_str:
+                    raise RuntimeError(
+                        f"Failed to send transaction from {from_addr} on {self.rpc_url}: "
+                        f"RPC node does not support eth_sendTransaction (-32601) and no private key "
+                        f"was configured to sign the transaction locally. Configure a private key via "
+                        f"manifest.yaml private_key_files, environment variable (WARRANT_PRIVATE_KEY or "
+                        f"WARRANT_BUYER_KEY), or CLI flag (--private-key)."
+                    ) from e
+                raise
 
         receipt = self.wait_for_receipt(tx_hash)
         status = receipt.get("status")

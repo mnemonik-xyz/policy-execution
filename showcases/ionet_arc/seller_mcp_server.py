@@ -1285,6 +1285,8 @@ class ServerConfig:
     token_address: str | None = None
     verifier_address: str | None = None
     server_account: str | None = None
+    seller_private_key: str | None = None
+    seller_key_path: pathlib.Path | None = None
     buyer_account: str | None = None
     mock_ionet: bool = False
     local_server: bool = False
@@ -1295,7 +1297,7 @@ class ServerConfig:
     manifest_path: pathlib.Path | None = None
     escrow_client: EscrowClient | None = None
 
-    def __post_init__(self):
+    def _resolve_paths(self):
         if isinstance(self.state_dir, str):
             self.state_dir = pathlib.Path(self.state_dir)
         if isinstance(self.vendor_credential_path, str):
@@ -1304,8 +1306,10 @@ class ServerConfig:
             self.vendor_signature_path = pathlib.Path(self.vendor_signature_path)
         if isinstance(self.manifest_path, str):
             self.manifest_path = pathlib.Path(self.manifest_path)
+        if isinstance(self.seller_key_path, str):
+            self.seller_key_path = pathlib.Path(self.seller_key_path)
 
-        manifest = load_manifest(self.manifest_path)
+    def _resolve_parameters(self, manifest: dict):
         if self.rpc_url is None:
             self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
@@ -1322,6 +1326,35 @@ class ServerConfig:
             self.server_account = get_manifest_parameter(
                 manifest, "seller_address", "seller-address", "server_account", "server-account"
             )
+
+    def _resolve_key(self, manifest: dict):
+        if self.seller_key_path is None:
+            raw_key_path = manifest.get("private_key_files", {}).get(
+                "seller_key", manifest.get("private_key_files", {}).get("seller_account_key")
+            )
+            if raw_key_path:
+                cand = pathlib.Path(raw_key_path)
+                self.seller_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
+            else:
+                default_seller_key = REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "seller.key"
+                if default_seller_key.exists():
+                    self.seller_key_path = default_seller_key
+
+        if self.seller_private_key is None:
+            if self.seller_key_path and self.seller_key_path.exists() and self.seller_key_path.is_file():
+                with contextlib.suppress(Exception):
+                    self.seller_private_key = self.seller_key_path.read_text().strip()
+            if not self.seller_private_key:
+                for env_var in ("WARRANT_SELLER_KEY", "SELLER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
+                    if os.environ.get(env_var):
+                        self.seller_private_key = os.environ.get(env_var).strip()
+                        break
+
+    def __post_init__(self):
+        self._resolve_paths()
+        manifest = load_manifest(self.manifest_path)
+        self._resolve_parameters(manifest)
+        self._resolve_key(manifest)
 
 
 SellerServerConfig = ServerConfig
@@ -1357,6 +1390,13 @@ def create_server(
         verifier_address=cfg.verifier_address,
         server_account=cfg.server_account,
     )
+    if cfg.seller_private_key:
+        if cfg.server_account:
+            escrow_client.register_key(cfg.server_account, cfg.seller_private_key)
+        with contextlib.suppress(Exception):
+            from eth_account import Account
+            derived_addr = Account.from_key(cfg.seller_private_key).address
+            escrow_client.register_key(derived_addr, cfg.seller_private_key)
 
     service = WarrantTranscriptionService(
         state_dir=cfg.state_dir,
@@ -1535,6 +1575,19 @@ def main():
         type=pathlib.Path,
         default=os.environ.get("WARRANT_VENDOR_SIGNATURE"),
         help="Path to vendor_signature.yaml (default: showcases/ionet_arc/config/vendor_signature.yaml)",
+    )
+    parser.add_argument(
+        "--private-key",
+        dest="seller_private_key",
+        default=None,
+        help="Private key for seller account to sign transactions (or set WARRANT_SELLER_KEY / WARRANT_PRIVATE_KEY)",
+    )
+    parser.add_argument(
+        "--key-file",
+        dest="seller_key_path",
+        type=pathlib.Path,
+        default=None,
+        help="Path to file containing seller private key (default: from manifest or .keys/seller.key)",
     )
     args = parser.parse_args()
 

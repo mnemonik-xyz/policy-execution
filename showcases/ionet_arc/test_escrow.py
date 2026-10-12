@@ -188,6 +188,20 @@ class EscrowClientTests(unittest.TestCase):
         self.assertEqual(tx_data["to"], to_checksum_address(to_address))
         self.assertEqual(tx_data["data"], "0x12345678")
 
+    def test_send_transaction_unlocked_mode_unsupported_error(self):
+        from_account = "0x" + "aa" * 20
+        to_address = "0x" + "bb" * 20
+        calldata = b"\x12\x34\x56\x78"
+
+        rpc_err_msg = (
+            "RPC error eth_sendTransaction: {'message': 'method not supported: eth_sendTransaction', 'code': -32601}"
+        )
+        self.mock_rpc.rpc.side_effect = RuntimeError(rpc_err_msg)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.client.send_transaction(from_account, to_address, calldata)
+        self.assertIn("RPC node does not support eth_sendTransaction (-32601)", str(ctx.exception))
+        self.assertIn("no private key was configured", str(ctx.exception))
+
     def test_send_transaction_signed_private_key_mode(self):
         acc = Account.create()
         self.client.register_key(acc.address, acc.key.hex())

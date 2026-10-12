@@ -12,6 +12,7 @@ Supports stdio (standard for desktop LLM agents) and Streamable HTTP transports.
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -642,6 +643,8 @@ class ServerConfig:
     token_address: str | None = None
     verifier_address: str | None = None
     buyer_account: str | None = None
+    buyer_private_key: str | None = None
+    buyer_key_path: pathlib.Path | None = None
     max_budget_usd: float | None = None
     max_duration_hours: int | None = None
     allowed_categories: list[int] | None = None
@@ -651,7 +654,7 @@ class ServerConfig:
     buyer_acceptance_key_path: pathlib.Path | None = None
     escrow_client: EscrowClient | None = None
 
-    def __post_init__(self):
+    def _resolve_paths(self):
         if isinstance(self.state_dir, str):
             self.state_dir = pathlib.Path(self.state_dir)
         if isinstance(self.manifest_path, str):
@@ -660,8 +663,10 @@ class ServerConfig:
             self.template_path = pathlib.Path(self.template_path)
         if isinstance(self.buyer_acceptance_key_path, str):
             self.buyer_acceptance_key_path = pathlib.Path(self.buyer_acceptance_key_path)
+        if isinstance(self.buyer_key_path, str):
+            self.buyer_key_path = pathlib.Path(self.buyer_key_path)
 
-        manifest = load_manifest(self.manifest_path)
+    def _resolve_parameters(self, manifest: dict):
         if self.rpc_url is None:
             self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
@@ -686,6 +691,35 @@ class ServerConfig:
                 manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
             )
             self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+
+    def _resolve_key(self, manifest: dict):
+        if self.buyer_key_path is None:
+            raw_key_path = manifest.get("private_key_files", {}).get(
+                "buyer_key", manifest.get("private_key_files", {}).get("buyer_account_key")
+            )
+            if raw_key_path:
+                cand = pathlib.Path(raw_key_path)
+                self.buyer_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
+            else:
+                default_buyer_key = REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer.key"
+                if default_buyer_key.exists():
+                    self.buyer_key_path = default_buyer_key
+
+        if self.buyer_private_key is None:
+            if self.buyer_key_path and self.buyer_key_path.exists() and self.buyer_key_path.is_file():
+                with contextlib.suppress(Exception):
+                    self.buyer_private_key = self.buyer_key_path.read_text().strip()
+            if not self.buyer_private_key:
+                for env_var in ("WARRANT_BUYER_KEY", "BUYER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
+                    if os.environ.get(env_var):
+                        self.buyer_private_key = os.environ.get(env_var).strip()
+                        break
+
+    def __post_init__(self):
+        self._resolve_paths()
+        manifest = load_manifest(self.manifest_path)
+        self._resolve_parameters(manifest)
+        self._resolve_key(manifest)
 
 
 BuyerServerConfig = ServerConfig
@@ -717,6 +751,13 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
         verifier_address=cfg.verifier_address,
         server_account=cfg.buyer_account,
     )
+    if cfg.buyer_private_key:
+        if cfg.buyer_account:
+            escrow_client.register_key(cfg.buyer_account, cfg.buyer_private_key)
+        with contextlib.suppress(Exception):
+            from eth_account import Account
+            derived_addr = Account.from_key(cfg.buyer_private_key).address
+            escrow_client.register_key(derived_addr, cfg.buyer_private_key)
 
     service = BuyerWarrantService(
         state_dir=cfg.state_dir,
@@ -844,6 +885,18 @@ def main():
         default="artifacts/buyer_state",
         help="Directory to store local buyer state and task history",
     )
+    parser.add_argument(
+        "--private-key",
+        default=None,
+        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY / WARRANT_PRIVATE_KEY)",
+    )
+    parser.add_argument(
+        "--key-file",
+        dest="buyer_key_path",
+        type=pathlib.Path,
+        default=None,
+        help="Path to file containing buyer private key (default: from manifest or .keys/buyer.key)",
+    )
     args = parser.parse_args()
 
     config = ServerConfig(
@@ -854,6 +907,8 @@ def main():
         auto_mint=args.auto_mint,
         state_dir=pathlib.Path(args.state_dir),
         manifest_path=args.manifest_path,
+        buyer_private_key=args.private_key,
+        buyer_key_path=args.buyer_key_path,
     )
     run_server(config)
 

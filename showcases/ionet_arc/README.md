@@ -399,7 +399,15 @@ Start the Buyer Warrant guardrail sidecar:
   --transport streamable-http
 ```
 
-Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`.
+On live networks such as Arc Testnet, the buyer agent signs on-chain transactions (`USDC.approve`
+and `TaskEscrow.offer`) locally. Configure the buyer private key via any of:
+- File: save the key to `showcases/ionet_arc/.keys/buyer.key` (or reference in `manifest.yaml`
+  under `private_key_files.buyer_key`)
+- Environment variable: `export WARRANT_BUYER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- CLI flag: `--private-key 0x...` or `--key-file <path>`
+
+Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`, `--private-key <hex>`,
+`--key-file <path>`.
 
 ### 3. Run with an LLM Agent or Headless Test Runner
 

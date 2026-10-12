@@ -1,10 +1,11 @@
 """Tests for Buyer Warrant guardrail MCP server."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
@@ -361,6 +362,23 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             service._resolve_buyer_account()
         self.assertIn("Buyer account is not configured in config/manifest.yaml", str(ctx.exception))
+
+    def test_buyer_private_key_resolved_from_key_file(self):
+        key_file = Path(self.state_dir) / "custom_buyer.key"
+        key_file.write_text("0x" + "11" * 32 + "\n")
+        custom_manifest = Path(self.state_dir) / "manifest_with_key.yaml"
+        custom_manifest.write_text(yaml.dump({
+            "private_key_files": {
+                "buyer_key": str(key_file),
+            }
+        }))
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
+        self.assertEqual(config.buyer_private_key, "0x" + "11" * 32)
+
+    def test_buyer_private_key_resolved_from_env_var(self):
+        with patch.dict(os.environ, {"WARRANT_BUYER_KEY": "0x" + "22" * 32}):
+            config = ServerConfig(state_dir=self.state_dir, buyer_key_path=Path("/nonexistent"))
+            self.assertEqual(config.buyer_private_key, "0x" + "22" * 32)
 
 
 if __name__ == "__main__":
