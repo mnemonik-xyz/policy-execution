@@ -7,29 +7,36 @@ description: Verified call formats for Warrant audio transcription and buyer gua
 
 Guidelines and verified call formats for driving the dual-MCP Warrant audio transcription
 workflow across both servers:
-1. **Seller Service (`showcases/ionet_arc/seller_mcp_server.py`)**: Hardware discovery, pricing
-   proposals, container provisioning, on-chain settlement, and Whisper inference.
-2. **Buyer Guardrail (`showcases/ionet_arc/buyer_mcp_server.py`)**: Local policy validation,
-   cryptographic policy hash verification, and on-chain escrow funding.
+1. **Seller Service (`seller-mcp-server`)**: Hardware discovery, pricing proposals, container
+   provisioning, on-chain settlement, and Whisper inference.
+2. **Buyer Guardrail (`buyer-warrant-guardrail`)**: Local policy validation, cryptographic policy
+   hash verification, on-chain escrow funding, and deliverable sign-off.
 
 ## Core Principles
 
 - **No Destroy Tool**: Deployments use a 1-hour duration billing model (`billing_model: "duration"`)
   and automatically terminate on io.net. Do not search for or call a destroy tool.
+- **Capability-Based Two-Step Escrow**: Escrow is **not** settled on deployment. The seller commits
+  to the agreement on-chain (`TaskEscrow.accept`), provisions the container in the background, and
+  claims escrow payment only after the buyer verifies `/health` and signs an `Acceptance` receipt.
 - **Repeatable Inference**: While the 1-hour container session is active, `transcribe_audio` can be
   called repeatedly for multiple audio files.
-- **Strict 5-Step Lifecycle**:
+- **Strict 8-Step Lifecycle**:
   1. `list_suitable_hardware` (Seller): Find single-GPU options for Whisper.
   2. `propose_deployment` (Seller): Obtain formal escrow payment terms.
-  3. `warrant_evaluate_and_offer` (Buyer): Validate policy, verify hash, and fund escrow.
-  4. `deploy_with_escrow` (Seller): Verify deposit, launch container, settle deliverable.
-  5. `transcribe_audio` (Seller): Submit audio files for Whisper inference.
+  3. `warrant_evaluate_and_offer` (Buyer): Validate policy, verify hash, and fund escrow on-chain.
+  4. `deploy_with_escrow` (Seller): Commit agreement on-chain and start background provisioning.
+  5. `get_deployment_status` (Seller): Poll until status is `"ready"`, getting URL and token.
+  6. Health Check: Verify `GET /health` on the worker endpoint using the bearer token.
+  7. Deliverable Settlement: Call `warrant_sign_acceptance` (Buyer) and `submit_acceptance`
+     (Seller) to sign evidence and settle on-chain.
+  8. `transcribe_audio` (Seller): Submit audio files for Whisper inference.
 
 ---
 
 ## Tool Reference
 
-### Buyer Guardrail Tools (`buyer-warrant-mcp-server`)
+### Buyer Guardrail Tools (`buyer-warrant-guardrail`)
 
 #### 1. `warrant_get_policy`
 Inspect local spending constraints and configured buyer wallet before requesting quotes.
@@ -47,14 +54,28 @@ the cryptographic `warrant-policy` hash, approves ERC-20 token allowance, and su
     Alternatively accepts unpacked fields (`task_id`, `amount`, `amount_usd`, `salt`, `recipient`,
     `policy_hash`, `duration_hours`, `category`, `escrow_address`, `token_address`).
 - Returns:
-  - `status`: `"APPROVED_AND_OFFERED"` on success (raises `ToolError` on policy violation).
-  - `task_id`, `transaction_hash`, `customer`, `amount`, `policy_hash`, `escrow_address`.
+  - `status`: `"APPROVED"` on success (raises `ToolError` on policy violation).
+  - `task_id`, `transaction_hash`, `customer`, `recipient`, `amount`, `amount_usd`, `policy`,
+    `policy_hash`, `policy_version`, `escrow_address`, `token_address`, `accept_by`, `settle_by`.
 
-#### 3. `warrant_check_escrow_status`
+#### 3. `warrant_sign_acceptance`
+Signs an off-chain `Acceptance` deliverable receipt for an offered task using the buyer's private
+acceptance key (`buyer_acceptance.key`). Required by compute seller before on-chain settlement.
+- Arguments:
+  - `task_id` (string, required): Task identifier.
+  - `deliverable_hash` (string, required): Lowercase SHA-256 hash of `WARRANT_WORKER_TOKEN`.
+  - `recipient` (string, required): Payout address of seller.
+  - `amount` (int/str, required): Atomic token amount matching offered task.
+- Returns:
+  - `status`: `"signed"`.
+  - `task_id`, `acceptance` (object), `signature` (array of bytes).
+
+#### 4. `warrant_check_escrow_status`
 Queries on-chain `TaskEscrow` state to verify task lifecycle.
 - Arguments: `task_id` (string, required).
-- Returns: `task_id`, `state` (`"Offered"`, `"Accepted"`, `"Paid"`, `"Refunded"`), `amount`,
-  `policy_hash`, `recipient`, `customer`.
+- Returns: `task_id`, `state` (`"Offered"`, `"Accepted"`, `"Paid"`, `"Refunded"`), `state_idx`,
+  `customer`, `recipient`, `amount`, `policy_hash`, `policy_version`, `accept_by`, `settle_by`,
+  `escrow_address`.
 
 ---
 
@@ -75,27 +96,47 @@ calculated from actual hardware hourly pricing and duration.
   - `budget_cap_usd` (optional string): Maximum budget ceiling in USD (default: `"1.00"`).
   - `hardware_id` (optional string/int): Specific hardware ID to select.
   - `duration_hours` (optional int): Deployment duration in hours (default: `1`).
-- Returns: `task_id`, `salt`, `recipient`, `amount`, `amount_usd`, `duration_hours`,
-  `policy_hash`, `escrow_address`, `token_address`.
+  - `location_id` (optional string): Region identifier (default: `"US"`).
+- Returns: `status` (`"proposed"`), `task_id`, `salt`, `customer`, `recipient`, `amount`,
+  `amount_usd`, `duration_hours`, `policy_hash`, `escrow_address`, `token_address`,
+  `verifier_address`, `chain_id`.
 
 #### 3. `deploy_with_escrow`
-Verifies on-chain escrow funding, provisions the container on io.net, accepts the task on-chain
-once provisioned, settles the deliverable with a 384-byte authorization journal, and activates
-the transcription worker.
-- Arguments: `task_id` (string, required).
-- Returns: `status` (`"deployed"`), `deployment_id`, `public_url`, `expires_at`,
-  `settlement_transaction`.
+Verifies on-chain escrow deposit, commits the agreement on-chain via `TaskEscrow.accept()`,
+generates `WARRANT_WORKER_TOKEN` and deliverable hash, launches background container provisioning,
+and returns initial session state.
+- Arguments:
+  - `task_id` (string, required): Task ID from `propose_deployment`.
+  - `policy` (optional object): Concrete buyer policy stamped by buyer guardrail.
+- Returns: `status` (`"provisioning"` or `"ready"`), `task_id`, `deployment_id`, `public_url`,
+  `deliverable_hash`, `message`.
 
-#### 4. `transcribe_audio`
+#### 4. `get_deployment_status`
+Inspects active container provisioning status, health, and remaining seconds in the 1-hour window.
+- Arguments: `task_id` (optional string).
+- Returns:
+  - When provisioning: `active` (`false`), `status` (`"provisioning"`), `task_id`, `deployment_id`,
+    `deliverable_hash`, `elapsed_seconds`, `message`.
+  - When ready: `active` (`true`), `status` (`"ready"`), `task_id`, `deployment_id`, `public_url`,
+    `worker_token`, `deliverable_hash`, `hardware_id`, `remaining_seconds`, `is_expired`,
+    `settlement_transaction`.
+  - When failed: `active` (`false`), `status` (`"failed"`), `error`, `message`.
+
+#### 5. `submit_acceptance`
+Submits buyer-signed `Acceptance` evidence. Verifies policy rules and authority signatures
+off-chain via native `warrant-host evaluate`, approves the 384-byte authorization journal on
+`JournalVerifier`, and settles payment on `TaskEscrow` on-chain.
+- Arguments:
+  - `task_id` (string, required): Task identifier.
+  - `acceptance` (object, required): `Acceptance` struct signed by buyer.
+  - `signature` (array of ints or hex string, required): Buyer signature on acceptance.
+- Returns: `status` (`"settled"`), `task_id`, `settlement_transaction` (tx hash), `message`.
+
+#### 6. `transcribe_audio`
 Transcribes audio using the active 1-hour Whisper deployment on io.net.
 - Arguments:
-  - `audio_base64` (string, required): Base64-encoded audio file bytes (the caller reads the
-    file; the seller never accesses its own filesystem).
-  - `language` (optional string): 2-letter ISO language code (e.g. `"en"`).
+  - `audio_base64` (string, required): Base64-encoded audio file bytes.
+  - `language` (optional string): 2 or 3 letter ISO language code (e.g. `"en"`).
   - `task_id` (optional string): Target task ID to route inference when multiple deployments exist.
-- Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`.
-
-#### 5. `get_deployment_status`
-Inspects active container health, public URL, and remaining seconds in the 1-hour window.
-- Arguments: `task_id` (optional string).
-- Returns: `active` (bool), `is_expired` (bool), `remaining_seconds`, `settlement_transaction`.
+- Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`,
+  `elapsed_seconds`.
