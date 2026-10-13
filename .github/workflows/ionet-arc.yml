@@ -6,6 +6,8 @@ on:
       - 'showcases/ionet_arc/**'
       - 'contracts/**'
       - 'scripts/ionet-showcase.py'
+      - 'scripts/check-arc.py'
+      - 'scripts/test_check_arc.py'
       - '.github/workflows/ionet-arc.yml'
   workflow_dispatch:
 
@@ -47,13 +49,16 @@ jobs:
           echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
           npm ci --prefix contracts --ignore-scripts
       - name: Lint Python sources
-        run: ruff check showcases
+        run: ruff check showcases scripts/check-arc.py scripts/test_check_arc.py
       - name: Prepare test authority keys and credentials
         run: python showcases/ionet_arc/init.py
       - name: Run io.net Arc showcase test suite
         run: python -m unittest discover showcases/ionet_arc -v
+      - name: Arc probe script guard tests
+        run: python scripts/test_check_arc.py
       - name: Check CLI imports
         run: |
           python scripts/ionet-showcase.py --help
+          python scripts/check-arc.py --help
           python -m showcases.ionet_arc.seller_mcp_server --help
           python -m showcases.ionet_arc.buyer_test_agent --help

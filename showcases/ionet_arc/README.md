@@ -20,10 +20,15 @@ This showcase is an infrastructure and agent-interaction pilot. It demonstrates 
 policy evaluation, capability deliverable verification, and dual-MCP orchestration with the
 following design trade-offs:
 
-1. **Mock On-Chain ZK Verification (`JournalVerifier`)**:
-   - On-chain `TaskEscrow` settlement on Arc uses pre-approved digest verification
+1. **Mock On-Chain ZK Verification (`JournalVerifier`) on the testnet showcase**:
+   - On-chain `TaskEscrow` settlement on Arc testnet uses pre-approved digest verification
      (`JournalVerifier`) with a mock seal (`0xabcd`), rather than full RISC Zero Groth16
      proving (which requires Docker and takes 2–4 minutes per proof).
+   - The seller server also has a real-proof mode (`settlement: proof` in the manifest, or
+     `--settlement proof`). It runs `warrant-host prove`, `wrap` and `export-evm` in the
+     background, checks the proof image ID against `TaskEscrow.imageId()`, and calls
+     `TaskEscrow.settle(seal, journal)`. On Arc mainnet (chain ID 5042) this mode is mandatory;
+     mock settlement is refused there. See [Mainnet canary](#mainnet-canary).
    - Off-chain policy evaluation is **fully real and cryptographic**: the native Rust
      `warrant-host evaluate` binary executes in under 10ms, cryptographically verifying all
      ECDSA authority signatures (`registry.key`, `buyer_acceptance.key`), category limits,
@@ -346,6 +351,43 @@ forge script script/Deploy.s.sol:Deploy \
 
 ---
 
+## Mainnet canary
+
+The mainnet canary runs this flow once on Arc mainnet (chain ID 5042) with a real proof and an
+order of at most 2 USDC. The plan is `docs/product/mainnet-canary-plan.md`. The code gaps that
+plan lists under Phase 0 are closed in this repository; nothing is deployed.
+
+Mainnet differs from the testnet showcase in four ways:
+
+1. **Manifest.** `config/mainnet/manifest.yaml` holds chain ID 5042, the mainnet RPC,
+   `settlement: proof`, `validity_seconds: 7200`, and the worker image pinned by digest. The
+   address and image ID fields stay empty until deployment. Generate its credentials with
+   `python3 showcases/ionet_arc/init.py --manifest showcases/ionet_arc/config/mainnet/manifest.yaml`
+   after the escrow address is known, because the vendor credential binds the vault address.
+2. **Verifier.** `Deploy.s.sol` creates the real `RiscZeroGroth16Verifier` with the escrow.
+   `DeployMock.s.sol` and `JournalVerifier` must not be used. The guest image ID must come from a
+   `RISC0_USE_DOCKER=1` build of `warrant-host`; local builds differ between machines.
+3. **Read-only checks.** `scripts/check-arc.py probe --network mainnet <proof.json>` runs before
+   deployment: chain ID, USDC decimals, BN254 precompiles and a real proof simulated with
+   `eth_call`. `scripts/check-arc.py verify --network mainnet --escrow <addr> --verifier <addr>`
+   runs after deployment and before any order is funded: it reads the immutables, compares the
+   deployed code with the local build, and writes the deployment manifest.
+4. **Keys.** The deployer signs through a Foundry keystore or a Ledger. The buyer and seller
+   services hold dedicated low-balance keys in `0600` files. No key goes on a command line.
+
+Recorded decisions (2026-10-13):
+
+- The core team decided on 2026-10-09 to skip the public Arc testnet settlement rehearsal
+  (criterion CHAIN-1 in `docs/product/settlement.md`). The plan of 2026-10-12 recommends one
+  real-proof order on testnet first, because this MCP flow has only settled with the mock seal.
+  Until that order runs, the canary is the first real-proof settlement of this flow on a public
+  chain.
+- No independent review (criterion CHAIN-5) is planned before the canary. The spend caps
+  (`max_budget_usd`, one order, `--max-cost-usd 1.00` for io.net) are the control that replaces
+  it. The canary is not a production launch.
+
+---
+
 ## Running the Showcase
 
 Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their initial parameters
@@ -384,14 +426,15 @@ Execution modes:
   (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
 On live networks like Arc Testnet, the seller agent signs `TaskEscrow.accept()` and
-`TaskEscrow.settle()` on-chain. Configure the seller private key via any of:
+`TaskEscrow.settle()` on-chain. Configure the seller private key via one of:
 - File: save to `showcases/ionet_arc/.keys/seller.key` (or reference in `manifest.yaml`
-  under `private_key_files.seller_key`)
-- Environment variable: `export WARRANT_SELLER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
-- CLI flag: `--private-key 0x...` or `--key-file <path>`
+  under `private_key_files.seller_key`), or pass `--key-file <path>`. The file must be a
+  regular file with mode `0600`; a file that group or others can read is refused.
+- Environment variable: `export WARRANT_SELLER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`). Use this
+  for local Anvil runs only; the servers do not enforce that limit.
 
-Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`,
-`--private-key <hex>`, `--key-file <path>`.
+A private key is never accepted on the command line. Optional CLI flags: `--manifest <path>`,
+`--rpc-url <url>`, `--server-account <address>`, `--key-file <path>`, `--settlement mock|proof`.
 
 ### 2. Run the Buyer Warrant MCP Server
 
@@ -408,14 +451,18 @@ Start the Buyer Warrant guardrail sidecar:
 ```
 
 On live networks such as Arc Testnet, the buyer agent signs on-chain transactions (`USDC.approve`
-and `TaskEscrow.offer`) locally. Configure the buyer private key via any of:
+and `TaskEscrow.offer`) locally. Configure the buyer private key via one of:
 - File: save the key to `showcases/ionet_arc/.keys/buyer.key` (or reference in `manifest.yaml`
-  under `private_key_files.buyer_key`)
-- Environment variable: `export WARRANT_BUYER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
-- CLI flag: `--private-key 0x...` or `--key-file <path>`
+  under `private_key_files.buyer_key`), or pass `--key-file <path>`. The file must be a
+  regular file with mode `0600`; a file that group or others can read is refused.
+- Environment variable: `export WARRANT_BUYER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`). Use this
+  for local Anvil runs only; the servers do not enforce that limit.
 
-Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`, `--private-key <hex>`,
-`--key-file <path>`.
+A private key is never accepted on the command line. Optional CLI flags: `--manifest <path>`,
+`--rpc-url <url>`, `--auto-mint`, `--key-file <path>`.
+
+The escrow deadline `settleBy` equals the compiled policy's `valid_until`, which is
+`validity_seconds` (2 hours in the manifests) after funding. A real proof must settle before it.
 
 ### 3. Run with an LLM Agent or Headless Test Runner
 

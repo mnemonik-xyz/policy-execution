@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,7 +11,13 @@ from unittest.mock import MagicMock, patch
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
-from showcases.ionet_arc.buyer_mcp_server import BuyerServerConfig, ServerConfig, create_app, create_server
+from showcases.ionet_arc.buyer_mcp_server import (
+    BuyerServerConfig,
+    BuyerWarrantService,
+    ServerConfig,
+    create_app,
+    create_server,
+)
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
 
 
@@ -366,6 +373,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
     def test_buyer_private_key_resolved_from_key_file(self):
         key_file = Path(self.state_dir) / "custom_buyer.key"
         key_file.write_text("0x" + "11" * 32 + "\n")
+        os.chmod(key_file, 0o600)
         custom_manifest = Path(self.state_dir) / "manifest_with_key.yaml"
         custom_manifest.write_text(yaml.dump({
             "private_key_files": {
@@ -374,6 +382,32 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         }))
         config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
         self.assertEqual(config.buyer_private_key, "0x" + "11" * 32)
+
+    def test_buyer_key_file_shared_with_group_or_others_is_refused(self):
+        key_file = Path(self.state_dir) / "shared_buyer.key"
+        key_file.write_text("0x" + "11" * 32 + "\n")
+        os.chmod(key_file, 0o640)
+        with self.assertRaises(PermissionError):
+            ServerConfig(state_dir=self.state_dir, buyer_key_path=key_file)
+
+    def test_settle_by_follows_the_compiled_policy_validity(self):
+        service = BuyerWarrantService(state_dir=self.state_dir, escrow_client=self.mock_escrow)
+        self.mock_escrow.token_balance.return_value = 10_000_000
+        self.mock_escrow.offer.return_value = {"transactionHash": "0x" + "cc" * 32}
+        deadline = int(time.time()) + 7200
+        funded = service._fund_escrow(
+            escrow_addr="0x" + "11" * 20, token_addr="0x" + "22" * 20, atomic_amount=1_000_000,
+            salt="0x" + "33" * 32, recipient="0x" + "44" * 20, policy_hash="0x" + "55" * 32, policy_version=1,
+            buyer_account="0x" + "66" * 20, settle_by=deadline,
+        )
+        self.assertEqual(funded["settle_by"], deadline)
+        self.assertEqual(self.mock_escrow.offer.call_args.kwargs["settle_by"], deadline)
+        with self.assertRaises(ToolError):
+            service._fund_escrow(
+                escrow_addr="0x" + "11" * 20, token_addr="0x" + "22" * 20, atomic_amount=1_000_000,
+                salt="0x" + "33" * 32, recipient="0x" + "44" * 20, policy_hash="0x" + "55" * 32, policy_version=1,
+                buyer_account="0x" + "66" * 20, settle_by=int(time.time()),
+            )
 
     def test_buyer_private_key_resolved_from_env_var(self):
         with patch.dict(os.environ, {"WARRANT_BUYER_KEY": "0x" + "22" * 32}):

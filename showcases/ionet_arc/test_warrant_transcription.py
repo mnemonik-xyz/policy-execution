@@ -1,12 +1,15 @@
 """Tests for Warrant io.net transcription MCP server."""
 
+import asyncio
 import base64
+import hashlib
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
@@ -18,7 +21,10 @@ from showcases.ionet_arc.seller_mcp_server import (
     create_app,
     create_server,
     filter_suitable_gpus,
+    resolve_settlement_mode,
 )
+
+IMAGE_ID = "0x" + "ab" * 32
 
 
 def encode_audio(path: Path) -> str:
@@ -356,6 +362,149 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
         self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
+
+    async def _ready_session_with_acceptance(self, mcp=None) -> tuple[str, dict, list[int]]:
+        """Propose, deploy and sign an acceptance against the mock worker. Returns task_id, acceptance, signature."""
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        call = self.call if mcp is None else (lambda n, a=None: self._call_on(mcp, n, a))
+        proposal = await call("propose_deployment")
+        task_id = proposal["task_id"]
+        buyer_policy, task_data = self._create_mock_offered_task(proposal)
+        self.mock_escrow.get_task.return_value = task_data
+        await call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await call("get_deployment_status", {"task_id": task_id})
+        acceptance = {
+            "scope": {
+                "chain_id": proposal["chain_id"],
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        return task_id, acceptance, sign_acceptance(acceptance)
+
+    @staticmethod
+    async def _call_on(mcp, tool_name: str, arguments: dict | None = None) -> dict:
+        res = await mcp.call_tool(tool_name, arguments or {})
+        return json.loads(res.content[0].text)
+
+    def _proof_server(self):
+        self.mock_escrow.async_image_id = AsyncMock(return_value=IMAGE_ID)
+        self.mock_escrow.async_settle = AsyncMock(return_value={"transactionHash": "0x" + "bb" * 32})
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            return create_server(
+                self.state_dir,
+                mock_ionet=True,
+                vendor_credential_path=self.cred_path,
+                vendor_signature_path=self.sig_path,
+                settlement_mode="proof",
+            )
+
+    @staticmethod
+    def _fake_prover(image_id: str):
+        from showcases.ionet_arc.escrow import evaluate_authorization
+
+        def prove(policy, request, evidence, work_dir):
+            _, journal = evaluate_authorization(policy, request, evidence)
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+            return {
+                "imageId": image_id,
+                "journal": "0x" + journal.hex(),
+                "journalDigest": "0x" + hashlib.sha256(journal).hexdigest(),
+                "seal": "0x" + "cd" * 4,
+            }
+
+        return prove
+
+    async def _wait_for_settlement(self, mcp, task_id: str) -> dict:
+        for _ in range(200):
+            status = await self._call_on(mcp, "get_deployment_status", {"task_id": task_id})
+            if status["status"] in ("settled", "settlement_failed"):
+                return status
+            await asyncio.sleep(0.02)
+        self.fail("settlement did not finish")
+
+    def test_resolve_settlement_mode_rules(self):
+        self.assertEqual(resolve_settlement_mode(None, 31337), "mock")
+        self.assertEqual(resolve_settlement_mode(None, 5042002), "mock")
+        self.assertEqual(resolve_settlement_mode(None, 5042), "proof")
+        self.assertEqual(resolve_settlement_mode("proof", 31337), "proof")
+        with self.assertRaises(ValueError):
+            resolve_settlement_mode("mock", 5042)
+        with self.assertRaises(ValueError):
+            resolve_settlement_mode("fake", 31337)
+
+    def test_mainnet_manifest_forces_proof_mode(self):
+        manifest = Path(self.state_dir) / "mainnet.yaml"
+        manifest.write_text(yaml.dump({"chain_id": 5042, "settlement": "mock"}))
+        with self.assertRaises(ValueError):
+            ServerConfig(state_dir=self.state_dir, manifest_path=manifest)
+        manifest.write_text(yaml.dump({"chain_id": 5042}))
+        self.assertEqual(ServerConfig(state_dir=self.state_dir, manifest_path=manifest).settlement_mode, "proof")
+        manifest.write_text(yaml.dump({"chain_id": 31337, "worker_image": "ghcr.io/x/y@sha256:" + "00" * 32}))
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=manifest)
+        self.assertEqual(config.settlement_mode, "mock")
+        self.assertEqual(config.worker_image, "ghcr.io/x/y@sha256:" + "00" * 32)
+
+    async def test_proof_mode_settles_with_the_real_seal_in_the_background(self):
+        mcp = self._proof_server()
+        task_id, acceptance, sig = await self._ready_session_with_acceptance(mcp)
+        with patch("showcases.ionet_arc.seller_mcp_server.prove_authorization", self._fake_prover(IMAGE_ID)):
+            first = await self._call_on(mcp, "submit_acceptance", {"task_id": task_id, "acceptance": acceptance,
+                                                                    "signature": sig})
+            self.assertEqual(first["status"], "proving")
+            self.assertEqual(first["settlement"]["attempt"], 1)
+            status = await self._wait_for_settlement(mcp, task_id)
+        self.assertEqual(status["status"], "settled")
+        self.assertEqual(status["settlement_transaction"], "0x" + "bb" * 32)
+        self.assertEqual(status["settlement"]["image_id"], IMAGE_ID)
+        self.mock_escrow.settle_mock.assert_not_called()
+        seal, journal = self.mock_escrow.async_settle.await_args.args[:2]
+        self.assertEqual(seal, "0x" + "cd" * 4)
+        self.assertEqual(len(journal), 384)
+        again = await self._call_on(mcp, "submit_acceptance", {"task_id": task_id, "acceptance": acceptance,
+                                                                "signature": sig})
+        self.assertEqual(again["status"], "settled")
+        self.assertEqual(self.mock_escrow.async_settle.await_count, 1)
+
+    async def test_proof_mode_refuses_a_proof_for_another_image_and_allows_a_retry(self):
+        mcp = self._proof_server()
+        task_id, acceptance, sig = await self._ready_session_with_acceptance(mcp)
+        args = {"task_id": task_id, "acceptance": acceptance, "signature": sig}
+        with patch("showcases.ionet_arc.seller_mcp_server.prove_authorization", self._fake_prover("0x" + "ee" * 32)):
+            await self._call_on(mcp, "submit_acceptance", args)
+            status = await self._wait_for_settlement(mcp, task_id)
+        self.assertEqual(status["status"], "settlement_failed")
+        self.assertIn("image ID", status["settlement"]["error"])
+        self.mock_escrow.async_settle.assert_not_awaited()
+        with patch("showcases.ionet_arc.seller_mcp_server.prove_authorization", self._fake_prover(IMAGE_ID)):
+            retry = await self._call_on(mcp, "submit_acceptance", args)
+            self.assertEqual((retry["status"], retry["settlement"]["attempt"]), ("proving", 2))
+            status = await self._wait_for_settlement(mcp, task_id)
+        self.assertEqual(status["status"], "settled")
+
+    async def test_proof_mode_refuses_dev_mode_receipts(self):
+        from showcases.ionet_arc.escrow import prove_authorization
+
+        with patch.dict(os.environ, {"RISC0_DEV_MODE": "1"}), self.assertRaises(RuntimeError):
+            prove_authorization({}, {}, {}, Path(self.state_dir) / "proof")
+
+    def test_seller_key_file_must_be_owner_only(self):
+        key_file = Path(self.state_dir) / "seller.key"
+        key_file.write_text("0x" + "11" * 32 + "\n")
+        os.chmod(key_file, 0o644)
+        with self.assertRaises(PermissionError):
+            ServerConfig(state_dir=self.state_dir, seller_key_path=key_file)
+        os.chmod(key_file, 0o600)
+        self.assertEqual(ServerConfig(state_dir=self.state_dir, seller_key_path=key_file).seller_private_key,
+                         "0x" + "11" * 32)
 
     async def test_submit_acceptance_fails_when_vendor_credential_missing(self):
         proposal = await self.call("propose_deployment")

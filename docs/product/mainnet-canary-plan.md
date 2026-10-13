@@ -1,5 +1,55 @@
 # Plan: Arc mainnet canary + io.net showcase
 
+## Revision of 2026-10-12 and Phase 0 status of 2026-10-13
+
+The revised plan (2026-10-12) replaces the solver-based plan below where the two differ.
+The canary is one real GPU-rental order of at most 2 USDC through `TaskEscrow` on Arc
+mainnet with a real proof, driven by the two MCP servers in `showcases/ionet_arc`, then a
+Circle Agent Marketplace listing for the seller. `SolverBountyEscrow` and
+`scripts/solver-canary.py` stay available but are not the canary path.
+
+### Phase 0: code gaps closed in this repository
+
+| Gap | Status | Where |
+|---|---|---|
+| Real-proof settlement in the seller server | Done. `settlement: proof` runs `warrant-host prove`, `wrap`, `export-evm` in the background, checks the proof image ID against `TaskEscrow.imageId()`, then calls `settle(seal, journal)`. Mock settlement is refused on chain 5042. | `seller_mcp_server.py`, `escrow.py` |
+| Settlement window | Done. `validity_seconds: 7200` in both manifests. The buyer sets `settleBy` equal to the policy `valid_until`; before this change `settleBy` stayed at 900 seconds whatever the manifest said. | `buyer_mcp_server.py`, `config/*.yaml` |
+| Mainnet manifest | Done, with empty address and image fields until deployment. | `config/mainnet/manifest.yaml` |
+| `check-arc.py` accepts chain 5042 | Done. `probe` and `verify` phases; `verify` compares deployed code with the local build and writes the deployment manifest. `ArcProbe` accepts both chains. | `scripts/check-arc.py`, `scripts/test_check_arc.py` |
+| No private key on the command line | Done. `--private-key` removed from both servers. Key files must be regular files with mode `0600`. | both servers, `escrow.py` |
+| Reproducible image ID | Open. Needs an x86 host with Docker: `RISC0_USE_DOCKER=1 cargo build --release --locked -p warrant-host` then `warrant-host image-id`. The cloud session cannot install the RISC Zero toolchain through its proxy. | runbook |
+| Worker image digest | Done for 2026-10-13: `sha256:08e42fc4…` for the mutable tag `:pilot` (the tag moved again since 2026-10-09). Re-read it at deploy time. | `config/mainnet/manifest.yaml` |
+| Gate decisions recorded | Done. | `settlement.md`, showcase README |
+
+Phase 0 test status on 2026-10-13: the showcase suite passes (114 tests, one skipped) with
+natively built `warrant-host`, `warrant-policy` and `warrant-evidence`; the probe and canary
+guard tests pass. The Solidity suite and a real proof were not run in this session: it has no
+`forge`, no `rzup` toolchain and no Docker daemon. Run `forge test` and the local Anvil
+rehearsal (Phase 1) on the prover host before any broadcast.
+
+### Infrastructure the canary needs
+
+| Component | What it is | Who provides it | Status |
+|---|---|---|---|
+| Prover host | x86-64 Linux, Docker daemon, Foundry 1.8.4, Rust 1.98.1, `rzup` with Rust 1.88.0 and `r0vm` 3.0.5, 16 GB RAM or more. Builds the reproducible image ID, runs Phase 1, generates every settlement proof. | Team | Not arranged |
+| Seller host | Public HTTPS host for the seller MCP server at `/mcp`, with the seller key file (`0600`), the io.net API key, and network access to the prover (or the prover runs on the same host). Later also the x402 front door. | Team | Not arranged |
+| Buyer machine | Runs the buyer guardrail over stdio with the buyer key file and `buyer_acceptance.key`. Any machine with Python 3.12 and the built binaries. | Team | Not arranged |
+| Deployer signer | Foundry keystore (`cast wallet import`) or a Ledger. Signs the two deployment transactions only. | Key holder | Not arranged |
+| Wallets on Arc mainnet | Deployer (gas for two contract creations), buyer (2 USDC order plus gas), seller (gas for `accept` and `settle`). Record the balances with read-only calls before Phase 3. | Key holder | Not funded |
+| Arc mainnet RPC | `https://rpc.mainnet.arc.io`, chain ID 5042. A private RPC URL goes in `WARRANT_RPC_URL`, never in a file under version control. | Public | Available |
+| io.net account | API key with io-cloud access and prefunded credits; cap 1 USD per run with `--max-cost-usd 1.00`, 1 GPU, 1 replica, 1 hour, duration billing. | Team | Not arranged |
+| Worker image | `ghcr.io/mnemonik-xyz/warrant-transcription` by digest, built by `.github/workflows/ionet-arc-image.yml`. No GPU run of the current image is recorded. | GHCR | Published |
+| Evidence storage | A directory per environment (local, testnet, mainnet) with the deployment manifest, proofs, receipts and transcripts, outside the containers. Optional Hetzner copy. | Team | Not arranged |
+| Public audio | One real public audio file as the workload. Synthetic data is disqualified. | Team | Not chosen |
+
+### Caps
+
+Order amount 2.00 USDC (`max_budget_usd`); lease 1 GPU, 1 replica, 1 hour; io.net 1.00 USD per
+run; one order, then stop and review. Settlement window 2 hours. A broadcast with an unknown
+outcome is read from the chain, never resent blind.
+
+## Plan of 2026-10-09 (solver flow, kept for the record)
+
 ## Context
 PR #12 and PR #14 (both merged 2026-10-09) polished the io.net adapter and reworked the worker image. Goal: a mainnet canary. `SolverBountyEscrow` on Arc mainnet (chain 5042, RPC verified live), one small real-proof settlement, then a separate capped io.net GPU transcription run. Decisions: mainnet canary, full local rehearsal first, prefunded io.net credits, new canary script for mainnet txs.
 

@@ -83,9 +83,12 @@ def no_credentials(value):
 
 def decode_result(result):
     if result.get("isError"):
+        # The provider text can echo request arguments, including environment values such as the
+        # worker token. Report its size and digest only; the raw text is never written anywhere.
         texts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
-        err = texts[0] if texts else "no details"
-        print(f"io.net error details: {err}", file=sys.stderr)
+        err = texts[0] if texts else ""
+        print(f"io.net tool error: {len(err)} characters, sha256 {hashlib.sha256(err.encode()).hexdigest()[:16]}",
+              file=sys.stderr)
         raise PilotError("io.net returned a tool error; no automatic retry was made")
     data = result.get("structuredContent")
     if data is None:

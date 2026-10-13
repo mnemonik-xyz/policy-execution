@@ -12,7 +12,7 @@ The initial live run uses one GPU, one replica and one hour of duration billing.
 
 The solver's job-duration cost can differ from rental charges because providers charge for reserved time, startup, minimum periods and idle time. Display “modeled schedule cost” and “provider estimate” separately. A pricing-aware proof of the entire cloud bill would require a versioned checker and trustworthy price inputs.
 
-The pilot matches hardware, location, duration, GPU count and replica count between estimate and deploy and rejects estimates older than five minutes or over the authorized bound. This checks an estimate; it is not an atomic provider-enforced cap. Keep available credits bounded, reconcile actual charges and stop provisioning when uncertainty exists. PayG remains disabled for the pilot because duration does not bound PayG lifetime.
+The pilot matches hardware, location, duration, GPU count and replica count between estimate and deploy and rejects estimates older than five minutes or over the authorized bound. This checks an estimate; it is not an atomic provider-enforced cap. Keep available credits bounded, reconcile actual charges and stop provisioning when uncertainty exists. The adapter accepts `duration` and `payg` as billing models, but the seller server and the canary use `duration` only, because a duration lease bounds the lifetime of the container and PayG does not.
 
 ## Durable execution flow
 

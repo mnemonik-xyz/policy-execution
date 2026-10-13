@@ -48,6 +48,7 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     compile_buyer_policy,
     get_manifest_parameter,
     load_manifest,
+    read_private_key_file,
     sign_acceptance,
 )
 
@@ -253,7 +254,13 @@ class BuyerWarrantService:
         policy_version: int,
         buyer_account: str | None = None,
         validity_seconds: int = 900,
+        settle_by: int | None = None,
     ) -> dict:
+        """Approve the exact amount and call TaskEscrow.offer().
+
+        ``settle_by`` must equal the compiled policy's ``valid_until``: the contract rejects a proof after
+        either deadline, so the two must not drift apart.
+        """
         buyer_account = buyer_account or self._resolve_buyer_account()
         logger.info(
             "Funding TaskEscrow on-chain: escrow=%s, token=%s, amount=%d, buyer=%s, recipient=%s",
@@ -296,7 +303,10 @@ class BuyerWarrantService:
 
         now = int(time.time())
         accept_by = now + 300
-        settle_by = now + validity_seconds
+        if settle_by is None:
+            settle_by = now + validity_seconds
+        if settle_by <= accept_by:
+            raise ToolError(f"settle_by {settle_by} must come after accept_by {accept_by}")
 
         try:
             logger.info(
@@ -468,6 +478,7 @@ class BuyerWarrantService:
             policy_hash=derived_policy_hash,
             policy_version=policy_version,
             buyer_account=buyer_account,
+            settle_by=int(concrete_policy["valid_until"]),
         )
 
         # Record task state for subsequent acceptance verification
@@ -706,9 +717,9 @@ class ServerConfig:
                     self.buyer_key_path = default_buyer_key
 
         if self.buyer_private_key is None:
-            if self.buyer_key_path and self.buyer_key_path.exists() and self.buyer_key_path.is_file():
-                with contextlib.suppress(Exception):
-                    self.buyer_private_key = self.buyer_key_path.read_text().strip()
+            if self.buyer_key_path and self.buyer_key_path.exists():
+                # A key file that exists but is unreadable, shared or malformed is a configuration error.
+                self.buyer_private_key = read_private_key_file(self.buyer_key_path)
             if not self.buyer_private_key:
                 for env_var in ("WARRANT_BUYER_KEY", "BUYER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
                     if os.environ.get(env_var):
@@ -886,16 +897,14 @@ def main():
         help="Directory to store local buyer state and task history",
     )
     parser.add_argument(
-        "--private-key",
-        default=None,
-        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY / WARRANT_PRIVATE_KEY)",
-    )
-    parser.add_argument(
         "--key-file",
         dest="buyer_key_path",
         type=pathlib.Path,
         default=None,
-        help="Path to file containing buyer private key (default: from manifest or .keys/buyer.key)",
+        help=(
+            "Path to the buyer private key file, mode 0600 (default: from manifest or .keys/buyer.key). "
+            "A key is never accepted on the command line."
+        ),
     )
     args = parser.parse_args()
 
@@ -907,7 +916,6 @@ def main():
         auto_mint=args.auto_mint,
         state_dir=pathlib.Path(args.state_dir),
         manifest_path=args.manifest_path,
-        buyer_private_key=args.private_key,
         buyer_key_path=args.buyer_key_path,
     )
     run_server(config)

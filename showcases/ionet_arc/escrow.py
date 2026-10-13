@@ -8,7 +8,9 @@ import contextlib
 import functools
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -28,6 +30,7 @@ __all__ = [
     "DEFAULT_CATEGORY",
     "DEFAULT_CHAIN_ID",
     "DEFAULT_MANIFEST_PATH",
+    "MAINNET_CHAIN_IDS",
     "MOCK_IMAGE_ID",
     "MOCK_SEAL",
     "REPO_ROOT",
@@ -48,6 +51,8 @@ __all__ = [
     "hash_policy",
     "load_manifest",
     "parse_public_key",
+    "prove_authorization",
+    "read_private_key_file",
     "should_trust_env",
     "sign_acceptance",
     "sign_vendor_credential",
@@ -59,6 +64,7 @@ DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 42
 MOCK_SEAL = "0xabcd"
 MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
+MAINNET_CHAIN_IDS = frozenset({5042})  # Arc mainnet. Mock settlement is refused on these chains.
 DEFAULT_MANIFEST_PATH = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
 
 
@@ -279,6 +285,29 @@ def find_warrant_binary(name: str) -> Path:
         if cand and cand.exists() and cand.is_file():
             return cand
     raise FileNotFoundError(f"Could not find compiled binary '{name}'. Run 'cargo build --release -p warrant-host'.")
+
+
+def read_private_key_file(path: Path | str) -> str:
+    """Read a hex private key from a regular file that only its owner can read.
+
+    The file must not be readable or writable by group or others (mode 0600 or stricter).
+    The key never appears on a command line, in a log line, or in an error message.
+    """
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise FileNotFoundError(f"Private key file not found: {path}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Private key file must be a regular file, not a link or directory: {path}")
+    if info.st_mode & 0o077:
+        raise PermissionError(
+            f"Private key file {path} is readable by group or others; run: chmod 600 {path}"
+        )
+    key = path.read_text().strip()
+    if not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", key):
+        raise ValueError(f"Private key file {path} does not hold one 32-byte hex key")
+    return key
 
 
 def parse_public_key(key: list[int] | str | bytes) -> list[int]:
@@ -522,6 +551,45 @@ def evaluate_authorization(policy: dict, request: dict, evidence: dict) -> tuple
     return auth, journal_bytes
 
 
+def prove_authorization(policy: dict, request: dict, evidence: dict, work_dir: Path | str) -> dict:
+    """Produce a real Groth16 proof of the authorization and export it for the EVM verifier.
+
+    Runs ``warrant-host prove``, ``wrap`` and ``export-evm`` in ``work_dir``. ``wrap`` needs an x86 host
+    with Docker. Fake receipts are refused: the host binary rejects them, and ``RISC0_DEV_MODE`` is refused
+    here before any work starts. Returns the exported proof: ``imageId``, ``journal``, ``journalDigest``
+    and ``seal`` as 0x-prefixed hex strings. The caller must compare ``journal`` with the native journal.
+    """
+    if os.environ.get("RISC0_DEV_MODE"):
+        raise RuntimeError("RISC0_DEV_MODE is set; fake receipts are prohibited for settlement")
+    host_bin = find_warrant_binary("warrant-host")
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    input_file = work / "input.json"
+    receipt = work / "request.receipt"
+    groth16 = work / "request-groth16.receipt"
+    exported = work / "evm.json"
+    for path in (receipt, groth16, exported):
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite an existing proof artifact: {path}")
+    input_file.write_text(json.dumps({"policy": policy, "request": request, "evidence": evidence}))
+
+    def run(*args: str) -> None:
+        res = subprocess.run([str(host_bin), *args], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            tail = (res.stderr or res.stdout).strip()[-1500:]
+            raise RuntimeError(f"warrant-host {args[0]} failed: {tail}")
+
+    run("prove", str(input_file), str(receipt))
+    run("wrap", str(receipt), str(groth16))
+    run("export-evm", str(groth16), str(exported))
+    proof = json.loads(exported.read_text())
+    for key in ("imageId", "journal", "journalDigest", "seal"):
+        value = proof.get(key)
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise RuntimeError(f"Exported proof is missing {key}")
+    return proof
+
+
 def compute_task_id(chain_id: int, escrow_address: str, customer_address: str, salt: str | bytes) -> str:
     """Derive deterministic TaskEscrow task_id matching keccak256(abi.encode(chain_id, escrow, customer, salt))."""
     encoded = encode(
@@ -650,14 +718,14 @@ class EscrowClient:
             raise RuntimeError(f"Transaction reverted: {receipt}")
         return receipt
 
-    def wait_for_receipt(self, tx_hash: str, timeout: float = 30.0) -> dict:
+    def wait_for_receipt(self, tx_hash: str, timeout: float = 120.0) -> dict:
         started = time.time()
         while time.time() - started < timeout:
             receipt = self.rpc.rpc("eth_getTransactionReceipt", [tx_hash])
             if receipt:
                 return receipt
-            time.sleep(0.05)
-        raise TimeoutError(f"Transaction receipt timeout for {tx_hash}")
+            time.sleep(1.0 if should_trust_env(self.rpc_url) else 0.05)
+        raise TimeoutError(f"Transaction receipt timeout for {tx_hash}; read the chain before any retry")
 
     def task_id_for(self, customer: str, salt: str) -> str:
         """Call TaskEscrow.taskIdFor(customer, salt) with result caching and offline fallback."""
@@ -715,6 +783,11 @@ class EscrowClient:
             "state": state_name,
         }
 
+    def image_id(self) -> str:
+        """Read the guest image ID the escrow was deployed with (TaskEscrow.imageId)."""
+        res = self.call_contract(self.escrow, "imageId()", [], [], ["bytes32"])
+        return "0x" + res[0].hex()
+
     def accept(self, task_id: str, sender: str | None = None) -> dict:
         sender = sender or self.server_account
         if not sender:
@@ -756,6 +829,8 @@ class EscrowClient:
     ) -> dict:
         """Approve journal on JournalVerifier (if configured) and settle TaskEscrow with mock seal."""
         sender = sender or self.server_account
+        if int(self.rpc.chain_id()) in MAINNET_CHAIN_IDS:
+            raise RuntimeError("Mock settlement is refused on a mainnet chain; use a real proof")
         if self.verifier:
             with contextlib.suppress(Exception):
                 self.approve_journal(journal_bytes, sender=sender)
@@ -863,6 +938,9 @@ class EscrowClient:
 
     async def async_get_task(self, task_id: str) -> dict:
         return await asyncio.to_thread(self.get_task, task_id)
+
+    async def async_image_id(self) -> str:
+        return await asyncio.to_thread(self.image_id)
 
     async def async_accept(self, task_id: str, sender: str | None = None) -> dict:
         return await asyncio.to_thread(self.accept, task_id, sender)

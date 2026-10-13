@@ -65,4 +65,14 @@ Before offering real deals, verify the RPC chain, token behavior/decimals, deplo
 - CHAIN-5: Independent review covers the solver checker, projection, escrow, proving build and signing boundary. Mainnet rollout requires recorded resolution of findings.
 - CHAIN-6: Each enabled task, invoice and revocable-vault deployment has its own verified manifest and settlement evidence; the Circom deployment uses its own reviewed key/setup. CAT coverage prevents presenting a solver-only deployment as complete site support.
 
+## Mainnet canary exceptions
+
+Recorded 2026-10-13 for the Arc mainnet canary described in [mainnet-canary-plan.md](mainnet-canary-plan.md).
+
+- CHAIN-1 (Arc testnet settlement with a real proof): not satisfied. The core team decided on 2026-10-09 to skip the public testnet rehearsal. The revised plan of 2026-10-12 recommends one real-proof order on testnet before mainnet; that order has not run. The task-escrow MCP flow has settled only with the mock `JournalVerifier` seal on a public chain. The canary is therefore the first real-proof settlement of this flow outside a local chain.
+- CHAIN-5 (independent review): not satisfied. No independent review is planned before the canary. A self-review of the escrow, the proving build and the signing boundary replaces it, and the spend caps (one order of at most 2 USDC, 1 USD of io.net credit per run) bound the loss.
+- CHAIN-2, CHAIN-3 and CHAIN-4 are covered by the Solidity suite on a local chain. CHAIN-6 is satisfied for the task escrow only once `scripts/check-arc.py verify` has written the deployment manifest.
+
+The canary is a developer showcase with canary amounts, not a production launch. These exceptions must be removed, by running the gates, before any deployment that handles customer funds.
+
 Sources: [Arc network configuration](https://docs.arc.io/arc/references/connect-to-arc), [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses), [Arc EVM differences](https://docs.arc.io/integrate/evm-differences).

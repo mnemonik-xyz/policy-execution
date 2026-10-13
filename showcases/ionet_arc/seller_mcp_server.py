@@ -50,6 +50,7 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
+    MAINNET_CHAIN_IDS,
     EscrowClient,
     address20,
     bytes32,
@@ -57,11 +58,26 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     get_manifest_parameter,
     hash_policy,
     load_manifest,
+    prove_authorization,
+    read_private_key_file,
     should_trust_env,
 )
 from showcases.ionet_arc.worker import Worker, handler  # noqa: E402
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/warrant-transcription:pilot"
+SETTLEMENT_MODES = ("mock", "proof")
+
+
+def resolve_settlement_mode(mode: str | None, chain_id: int | None) -> str:
+    """Pick the settlement mode. Mainnet chains always use a real proof; the mock verifier is refused there."""
+    if mode is not None and mode not in SETTLEMENT_MODES:
+        raise ValueError(f"settlement must be one of {SETTLEMENT_MODES}, not {mode!r}")
+    mainnet = chain_id is not None and int(chain_id) in MAINNET_CHAIN_IDS
+    if mode is None:
+        return "proof" if mainnet else "mock"
+    if mode == "mock" and mainnet:
+        raise ValueError(f"Mock settlement is refused on chain {chain_id}; set settlement: proof")
+    return mode
 
 
 class BasicAuthMiddleware:
@@ -256,6 +272,8 @@ class WarrantTranscriptionService:
         vendor_signature_path: pathlib.Path | None = None,
         buyer_account: str | None = None,
         manifest_path: pathlib.Path | None = None,
+        settlement_mode: str = "mock",
+        worker_image: str = PILOT_IMAGE,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +281,11 @@ class WarrantTranscriptionService:
         self.proposals_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir = self.state_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.proofs_dir = self.state_dir / "proofs"
+        if settlement_mode not in SETTLEMENT_MODES:
+            raise ValueError(f"settlement_mode must be one of {SETTLEMENT_MODES}")
+        self.settlement_mode = settlement_mode
+        self.worker_image = worker_image
         self.escrow_client = escrow_client
         self.use_mock_ionet = use_mock_ionet
         self.local_server = local_server
@@ -486,7 +509,7 @@ class WarrantTranscriptionService:
                 "location_ids": selected_hw.get("location") or location_id,
                 "duration_hours": duration_hours,
                 "billing_model": "duration",
-                "image_url": PILOT_IMAGE,
+                "image_url": self.worker_image,
                 "traffic_port": 8080,
                 "proposed_at": int(time.time()),
                 "instructions": (
@@ -588,7 +611,7 @@ class WarrantTranscriptionService:
                 "8080:8080",
                 "-e",
                 f"WARRANT_WORKER_TOKEN={worker_token}",
-                PILOT_IMAGE,
+                self.worker_image,
             ]
             run_res = await asyncio.to_thread(
                 subprocess.run,
@@ -645,7 +668,7 @@ class WarrantTranscriptionService:
             "gpus_per_container": 1,
             "replica_count": 1,
             "resource_private_name": f"warrant-whisper-{proposal['task_id'][-8:]}",
-            "image_url": PILOT_IMAGE,
+            "image_url": self.worker_image,
             "traffic_port": 8080,
             "env_variables": {"WARRANT_WORKER_TOKEN": worker_token},
         }
@@ -1062,6 +1085,7 @@ class WarrantTranscriptionService:
             "remaining_seconds": remaining,
             "is_expired": is_expired,
             "settlement_transaction": session.get("settlement_tx"),
+            "settlement": session.get("settlement"),
         }
         logger.info(
             "get_deployment_status returning: status=%s, active=%s, task_id=%s, remaining_seconds=%d, public_url=%s",
@@ -1151,13 +1175,116 @@ class WarrantTranscriptionService:
         }
         return cred_obj, sig_bytes
 
+    def _save_session(self, task_id: str, session: dict) -> None:
+        save(self.state_dir / "active_session.json", session)
+        save(self.state_dir / "sessions" / f"{task_id}.json", session)
+
+    @staticmethod
+    def _proving_response(session: dict) -> dict:
+        settlement = session.get("settlement") or {}
+        elapsed = int(time.time() - settlement.get("started_at", time.time()))
+        return {
+            "status": "proving",
+            "task_id": session.get("task_id"),
+            "settlement": settlement,
+            "elapsed_seconds": elapsed,
+            "message": (
+                f"A real proof is being generated ({elapsed}s elapsed). Settlement follows automatically. "
+                "Poll get_deployment_status(task_id) until status is 'settled' or 'settlement_failed'."
+            ),
+        }
+
+    def _start_proof_settlement(
+        self,
+        task_id: str,
+        session: dict,
+        policy: dict,
+        request: dict,
+        evidence: dict,
+        journal_bytes: bytes,
+        sender: str | None,
+    ) -> dict:
+        attempt = int(session.get("settlement", {}).get("attempt", 0)) + 1
+        work_dir = self.proofs_dir / task_id / f"attempt-{attempt}"
+        session["status"] = "proving"
+        session["journal_hex"] = "0x" + journal_bytes.hex()
+        session["settlement"] = {
+            "mode": "proof",
+            "state": "proving",
+            "attempt": attempt,
+            "started_at": int(time.time()),
+            "proof_dir": str(work_dir),
+            "error": None,
+        }
+        self._save_session(task_id, session)
+        logger.info("Starting background proof for task_id=%s (attempt %d) in %s", task_id, attempt, work_dir)
+        bg = asyncio.create_task(
+            self._settle_with_proof_bg(task_id, policy, request, evidence, journal_bytes, work_dir, sender)
+        )
+        self._bg_tasks.add(bg)
+        bg.add_done_callback(self._bg_tasks.discard)
+        return self._proving_response(session)
+
+    async def _settle_with_proof_bg(
+        self,
+        task_id: str,
+        policy: dict,
+        request: dict,
+        evidence: dict,
+        journal_bytes: bytes,
+        work_dir: pathlib.Path,
+        sender: str | None,
+    ) -> None:
+        """Prove, check the proof against the native journal and the deployed image ID, then settle."""
+        try:
+            proof = await asyncio.to_thread(prove_authorization, policy, request, evidence, work_dir)
+            if proof["journal"].lower() != "0x" + journal_bytes.hex():
+                raise RuntimeError("Proven journal differs from the native journal")
+            deployed_image = await self.escrow_client.async_image_id()
+            if proof["imageId"].lower() != deployed_image.lower():
+                raise RuntimeError(
+                    f"Proof image ID {proof['imageId']} differs from the escrow image ID {deployed_image}"
+                )
+            logger.info("Proof ready for task_id=%s; settling TaskEscrow with the real seal", task_id)
+            receipt = await self.escrow_client.async_settle(proof["seal"], journal_bytes, sender=sender)
+            settlement_tx = receipt.get("transactionHash")
+            session = self._lookup_session(task_id) or {}
+            session["status"] = "settled"
+            session["settlement_tx"] = settlement_tx
+            session["settlement"] = {
+                **(session.get("settlement") or {}),
+                "state": "settled",
+                "transaction": settlement_tx,
+                "image_id": proof["imageId"],
+                "journal_digest": proof["journalDigest"],
+                "finished_at": int(time.time()),
+            }
+            self._save_session(task_id, session)
+            logger.info("TaskEscrow settled with a real proof for task_id=%s in tx %s", task_id, settlement_tx)
+        except Exception as exc:
+            logger.error("Proof settlement failed for task_id=%s: %s", task_id, exc)
+            session = self._lookup_session(task_id) or {}
+            session["status"] = "settlement_failed"
+            session["settlement"] = {
+                **(session.get("settlement") or {}),
+                "state": "failed",
+                "error": str(exc),
+                "finished_at": int(time.time()),
+            }
+            self._save_session(task_id, session)
+
     async def submit_acceptance(
         self,
         task_id: str,
         acceptance: dict,
         signature: list[int] | str,
     ) -> dict:
-        """Verify buyer acceptance evidence off-chain, approve journal, and settle TaskEscrow on-chain."""
+        """Verify buyer acceptance evidence off-chain, then settle TaskEscrow on-chain.
+
+        Mock mode approves the journal digest and settles at once. Proof mode starts a real proof in the
+        background and returns ``proving``; a failed attempt can be resubmitted, because the contract
+        rejects a second settlement of a paid task.
+        """
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
         logger.info("Tool called: submit_acceptance with task_id=%s, signature_length=%d", task_id, sig_len)
         try:
@@ -1171,9 +1298,14 @@ class WarrantTranscriptionService:
                     "status": "settled",
                     "task_id": task_id,
                     "settlement_transaction": session.get("settlement_tx"),
+                    "settlement": session.get("settlement"),
                     "message": "Task is already settled.",
                 }
                 logger.info("submit_acceptance returning: task already settled (tx=%s)", session.get("settlement_tx"))
+                return res
+            if session.get("status") == "proving":
+                res = self._proving_response(session)
+                logger.info("submit_acceptance returning: proof still in progress for task_id=%s", task_id)
                 return res
 
             expected_deliv = session.get("deliverable_hash")
@@ -1234,15 +1366,17 @@ class WarrantTranscriptionService:
                 logger.error("Off-chain Warrant authorization evaluation failed: %s", e)
                 raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
 
-            # Settle on-chain via TaskEscrow (Option B: JournalVerifier approves digest, settles with mock seal)
+            sender = session.get("recipient") or self.escrow_client.server_account
+            if self.settlement_mode == "proof":
+                # Real proof: prove in the background, then TaskEscrow.settle(seal, journal). Minutes, not seconds.
+                return self._start_proof_settlement(task_id, session, policy, request, evidence, journal_bytes, sender)
+
+            # Mock settlement (local chains and the testnet showcase): JournalVerifier approves the digest,
+            # then settle with the mock seal. settle_mock itself refuses mainnet chains.
             settlement_tx = None
             try:
                 logger.info("Settling TaskEscrow on-chain via settle_mock with journal digest")
-                settle_res = await asyncio.to_thread(
-                    self.escrow_client.settle_mock,
-                    journal_bytes,
-                    sender=session.get("recipient") or self.escrow_client.server_account,
-                )
+                settle_res = await asyncio.to_thread(self.escrow_client.settle_mock, journal_bytes, sender=sender)
                 settlement_tx = settle_res.get("transactionHash")
                 logger.info("TaskEscrow settled on-chain in tx %s", settlement_tx)
             except Exception as err:
@@ -1252,13 +1386,14 @@ class WarrantTranscriptionService:
             session["status"] = "settled"
             session["settlement_tx"] = settlement_tx
             session["journal_hex"] = "0x" + journal_bytes.hex()
-            save(self.state_dir / "active_session.json", session)
-            save(self.state_dir / "sessions" / f"{task_id}.json", session)
+            session["settlement"] = {"mode": "mock", "state": "settled", "transaction": settlement_tx}
+            self._save_session(task_id, session)
 
             res = {
                 "status": "settled",
                 "task_id": task_id,
                 "settlement_transaction": settlement_tx,
+                "settlement": session["settlement"],
                 "message": "Authorization successfully verified off-chain and TaskEscrow settled on-chain.",
             }
             logger.info(
@@ -1288,6 +1423,9 @@ class ServerConfig:
     seller_private_key: str | None = None
     seller_key_path: pathlib.Path | None = None
     buyer_account: str | None = None
+    settlement_mode: str | None = None
+    worker_image: str | None = None
+    chain_id: int | None = None
     mock_ionet: bool = False
     local_server: bool = False
     ssh_host: str = "localhost"
@@ -1326,6 +1464,13 @@ class ServerConfig:
             self.server_account = get_manifest_parameter(
                 manifest, "seller_address", "seller-address", "server_account", "server-account"
             )
+        if self.chain_id is None:
+            raw_chain = get_manifest_parameter(manifest, "chain_id", "chain-id")
+            self.chain_id = int(raw_chain) if raw_chain is not None else None
+        manifest_mode = get_manifest_parameter(manifest, "settlement", "settlement_mode", "settlement-mode")
+        self.settlement_mode = resolve_settlement_mode(self.settlement_mode or manifest_mode, self.chain_id)
+        if self.worker_image is None:
+            self.worker_image = get_manifest_parameter(manifest, "worker_image", "worker-image") or PILOT_IMAGE
 
     def _resolve_key(self, manifest: dict):
         if self.seller_key_path is None:
@@ -1341,9 +1486,9 @@ class ServerConfig:
                     self.seller_key_path = default_seller_key
 
         if self.seller_private_key is None:
-            if self.seller_key_path and self.seller_key_path.exists() and self.seller_key_path.is_file():
-                with contextlib.suppress(Exception):
-                    self.seller_private_key = self.seller_key_path.read_text().strip()
+            if self.seller_key_path and self.seller_key_path.exists():
+                # A key file that exists but is unreadable, shared or malformed is a configuration error.
+                self.seller_private_key = read_private_key_file(self.seller_key_path)
             if not self.seller_private_key:
                 for env_var in ("WARRANT_SELLER_KEY", "SELLER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
                     if os.environ.get(env_var):
@@ -1409,7 +1554,10 @@ def create_server(
         vendor_signature_path=cfg.vendor_signature_path,
         buyer_account=cfg.buyer_account,
         manifest_path=cfg.manifest_path,
+        settlement_mode=cfg.settlement_mode or "mock",
+        worker_image=cfg.worker_image or PILOT_IMAGE,
     )
+    logger.info("Settlement mode: %s; worker image: %s", service.settlement_mode, service.worker_image)
 
     server.tool(
         name="list_suitable_hardware",
@@ -1459,8 +1607,9 @@ def create_server(
         name="submit_acceptance",
         description=(
             "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
-            "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, "
-            "and settles payment on TaskEscrow on-chain."
+            "Evaluates policy and signatures off-chain via Warrant and settles payment on TaskEscrow on-chain. "
+            "In proof mode a real RISC Zero proof is generated first; the call returns 'proving' and "
+            "get_deployment_status reports 'settled' or 'settlement_failed' later."
         ),
     )(service.submit_acceptance)
 
@@ -1577,17 +1726,22 @@ def main():
         help="Path to vendor_signature.yaml (default: showcases/ionet_arc/config/vendor_signature.yaml)",
     )
     parser.add_argument(
-        "--private-key",
-        dest="seller_private_key",
-        default=None,
-        help="Private key for seller account to sign transactions (or set WARRANT_SELLER_KEY / WARRANT_PRIVATE_KEY)",
-    )
-    parser.add_argument(
         "--key-file",
         dest="seller_key_path",
         type=pathlib.Path,
         default=None,
-        help="Path to file containing seller private key (default: from manifest or .keys/seller.key)",
+        help=(
+            "Path to the seller private key file, mode 0600 (default: from manifest or .keys/seller.key). "
+            "A key is never accepted on the command line."
+        ),
+    )
+    parser.add_argument(
+        "--settlement",
+        dest="settlement_mode",
+        choices=SETTLEMENT_MODES,
+        default=os.environ.get("WARRANT_SETTLEMENT"),
+        help="mock: JournalVerifier digest approval (local and testnet only); proof: real RISC Zero proof. "
+        "Mainnet chains always use proof.",
     )
     args = parser.parse_args()
 

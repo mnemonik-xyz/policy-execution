@@ -9,7 +9,7 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 /// @dev Constructor-only eth_call probe. Never broadcast this test helper.
 contract ArcProbe {
     constructor(address token, bytes memory seal, bytes32 imageId, bytes32 journalDigest) {
-        require(block.chainid == 5042002, "Arc testnet only");
+        require(block.chainid == 5042 || block.chainid == 5042002, "Arc mainnet or testnet only");
         require(IERC20Metadata(token).decimals() == 6, "Expected six-decimal USDC interface");
         RiscZeroGroth16Verifier verifier =
             new RiscZeroGroth16Verifier(ControlID.CONTROL_ROOT, ControlID.BN254_CONTROL_ID);

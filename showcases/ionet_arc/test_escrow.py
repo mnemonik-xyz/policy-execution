@@ -202,6 +202,47 @@ class EscrowClientTests(unittest.TestCase):
         self.assertIn("RPC node does not support eth_sendTransaction (-32601)", str(ctx.exception))
         self.assertIn("no private key was configured", str(ctx.exception))
 
+    def test_settle_mock_is_refused_on_mainnet(self):
+        self.mock_rpc.chain_id.return_value = 5042
+        with self.assertRaises(RuntimeError):
+            self.client.settle_mock(b"\x00" * 384)
+        self.mock_rpc.rpc.assert_not_called()
+
+    def test_image_id_reads_the_escrow_immutable(self):
+        self.mock_rpc.rpc.return_value = "0x" + "ab" * 32
+        self.assertEqual(self.client.image_id(), "0x" + "ab" * 32)
+        method, params = self.mock_rpc.rpc.call_args.args
+        self.assertEqual(method, "eth_call")
+        self.assertEqual(params[0]["data"], "0x" + function_signature_to_4byte_selector("imageId()").hex())
+
+    def test_read_private_key_file_rules(self):
+        import os
+        import tempfile
+
+        from showcases.ionet_arc.escrow import read_private_key_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key = os.path.join(tmp, "k.key")
+            with open(key, "w") as stream:
+                stream.write("0x" + "11" * 32 + "\n")
+            os.chmod(key, 0o600)
+            self.assertEqual(read_private_key_file(key), "0x" + "11" * 32)
+            for mode in (0o640, 0o604, 0o644, 0o660):
+                os.chmod(key, mode)
+                with self.subTest(mode=oct(mode)), self.assertRaises(PermissionError):
+                    read_private_key_file(key)
+            os.chmod(key, 0o600)
+            with open(key, "w") as stream:
+                stream.write("not a key\n")
+            with self.assertRaises(ValueError):
+                read_private_key_file(key)
+            with self.assertRaises(FileNotFoundError):
+                read_private_key_file(os.path.join(tmp, "missing.key"))
+            link = os.path.join(tmp, "link.key")
+            os.symlink(key, link)
+            with self.assertRaises(ValueError):
+                read_private_key_file(link)
+
     def test_send_transaction_signed_private_key_mode(self):
         acc = Account.create()
         self.client.register_key(acc.address, acc.key.hex())

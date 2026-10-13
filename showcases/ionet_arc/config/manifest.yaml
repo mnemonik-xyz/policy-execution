@@ -11,7 +11,9 @@ buyer_address: '0x9793Dd93D46F153a2A879165cd163A01b54d8A00'  # The client agent'
 category: 42  # Accredited GPU Whisper transcription service
 max_budget_usd: 2.00  # $2.00 maximum budget per proposal
 duration_hours: 1  # GPU container lease duration
-validity_seconds: 900  # 15 minutes per-request escrow settlement deadline
+validity_seconds: 7200  # 2 hours: policy valid_until and TaskEscrow settleBy. A real proof takes minutes.
+settlement: mock  # JournalVerifier digest approval. Local and testnet only; refused on chain 5042.
+worker_image: 'ghcr.io/mnemonik-xyz/warrant-transcription:pilot'  # Mutable tag; mainnet pins a digest.
 vendor_validity_days: 365  # 1-year Registry Authority credential lifetime
 
 public_files:
