@@ -133,7 +133,7 @@ sequenceDiagram
     Note over Agent,Escrow: Order: commitment before delivery
     Agent->>Guard: fund lease (quote)
     Guard->>Guard: check quote, credential rule, policy hash
-    Guard->>Escrow: offer(policyHash, vendor, ceiling, signer, acceptBy, settleBy)
+    Guard->>Escrow: offer(policyHash, vendor, ceiling, signer = 0, acceptBy, settleBy)
     Svc->>Escrow: read order, inspect policy (SS-5)
     Svc->>Escrow: accept(orderId)
     end
