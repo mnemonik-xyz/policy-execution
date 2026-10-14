@@ -191,11 +191,11 @@ steps as the local demonstration. Each step is a separate command.
 ```sh
 export WARRANT_CANARY_RPC=https://...        # never put the URL in arguments
 export RISC0_USE_DOCKER=1                    # reproducible image ID
-python3 scripts/solver-canary.py init --dir artifacts/canary-1 --amount 2000000 --max-cost 14 \
+python3 scripts/solver-canary.py init --dir solver-bounty/canary/mainnet/20261014T120000Z --amount 2000000 --max-cost 14 \
   --instance solver-bounty/instance.json --deployer account:NAME --buyer account:NAME \
   --seller account:NAME --relayer account:NAME
-python3 scripts/solver-canary.py check --dir artifacts/canary-1
-python3 scripts/solver-canary.py deploy --dir artifacts/canary-1 [--execute ...]
+python3 scripts/solver-canary.py check --dir solver-bounty/canary/mainnet/20261014T120000Z
+python3 scripts/solver-canary.py deploy --dir solver-bounty/canary/mainnet/20261014T120000Z [--execute ...]
 ```
 
 The order is: `init`, `check`, `deploy`, `quote`, `offer`, `accept`, `deliver`,
@@ -217,7 +217,26 @@ Rules that the script enforces:
   After payment it checks the seller balance, the result event and that a replay fails.
 
 Run `python3 scripts/test_solver_canary.py` for the guard tests. They need no chain.
+
+Evidence of each run lives in `solver-bounty/canary/`. The `--dir` of a run is a
+directory named by its UTC timestamp under `canary/local/` for Anvil (chain 31337)
+or `canary/mainnet/` for Arc (chain 5042). The `evidence` step refuses any other
+placement. It writes `manifest.json`, checked against `canary/manifest.schema.json`,
+next to `result.json`. [canary/README.md](canary/README.md) lists the files, the
+manifest fields with their sources, and the rules for what must never be committed.
 The checker proves a modelled cost, not a cloud bill. Settlement starts no cloud run.
+
+### Mainnet probe
+
+`scripts/check-arc-solver.py` is the read-only probe of canary plan item 4. It only reads
+the chain and never broadcasts. `before evm.json --out report.json` checks chain ID 5042,
+the BN254 precompiles, the USDC decimals, and simulates `contracts/test/ArcSolverProbe.t.sol`
+with `eth_call`: real seal verified, changed journal rejected, escrow constructed.
+`after manifest.json --out report.json` hashes the deployed escrow and verifier code,
+compares the hashes with the manifest and the masked local build, checks the escrow
+getters and refuses to proceed when `totalReserved()` is not zero. The RPC URL comes from
+`WARRANT_CANARY_RPC`. Reports are never overwritten. `--allow-chain N` is for a local
+rehearsal only. Tests: `python3 -m unittest scripts.test_check_arc_solver`.
 
 ## Validation and trust limits
 

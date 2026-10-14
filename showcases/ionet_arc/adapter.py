@@ -84,8 +84,12 @@ def no_credentials(value):
 def decode_result(result):
     if result.get("isError"):
         texts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
-        err = texts[0] if texts else "no details"
-        print(f"io.net error details: {err}", file=sys.stderr)
+        # Provider text can echo request inputs such as env_variables. Log only
+        # a length and a digest prefix so an operator can correlate the event.
+        details = (texts[0] if texts else "").encode("utf-8", "replace")
+        fingerprint = hashlib.sha256(details).hexdigest()[:16]
+        print(f"io.net tool error (details redacted; length={len(details)}, sha256={fingerprint})",
+              file=sys.stderr)
         raise PilotError("io.net returned a tool error; no automatic retry was made")
     data = result.get("structuredContent")
     if data is None:
@@ -189,8 +193,9 @@ async def connected(operation):
 def validate_deployment(arguments):
     no_credentials(arguments)
     req = arguments.get("request", arguments)
-    if req.get("billing_model") not in ("duration", "payg"):
-        raise PilotError("Pilot deployments require explicit duration or payg billing")
+    if req.get("billing_model") != "duration":
+        raise PilotError("Pilot deployments require duration billing; "
+                         "payg is rejected because duration_hours does not bound PayG lifetime")
     for field in ("duration_hours", "gpus_per_container", "replica_count"):
         value = req.get(field)
         if type(value) is not int or value < 1:
