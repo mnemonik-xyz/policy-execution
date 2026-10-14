@@ -103,6 +103,72 @@ Nothing is disputed in this flow. The proof replaces the buyer's countersignatur
 with a receipt that the same checker ran on the same bytes. The contract pays or
 refuses by the same rules either way. No arbiter, no third party, no new trust.
 
+## 4a. Process flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent as Buyer agent
+    participant Guard as Buyer guardrail
+    participant Escrow as InvoiceEscrow (Arc)
+    participant Svc as Seller service
+    participant Worker as Seller settlement worker
+    participant Prover as Prover (seller's)
+
+    rect rgb(240, 248, 255)
+    Note over Agent,Escrow: Order: commitment before delivery
+    Agent->>Guard: fund lease (quote)
+    Guard->>Guard: check quote, credential rule, policy hash
+    Guard->>Escrow: offer(policyHash, vendor, ceiling, signer, acceptBy, settleBy)
+    Svc->>Escrow: read order, inspect policy (SS-5)
+    Svc->>Escrow: accept(orderId)
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Agent,Svc: Metered use: one note per piece, repeated
+    Agent->>Svc: request (unpaid)
+    Svc-->>Agent: 402 PAYMENT-REQUIRED {leaseId, index, amount, payloadHash}
+    Agent->>Guard: answer challenge
+    Guard->>Guard: BG-1 checks, assign index, sign note
+    Guard-->>Agent: signed note
+    Agent->>Svc: request + PAYMENT-SIGNATURE (note)
+    Svc->>Svc: verify note natively (SS-2, SS-3), queue it
+    Svc-->>Agent: 200 result + PAYMENT-RESPONSE
+    end
+
+    rect rgb(255, 250, 240)
+    Note over Guard,Prover: Settlement: by signature, proof as fallback
+    loop every tick, while a batch is full
+        Worker->>Worker: build batch input and journal
+        Worker->>Guard: meter-sign(batch)
+        alt signer answers
+            Guard->>Escrow: read live order
+            Guard->>Guard: authorize_meter natively, sign journal
+            Guard-->>Worker: 65-byte signature
+            Worker->>Escrow: settleSigned(journal, signature)
+        else signer refuses or silent
+            Worker->>Worker: keep batch, retry next tick
+        end
+    end
+    opt settleBy minus margin reached
+        Worker->>Prover: meter-prove(batch), Groth16 wrap
+        Prover-->>Worker: receipt
+        Worker->>Escrow: settle(seal, journal)
+    end
+    Escrow->>Escrow: order accepted, vendor, ceiling, obligation unconsumed, window
+    Escrow-->>Svc: pay batch to vendor
+    end
+
+    rect rgb(245, 245, 245)
+    Note over Guard,Escrow: After settleBy
+    Guard->>Escrow: close(orderId): unpaid remainder returns to the buyer
+    end
+```
+
+The diagram shows one lease. Steps 7 to 14 repeat once per piece of service. Steps
+15 to 23 run in the background and never block step 14. Step 24 runs at most once per
+lease, and only when the signer stayed silent until the margin.
+
 ## 5. The module
 
 The module `core/src/meter.rs` follows the solver path: mandatory gates first, the rule
