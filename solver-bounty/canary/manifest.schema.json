@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mnemonik-xyz/warrant/solver-bounty/canary/manifest.schema.json",
+  "title": "Solver bounty canary deployment manifest",
+  "description": "Written by scripts/solver-canary.py evidence next to result.json. One manifest per run directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_commit",
+    "source_dirty",
+    "compiler",
+    "dependencies",
+    "chain_id",
+    "token",
+    "escrow",
+    "verifier",
+    "image_id",
+    "image_builder",
+    "code_hashes",
+    "transactions",
+    "addresses",
+    "created_at"
+  ],
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$"
+    },
+    "hash32": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{64}$"
+    }
+  },
+  "properties": {
+    "source_commit": {
+      "description": "Output of git rev-parse HEAD in the policy-execution checkout that ran deploy.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source_dirty": {
+      "description": "True when git status --porcelain printed any line, including untracked files.",
+      "type": "boolean"
+    },
+    "compiler": {
+      "description": "Fixed values from contracts/foundry.toml.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["solc", "evm_version", "optimizer_runs"],
+      "properties": {
+        "solc": { "const": "0.8.28" },
+        "evm_version": { "const": "cancun" },
+        "optimizer_runs": { "const": 200 }
+      }
+    },
+    "dependencies": {
+      "description": "Pinned dependency versions. The sources are listed in README.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["openzeppelin_contracts"],
+      "properties": {
+        "openzeppelin_contracts": {
+          "description": "contracts/package.json",
+          "const": "5.6.1"
+        },
+        "risc0_ethereum_contracts": {
+          "description": "Tag in contracts/vendor/risc0/PROVENANCE.json. Optional.",
+          "type": "string",
+          "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "risc0_zkvm": {
+          "description": "risc0-zkvm version in Cargo.lock. Optional.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      }
+    },
+    "chain_id": {
+      "description": "31337 for an Anvil rehearsal in local/, 5042 for Arc mainnet in mainnet/.",
+      "enum": [31337, 5042]
+    },
+    "token": { "$ref": "#/$defs/address" },
+    "escrow": { "$ref": "#/$defs/address" },
+    "verifier": { "$ref": "#/$defs/address" },
+    "image_id": {
+      "description": "Solver guest image ID as returned by warrant-host solver-image-id.",
+      "$ref": "#/$defs/hash32"
+    },
+    "image_builder": {
+      "description": "Docker image that compiled the guest, or the word local for a build without RISC0_USE_DOCKER.",
+      "type": "string",
+      "pattern": "^(risczero/risc0-guest-builder:[A-Za-z0-9._-]+|local)$"
+    },
+    "code_hashes": {
+      "description": "keccak256 of the deployed runtime bytecode, read with cast code after deployment.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["escrow", "verifier"],
+      "properties": {
+        "escrow": { "$ref": "#/$defs/hash32" },
+        "verifier": { "$ref": "#/$defs/hash32" }
+      }
+    },
+    "transactions": {
+      "description": "Transaction hashes of the broadcast steps. A step that was not broadcast is absent.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploy": { "$ref": "#/$defs/hash32" },
+        "deploy_verifier": { "$ref": "#/$defs/hash32" },
+        "approve": { "$ref": "#/$defs/hash32" },
+        "offer": { "$ref": "#/$defs/hash32" },
+        "accept": { "$ref": "#/$defs/hash32" },
+        "settle": { "$ref": "#/$defs/hash32" }
+      }
+    },
+    "worker_image": {
+      "description": "GHCR image used for the separate GPU run. Optional for the settlement evidence.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[a-z0-9._/-]+$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "addresses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployer", "buyer", "seller", "relayer"],
+      "properties": {
+        "deployer": { "$ref": "#/$defs/address" },
+        "buyer": { "$ref": "#/$defs/address" },
+        "seller": { "$ref": "#/$defs/address" },
+        "relayer": { "$ref": "#/$defs/address" }
+      }
+    },
+    "created_at": {
+      "description": "UTC time when the evidence command wrote the manifest.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "if": {
+    "properties": { "chain_id": { "const": 5042 } }
+  },
+  "then": {
+    "properties": {
+      "image_builder": { "pattern": "^risczero/risc0-guest-builder:" }
+    }
+  }
+}

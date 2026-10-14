@@ -26,6 +26,22 @@ ROLES = ("deployer", "buyer", "seller", "relayer")
 RPC_ENV = "WARRANT_CANARY_RPC"
 ENV = dict(os.environ, RISC0_BUILD_LOCKED="1", RAYON_NUM_THREADS="4", DOCKER_DEFAULT_PLATFORM="linux/amd64")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
+HASH32 = re.compile(r"0x[0-9a-fA-F]{64}")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# Evidence layout and manifest, see solver-bounty/canary/README.md and manifest.schema.json.
+CANARY_ROOT = ROOT / "solver-bounty/canary"
+EVIDENCE_FOLDERS = {31337: "local", 5042: "mainnet"}
+COMPILER = {"solc": "0.8.28", "evm_version": "cancun", "optimizer_runs": 200}  # contracts/foundry.toml
+DEPENDENCIES = {"openzeppelin_contracts": "5.6.1",  # contracts/package.json
+                "risc0_ethereum_contracts": "v3.0.0",  # contracts/vendor/risc0/PROVENANCE.json
+                "risc0_zkvm": "3.0.5"}  # Cargo.lock
+BUILDER_IMAGE = "risczero/risc0-guest-builder"
+DEFAULT_BUILDER_TAG = "r0.1.88.0"  # DEFAULT_DOCKER_TAG in risc0-build 3.0.5; RISC0_DOCKER_CONTAINER_TAG overrides it
+BUILDER = re.compile(r"risczero/risc0-guest-builder:[A-Za-z0-9._-]+|local")
+WORKER_REPOSITORY = "ghcr.io/mnemonik-xyz/warrant-transcription"
+TX_NAMES = ("deploy", "deploy_verifier", "approve", "offer", "accept", "settle")
+MANIFEST_KEYS = ("source_commit", "source_dirty", "compiler", "dependencies", "chain_id", "token", "escrow",
+                 "verifier", "image_id", "image_builder", "code_hashes", "transactions", "addresses", "created_at")
 
 
 class CanaryError(Exception):
@@ -196,6 +212,13 @@ def build():
     run("cargo", "build", "--locked", "-p", "warrant-solver")
 
 
+def image_builder():
+    """The guest builder that methods/build.rs selects. Recorded at build time, not read back from Docker."""
+    if os.environ.get("RISC0_USE_DOCKER") != "1":
+        return "local"
+    return f"{BUILDER_IMAGE}:{os.environ.get('RISC0_DOCKER_CONTAINER_TAG', DEFAULT_BUILDER_TAG)}"
+
+
 def cmd_deploy(args):
     d, st = args.dir, load(args.dir)
     connect(st)
@@ -224,7 +247,7 @@ def cmd_deploy(args):
         raise CanaryError("Deployed escrow does not hold the expected token and image ID")
     hashes = {name: run("cast", "keccak", run("cast", "code", address)) for name, address in
               (("escrow", escrow), ("verifier", verifier))}
-    st.update(escrow=escrow, verifier=verifier, image_id=image, code_hashes=hashes)
+    st.update(escrow=escrow, verifier=verifier, image_id=image, code_hashes=hashes, image_builder=image_builder())
     save(d, st)
     write_new(pathlib.Path(d) / "deployment.json", broadcast)
     print(json.dumps(dict(escrow=escrow, verifier=verifier, image_id=image, code_hashes=hashes), indent=2))
@@ -423,14 +446,110 @@ def cmd_settle(args):
         raise CanaryError("Replay passed simulation. Stop and investigate.")
 
 
+def evidence_folder(d, chain_id):
+    """A run directory sits directly under canary/local for 31337 or canary/mainnet for 5042. Nothing else."""
+    folder = EVIDENCE_FOLDERS.get(chain_id)
+    if folder is None:
+        raise CanaryError(f"No evidence folder for chain {chain_id}: only 31337 (local) and 5042 (mainnet) are allowed")
+    expected = (CANARY_ROOT / folder).resolve()
+    if d.resolve().parent != expected:
+        raise CanaryError(f"Evidence for chain {chain_id} must be a run directory directly under {expected}")
+
+
+def deploy_hashes(d):
+    path = d / "deployment.json"
+    if not path.is_file():
+        return {}
+    created = {t["contractName"]: t.get("hash") for t in json.loads(path.read_text())["transactions"]
+               if t["transactionType"] == "CREATE"}
+    pairs = (("deploy", created.get("SolverBountyEscrow")), ("deploy_verifier", created.get("RiscZeroGroth16Verifier")))
+    return {name: value for name, value in pairs if value}
+
+
+def manifest_problems(m):
+    problems = [f"missing {key}" for key in MANIFEST_KEYS if key not in m]
+    patterns = {"source_commit": re.compile(r"[0-9a-f]{40}"), "token": ADDRESS, "escrow": ADDRESS,
+                "verifier": ADDRESS, "image_id": HASH32, "image_builder": BUILDER}
+    for key, pattern in patterns.items():
+        if key in m and not (isinstance(m[key], str) and pattern.fullmatch(m[key])):
+            problems.append(f"bad {key}")
+    if not isinstance(m.get("source_dirty"), bool):
+        problems.append("source_dirty must be a boolean")
+    if m.get("chain_id") not in EVIDENCE_FOLDERS:
+        problems.append("chain_id must be 31337 or 5042")
+    if m.get("chain_id") == 5042 and not str(m.get("image_builder", "")).startswith(BUILDER_IMAGE + ":"):
+        problems.append("a mainnet manifest must record a Docker builder image")
+    if m.get("compiler") != COMPILER:
+        problems.append("compiler must be " + json.dumps(COMPILER))
+    if m.get("dependencies", {}).get("openzeppelin_contracts") != DEPENDENCIES["openzeppelin_contracts"]:
+        problems.append("dependencies.openzeppelin_contracts must be " + DEPENDENCIES["openzeppelin_contracts"])
+    return problems + manifest_table_problems(m)
+
+
+def manifest_table_problems(m):
+    problems = []
+    for name in ("escrow", "verifier"):
+        if not HASH32.fullmatch(str(m.get("code_hashes", {}).get(name, ""))):
+            problems.append(f"bad code_hashes.{name}")
+    for name, value in m.get("transactions", {}).items():
+        if name not in TX_NAMES or not HASH32.fullmatch(str(value)):
+            problems.append(f"bad transactions.{name}")
+    for role in ROLES:
+        if not ADDRESS.fullmatch(str(m.get("addresses", {}).get(role, ""))):
+            problems.append(f"bad addresses.{role}")
+    worker = m.get("worker_image")
+    if worker is not None and (set(worker) != {"repository", "digest"} or not DIGEST.fullmatch(str(worker["digest"]))
+                               or not str(worker["repository"]).startswith("ghcr.io/")):
+        problems.append("bad worker_image")
+    try:
+        datetime.datetime.fromisoformat(str(m.get("created_at")))
+    except ValueError:
+        problems.append("bad created_at")
+    return problems
+
+
+def check_manifest(m):
+    """A hand-written subset of manifest.schema.json: required keys, patterns, fixed values and the chain rule."""
+    problems = manifest_problems(m)
+    if problems:
+        raise CanaryError("manifest.json is invalid: " + "; ".join(problems))
+
+
+def build_manifest(d, st, worker_digest):
+    for key in ("escrow", "verifier", "image_id", "code_hashes"):
+        if key not in st:
+            raise CanaryError("Deploy first: the manifest needs the deployed addresses, code hashes and image ID")
+    if "image_builder" not in st:
+        raise CanaryError("state.json has no image_builder; this run was deployed by an older script version")
+    sent = {name: tx["hash"] for name, tx in st["tx"].items() if HASH32.fullmatch(str(tx.get("hash", "")))}
+    commit, dirty = run("git", "rev-parse", "HEAD"), bool(run("git", "status", "--porcelain"))
+    manifest = {"source_commit": commit, "source_dirty": dirty, "compiler": dict(COMPILER),
+                "dependencies": dict(DEPENDENCIES), "chain_id": st["chain_id"], "token": st["token"],
+                "escrow": st["escrow"], "verifier": st["verifier"], "image_id": st["image_id"],
+                "image_builder": st["image_builder"], "code_hashes": st["code_hashes"],
+                "transactions": {**deploy_hashes(d), **sent}, "addresses": st["addresses"], "created_at": now_iso()}
+    if worker_digest:
+        manifest["worker_image"] = {"repository": WORKER_REPOSITORY, "digest": worker_digest}
+    check_manifest(manifest)
+    return manifest
+
+
 def cmd_evidence(args):
     d, st = pathlib.Path(args.dir), load(args.dir)
+    evidence_folder(d, st["chain_id"])
+    if args.worker_digest and not DIGEST.fullmatch(args.worker_digest):
+        raise CanaryError("--worker-digest must be sha256: followed by 64 lowercase hex digits")
+    for name in ("manifest.json", "result.json"):
+        if (d / name).exists():
+            raise CanaryError(f"{name} already exists. A run directory is never edited after evidence. Start a new run")
+    manifest = build_manifest(d, st, args.worker_digest)
     summary = dict(chain_id=st["chain_id"], escrow=st.get("escrow"), verifier=st.get("verifier"), token=st["token"],
                    image_id=st.get("image_id"), code_hashes=st.get("code_hashes"), amount=st["amount"],
                    addresses=st["addresses"], quote=st.get("quote"), delivery=st.get("delivery"),
                    transactions=st["tx"], checks=st.get("checks", {}), realProof="proof" in st, mockVerifier=False,
                    note="The checker proves a modelled cost, not a cloud bill. "
                         "Settlement does not start any cloud run.")
+    write_new(d / "manifest.json", manifest)
     write_new(d / "result.json", summary)
     print(json.dumps(summary, indent=2))
 
@@ -462,9 +581,10 @@ def parser():
     add("check", cmd_check)
     deploy = add("deploy", cmd_deploy, spends=True)
     deploy.add_argument("--allow-local-image-id", action="store_true")
-    for name, handler in (("quote", cmd_quote), ("deliver", cmd_deliver), ("prove", cmd_prove),
-                          ("evidence", cmd_evidence)):
+    for name, handler in (("quote", cmd_quote), ("deliver", cmd_deliver), ("prove", cmd_prove)):
         add(name, handler)
+    add("evidence", cmd_evidence).add_argument(
+        "--worker-digest", help="GHCR digest of the worker image, sha256:<64 hex>, read at deploy time of the GPU run")
     for name, handler in (("offer", cmd_offer), ("accept", cmd_accept), ("settle", cmd_settle)):
         add(name, handler, spends=True)
     return top

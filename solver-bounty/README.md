@@ -191,11 +191,11 @@ steps as the local demonstration. Each step is a separate command.
 ```sh
 export WARRANT_CANARY_RPC=https://...        # never put the URL in arguments
 export RISC0_USE_DOCKER=1                    # reproducible image ID
-python3 scripts/solver-canary.py init --dir artifacts/canary-1 --amount 2000000 --max-cost 14 \
+python3 scripts/solver-canary.py init --dir solver-bounty/canary/mainnet/20261014T120000Z --amount 2000000 --max-cost 14 \
   --instance solver-bounty/instance.json --deployer account:NAME --buyer account:NAME \
   --seller account:NAME --relayer account:NAME
-python3 scripts/solver-canary.py check --dir artifacts/canary-1
-python3 scripts/solver-canary.py deploy --dir artifacts/canary-1 [--execute ...]
+python3 scripts/solver-canary.py check --dir solver-bounty/canary/mainnet/20261014T120000Z
+python3 scripts/solver-canary.py deploy --dir solver-bounty/canary/mainnet/20261014T120000Z [--execute ...]
 ```
 
 The order is: `init`, `check`, `deploy`, `quote`, `offer`, `accept`, `deliver`,
@@ -217,6 +217,13 @@ Rules that the script enforces:
   After payment it checks the seller balance, the result event and that a replay fails.
 
 Run `python3 scripts/test_solver_canary.py` for the guard tests. They need no chain.
+
+Evidence of each run lives in `solver-bounty/canary/`. The `--dir` of a run is a
+directory named by its UTC timestamp under `canary/local/` for Anvil (chain 31337)
+or `canary/mainnet/` for Arc (chain 5042). The `evidence` step refuses any other
+placement. It writes `manifest.json`, checked against `canary/manifest.schema.json`,
+next to `result.json`. [canary/README.md](canary/README.md) lists the files, the
+manifest fields with their sources, and the rules for what must never be committed.
 The checker proves a modelled cost, not a cloud bill. Settlement starts no cloud run.
 
 ### Mainnet probe
