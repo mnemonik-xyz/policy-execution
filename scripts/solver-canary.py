@@ -150,6 +150,9 @@ def send_tx(st, role, address, signature, *values):
 
 def cmd_init(args):
     mainnet = args.chain_id in MAINNET_IDS
+    if not mainnet and not args.allow_chain:
+        raise CanaryError(f"--chain-id {args.chain_id} is not Arc mainnet {sorted(MAINNET_IDS)}. "
+                          "Pass --allow-chain only for a local rehearsal or a testnet.")
     if not 0 < args.amount <= HARD_CAP:
         raise CanaryError(f"--amount must be between 1 and {HARD_CAP} token units")
     if not ADDRESS.fullmatch(args.token):
@@ -423,8 +426,22 @@ def cmd_settle(args):
         raise CanaryError("Replay passed simulation. Stop and investigate.")
 
 
+SETTLEMENT_CHECKS = ("seller_paid", "result_published", "replay_rejected", "result_substitution_rejected")
+
+
+def settled(d, st):
+    """The evidence record is terminal. It exists only after settlement and its checks completed."""
+    sent = st.get("tx", {}).get("settle", {})
+    if "proof" not in st or not sent.get("hash") or not (d / "settlement.json").exists():
+        raise CanaryError("Run settle to completion before evidence: no confirmed settlement transaction")
+    missing = [name for name in SETTLEMENT_CHECKS if not st.get("checks", {}).get(name)]
+    if missing:
+        raise CanaryError("Post-settlement checks did not complete: " + ", ".join(missing))
+
+
 def cmd_evidence(args):
     d, st = pathlib.Path(args.dir), load(args.dir)
+    settled(d, st)
     summary = dict(chain_id=st["chain_id"], escrow=st.get("escrow"), verifier=st.get("verifier"), token=st["token"],
                    image_id=st.get("image_id"), code_hashes=st.get("code_hashes"), amount=st["amount"],
                    addresses=st["addresses"], quote=st.get("quote"), delivery=st.get("delivery"),
@@ -451,6 +468,8 @@ def parser():
 
     init = add("init", cmd_init)
     init.add_argument("--chain-id", type=int, default=5042)
+    init.add_argument("--allow-chain", action="store_true",
+                      help="Accept a chain ID other than Arc mainnet, for a local rehearsal or a testnet")
     init.add_argument("--token", default=ARC_USDC)
     init.add_argument("--amount", type=int, required=True, help=f"Token units, at most {HARD_CAP}")
     init.add_argument("--max-cost", type=int, required=True, help="Checker cost ceiling in instance units")

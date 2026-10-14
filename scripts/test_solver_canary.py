@@ -21,7 +21,7 @@ A, B, C, D = ("0x" + str(n) * 40 for n in (1, 2, 3, 4))
 
 def init_args(directory, **change):
     values = dict(dir=directory, chain_id=5042, token=canary.ARC_USDC, amount=2_000_000, max_cost=14,
-                  instance=None, accept_window=3600, settle_window=14400,
+                  instance=None, accept_window=3600, settle_window=14400, allow_chain=False,
                   deployer=f"ledger:{A}", buyer=f"ledger:{B}", seller=f"ledger:{C}", relayer=f"ledger:{D}")
     values.update(change)
     return argparse.Namespace(**values)
@@ -57,9 +57,16 @@ class InitTests(TempCase):
             self.init()
 
     def test_unlocked_signers_are_allowed_off_mainnet(self):
-        directory = self.init(name="local", chain_id=31337, deployer=f"unlocked:{A}", buyer=f"unlocked:{B}",
-                              seller=f"unlocked:{C}", relayer=f"unlocked:{D}")
+        directory = self.init(name="local", chain_id=31337, allow_chain=True, deployer=f"unlocked:{A}",
+                              buyer=f"unlocked:{B}", seller=f"unlocked:{C}", relayer=f"unlocked:{D}")
         self.assertEqual(canary.load(directory)["chain_id"], 31337)
+
+    def test_other_chains_need_an_explicit_override(self):
+        for chain in (31337, 5042002, 5024, 1):
+            with self.subTest(chain=chain), self.assertRaises(canary.CanaryError) as ctx:
+                self.init(name=f"chain{chain}", chain_id=chain)
+            self.assertIn("--allow-chain", str(ctx.exception))
+            self.assertFalse((self.root / f"chain{chain}").exists())
 
 
 class StepTests(TempCase):
@@ -109,6 +116,53 @@ class StepTests(TempCase):
                 canary.cmd_settle(argparse.Namespace(dir=self.dir, execute=False, confirm_chain=None,
                                                      confirm_amount=None))
         self.assertIn("substituted", str(ctx.exception))
+
+
+class EvidenceTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.dir = self.init()
+        self.d = pathlib.Path(self.dir)
+
+    def evidence(self):
+        return canary.cmd_evidence(argparse.Namespace(dir=self.dir))
+
+    def complete(self):
+        st = canary.load(self.dir)
+        st.update(proof={}, tx={"settle": {"hash": "0x1", "block": "0x2"}},
+                  checks={name: True for name in canary.SETTLEMENT_CHECKS})
+        canary.save(self.dir, st)
+        (self.d / "settlement.json").write_text("{}")
+
+    def test_evidence_needs_a_completed_settlement(self):
+        with self.assertRaises(canary.CanaryError):
+            self.evidence()
+        st = canary.load(self.dir)
+        st.update(proof={}, tx={"settle": {"intent_at": "now"}})
+        canary.save(self.dir, st)
+        with self.assertRaises(canary.CanaryError) as ctx:
+            self.evidence()
+        self.assertIn("settlement transaction", str(ctx.exception))
+        self.assertFalse((self.d / "result.json").exists())
+
+    def test_evidence_needs_every_post_settlement_check(self):
+        self.complete()
+        st = canary.load(self.dir)
+        st["checks"]["replay_rejected"] = False
+        canary.save(self.dir, st)
+        with self.assertRaises(canary.CanaryError) as ctx:
+            self.evidence()
+        self.assertIn("replay_rejected", str(ctx.exception))
+        self.assertFalse((self.d / "result.json").exists())
+
+    def test_evidence_is_written_once_after_completion(self):
+        self.complete()
+        self.evidence()
+        summary = json.loads((self.d / "result.json").read_text())
+        self.assertTrue(summary["realProof"])
+        self.assertEqual(summary["transactions"]["settle"]["hash"], "0x1")
+        with self.assertRaises(FileExistsError):
+            self.evidence()
 
 
 class RunTests(unittest.TestCase):
