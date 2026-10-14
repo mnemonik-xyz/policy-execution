@@ -46,10 +46,10 @@ io.net CaaS (Containers-as-a-Service) with Arc/Warrant.
 * **Preflight Budget Gate (`--usd-pointer`):**
   `--usd-pointer /data/data/total_cost_usdc` inspects the live estimate JSON. If the extracted
   price exceeds `--max-cost-usd`, deployment aborts before sending requests to io.net.
-* **PayG vs Duration Cleanup:**
-  When `billing_model: "payg"` is selected, io.net will **not** terminate the container at the
-  1-hour mark. Run the teardown step immediately after completing transcription to avoid ongoing
-  metered charges.
+* **Duration Billing Only:**
+  `adapter.py` rejects `billing_model: "payg"` because `duration_hours` does not bound a PayG
+  container's lifetime. Use `"duration"`. Still run the teardown step immediately after
+  transcription: the one-hour limit is a provider setting, not proof that charges stopped.
 
 ---
 
@@ -153,7 +153,7 @@ Request the estimate:
 2. Create `deploy-args.json` with matching resources:
    ```json
    {
-     "billing_model": "payg",
+     "billing_model": "duration",
      "hardware_id": "gpu_1x_l40",
      "location_ids": "US",
      "duration_hours": 1,
@@ -237,7 +237,7 @@ Request the estimate:
 
 ### Step 7: Teardown and Cleanup
 
-Immediately terminate the container to stop PayG billing:
+Immediately terminate the container; do not wait for the one-hour duration to end:
 
 ```sh
 .venv/bin/python scripts/ionet-showcase.py destroy \

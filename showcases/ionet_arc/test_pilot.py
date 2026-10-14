@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import hashlib
+import io
 import json
 import os
 import socket
@@ -144,10 +146,12 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["phase"], "deployed")
                 self.assertEqual(result["deployment_id"], DEPLOYMENT_ID)
 
-    async def test_payg_billing_model_allowed(self):
-        result = await self.launch(args=dict(ARGS, billing_model="payg"))
-        self.assertEqual(result["phase"], "deployed")
-        self.assertEqual(result["deployment_id"], DEPLOYMENT_ID)
+    async def test_payg_billing_model_rejected_before_call(self):
+        with self.assertRaises(PilotError) as ctx:
+            await self.launch(args=dict(ARGS, billing_model="payg"))
+        self.assertIn("duration", str(ctx.exception))
+        self.cloud.call.assert_not_awaited()
+        self.assertFalse(self.state.exists())
 
     async def test_stale_mismatched_overbudget_estimates_rejected(self):
         for kind in ("stale", "changed", "expensive", "negative", "nan", "missing"):
@@ -305,9 +309,22 @@ class ArcAndPaymentTests(unittest.TestCase):
             {"structuredContent": {"status": "error", "error": "SECRET"}},
             {"content": [{"type": "text", "text": "SECRET"}]},
         ):
-            with self.assertRaises(PilotError) as ctx:
-                decode_result(result)
-            self.assertNotIn("SECRET", str(ctx.exception))
+            stderr = io.StringIO()
+            with self.subTest(result=result), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(PilotError) as ctx:
+                    decode_result(result)
+                self.assertNotIn("SECRET", str(ctx.exception))
+                self.assertNotIn("SECRET", stderr.getvalue())
+
+    def test_tool_error_stderr_carries_only_length_and_digest(self):
+        details = "WARRANT_WORKER_TOKEN=SECRET"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(PilotError):
+            decode_result({"isError": True, "content": [{"type": "text", "text": details}]})
+        logged = stderr.getvalue()
+        self.assertNotIn("SECRET", logged)
+        self.assertIn(f"length={len(details.encode())}", logged)
+        self.assertIn(hashlib.sha256(details.encode()).hexdigest()[:16], logged)
 
     def test_read_json_file_and_inline(self):
         with tempfile.NamedTemporaryFile("w+", delete=False) as f:
