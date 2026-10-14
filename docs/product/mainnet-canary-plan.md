@@ -26,7 +26,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 10. **Deployment manifest and evidence folder**: source commit, compiler (0.8.28 Cancun), addresses, code hashes, image ID, tx hashes, GHCR digest; separate local / mainnet evidence.
 11. **Optional**: Hetzner evidence storage via a new `warrant-showcase` role copying the `universal-paywall-staging` pattern. Neither blocks the canary.
 12. **Circle marketplace listing** (added 2026-10-14): make the seller discoverable through Circle's Discovery API. The seller needs a paid x402 quote endpoint, a seller signature on the quote, an OpenAPI document and a public HTTPS host. Circle lists Arc mainnet only, so the listing names the mainnet payout wallet and the mainnet escrow from step 5. Specification: [circle-listing.md](circle-listing.md). Marketplace design: [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13). Does not block the canary settlement; it follows it.
-13. **Lease guest** (added 2026-10-14): the target lease design settles each interval of a GPU lease against a buyer-signed voucher through `InvoiceEscrow`, with no contract change. Needs a new guest, four host subcommands, a fixture, a template and a deployment of `InvoiceEscrow` pinned to the lease image ID. Specification: [lease-evidence.md](lease-evidence.md). Not a canary gate. Starts after the first release of the marketplace, which uses interval tasks on `TaskEscrow`.
+13. **Metered lease family** (added 2026-10-14): production-readiness track L1 in the [delivery plan](delivery-plan.md). A new guest and a deployment of `InvoiceEscrow` pinned to the lease image ID, no contract change. Specification: [lease-evidence.md](lease-evidence.md). Not a canary gate. Listed here because its mainnet deployment follows the same deploy, probe and evidence steps as items 3, 4 and 10.
 
 ## Execution order
 1. Local rehearsal on Anvil: `cargo test -p warrant-policy --locked`; `forge test`; `python3 -m unittest showcases.ionet_arc.test_pilot -v`; `scripts/solver-demo.py` with real Groth16 on an x86 Docker host (negatives: wrong image, changed journal, result substitution, replay, buyer cancellation).
@@ -36,7 +36,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 5. With explicit user approval at each step: deploy verifier and escrow -> post-deployment code-hash check against the manifest (item 4) -> one capped order -> prove -> settle -> one negative (duplicate settle) -> publish evidence.
 6. io.net run, separately authorized: estimate -> `deploy` (duration billing, 1 GPU/1 replica/1 h, `--max-cost-usd 1.00`) -> `/health` -> `POST /job` -> poll `GET /job/<job_id>` -> collect transcript off-container -> `destroy` -> confirm status and credits.
 7. Circle listing (item 12), after the mainnet escrow exists: keyless x402 trial on Arc testnet -> quote endpoint and OpenAPI on a public HTTPS host -> ask Circle whether an escrow-settled product is eligible -> submit the form with the mainnet payout wallet -> record the review outcome.
-8. Lease guest (item 13), after the first marketplace release: module and tests -> reproducible image ID -> local Anvil settlement on both paths -> deployment pinned to that ID -> one capped lease on mainnet.
+8. Metered lease family (item 13, track L1): module and tests -> reproducible image ID -> local Anvil settlement on both paths -> deployment pinned to that ID -> one capped lease on mainnet.
 9. Bump pins in `warrant` and `tameion` after review.
 
 ## Open before the first mainnet step (status 2026-10-09)

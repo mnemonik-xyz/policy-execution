@@ -1,19 +1,24 @@
-# Specification: the lease evidence module
+# Specification: the metered lease policy family
 
 Status: **proposed, 2026-10-14. Nothing in this document is implemented.**
-This is the target lease design of the
-[compute marketplace proposal](https://github.com/mnemonik-xyz/warrant/pull/13),
-section 6.2: one `InvoiceEscrow` order per lease, settled per interval against
-buyer-signed vouchers. It is a `policy-execution` work item in the
-[mainnet canary plan](mainnet-canary-plan.md), item 13. It is not a canary gate.
+The metered lease is a Warrant policy family, beside task, invoice and solver. It is
+part of production readiness: track L1 in the [delivery plan](delivery-plan.md) and
+an entry in the [policy catalog](policy-catalog.md). The compute marketplace in
+[warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13) is its first consumer,
+not its owner.
 
 Abbreviations: GPU — Graphics Processing Unit.
 
 ## 1. Goal
 
-Add a lease guest, so that a GPU lease settles through `InvoiceEscrow` without a
-contract change. The buyer funds one order with the ceiling. The seller settles each
-interval with a proof that a buyer-signed voucher for that interval exists.
+Add a lease guest, so that a metered service settles through `InvoiceEscrow` without
+a contract change. The buyer funds one order with the ceiling. The seller settles each
+interval with a proof that a buyer-signed voucher for that interval exists. A GPU lease
+is the first service. Any service billed per interval against a buyer voucher fits.
+
+Catalog entry: **Metered lease**. Adapters: `lease-proof-v1` on `InvoiceEscrow.settle`
+and `lease-signature-v1` on `InvoiceEscrow.settleSigned`, both with the fifteen-word
+journal and a deployment pinned to the lease image ID.
 
 ## 2. The module
 

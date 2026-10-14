@@ -74,7 +74,7 @@ An invalid schedule never becomes payable merely because a transcript was produc
 - [Delivery plan, operations and release gates](delivery-plan.md)
 - [Arc mainnet canary plan](mainnet-canary-plan.md)
 - [Circle marketplace listing of the io.net seller](circle-listing.md)
-- [Lease evidence module](lease-evidence.md)
+- [Metered lease policy family](lease-evidence.md)
 
 ## Evidence baseline
 

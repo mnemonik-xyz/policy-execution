@@ -14,6 +14,7 @@ A policy defines authorization conditions. A funding arrangement defines who ret
 | Invoice against purchase order | `core/src/evidence.rs`, invoice guest | Customer, vendor credential, signed PO, invoice authority, exact UBL bytes, checked line evidence, approved lexicon, rules; optional reviewer | Invoice proof, authorized signer, or explicit buyer approval |
 | Policy-controlled spending vault | `PolicyExecutionVault.sol`, task guest | Supported task-policy rule tree and authority keys; lifetime budget, hard payment cap and owner controls | Vault proof |
 | Fixed-circuit payment | `proof-execution`, `ProofPolicyVault.sol` | One allowed category, amount cap, validity, policy version; owner-approved facts commitment | Circom/Groth16 proof |
+| Metered lease | New specification only, [lease-evidence.md](lease-evidence.md) | Rate per interval, maximum intervals, ceiling, registry and acceptance keys; a buyer-signed voucher per interval | Lease proof or authorized signer on `InvoiceEscrow` pinned to the lease image; no contract change |
 | Bounded DeFi swap | New specification only | Token pair, exact input, output minimum, recipient, route, expiry and spend authorization | New swap executor; see [swap specification](defi-swaps.md) |
 
 The fixed-circuit entry remains visible and integrable through the same site, with its separate setup/provenance requirements. Its current single-machine development setup cannot be presented as production-ready. Do not silently migrate its commitments to RISC Zero or label it as a task escrow.
@@ -50,6 +51,8 @@ These adapter IDs are proposed site integration identifiers for existing contrac
 | `solver-proof-v1` | `SolverBountyEscrow.settleWithResult(seal,journal,result)` | Solver guest, 13 words / 416 bytes | Task lifecycle; public result mandatory; hash-only path rejected |
 | `invoice-proof-v2` | `InvoiceEscrow.settle(seal,journal)` | Invoice guest, 15 words / 480 bytes | Multiple invoices per accepted PO; fixed vendor and aggregate ceiling |
 | `invoice-signature-v2` | `InvoiceEscrow.settleSigned(journal,signature)` | Same 15-word journal; approved signer digest | Buyer-designated service trusted; amount strictly below threshold and within remaining signer allowance |
+| `lease-proof-v1` | `InvoiceEscrow.settle(seal,journal)` | Lease guest, 15 words / 480 bytes; specified only | One order per lease; one obligation per interval; fixed recipient and ceiling |
+| `lease-signature-v1` | `InvoiceEscrow.settleSigned(journal,signature)` | Same 15-word journal; approved signer digest; specified only | Buyer guardrail as the named signer below the threshold; proof path as fallback |
 | `invoice-approval-v2` | `InvoiceEscrow.settleApproved(orderId,obligationId,amount,documentHash)` | Buyer's direct transaction; no policy proof | Explicit override, including a Deny; still bounded by vendor, ceiling, deadline and replay checks |
 | `vault-proof-v1` | `PolicyExecutionVault.pay(seal,journal)` | Task guest, 12 words / 384 bytes | Owner can pause, withdraw, cancel and rotate policy; no irrevocable task reservation |
 | `circom-payment-v1` | `ProofPolicyVault.pay(a,b,c,publicSignals)` | Fixed circuit, 11 public signals and pinned verifier key | Owner approves facts; revocable vault; separate commitments/setup |
