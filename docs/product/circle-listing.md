@@ -118,10 +118,24 @@ base64 of this object:
     }
   ],
   "extensions": {
-    "payment-identifier": { "info": { "required": true } }
+    "payment-identifier": {
+      "info": { "required": true },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "required": { "type": "boolean" },
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" }
+        },
+        "required": ["id"]
+      }
+    }
   }
 }
 ```
+
+An extension envelope carries `info` and `schema`, per the x402 version 2 specification.
+The client sets `info.id` in its `PaymentPayload`. The server validates it against the
+pattern and uses it as the idempotency key. A retry reuses the same identifier.
 
 The quote fee is 0.01 USDC. It is a nominal fee. It exists because Circle lists paid
 endpoints only. The network is `eip155:5042002` for the trial and `eip155:5042` for the
@@ -130,19 +144,22 @@ listing. One deployment serves one network.
 ### 4.4 Paid request
 
 1. The client repeats the request with the header `PAYMENT-SIGNATURE`.
-2. The server decodes the `PaymentPayload`. It checks `accepted` against its own requirements field by field. A mismatch returns 402 again.
-3. The server builds the Facilitator-Seller-Proof with the `server_account` key and calls settle with a fresh payment identifier.
+2. The server decodes the `PaymentPayload`. It checks `accepted` against its own requirements field by field. It reads the payment identifier from `extensions.payment-identifier.info.id`. A mismatch or a missing identifier returns 402 again.
+3. The server builds the Facilitator-Seller-Proof with the `server_account` key and calls settle with that payment identifier.
 4. On `success`, the server returns 200, the quote, and the header `PAYMENT-RESPONSE` with the settlement response.
 5. On `settlement_pending`, the server polls the status URL up to `maxTimeoutSeconds`. On `completed`, step 4 applies. Otherwise the server returns 402 with an `error`.
-6. The server stores the payment identifier with the quote. A repeat of the same payment returns the same quote.
+6. The server stores the payment identifier with the quote. A repeat of the same identifier returns the same quote and makes no second settle call.
 
 ### 4.5 The quote body
 
-The body is the existing `propose_deployment` result, with three additions:
+The body is the existing `propose_deployment` result, with four additions:
 
 - `quote_id`: the payment identifier.
 - `valid_until`: `proposed_at` plus 900 seconds.
-- `signature`: a 65-byte secp256k1 signature by the `server_account` key over the SHA-256 of the canonical JSON of all other fields. `canonical` and `digest` in `adapter.py` define the encoding.
+- `fulfillment`: the MCP URL and a bearer credential, see section 4.7.
+- `signature`: a 65-byte secp256k1 signature by the `server_account` key over the SHA-256 of the canonical JSON of all other fields except `fulfillment`. `canonical` and `digest` in `adapter.py` define the encoding.
+
+The credential stays outside the signed fields, so the quote can be shown to a third party without it.
 
 One invariant holds across the whole path:
 
@@ -152,7 +169,30 @@ payTo in PAYMENT-REQUIRED == recipient in the quote == recovered signer of the q
 
 The buyer guardrail checks the first three. The escrow enforces the fourth.
 
-### 4.6 Implementation choice
+### 4.6 The fulfilment path
+
+A discovery client that paid for a quote must be able to complete the deal. The deal
+completes through the existing MCP tools `deploy_with_escrow`, `get_deployment_status`,
+`submit_acceptance` and `transcribe_audio`. The MCP route sits behind Basic Auth, which
+a discovery client does not hold. The paid quote therefore carries a credential:
+
+```json
+{
+  "fulfillment": {
+    "mcp_url": "https://<host>/mcp",
+    "authorization": "Bearer <token>",
+    "expires_at": 1791900000
+  }
+}
+```
+
+- The token is an HMAC of `quote_id` under a server secret. The server stores nothing extra.
+- The token is valid until the task `settleBy` of the quote. It is accepted for that `task_id` only.
+- `BasicAuthMiddleware` accepts either the Basic credentials or a valid bearer token on the MCP route.
+- The tools stay safe without a stronger credential. `deploy_with_escrow` reads the funded task from the chain. `submit_acceptance` requires the buyer acceptance signature. A stranger with the token can at most trigger provisioning for a task the buyer already funded.
+- The OpenAPI document describes the `fulfillment` object and names the MCP tools and their argument schemas, so an agent can read the whole flow from the listing.
+
+### 4.7 Implementation choice
 
 Write the x402 server side in this repository. It is about 150 lines:
 header encoding, requirement matching, the EIP-712 seller proof with `eth-account`,
@@ -167,6 +207,7 @@ than it removes. Revisit if Circle changes the proof format.
 - One path, `POST /x402/quote`, with the request schema of section 4.2.
 - Response 402 documents the `PAYMENT-REQUIRED` header. Response 200 documents the quote schema and the `PAYMENT-RESPONSE` header.
 - The description states that the quote fee buys a quote, and that the lease settles through `TaskEscrow`.
+- The quote schema includes the `fulfillment` object. A section lists the MCP tools of the fulfilment path with their argument schemas.
 - A test validates the committed document against the served one.
 
 ## 6. The submission
@@ -206,6 +247,7 @@ only what the quote endpoint requires of it:
 - The route must not provision, accept or settle. It prices and signs only.
 - Never log the `PAYMENT-SIGNATURE` header or the seller proof.
 - The seller proof key is the payout key. The seller server already holds it, because it calls `accept` and `settle`. No new key appears.
+- The fulfilment token is a bearer credential. Transmit it over TLS only, and never log it.
 - A quote fee paid to a copied `payTo` is lost to the buyer. The guardrail must take `payTo` from Circle's listing, not from the 402 header alone.
 
 ## 9. Acceptance criteria
@@ -218,12 +260,15 @@ only what the quote endpoint requires of it:
 - AC-6: The committed OpenAPI document equals the served one and validates as OpenAPI 3.1.
 - AC-7: The invariant of section 4.5 has a test.
 - AC-8: One keyless trial settlement on Arc testnet is recorded with its transaction hash.
+- AC-9: A 402 challenge without `info.id` in the payload, or with an identifier outside the pattern, is rejected.
+- AC-10: The fulfilment token of one quote opens the MCP route for that `task_id`, and is rejected for another `task_id` and after `settleBy`.
 
 ## 10. Effort
 
 | Work | Estimate |
 |---|---|
 | Quote route, 402 and paid path | 2 days |
+| Fulfilment token in the quote and on the MCP route | 0.5 day |
 | Facilitator client and seller proof | 1 day |
 | OpenAPI document and test | 0.5 day |
 | Tests for AC-1 to AC-7 | 1 day |
@@ -231,7 +276,7 @@ only what the quote endpoint requires of it:
 | Public HTTPS host | 0.5 day |
 | Submission and Circle review | Unknown |
 
-About six engineer-days plus the review wait. No contract, guest or proof changes.
+About seven engineer-days plus the review wait. No contract, guest or proof changes.
 
 ## 11. Open questions
 
