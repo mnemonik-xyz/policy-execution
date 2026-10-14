@@ -244,6 +244,101 @@ a key that can spend the buyer's funds. No component outside Arc decides who get
 paid. The seller depends on nobody for settlement except its own worker and, in the
 fallback, its own prover.
 
+## 4c. Hardware and other requirements per component
+
+Figures marked "measured" come from `validation-results.md` or the showcase. Figures
+marked "unmeasured" are gates, not estimates. ME-8 measures the prover before any
+batch size or threshold is chosen.
+
+### Buyer agent
+
+| Requirement | Value |
+|---|---|
+| Hardware | Any machine that runs the LLM client. No GPU, no key. |
+| Software | An MCP client: Claude Desktop, Cursor or a server-side agent. |
+| Network | HTTPS to the seller service, to Circle Discovery and, for the quote fee, to the seller's quote endpoint. |
+| Keys | None. BG-4. |
+
+### Buyer guardrail
+
+| Requirement | Value |
+|---|---|
+| Hardware | One always-on host. A small VPS or the buyer's server. Two CPUs and 2 GiB of memory are enough for native checking, which is measured at 0.04 s per decision. |
+| Software | Python 3 with `mcp==2.3.0`, `httpx2`, `eth-account`, `pyyaml`. The `warrant-host` binary built with Rust 1.88.0 from `rzup` and `r0vm 3.0.5` for `meter-sign` and `meter-evaluate`. |
+| Process | A daemon with a restart policy, not a child of the desktop app. It answers 402 challenges and `meter-sign` calls while the agent is offline. |
+| Network | Arc JSON-RPC for order reads and `offer`, `close`. Inbound HTTPS from the seller's worker for `meter-sign`, or an outbound long-poll if the buyer has no inbound address. |
+| Keys | Wallet key for `offer` and `close`; registry key; note key; signer key named in the order. Each in a keystore, never in a config file. The note key and the signer key are low-value keys bounded by one order's ceiling. |
+| Clock | NTP. Note windows and `settleBy` are compared with block time. |
+| State | The next note index per lease, persisted before a note is signed. A lost index means a reused index and a refused request. |
+
+### Seller service
+
+| Requirement | Value |
+|---|---|
+| Hardware | One public host. Two CPUs and 2 GiB of memory for the service and the worker together. Disk for the note store, below 1 KiB per note. |
+| Software | Python 3 with the showcase dependencies, `uvicorn`, Starlette with the MCP transport, the 402 middleware of section 3, and the `warrant-host` binary for native note checks. |
+| Network | A public HTTPS host with a valid TLS certificate and a stable DNS name. Circle health-checks it continuously and drops the listing while it is unreachable. Port 443 inbound. Outbound to Arc JSON-RPC, to the cloud provider's API, and to Circle's Facilitator Service for the quote fee. |
+| Keys | The payout key, used for `accept`, for the quote signature, for the seller proof toward Circle, and by the worker for `settleSigned` and `settle`. In a keystore. |
+| Accounts | A cloud provider account with an API key and prefunded credits, bounded per the canary plan. A Circle API key for the Facilitator Service in production; the Arc testnet trial is keyless. |
+| Operations | Rate limiting on the public paths, request logs without note bodies (SS-7), a backup of the note store, alerts for approaching `settleBy`, low gas and a proof backlog, per the delivery plan. |
+
+### Seller settlement worker
+
+| Requirement | Value |
+|---|---|
+| Hardware | Shares the seller host. |
+| Software | The `warrant-host` binary for batch inputs and `meter-evaluate`; Arc JSON-RPC access; a local path or a remote call to the prover. |
+| Funds | Native USDC on Arc for gas on `settleSigned` and `settle`. Arc pays gas in USDC. One settlement per batch; the batch size sets the transaction count. |
+| Clock | NTP. The margin before `settleBy` is measured in block time. |
+| State | Per batch: built, signed, submitted, confirmed, or proving. Persisted so that a restart neither double-submits nor loses a batch. |
+
+### Prover
+
+| Requirement | Value |
+|---|---|
+| Hardware | x86_64 Linux with Docker. The Groth16 wrap runs only in Docker on x86. CPU count and memory: unmeasured for the meter guest. The measured sample for the invoice guest ran on 14 reported CPUs with four Rayon workers and segment exponent 18, used 2,097,152 cycles in eight segments, and took 445.65 s to prove and 79.73 s to wrap. Peak memory was not recorded. |
+| Software | Ubuntu, Docker, Rust via `rustup`, `rzup install rust 1.88.0`, `rzup install r0vm 3.0.5`, Foundry. `scripts/prover-vm.sh` installs all of it on a fresh machine. |
+| Settings | `RAYON_NUM_THREADS` and `WARRANT_SEGMENT_PO2` between 16 and 20 to keep proving out of swap. `RISC0_DEV_MODE` is rejected. |
+| Alternative | A rented proving service. The receipt is verified on chain, so the prover needs no trust. It needs the batch input, which contains the notes and the credential, not the job payloads. |
+| Gate | ME-8: one full batch proved and wrapped on this host, with wall time, CPU seconds and peak memory recorded, before the batch size and the threshold are set. |
+
+### Worker container
+
+| Requirement | Value |
+|---|---|
+| Hardware | One GPU per container, one replica, duration billing. The showcase uses an RTX 4090 class at about 0.35 USD per hour on io.net. |
+| Image | `ghcr.io/mnemonik-xyz/warrant-transcription:pilot`, about 1.9 GiB compressed, CUDA 12.3 base, `libcublas-12-3` and `libcudnn9-cuda-12` only, `faster-whisper-small` pinned by revision. Deploy by digest, not by tag. |
+| Network | One traffic port, 8080, reachable by the seller service. The buyer reaches it through the seller's metered path, not directly. |
+| Keys | None of Warrant. The worker never sees a note. |
+| Provider | An io.net account, API key, credits, and the hardware and location identifiers discovered through the provider's API, never invented. |
+
+### Arc
+
+| Requirement | Value |
+|---|---|
+| Networks | Testnet chain 5042002 at `https://rpc.testnet.arc.io`; mainnet chain 5042 at `https://rpc.mainnet.arc.io`. USDC at `0x3600000000000000000000000000000000000000`, six decimals. Native and ERC-20 USDC share one balance. |
+| Contracts | `InvoiceEscrow` and the RISC Zero verifier deployed together by `DeployInvoice.s.sol`, Solidity 0.8.28 Cancun, OpenZeppelin 5.6.1, pinned to the meter image ID from a `RISC0_USE_DOCKER=1` build. The BN254 precompiles at `0x07` and `0x08` answered correctly on testnet. |
+| Funds | Deployer gas; buyer ceiling plus gas; seller gas for `accept` and settlements. Canary amounts first. |
+| Keys | Deployer in a Foundry keystore or a hardware wallet. Separate low-value buyer, seller and relayer keys. Mainnet keys never in the team's secrets file, per the canary plan. |
+| Probe | Before any order: chain ID, precompiles, USDC decimals, and the code hashes of the deployed verifier and escrow against the build. |
+
+### Circle
+
+| Requirement | Value |
+|---|---|
+| Discovery | Keyless. The listing needs the public HTTPS quote endpoint, the OpenAPI document, the payout wallet and the form. Manual review. |
+| Facilitator Service | Keyless trial on Arc testnet. A Circle API key for production. The seller proof signed by the payout key on every call. Used for the quote fee only. |
+| Open point | Acceptance of the `warrant-note` scheme on metered paths is not established. |
+
+### Build and release, `policy-execution`
+
+| Requirement | Value |
+|---|---|
+| Toolchains | Rust 1.98.1 from `rust-toolchain.toml` for the workspace; `rzup` Rust 1.88.0 and `r0vm 3.0.5` for the guests; Solidity 0.8.28 with Foundry; Python 3 for the scripts; Verus for `verified/verify.py`. |
+| Reproducible image | `RISC0_USE_DOCKER=1 RISC0_BUILD_LOCKED=1 cargo build -p warrant-host --release --locked` on an x86 Docker host. Record `meter-image-id`. Local builds differ between machines and must not be deployed. |
+| Tests | `cargo test -p warrant-policy --locked`, `forge test`, the showcase unit tests, and the Verus run with mutations. The meter checker adds its gate tests and removed-check experiments. |
+| Artefacts | The image ID, the deployment addresses and code hashes, the compiler versions and the GHCR digest in one manifest, with local, testnet and mainnet evidence kept apart. |
+
 ## 5. The module
 
 The module `core/src/meter.rs` follows the solver path: mandatory gates first, the rule
