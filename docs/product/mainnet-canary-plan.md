@@ -3,7 +3,7 @@
 ## Context
 PR #12 and PR #14 (both merged 2026-10-09) polished the io.net adapter and reworked the worker image. Goal: a mainnet canary. `SolverBountyEscrow` on Arc mainnet (chain 5042, RPC verified live), one small real-proof settlement, then a separate capped io.net GPU transcription run. Decisions: mainnet canary, full local rehearsal first, prefunded io.net credits, new canary script for mainnet txs.
 
-**Deviation from the written gates (core team decision, 2026-10-09).** The core team chose to skip the public Arc-testnet settlement rehearsal. `docs/product/settlement.md` CHAIN-1 and `showcases/ionet_arc/README.md` (milestone 5) still require it. The independent review in CHAIN-5 is also not planned. Neither gate is satisfied by this plan. Before the canary, either update those documents to record the exception, or run the gates. The canary is not a production launch.
+**Deviation from the written gates (core team decision, 2026-10-09).** The core team chose to skip the public Arc-testnet settlement rehearsal. `docs/product/settlement.md` CHAIN-1 and `showcases/ionet_arc/README.md` (milestone 5) still require it. The independent review in CHAIN-5 is also not planned. Neither gate is satisfied by this plan. The exception is recorded in `settlement.md`, section "Recorded exception for the Arc mainnet canary", on 2026-10-14. The `ionet_arc` README no longer carries the milestone list. The canary is not a production launch.
 
 Not implemented (state in the showcase): CCTP bridging, automatic provider payment, settlement-triggered GPU run. The GPU run is a manual step after settlement.
 
@@ -44,7 +44,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 - Funds and signers: no USDC, gas, keystores or hardware wallet arranged.
 - io.net: no API key, credit balance or spend cap arranged.
 - Workload: no real instance or public audio file chosen.
-- Gate documents: `settlement.md` and the `ionet_arc` README do not yet record the testnet and CHAIN-5 exception.
+- Gate documents: resolved 2026-10-14. `settlement.md` records the testnet and CHAIN-5 exception.
 - Circle listing (status 2026-10-14): no public HTTPS host, no Circle API key, no x402 endpoint, no OpenAPI document. Circle has not confirmed eligibility of an escrow-settled product.
 
 ## Risks to state in the showcase
