@@ -89,7 +89,7 @@ established. The quote path keeps the `exact` scheme, so the listing is not at r
 Serving never waits for settlement. A worker inside the seller server settles later:
 
 1. Notes accumulate in a queue as the buyer uses the service.
-2. On a timer, the worker takes the unsettled notes that fill a batch, builds the batch input and the journal, and asks the buyer's signing endpoint to countersign. That endpoint is the existing signer service, `warrant-host invoice-sign` in the host, run by the buyer's guardrail. It reads the order from the chain, runs the checker natively and signs.
+2. On a timer, the worker takes the unsettled notes that fill a batch, builds the batch input and the journal, and asks the buyer's signing endpoint to countersign. That endpoint runs the new `warrant-host meter-sign`, under the buyer's guardrail. It reads the live order from the chain, runs `authorize_meter` natively on the batch, checks that the journal matches, and signs the journal with the existing `sign_journal`. The note signatures are not settlement signatures. `settleSigned` recovers a 65-byte signature over `signerDigest(journal)`, and `invoice-sign` accepts only invoice requests.
 3. The worker calls `settleSigned`.
 4. If the signing endpoint refuses or does not answer, the worker keeps the batch and retries on the next tick.
 5. At `settleBy` minus a margin, the worker stops retrying and proves every unsettled batch itself: `warrant-host meter-prove`, the Groth16 wrap, then `settle`. One proof covers a whole batch.
@@ -177,7 +177,7 @@ The rest of the delta:
 | Piece | Work |
 |---|---|
 | `methods/meter-guest` | Read `MeterInput`, call `authorize_meter`, commit the journal. Add the name to `build.rs`. |
-| Host | `meter-image-id`, `meter-evaluate`, `meter-execute`, `meter-prove`, copied from the solver ones. |
+| Host | `meter-image-id`, `meter-evaluate`, `meter-execute`, `meter-prove`, copied from the solver ones. `meter-sign signer-key policy rpc-url batch.json output.json`, modelled on `invoice-sign`: read the order, run the checker natively, sign the journal. |
 | Signer path | `signer_digest` and `sign_journal` from `evidence.rs` apply unchanged. |
 | Fixtures | One meter journal for the Solidity test that mutates all fifteen words. |
 | Template | `templates/meter-v1.json` with ceiling, per-note cap and batch size as parameters. |
@@ -199,7 +199,7 @@ The rest of the delta:
 
 - BG-1: The guardrail answers a 402 challenge only when the lease is one it funded, the recipient equals the order's vendor, the escrow and network match the order, the amount is at most the per-note cap, and a per-lease rate limit allows it. Everything else is refused.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
-- BG-3: The guardrail runs the signing endpoint of section 4 for its own leases.
+- BG-3: The guardrail runs the signing endpoint of section 4 for its own leases, with `meter-sign` and the signer key named in the order.
 - BG-4: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
 
 ## 8. Trust assumptions
@@ -242,7 +242,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 
 - ME-1: `authorize_meter` rejects every gate of section 5 in a dedicated test, and a removed-check experiment fails for each.
 - ME-2: The meter journal is byte for byte the `InvoiceAuthorization` layout, and the Solidity fixture test that mutates all fifteen words passes with a meter journal.
-- ME-3: `settleSigned` and `settle` on `InvoiceEscrow` both pay one batch on local Anvil, and a second settlement of the same batch, or a batch that reuses an index, is rejected.
+- ME-3: `settleSigned` with a `meter-sign` signature and `settle` with a receipt both pay one batch on `InvoiceEscrow` on local Anvil, and a second settlement of the same batch, or a batch that reuses an index, is rejected.
 - ME-4: A note with `valid_after` in the future is rejected by the contract until that time.
 - ME-5: `meter-image-id` is recorded from a `RISC0_USE_DOCKER=1` build before any deployment.
 - ME-6: A metered path returns the 402 challenge of section 3 unpaid, serves against a valid note, and refuses a reused index.
@@ -251,8 +251,8 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 
 ## 11. Effort
 
-About one engineer-week for the family: the module and its tests, the guest, four
-host subcommands, one fixture, one template, one deployment script run. About three
+About one engineer-week for the family: the module and its tests, the guest, five
+host subcommands including the signer, one fixture, one template, one deployment script run. About three
 days for the seller side: the 402 middleware on the showcase service and the settlement
 worker. About two days for the guardrail: the challenge handler and the signing
 endpoint. The Verus proof covers the evaluator only. The meter checker is tested, not
