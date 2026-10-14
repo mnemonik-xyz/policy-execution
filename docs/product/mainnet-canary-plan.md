@@ -25,6 +25,8 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 9. **Pre-mainnet self-review** (does not satisfy CHAIN-5, which requires an independent review) of checker, projection, escrow, proving build, signing boundary; record findings and resolutions in a file.
 10. **Deployment manifest and evidence folder**: source commit, compiler (0.8.28 Cancun), addresses, code hashes, image ID, tx hashes, GHCR digest; separate local / mainnet evidence.
 11. **Optional**: Hetzner evidence storage via a new `warrant-showcase` role copying the `universal-paywall-staging` pattern. Neither blocks the canary.
+12. **Circle marketplace listing** (added 2026-10-14): make the seller discoverable through Circle's Discovery API. The seller needs a paid x402 quote endpoint, a seller signature on the quote, an OpenAPI document and a public HTTPS host. Circle lists Arc mainnet only, so the listing names the mainnet payout wallet and the mainnet escrow from step 5. Specification: [circle-listing.md](circle-listing.md). Marketplace design: [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13). Does not block the canary settlement; it follows it.
+13. **Metered payment family** (added 2026-10-14): production-readiness track L1 in the [delivery plan](delivery-plan.md). A new guest and a deployment of `InvoiceEscrow` pinned to the meter image ID, no contract change. Specification: [lease-evidence.md](lease-evidence.md). Not a canary gate. Listed here because its mainnet deployment follows the same deploy, probe and evidence steps as items 3, 4 and 10.
 
 ## Execution order
 1. Local rehearsal on Anvil: `cargo test -p warrant-policy --locked`; `forge test`; `python3 -m unittest showcases.ionet_arc.test_pilot -v`; `scripts/solver-demo.py` with real Groth16 on an x86 Docker host (negatives: wrong image, changed journal, result substitution, replay, buyer cancellation).
@@ -33,7 +35,9 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 4. Items 2, 3, 7, 9, 10 above, and the pre-deployment phase of item 4. Then a checkpoint, before any broadcast: the deployer, buyer, seller and relayer signers exist and sign through the chosen keystore or hardware wallet (item 6), and hold the bounty and gas balances (item 5). Check the balances with read-only calls and record them.
 5. With explicit user approval at each step: deploy verifier and escrow -> post-deployment code-hash check against the manifest (item 4) -> one capped order -> prove -> settle -> one negative (duplicate settle) -> publish evidence.
 6. io.net run, separately authorized: estimate -> `deploy` (duration billing, 1 GPU/1 replica/1 h, `--max-cost-usd 1.00`) -> `/health` -> `POST /job` -> poll `GET /job/<job_id>` -> collect transcript off-container -> `destroy` -> confirm status and credits.
-7. Bump pins in `warrant` and `tameion` after review.
+7. Circle listing (item 12), after the mainnet escrow exists: keyless x402 trial on Arc testnet -> quote endpoint and OpenAPI on a public HTTPS host -> ask Circle whether an escrow-settled product is eligible -> submit the form with the mainnet payout wallet -> record the review outcome.
+8. Metered payment family (item 13, track L1): module and tests -> reproducible image ID -> local Anvil settlement on both paths -> deployment pinned to that ID -> one capped lease on mainnet.
+9. Bump pins in `warrant` and `tameion` after review.
 
 ## Open before the first mainnet step (status 2026-10-09)
 - Tools: the cloud session used for this plan has `cargo` and `docker` but no `forge`, `cast`, `anvil` or `rzup`. GitHub release pages returned 403 through its proxy. The rehearsal needs a machine with Foundry, RISC Zero (`rzup`, `r0vm` 3.0.5) and x86 Docker.
@@ -41,6 +45,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 - io.net: no API key, credit balance or spend cap arranged.
 - Workload: no real instance or public audio file chosen.
 - Gate documents: `settlement.md` and the `ionet_arc` README do not yet record the testnet and CHAIN-5 exception.
+- Circle listing (status 2026-10-14): no public HTTPS host, no Circle API key, no x402 endpoint, no OpenAPI document. Circle has not confirmed eligibility of an escrow-settled product.
 
 ## Risks to state in the showcase
 Scope: this is a developer showcase of verified settlement for an agent-sold schedule, plus a separate cloud run. It is not a product. There is no web app, hosted API or agent-facing interface (MCP or HTTP). The seller is a deterministic heuristic, not an LLM. The GPU run is started by hand after settlement. Do not describe it as autonomous agents or automated payment of cloud bills.

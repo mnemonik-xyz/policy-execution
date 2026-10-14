@@ -76,9 +76,9 @@ Verify tests pass locally:
 
 ### Step 2: Build and Push Worker Image
 
-Run the **Build io.net Arc transcription image** workflow from GitHub Actions using `workflow_dispatch`.
-It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for `linux/amd64` with CUDA
-for GPU execution on io.net, plus the separate
+Run the **Build io.net Arc transcription image** workflow from GitHub Actions using
+`workflow_dispatch`. It publishes `ghcr.io/mnemonik-xyz/warrant-transcription:pilot` for
+`linux/amd64` with CUDA for GPU execution on io.net, plus the separate
 `ghcr.io/mnemonik-xyz/warrant-transcription:pilot-arm64` image for CPU inference on Apple
 Silicon Macs.
 
@@ -176,6 +176,16 @@ Request the estimate:
      --usd-pointer /data/data/total_cost_usdc \
      --max-cost-usd 1.00 \
      --state artifacts/io-deployment.json
+   ```
+
+   or run manually with the following command
+   ```sh
+   docker run --rm \
+     --name warrant-transcription \
+     --gpus all \
+     -p 8080:8080 \
+     -e WARRANT_WORKER_TOKEN="$WORKER_TOKEN" \
+     ghcr.io/mnemonik-xyz/warrant-transcription:pilot
    ```
 
 ---
