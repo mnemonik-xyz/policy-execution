@@ -169,6 +169,81 @@ The diagram shows one lease. Steps 7 to 14 repeat once per piece of service. Ste
 15 to 23 run in the background and never block step 14. Step 24 runs at most once per
 lease, and only when the signer stayed silent until the margin.
 
+## 4b. Components, deployment and ownership
+
+```mermaid
+flowchart TB
+    subgraph BUYER["Buyer's environment (owned and run by the buyer)"]
+        AG["Buyer agent<br/>LLM client, desktop or server<br/>holds no key"]
+        GD["Buyer guardrail<br/>MCP sidecar, daemon on the buyer's host<br/>holds: wallet key, registry key, note key, signer key<br/>runs: warrant-host meter-sign"]
+        AG -->|answer 402, fund lease| GD
+    end
+
+    subgraph SELLER["Seller's environment (owned and run by the seller)"]
+        SV["Seller service<br/>HTTP + MCP, public HTTPS host<br/>402 middleware, native note check<br/>holds: payout key"]
+        NQ[("Note store<br/>signed notes, batches, settlement state")]
+        WK["Settlement worker<br/>background process beside the service<br/>timer, signer call, settleSigned, prove fallback"]
+        PR["Prover<br/>x86 Docker host, seller's or rented<br/>runs: warrant-host meter-prove, wrap"]
+        SV --> NQ --> WK --> PR
+    end
+
+    subgraph PROVIDER["Cloud provider (io.net, owned by the provider)"]
+        WR["Worker container<br/>GPU job runner<br/>holds: nothing of Warrant"]
+    end
+
+    subgraph ARC["Arc (public chain, owned by nobody)"]
+        ES["InvoiceEscrow<br/>no owner, no upgrade, pinned meter image ID"]
+        VF["RISC Zero verifier"]
+        US["USDC"]
+        ES --> VF
+        ES --> US
+    end
+
+    subgraph CIRCLE["Circle (owned by Circle)"]
+        DS["Discovery API<br/>lists the seller's quote endpoint"]
+        FC["Facilitator Service<br/>settles the quote fee only"]
+    end
+
+    subgraph BUILD["policy-execution (owned by the Warrant team)"]
+        IMG["Meter guest image<br/>built with RISC0_USE_DOCKER=1<br/>image ID pinned at deployment"]
+        HOST["warrant-host binary<br/>same checker on both sides"]
+    end
+
+    AG -->|discover| DS
+    AG -->|quote fee, x402 exact| FC
+    AG -->|requests + notes| SV
+    SV -->|jobs| WR
+    GD -->|offer, close| ES
+    SV -->|accept| ES
+    WK -->|meter-sign| GD
+    WK -->|settleSigned / settle| ES
+    IMG -.->|image ID| ES
+    HOST -.-> GD
+    HOST -.-> WK
+    HOST -.-> PR
+```
+
+| Component | Runs where | Owner | Holds | Trusted for |
+|---|---|---|---|---|
+| Buyer agent | The buyer's desktop or server | Buyer | No key | Nothing. It proposes. |
+| Buyer guardrail | A daemon on the buyer's host | Buyer | Wallet key, registry key, note key, signer key | Funding, note signing under BG-1, countersigning batches |
+| Seller service | A public HTTPS host of the seller | Seller | Payout key | Serving against notes, SS-1 to SS-8 |
+| Note store | The seller's host | Seller | Signed notes, settlement state | Liveness of settlement only |
+| Settlement worker | A background process on the seller's host | Seller | Access to the note store and the payout key | Settling in time |
+| Prover | The seller's x86 Docker host, or a rented proving service | Seller, or a vendor | Batch inputs | Nothing. The receipt is checked on chain. |
+| Worker container | The cloud provider | Provider, rented by the seller | No Warrant key | Nothing. Service quality is outside the protocol. |
+| `InvoiceEscrow` | Arc | Nobody. No owner, no upgrade. | Reserved USDC per order | Recipient, ceiling, deadline, one payment per batch |
+| RISC Zero verifier | Arc | Nobody | Verifying key | Proof validity |
+| Discovery API | Circle | Circle | Listings | Liveness of discovery only |
+| Facilitator Service | Circle | Circle | Quote fee settlement | The quote fee only. Never a note or a lease. |
+| Meter guest image | Built in `policy-execution`, pinned in the escrow | Warrant team | The checker program | Everything the proof claims |
+| `warrant-host` | Buyer's guardrail, seller's worker, seller's prover | Warrant team | The same native checker | Native results equal the guest's |
+
+Three facts follow from the table. No component outside the buyer's environment holds
+a key that can spend the buyer's funds. No component outside Arc decides who gets
+paid. The seller depends on nobody for settlement except its own worker and, in the
+fallback, its own prover.
+
 ## 5. The module
 
 The module `core/src/meter.rs` follows the solver path: mandatory gates first, the rule
