@@ -72,6 +72,8 @@ An invalid schedule never becomes payable merely because a transcript was produc
 - [Escrow, proof and trust boundary](settlement.md)
 - [io.net execution and cross-chain funding](execution-funding.md)
 - [Delivery plan, operations and release gates](delivery-plan.md)
+- [Arc mainnet canary plan](mainnet-canary-plan.md)
+- [Circle marketplace listing of the io.net seller](circle-listing.md)
 
 ## Evidence baseline
 
