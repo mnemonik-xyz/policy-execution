@@ -14,9 +14,9 @@ Nothing is broadcast, no key is read and no account is funded.
       Reads the code of the deployed escrow and verifier, hashes it with keccak256 and compares the hashes
       with the manifest. Masks the immutable slots and compares the code with the local build artifacts in
       contracts/out. Checks token(), verifier(), imageId() and totalReserved() == 0 on the escrow.
-      Manifest keys (read defensively, missing keys are reported): escrow, verifier, image_id,
-      code_hashes {escrow, verifier}. Optional: token (default Arc USDC), chain_id (default 5042).
-      The schema is defined in solver-bounty/canary/ (unverified on 2026-10-14; keys follow the brief).
+      Manifest keys used (schema: solver-bounty/canary/manifest.schema.json; missing keys are reported):
+      escrow, verifier, image_id, code_hashes {escrow, verifier}, token (default Arc USDC when absent),
+      chain_id (default 5042 when absent) and transactions, which must not yet hold an order step.
 
 The RPC URL comes from the WARRANT_CANARY_RPC variable. It is never put in arguments, reports or errors.
 Any other chain than 5042 is refused unless --allow-chain N names it for a local rehearsal.
@@ -39,6 +39,7 @@ RISC0_DEV_MODE = "RISC0_DEV_MODE"
 WORD_ONE = "0x" + "00" * 31 + "01"
 EMPTY_CODE = "0x"
 PROBE_GAS = 15_000_000
+ORDER_STEPS = ("approve", "offer", "accept", "settle")
 # BN254 generator G = (1, 2) and 2G, from the curve equation y^2 = x^3 + 3 over the base field (EIP-196).
 G = "0x" + "00" * 31 + "01" + "00" * 31 + "02"
 TWO_G = ("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd3"
@@ -228,6 +229,9 @@ def cmd_after(args):
     for key, value in list(addresses.items()) + [("image_id", image_id)]:
         if not isinstance(value, str) or not value.startswith("0x"):
             problems.append(f"manifest lacks a hex {key!r} field")
+    for step in ORDER_STEPS:
+        if manifest_value(manifest, "transactions", step):
+            problems.append(f"manifest already records a {step} transaction; the probe runs before any order")
     if problems:
         return finish(args, report, problems)
     report["manifest"] = {"escrow": addresses["escrow"], "verifier": addresses["verifier"], "image_id": image_id,

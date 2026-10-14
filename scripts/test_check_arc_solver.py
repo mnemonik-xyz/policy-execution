@@ -225,6 +225,13 @@ class AfterTests(ProbeCase):
         self.assertEqual(self.after(), 1)
         self.assertNotIn("code", self.report())
 
+    def test_manifest_with_an_order_transaction_is_refused(self):
+        self.manifest.write_text(json.dumps(dict(MANIFEST, transactions={"deploy": "0x" + "4" * 64,
+                                                                        "offer": "0x" + "5" * 64})))
+        self.assertEqual(self.after(), 1)
+        self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
+        self.assertNotIn("code", self.report())
+
 
 class RunTests(unittest.TestCase):
     def test_errors_do_not_leak_the_rpc_url(self):
