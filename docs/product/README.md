@@ -73,6 +73,7 @@ An invalid schedule never becomes payable merely because a transcript was produc
 - [io.net execution and cross-chain funding](execution-funding.md)
 - [Delivery plan, operations and release gates](delivery-plan.md)
 - [Arc mainnet canary plan](mainnet-canary-plan.md)
+- [Canary kickoff: dev tasks and session prompt](canary-kickoff.md)
 - [Circle marketplace listing of the io.net seller](circle-listing.md)
 - [Metered payment policy family](lease-evidence.md)
 
