@@ -3,6 +3,7 @@
 They tie solver-bounty/instance-ionet.json, solver-bounty/instance-ionet.md and the
 reference seller together. They need the native checker but no network or chain.
 
+Build the binary from this same checkout, so the hash comes from the checker under test.
 Run from the repository root after `cargo build --locked -p warrant-solver`:
 python3 scripts/test_instance_ionet.py
 """
@@ -113,6 +114,9 @@ class InstanceTests(unittest.TestCase):
             path.write_text(json.dumps(schedule))
             checked = json.loads(native("check", INSTANCE, path))
         self.assertEqual(checked["totalCost"], heuristic_cost)
+        # One machine and independent jobs: every feasible schedule costs the sum of durations times price.
+        price = integer(values()["price_per_unit_tick"], "price_per_unit_tick")
+        self.assertEqual(heuristic_cost, sum(job["durations"][0] for job in load_instance()["jobs"]) * price)
         self.assertLessEqual(heuristic_cost, integer(values()["max_cost"], "max_cost"))
 
     def test_instance_is_not_bundled_synthetic(self):
@@ -123,12 +127,16 @@ class InstanceTests(unittest.TestCase):
 class RecordTests(unittest.TestCase):
     def test_provenance_record_is_complete(self):
         text = record()
-        audio = section(text, "Audio")
-        self.assertRegex(audio, r"\b[0-9a-f]{64}\b")
-        self.assertRegex(section(text, "Estimate"), r"observed_at\D+[0-9]{10}\b")
+        audio = dict(table(section(text, "Audio")))
+        self.assertRegex(audio["SHA-256"], r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(audio["Size (bytes)"], r"\A[1-9][0-9]*\Z")
+        self.assertRegex(audio["Retrieved"], r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+        self.assertRegex(audio["Catalogue page"], r"\Ahttps://librivox\.org/\S+\Z")
+        self.assertRegex(audio["File URL"], r"\Ahttps://archive\.org/download/\S+\Z")
+        for field in ("Title", "Author", "Reader", "Format"):
+            self.assertTrue(audio[field], field)
+        self.assertIn("public domain", audio["Licence"].lower())
         self.assertIn("caas_get_price_estimate", text)
-        self.assertRegex(audio, r"https://librivox\.org/\S+")
-        self.assertIn("public domain", audio.lower())
         self.assertIn("The checker proves a modelled cost, not the bill.", section(text, "Limits"))
 
     def test_estimate_excerpt_matches_values(self):
@@ -140,6 +148,10 @@ class RecordTests(unittest.TestCase):
         total = estimate["result"]["data"]["data"]["total_cost_usdc"]
         self.assertEqual(decimal.Decimal(str(total)), decimal.Decimal(rows["estimate_total_usd"]))
         self.assertEqual(estimate["observed_at"], integer(rows["estimate_observed_at"], "estimate_observed_at"))
+        fields = dict(table(section(record(), "Estimate")))
+        self.assertEqual(fields["Tool"], estimate["tool"])
+        self.assertEqual(fields["observed_at"].split()[0], rows["estimate_observed_at"])
+        self.assertEqual(fields["Total cost"].split()[0], rows["estimate_total_usd"])
 
     def test_machine_price_follows_estimate(self):
         rows, instance = values(), load_instance()
@@ -153,13 +165,18 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(integer(rows["max_cost"], "max_cost"), deadline * price)
         self.assertEqual(instance["machines"], [{"capacity": arguments["gpus_per_container"],
                                                   "price_per_unit_tick": price}])
-        for job in instance["jobs"]:
-            self.assertEqual((job["units"], job["release"], job["deadline"], job["dependencies"]),
-                             (1, 0, deadline, []))
+
+    def test_jobs_follow_lease(self):
+        deadline = integer(values()["deadline"], "deadline")
+        for index, job in enumerate(load_instance()["jobs"]):
+            with self.subTest(job=index):
+                self.assertEqual((job["units"], job["release"], job["deadline"], job["dependencies"]),
+                                 (1, 0, deadline, []))
 
     def test_job_durations_follow_audio(self):
         rows = dict(table(section(record(), "Audio")))
         seconds = decimal.Decimal(rows["Duration (s)"])
+        self.assertGreaterEqual(seconds, SEGMENT_SECONDS, "the segment rule needs at least one full segment")
         whole = int(seconds // SEGMENT_SECONDS)
         remainder = seconds - whole * SEGMENT_SECONDS
         # Full 30 s segments; the remainder is folded into the last one and rounded up.

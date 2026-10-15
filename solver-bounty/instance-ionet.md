@@ -17,7 +17,13 @@ The user took it on the laptop with their own io.net key:
   --args artifacts/price-args-a6000.json --out artifacts/io-estimate.json
 ```
 
-The raw result stays in `artifacts/io-estimate.json`, which is not committed.
+`artifacts/price-args-a6000.json` holds exactly these arguments:
+
+```text
+{"hardware_id": "gpu_1x_a6000", "location_ids": "US", "duration_hours": 1, "gpus_per_container": 1, "replica_count": 1}
+```
+
+The raw result stays in `artifacts/io-estimate.json`. Neither file is committed.
 
 | Field | Value |
 |---|---|
@@ -114,6 +120,9 @@ The budget is never smaller than the audio.
 
 The reference seller places the four jobs back to back from tick 0.
 Its schedule ends at tick 121 and costs 59290000, about 0.0165 USD.
+On this instance every feasible schedule has that same modelled cost.
+There is one machine, no dependency and no release gap, so placement cannot change the cost.
+`max_cost` is the lease ceiling, not a tight bound. The deal is not a competitive solve.
 
 ## Values
 
