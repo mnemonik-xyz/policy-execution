@@ -1,7 +1,9 @@
 # io.net GPU Workload Pilot with Warrant on Arc
 
 This showcase demonstrates autonomous cloud compute procurement, container deployment, and
-on-chain escrow settlement on Arc (chain ID `5042002`) using the Warrant policy framework.
+on-chain escrow settlement on Arc testnet (chain ID `5042002`) using the Warrant policy framework.
+The section [Arc mainnet seller (canary)](#arc-mainnet-seller-canary) describes the hosted
+seller for Arc mainnet (chain ID `5042`).
 
 An autonomous buyer LLM agent interacts with an io.net GPU compute seller MCP server. A local
 Buyer Warrant MCP guardrail verifies policy rules (budget cap, lease duration, deterministic
@@ -40,6 +42,8 @@ following design trade-offs:
      a two-step workflow: the seller accepts the task on-chain to commit terms, provisions the
      container in the background, and can only claim escrow payment after the buyer verifies
      `/health` and signs an `Acceptance` evidence struct off-chain.
+   - On Arc mainnet, this protection does not hold: after seller acceptance, anyone can
+     trigger payout. See [Arc mainnet seller (canary)](#arc-mainnet-seller-canary).
 4. **Trust Boundary**:
    - The local Buyer Guardrail strictly prevents unauthorized transactions or spending cap
      violations before funds ever leave the buyer's wallet.
@@ -222,7 +226,7 @@ guardrail sidecar tools:
 Detailed tool specifications, argument schemas, verified return structures, and agent prompt
 guidelines are maintained in the agent skill definition:
 
-👉 **[skills/ionet/SKILL.md](skills/ionet/SKILL.md)**
+**[skills/ionet/SKILL.md](skills/ionet/SKILL.md)**
 
 ---
 
@@ -252,9 +256,179 @@ Because the Buyer Guardrail manages local keys and spending limits, it runs loca
 > [!NOTE]
 > If your client does not support direct HTTP MCP URLs, bridge the remote endpoint via
 > `mcp-remote`: `"command": "npx", "args": ["-y", "mcp-remote", "http://<seller-host>:8000/mcp"]`.
+> For the Arc mainnet seller with basic auth, see
+> [Desktop configuration for mainnet](#desktop-configuration-for-mainnet).
 
 The agent prompts can then naturally discover GPU hardware, request a quote, submit it to
 the local Warrant tool for policy check and escrow funding, deploy, and transcribe audio.
+
+---
+
+## Arc mainnet seller (canary)
+
+Status 2026-10-15, unverified: the endpoint does not answer yet, and the deployment PR fills
+in the addresses below.
+
+The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`.
+It settles through the no-proof escrow `TaskEscrow` and the test-double `JournalVerifier`.
+Access needs basic auth. The operator hands out the credential personally. This README never
+holds the credential.
+
+The seller puts this label in its `initialize` instructions and at the start of the
+descriptions of `propose_deployment`, `deploy_with_escrow` and `submit_acceptance`:
+
+> after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD
+
+The `initialize` instructions also state these limits:
+
+> Settlement uses a test-double verifier that accepts any digest the seller approves. The 1 USD cap and the one-hour lease are seller policy, not contract rules. One deal at a time. The mainnet seller path has not been exercised with money before this listing. Any holder of the basic-auth credential can read the current deployment status, including its worker token.
+
+The seller path on mainnet (funding, acceptance, GPU provisioning, settlement) has not run
+with money. The first buyer is therefore the first test.
+
+Further limits for the buyer:
+
+- The compiled buyer policy is valid for 900 seconds (`validity_seconds: 900`). Sign the
+  acceptance within 15 minutes of the policy compilation.
+- The buyer guardrail refuses a proposal above `max_budget_usd` of the manifest (1.00).
+  The policy rule comes from [`config/buyer_policy_template.yaml`](config/buyer_policy_template.yaml)
+  and allows up to 2.00 USDC. Do not edit the template: the 1.00 limit comes from the manifest.
+- On chain 5042, `deploy_with_escrow`, `get_deployment_status` and `submit_acceptance` need
+  the `task_id`. It is the `TaskEscrow` task ID that `propose_deployment` returns: `0x`
+  and 64 hex digits.
+- Any basic-auth holder who knows a public `task_id` can read the worker token through
+  `get_deployment_status`.
+- While the seller accepts one deal (up to about 30 seconds), it refuses a second
+  `deploy_with_escrow` with "another deal is being accepted". Try again after the active
+  deal ends. The buyer can still refund an offer that the seller did not accept.
+
+### Mainnet addresses
+
+| Role / Contract | Address or key |
+| --- | --- |
+| **TaskEscrow** (no-proof escrow) | `<TASK_ESCROW_ADDRESS>` |
+| **JournalVerifier** (test double) | `<JOURNAL_VERIFIER_ADDRESS>` |
+| **USDC Token** | `0x3600000000000000000000000000000000000000` |
+| **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
+| **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
+
+The deployment PR also publishes `config/mainnet-public_keys.yaml` (repository path
+`showcases/ionet_arc/config/mainnet-public_keys.yaml`). It holds the registry public key only.
+
+### Buyer setup
+
+Run every command from the repository root.
+
+1. Build the binaries with `cargo build --release -p warrant-host`. The buyer guardrail
+   finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
+   Without the build, it fails with "Could not find compiled binary".
+2. Copy [`config/mainnet-manifest.example.yaml`](config/mainnet-manifest.example.yaml) to
+   your own file outside git. Set the fields of the manifest table after step 7.
+3. Give the guardrail your own funded Arc wallet key. Use one of these inputs:
+   - the flag `--key-file <path>`;
+   - the manifest field `private_key_files.buyer_key`;
+   - the environment variable `WARRANT_BUYER_KEY`.
+
+   Use `--key-file` or `private_key_files.buyer_key` with a file of mode 0600. Give an
+   absolute path: a relative path resolves against the repository root. Never put
+   the key in the desktop configuration. Do not use `--private-key`, because the process
+   list shows its value.
+4. Generate your own acceptance key. Never use a key that another person gave you.
+
+   ```bash
+   mkdir -p showcases/ionet_arc/.keys
+   (umask 077 && openssl rand -hex 32 > showcases/ionet_arc/.keys/buyer_acceptance.key)
+   ```
+
+   The file holds 64 hex characters without `0x`, the same form that `init.py` writes.
+   The path `showcases/ionet_arc/.keys/buyer_acceptance.key` is fixed in
+   `buyer_mcp_server.py` and `escrow.py`. No flag or manifest field changes it.
+5. Get the public part of the acceptance key as `0x` hex. `warrant-evidence public-key`
+   prints a JSON array of 33 byte values, so convert it:
+
+   ```bash
+   target/release/warrant-evidence public-key showcases/ionet_arc/.keys/buyer_acceptance.key \
+     | python3 -c 'import json,sys; print("0x"+bytes(json.load(sys.stdin)).hex())'
+   ```
+
+6. Copy the published `config/mainnet-public_keys.yaml` to your own file. Add the line
+   `buyer_acceptance_key: '0x<hex from step 5>'`. Set `public_files.public_keys` of your
+   manifest to the absolute path of this file. A relative path resolves against the
+   repository root first. The published file has no `buyer_acceptance_key`. Each buyer
+   signs the acceptance with an own key. A shared key lets other people accept in your name.
+7. Configure the desktop agent as shown in the next section.
+
+| Manifest field | Buyer value |
+| --- | --- |
+| `chain_id` | `5042` |
+| `rpc_url` | `https://rpc.mainnet.arc.io`, or your own Arc mainnet RPC |
+| `escrow_address` | `<TASK_ESCROW_ADDRESS>` |
+| `verifier_address` | `<JOURNAL_VERIFIER_ADDRESS>` |
+| `token_address` | `0x3600000000000000000000000000000000000000` |
+| `category` | `42` |
+| `max_budget_usd` | `1.00` |
+| `duration_hours` | `1` |
+| `validity_seconds` | `900` |
+| `buyer_address` | Your own funded Arc wallet. Add this field: the example file does not have it. |
+| `public_files.public_keys` | Absolute path of your own public keys file (step 6) |
+| `private_key_files.buyer_key` | Optional. Absolute path of your wallet key file (step 3) |
+
+The guardrail does not read the other entries of the example file. `seller_address`,
+`vendor_validity_days`, `public_files.vendor_credential` and `public_files.vendor_signature`
+are seller-side values. `private_key_files.registry_key`, `private_key_files.buyer_acceptance_key`
+and `private_key_files.seller_key` are seller-side key paths that `init.py` and the seller
+read on the VM. Ignore them or delete them.
+
+### Desktop configuration for mainnet
+
+```json
+{
+  "mcpServers": {
+    "buyer-warrant-guardrail": {
+      "command": "/path/to/repo/.venv/bin/python",
+      "args": [
+        "-m", "showcases.ionet_arc.buyer_mcp_server",
+        "--transport", "stdio",
+        "--manifest", "/path/to/your/mainnet-manifest.yaml",
+        "--key-file", "/path/to/your/buyer.key"
+      ]
+    },
+    "seller-transcription-service": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp", "--header", "Authorization:${AUTH_HEADER}"],
+      "env": {
+        "AUTH_HEADER": "Basic <base64 of user:password>"
+      }
+    }
+  }
+}
+```
+
+`mcp-remote` puts the value of the environment variable `AUTH_HEADER` in place of
+`${AUTH_HEADER}`. The header argument has no space after the colon, because some clients
+split arguments on spaces. Set `AUTH_HEADER` to `Basic` and the base64 form of
+`user:password` from the operator. The configuration file then holds the credential:
+keep it at mode 0600 and out of git. If your client passes the shell environment to
+`mcp-remote`, export `AUTH_HEADER` in that shell and remove the `env` block. Unverified on 2026-10-15: this form follows the
+`mcp-remote` documentation, and it has not run against this endpoint.
+
+### Operator notes
+
+- The seller refuses to start when the RPC does not answer `eth_chainId`. It exits with
+  "cannot determine the chain". Check the RPC before you start the seller.
+- A blocked deal slot stops new deals. A session in `provisioning` after a crash or a
+  restart blocks the slot. So does an unreadable file in `<IONET_STATE_DIR>/sessions/`,
+  or a `failed` session with `"deployment_may_exist": true` before its `expires_at`.
+  The refusal names the task or the file. To clear the slot:
+  1. In the io.net console, make sure that no deployment for that task runs or bills.
+     Destroy a deployment that does.
+  2. In `<IONET_STATE_DIR>/sessions/<task_id>.json`, set `"status": "failed"` and remove
+     `deployment_may_exist`, or set `expires_at` to a past Unix time. Edit the file as the
+     container user, and keep the JSON valid.
+  3. Move an unreadable file out of `sessions/`.
+
+  No restart is necessary. By design, a failed deal whose io.net deploy state file exists
+  blocks the next deal for up to one hour.
 
 ---
 

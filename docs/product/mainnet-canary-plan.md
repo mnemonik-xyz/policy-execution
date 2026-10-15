@@ -20,6 +20,15 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 4. **Mainnet read-only probe** (done 2026-10-14: `scripts/check-arc-solver.py`, phases `before` and `after`, mocked tests; not yet run against a live RPC): extend `scripts/check-arc.py` (currently testnet-only, task/invoice) or add `check-arc-solver.py`. Two phases. Before deployment: chain ID 5042, BN254 precompiles, USDC decimals, and a real proof simulated with `eth_call` against the verifier and escrow constructors. After deployment and before any order is funded: code hashes of the deployed verifier and escrow, compared with the build and the manifest. `DeploySolver.s.sol` creates the verifier together with the escrow, so no verifier address exists before deployment.
 5. **Funds**: real USDC on Arc for the bounty (target 2–5 USDC) plus a native-USDC gas reserve for deployer, buyer, seller, relayer. Route onto Arc is the user's responsibility (not in repo).
 6. **Keys**: Foundry keystore or hardware wallet for the deployer; separate low-value buyer/seller/relayer keys. Mainnet keys never go into the coding-fabric sops file.
+
+   **Amendment 2026-10-14.** The user reversed the last sentence on 2026-10-14. The canary keys live in
+   `infrastructure/secrets/secrets.sops.yml` of coding-fabric, under the existing age recipient. These are the keys:
+   - the Foundry keystores and passwords of the deployer, buyer, seller and relayer;
+   - the seller hex key, the io.net key and the registry key;
+   - the basic-auth credential of the seller MCP.
+
+   The shared age key opens the whole file. The user accepted this risk for canary amounts. The team rotates these
+   keys after the hackathon. Keys never go into a command line or into a file in this repository.
 7. **Docs consistency after PR #12 and PR #14** (done 2026-10-14: the adapter rejects `payg`; `decode_result` logs a length and a digest only): `execution-funding.md:15` says PayG is disabled; the adapter allows it. Use `duration` billing for the canary and update docs. Fix the `decode_result` stderr print (can echo env values such as `WARRANT_WORKER_TOKEN`).
 8. **Image**: no rebuild needed. Deploy by the digest read at deploy time and record it in the manifest. The new multi-stage Dockerfile installs only `libcublas-12-3` and `libcudnn9-cuda-12` and sets `LD_LIBRARY_PATH` by hand. No GPU run of it is recorded, so the first io.net run is also its first GPU test. Keep the spend cap for that reason.
 9. **Pre-mainnet self-review** (done 2026-10-14: `solver-bounty/canary/self-review.md`, one medium and four open items; does not satisfy CHAIN-5, which requires an independent review) of checker, projection, escrow, proving build, signing boundary; record findings and resolutions in a file.
@@ -53,7 +62,7 @@ and S5.7, and the Arc USDC behavior probe before `offer`. Status 2026-10-09 foll
 - Circle listing (status 2026-10-14): no public HTTPS host, no Circle API key, no x402 endpoint, no OpenAPI document. Circle has not confirmed eligibility of an escrow-settled product.
 
 ## Risks to state in the showcase
-Scope: this is a developer showcase of verified settlement for an agent-sold schedule, plus a separate cloud run. It is not a product. There is no web app, hosted API or agent-facing interface (MCP or HTTP). The seller is a deterministic heuristic, not an LLM. The GPU run is started by hand after settlement. Do not describe it as autonomous agents or automated payment of cloud bills.
+Scope: this is a developer showcase of verified settlement for an agent-sold schedule, plus a separate cloud run. It is not a product. There is no web app. The proven deal has no agent-facing interface (MCP or HTTP). The hosted seller MCP on Arc mainnet (status 2026-10-15) is agent-facing, but it settles without proof. The plan seller of the proven deal is a deterministic heuristic, not an LLM. The GPU run is started by hand after settlement. Do not describe it as autonomous agents or automated payment of cloud bills.
 
 Solver proof path never settled on a public chain before; modelled cost is not the bill; settlement does not trigger the GPU run; no independent audit (self-review only); canary amounts only.
 

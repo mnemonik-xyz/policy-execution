@@ -2,7 +2,8 @@
 
 This folder holds the deployment manifest and the evidence of each solver-bounty
 canary run. Plan item 10 in `docs/product/mainnet-canary-plan.md` defines it.
-`scripts/solver-canary.py evidence` writes the files. People do not write them by hand.
+`scripts/solver-canary.py` and the coding-fabric canary role write the files.
+The table below names the writer of each file. People do not write them by hand.
 
 ## Layout
 
@@ -34,10 +35,57 @@ Each run directory holds:
 | `delivery.json`, `schedule.json`, `native.json` | `deliver` | The seller's schedule and the native check. |
 | `prove.log`, `evm.json` | `prove` | Prover output and the Groth16 seal with its journal. |
 | `settlement.json` | `settle` | Receipt of the settlement transaction. |
+| `prove.time` | `/usr/bin/time -v` around `prove` | Wall-clock time and peak memory of the `prove` step. |
+| `rehearsal.md`, `rehearsal.json` | `rehearse` action of the coding-fabric role | Rehearsal record, in `local/<UTC timestamp>/` only. Commit, image ID, instance hash, build and `prove` seconds. |
 
 The receipt files `solver.receipt` and `solver-groth16.receipt` are binary and
 large. Keep them out of the commit when they exceed a few megabytes. `evm.json`
 holds the seal that the chain verified.
+
+## Mainnet run (chain 5042)
+
+The proven deal on chain 5042 is a scripted canary, not an agent-to-agent deal. The
+`evidence` step writes this statement into the `note` of `result.json`:
+
+> Scripted canary: all four roles (deployer, buyer, seller, relayer) are held by the team and the quote comes from the heuristic scripts/solver-agent.py. An agent-driven proven deal and a separate proving service are the next feature.
+
+The team holds all four roles: deployer, buyer, seller and relayer. The quote comes from
+the heuristic `scripts/solver-agent.py`, not from an agent. The operator runs the steps of
+`scripts/solver-canary.py` over SSH on the VM. `script(1)` records the session.
+
+Solver-set addresses on Arc mainnet. The deployment PR replaces the placeholders.
+Unverified on 2026-10-15: the contracts are not deployed yet.
+
+| Contract | Address |
+|---|---|
+| `SolverBountyEscrow` (proof escrow) | `<SOLVER_ESCROW_ADDRESS>` |
+| `RiscZeroGroth16Verifier` | `<GROTH16_VERIFIER_ADDRESS>` |
+| USDC | `0x3600000000000000000000000000000000000000` |
+
+## Next feature
+
+The canary has no agent-facing interface for the proof escrow and no proving service.
+No such connector exists in the code today. The next feature adds these parts:
+
+- A plan seller as an MCP or x402 endpoint, with a signed quote.
+- Proving in the background after `accept`.
+- An independent relayer.
+- A separate proving service. It takes the checker input, returns the wrapped proof and
+  can relay it. The seller then needs neither x86 Docker nor RISC Zero.
+
+The proving service is safe for the funds. The checker input holds no secrets, because
+the task, the plan and the terms become public in calldata at settlement. The contract
+checks the proof, not the prover, so a prover gets no right to the funds.
+
+Open questions:
+
+- Who pays the prover, and how.
+- The response time of the prover against the settle window.
+- An own service or an external prover market.
+
+The Circle listing is part of the same next step: see
+[circle-listing.md](../../docs/product/circle-listing.md) and item 12 of the
+[canary plan](../../docs/product/mainnet-canary-plan.md).
 
 ## Rules
 
