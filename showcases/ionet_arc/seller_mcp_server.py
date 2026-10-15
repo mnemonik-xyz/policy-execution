@@ -226,13 +226,32 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
     return suitable
 
 
-def parse_credit_balance(status) -> Decimal:
-    """Return the USD balance from an io.net get_credit_status result. Raise ValueError when unreadable.
+def _credit_amount(balances: dict, field: str) -> Decimal:
+    value = balances.get(field)
+    # io.net reports the balances as JSON numbers; a bool, a string or a missing field is unreadable.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"get_credit_status field {field} is missing or not a number")
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"get_credit_status field {field} is not a finite amount of 0 or more")
+    return amount
 
-    The real response shape has not been read yet (Task 2 step 2). Until it is, every result is unreadable,
-    so propose_deployment on chain 5042 fails closed.
+
+def parse_credit_balance(status) -> Decimal:
+    """Return the spendable USD credits from an io.net get_credit_status result. Raise ValueError when unreadable.
+
+    Shape (read 2026-10-15): {"service", "operation", "data": {"balances": {"credits_balance": float,
+    "credits_courtesy_balance": float, ...}, "burn_rate": {...}}}. Courtesy credits do not pay for a deployment
+    (the price estimate reports min_non_promotional_credits_required), so they do not count toward the floor.
     """
-    raise ValueError("the io.net get_credit_status response shape is not confirmed")
+    data = status.get("data") if isinstance(status, dict) else None
+    balances = data.get("balances") if isinstance(data, dict) else None
+    if not isinstance(balances, dict):
+        raise ValueError("get_credit_status result has no data.balances object")
+    spendable = _credit_amount(balances, "credits_balance") - _credit_amount(balances, "credits_courtesy_balance")
+    if spendable < 0:
+        raise ValueError("get_credit_status courtesy credits exceed the credit balance")
+    return spendable
 
 
 class LocalMockWorker:

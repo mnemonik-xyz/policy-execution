@@ -29,10 +29,8 @@ from showcases.ionet_arc.seller_mcp_server import (
     create_app,
     create_server,
     filter_suitable_gpus,
+    parse_credit_balance,
 )
-
-# The real parser, kept before any fixture patches the module attribute.
-PARSE_CREDIT_BALANCE = seller_module.parse_credit_balance
 
 KEYS_DIR = Path(__file__).resolve().parent / ".keys"
 
@@ -172,16 +170,26 @@ MAINNET_HARDWARE = [
 EXAMPLE_MANIFEST = Path(__file__).resolve().parent / "config" / "mainnet-manifest.example.yaml"
 
 
-def credit_status_response(balance: str) -> dict:
-    """PROVISIONAL io.net get_credit_status result until the real shape is read (Task 2 step 2).
-
-    The fixture pairs it with provisional_credit_parser; both are replaced by the real shape and the real parser.
-    """
-    return {"provisional_balance": balance}
-
-
-def provisional_credit_parser(status) -> Decimal:
-    return Decimal(str(status["provisional_balance"]))
+def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
+    """io.net get_credit_status result in the real shape (read 2026-10-15; amounts are test values)."""
+    return {
+        "service": "io-cloud",
+        "operation": "get_credit_status",
+        "data": {
+            "balances": {
+                "cloud_balance": 0.0,
+                "cloud_iocoin_balance": 0.0,
+                "worker_io_coin_balance": 0.0,
+                "credits_balance": credits_balance,
+                "credits_withdrawable_balance": credits_balance,
+                "credits_courtesy_balance": courtesy_balance,
+                "credits_used": 1.32,
+                "all_credits": 10.0,
+                "purchased_credits_exempt": False,
+            },
+            "burn_rate": {"hourly_rate": None, "runway_hours_estimate": None, "cluster_count": 0},
+        },
+    }
 
 
 class FakeCloud:
@@ -189,7 +197,7 @@ class FakeCloud:
 
     def __init__(self):
         self.hardware = list(MAINNET_HARDWARE)
-        self.credit_result: dict | Exception = credit_status_response("10.00")
+        self.credit_result: dict | Exception = credit_status_response(10.0)
         self.calls: list[str] = []
 
     async def call(self, name, arguments):
@@ -1088,9 +1096,6 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         cloud_patch = patch("showcases.ionet_arc.seller_mcp_server.connected", self.connected)
         cloud_patch.start()
         self.addCleanup(cloud_patch.stop)
-        parser_patch = patch.object(seller_module, "parse_credit_balance", provisional_credit_parser)
-        parser_patch.start()
-        self.addCleanup(parser_patch.stop)
 
         self.mcp = self.build()
 
@@ -1270,7 +1275,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     # Credits
 
     async def test_mainnet_low_credits_refuse_proposal(self):
-        self.cloud.credit_result = credit_status_response("1.99")
+        self.cloud.credit_result = credit_status_response(1.99)
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment")
         self.assertIn("credit", str(ctx.exception).lower())
@@ -1278,14 +1283,14 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.task_id_for.assert_not_called()
 
     async def test_mainnet_sufficient_credits_allow_proposal(self):
-        self.cloud.credit_result = credit_status_response("2.5")
+        self.cloud.credit_result = credit_status_response(2.5)
         proposal = await self.call("propose_deployment")
         self.assertEqual(proposal["status"], "proposed")
         self.assertIn("get_credit_status", self.cloud.calls)
         self.assertTrue((self.state_dir / "proposals" / f"{proposal['task_id']}.json").exists())
 
     async def test_mainnet_credits_exactly_at_floor_allow_proposal(self):
-        self.cloud.credit_result = credit_status_response("2.00")
+        self.cloud.credit_result = credit_status_response(2.0)
         proposal = await self.call("propose_deployment")
         self.assertEqual(proposal["status"], "proposed")
 
@@ -1293,10 +1298,10 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         unreadable = (
             {},
             {"unexpected": "shape"},
-            credit_status_response("not-a-number"),
-            credit_status_response("NaN"),
-            credit_status_response("Infinity"),
-            credit_status_response("-5"),
+            credit_status_response("8.68"),
+            credit_status_response(float("nan")),
+            credit_status_response(float("inf")),
+            credit_status_response(-5.0),
             PilotError("io.net down"),
         )
         for result in unreadable:
@@ -1306,15 +1311,42 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("credit", str(ctx.exception).lower())
         self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
 
-    async def test_credit_parser_fails_closed_until_shape_confirmed(self):
-        for status in ({}, {"provisional_balance": "10.00"}, {"balance": "10.00"}, [], None):
-            with self.subTest(status=status), self.assertRaises(ValueError):
-                PARSE_CREDIT_BALANCE(status)
-        with patch.object(seller_module, "parse_credit_balance", PARSE_CREDIT_BALANCE):
-            with self.assertRaises(ToolError) as ctx:
-                await self.call("propose_deployment")
-        self.assertIn("credit", str(ctx.exception).lower())
-        self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
+    async def test_mainnet_courtesy_credits_do_not_count(self):
+        # 3.00 credits of which 1.50 are courtesy: 1.50 spendable is below the floor.
+        self.cloud.credit_result = credit_status_response(3.0, courtesy_balance=1.5)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment")
+        self.assertIn("below 2 USD", str(ctx.exception))
+
+    def test_parse_credit_balance_real_shape(self):
+        self.assertEqual(parse_credit_balance(credit_status_response(8.68)), Decimal("8.68"))
+        self.assertEqual(parse_credit_balance(credit_status_response(3.0, courtesy_balance=1.25)), Decimal("1.75"))
+        self.assertEqual(parse_credit_balance(credit_status_response(0)), Decimal("0"))
+
+    def test_parse_credit_balance_unreadable_fails_closed(self):
+        valid = credit_status_response(8.68)
+        balances = valid["data"]["balances"]
+        without_courtesy = {k: v for k, v in balances.items() if k != "credits_courtesy_balance"}
+        cases = {
+            "not a dict": [],
+            "no data": {"service": "io-cloud"},
+            "data not a dict": {"data": "x"},
+            "no balances": {"data": {"burn_rate": {}}},
+            "credits_balance missing": {"data": {"balances": {"credits_courtesy_balance": 0.0}}},
+            "courtesy missing": {"data": {"balances": without_courtesy}},
+            "credits_balance bool": credit_status_response(True),
+            "credits_balance string": credit_status_response("8.68"),
+            "credits_balance null": credit_status_response(None),
+            "credits_balance NaN": credit_status_response(float("nan")),
+            "credits_balance Infinity": credit_status_response(float("inf")),
+            "credits_balance negative": credit_status_response(-0.01),
+            "courtesy negative": credit_status_response(8.68, courtesy_balance=-1.0),
+            "courtesy bool": credit_status_response(8.68, courtesy_balance=False),
+            "courtesy above balance": credit_status_response(1.0, courtesy_balance=2.0),
+        }
+        for case, status in cases.items():
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                parse_credit_balance(status)
 
     # One active session
 
