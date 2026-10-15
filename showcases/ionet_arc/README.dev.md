@@ -250,3 +250,134 @@ Verify your credit balance after destruction:
 .venv/bin/python scripts/ionet-showcase.py read get_credit_status \
   --out artifacts/io-credit-after.json
 ```
+
+---
+
+## Seller MCP container
+
+[`Dockerfile.seller`](Dockerfile.seller) packages the seller MCP server
+([`seller_mcp_server.py`](seller_mcp_server.py)) for the VM, behind Caddy, and for a laptop
+smoke test. The image holds the seller modules, a Python 3.12 venv from
+[`requirements.txt`](requirements.txt), and the `warrant-host` and `warrant-policy` binaries in
+`/usr/local/bin`. It holds no `warrant-evidence`, `init.py`, keys or config: `init.py` runs on
+the host, and config and keys are mounted at runtime.
+
+### Build
+
+The build context is the repository root. BuildKit is required. The legacy builder ignores
+[`Dockerfile.seller.dockerignore`](Dockerfile.seller.dockerignore) and would send the whole
+repository, `.keys/` included. With BuildKit the context is about 12 MB.
+
+```sh
+# Laptop or CI (default BIN_SOURCE=build): compiles both binaries with RISC0_SKIP_BUILD=1,
+# so no RISC Zero toolchain is needed.
+DOCKER_BUILDKIT=1 docker build -f showcases/ionet_arc/Dockerfile.seller -t warrant-seller:dev .
+
+# Linux VM only: copy target/release/warrant-host and target/release/warrant-policy, built on
+# the host by the configure action with RISC0_USE_DOCKER=1.
+DOCKER_BUILDKIT=1 docker build --build-arg BIN_SOURCE=host \
+  -f showcases/ionet_arc/Dockerfile.seller -t warrant-seller:host .
+```
+
+* `BIN_SOURCE=build` is the default. The binaries it builds embed laptop guest image IDs. The
+  seller never proves, so that does not matter for the seller.
+* `BIN_SOURCE=host` is for the Linux VM only. On macOS `target/release` holds Mach-O binaries,
+  which do not run in the image. When the binaries are missing, the build fails with
+  `"/target/release/warrant-policy": not found`.
+* Any other value fails with `load metadata for docker.io/library/bins-<value>`, because no
+  stage `bins-<value>` exists.
+* Never pass a secret as `--build-arg`. Secrets arrive only at runtime.
+
+Check the binaries and the user:
+
+```sh
+docker run --rm warrant-seller:dev warrant-policy --help   # exits 1 and prints "Usage: warrant-policy ..."
+docker run --rm --entrypoint id warrant-seller:dev -u      # 10001
+docker run --rm --entrypoint cat warrant-seller:dev /usr/share/warrant-seller/pip-freeze.txt
+```
+
+### Container user and paths
+
+The container runs as UID/GID **10001**. The deploy role default `warrant_canary_seller_uid`
+matches it. Secret files on the host must be owned by UID 10001 with mode 0600, and the state
+directory on the host must be writable by UID 10001.
+
+| Path in the container | Mount | Purpose |
+| --- | --- | --- |
+| `/app/showcases/ionet_arc/config` | read-only | Manifest, public keys, vendor credential and signature. The manifest's checkout-relative `public_files.*` paths resolve here. |
+| `/var/lib/warrant-seller` | read-write volume | `IONET_STATE_DIR`: proposals and sessions. |
+| `/run/secrets/seller.key` | read-only file | Seller transaction key, bare 64-hex. The manifest names it in `private_key_files.seller_key`. |
+| `/tmp` | tmpfs | Temporary policy files. |
+
+Nothing else is written at runtime, so the root filesystem can be read-only.
+
+### Environment
+
+| Variable | Notes |
+| --- | --- |
+| `MCP_AUTH_USER`, `MCP_AUTH_PASS` | HTTP basic auth for `/mcp`. Secret; env file only. |
+| `WARRANT_MANIFEST` | Manifest path, for example `showcases/ionet_arc/config/mainnet-manifest.yaml`. |
+| `WARRANT_RPC_URL` | Optional; overrides the manifest `rpc_url`. The RPC must answer at start. |
+| `IO_NET_API_KEY` | Required on chain 5042. Secret; env file only. |
+| `IONET_STATE_DIR` | Set by the image to `/var/lib/warrant-seller`. |
+| `HOST`, `PORT` | Set by the image to `0.0.0.0` and `8000`. |
+| `MOCK_IONET` | Laptops only (`1`). Mock mode is refused on chain 5042. |
+
+### Run
+
+The hardening flags match the VM compose file:
+
+```sh
+docker run --rm --name warrant-seller \
+  --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+  -v "$PWD/scratch/config:/app/showcases/ionet_arc/config:ro" \
+  -v "$PWD/scratch/state:/var/lib/warrant-seller" \
+  -v "$PWD/scratch/seller.key:/run/secrets/seller.key:ro" \
+  --env-file scratch/seller.env \
+  -p 127.0.0.1:8000:8000 warrant-seller:dev
+```
+
+For a laptop smoke, start Anvil (`anvil --host 0.0.0.0`), use a scratch chain-31337 manifest
+whose `rpc_url` is `http://host.docker.internal:8545`, and set `MOCK_IONET=1`. Keep the scratch
+manifest and key out of the checkout.
+
+On chain 5042 the server refuses to start, exit code 1, in these cases:
+* `IO_NET_API_KEY` is missing (`IO_NET_API_KEY is required on chain 5042`);
+* `MOCK_IONET` or `LOCAL_SERVER` is set;
+* the manifest `chain_id` is not 5042;
+* the RPC does not answer.
+
+### MCP handshake
+
+The endpoint is `/mcp`. Responses are server-sent events: the JSON is on the `data:` line.
+
+```sh
+U=http://127.0.0.1:8000/mcp
+H='Accept: application/json, text/event-stream'
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+
+# 1. initialize: 200 and an mcp-session-id header
+curl -s -D headers.txt -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
+  -H 'Content-Type: application/json' -d "$INIT" "$U"
+SID=$(grep -i '^mcp-session-id:' headers.txt | cut -d' ' -f2 | tr -d '\r')
+
+# 2. notifications/initialized: 202
+curl -s -o /dev/null -w '%{http_code}\n' -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
+  -H 'Content-Type: application/json' -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$U"
+
+# 3. tools/list: 200
+curl -s -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
+  -H 'Content-Type: application/json' -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$U"
+
+# 4. initialize without auth: 401
+curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H 'Content-Type: application/json' -d "$INIT" "$U"
+```
+
+On chain 5042 the `initialize` instructions and the `propose_deployment`, `deploy_with_escrow`
+and `submit_acceptance` descriptions start with the label
+"after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD". On other
+chains there is no label. `initialize` and `tools/list` make no io.net call.
+
+The image has a port-only `HEALTHCHECK`. It sends no credential.
