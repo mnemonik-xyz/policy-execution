@@ -495,7 +495,9 @@ class WarrantTranscriptionService:
             if not isinstance(balance, Decimal) or not balance.is_finite() or balance < 0:
                 raise ValueError("the credit balance is not a finite amount of 0 or more")
         except Exception as exc:
-            logger.warning("io.net credit status could not be read: %s", type(exc).__name__)
+            # A ValueError from the parser names the field only, never an amount or an account identifier.
+            detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            logger.warning("io.net credit status could not be read: %s", detail)
             raise ToolError(
                 "The io.net credit balance cannot be read, so no deal is proposed on chain "
                 f"{MAINNET_CHAIN_ID}."

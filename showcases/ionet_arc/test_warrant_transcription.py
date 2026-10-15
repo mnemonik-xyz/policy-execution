@@ -1291,13 +1291,14 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             float("inf"): "no valid price",
             0: "No available suitable GPUs",
             -0.5: "No available suitable GPUs",
-            "0.49": "not supported between instances",
+            "0.49": None,  # fails in the existing filter; only the refusal matters
         }
         for price, message in expected.items():
             self.cloud.hardware = [{**MAINNET_HARDWARE[0], "price": price}]
             with self.subTest(price=price), self.assertRaises(ToolError) as ctx:
                 await self.call("propose_deployment")
-            self.assertIn(message, str(ctx.exception))
+            if message:
+                self.assertIn(message, str(ctx.exception))
         self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
 
     async def test_mainnet_cheapest_gpu_above_cap_is_refused(self):
@@ -1366,6 +1367,12 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment")
         self.assertIn("below 2 USD", str(ctx.exception))
+        # Spendable exactly 2.00 after courtesy is allowed; 1.99 is refused.
+        self.cloud.credit_result = credit_status_response(3.5, courtesy_balance=1.5)
+        self.assertEqual((await self.call("propose_deployment"))["status"], "proposed")
+        self.cloud.credit_result = credit_status_response(3.49, courtesy_balance=1.5)
+        with self.assertRaises(ToolError):
+            await self.call("propose_deployment")
 
     def test_parse_credit_balance_real_shape(self):
         self.assertEqual(parse_credit_balance(credit_status_response(8.68)), Decimal("8.68"))
