@@ -110,7 +110,8 @@
         "approve": { "$ref": "#/$defs/hash32" },
         "offer": { "$ref": "#/$defs/hash32" },
         "accept": { "$ref": "#/$defs/hash32" },
-        "settle": { "$ref": "#/$defs/hash32" }
+        "settle": { "$ref": "#/$defs/hash32" },
+        "refund": { "$ref": "#/$defs/hash32" }
       }
     },
     "worker_image": {

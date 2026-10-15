@@ -232,6 +232,53 @@ class AfterTests(ProbeCase):
         self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
         self.assertNotIn("code", self.report())
 
+    def write_state(self, tx):
+        """A run state.json as solver-canary.py writes it: steps live under tx, there is no transactions key."""
+        state = dict(MANIFEST, version=1, chain_id=5042, amount=2_000_000, tx=tx,
+                     addresses={"deployer": "0x" + "1" * 40, "buyer": "0x" + "2" * 40})
+        self.manifest.write_text(json.dumps(state))
+
+    def test_run_state_with_tx_is_accepted(self):
+        self.write_state({"deploy": {"intent_at": "t", "hash": "see deployment.json"}})
+        self.assertEqual(self.after(), 0)
+        self.assertEqual(self.report()["verdict"], "ok")
+
+    def test_order_step_in_tx_is_refused(self):
+        self.write_state({"deploy": {"intent_at": "t", "hash": "see deployment.json"},
+                          "offer": {"intent_at": "t", "hash": "0x" + "5" * 64}})
+        self.assertEqual(self.after(), 1)
+        self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
+        self.assertNotIn("code", self.report())
+
+    def test_unconfirmed_order_intent_in_tx_is_refused(self):
+        self.write_state({"approve": {"intent_at": "t"}})
+        self.assertEqual(self.after(), 1)
+        self.assertTrue(any("records a approve transaction" in p for p in self.report()["problems"]))
+        self.assertNotIn("code", self.report())
+
+    def test_order_step_in_tx_is_refused_beside_empty_transactions(self):
+        self.write_state({"offer": {"intent_at": "t", "hash": "0x" + "5" * 64}})
+        state = json.loads(self.manifest.read_text())
+        self.manifest.write_text(json.dumps(dict(state, transactions={})))
+        self.assertEqual(self.after(), 1)
+        self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
+
+    def test_reuse_probe_manifest_is_accepted(self):
+        """The exact six keys that solver-canary.py init --reuse-deployment passes to the probe, with no steps."""
+        self.manifest.write_text(json.dumps({"escrow": ESCROW, "verifier": VERIFIER, "image_id": IMAGE,
+                                             "code_hashes": {"escrow": HASH_OK, "verifier": HASH_OK},
+                                             "chain_id": 5042, "token": probe.ARC_USDC}))
+        self.assertEqual(self.after(), 0)
+        report = self.report()
+        self.assertEqual((report["verdict"], report["problems"]), ("ok", []))
+        self.assertNotIn(RPC, self.out.read_text())
+
+    def test_reused_run_state_with_empty_tx_is_accepted(self):
+        self.write_state({})
+        self.assertEqual(self.after(), 0)
+        report = self.report()
+        self.assertEqual((report["verdict"], report["problems"]), ("ok", []))
+
 
 class RunTests(unittest.TestCase):
     def test_errors_do_not_leak_the_rpc_url(self):
