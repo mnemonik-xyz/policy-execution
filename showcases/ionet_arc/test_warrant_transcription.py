@@ -1139,6 +1139,25 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         app = self.build_app(host="0.0.0.0", auth_user="u", auth_pass="p")
         self.assertIsInstance(app, BasicAuthMiddleware)
 
+    def test_default_host_is_loopback(self):
+        # The auth policy lets a default start run without auth only because the default bind is loopback.
+        self.assertTrue(is_loopback_host(ServerConfig.host))
+        with patch.dict(os.environ, {}, clear=True), patch("sys.argv", ["seller_mcp_server"]):
+            with patch.object(seller_module, "run_server") as run_server:
+                seller_module.main()
+        self.assertTrue(is_loopback_host(run_server.call_args.args[0].host))
+
+    def test_partial_auth_on_loopback_warns(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            app = self.build_app(host="127.0.0.1", auth_user="u")
+        self.assertNotIsInstance(app, BasicAuthMiddleware)
+        self.assertIn("warning: MCP_AUTH_PASS is not set, so basic auth is off", stderr.getvalue())
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.build_app(host="127.0.0.1")
+        self.assertNotIn("warning", stderr.getvalue())
+
     def test_is_loopback_host(self):
         for host in ("localhost", "LOCALHOST", "127.0.0.1", "127.1.2.3", "::1", "[::1]"):
             with self.subTest(host=host):

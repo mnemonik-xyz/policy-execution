@@ -1661,6 +1661,8 @@ def enforce_http_auth_policy(cfg: ServerConfig, chain_id: int):
         raise MainnetPolicyError(f"{names} {verb} required on chain {chain_id}")
     if not is_loopback_host(cfg.host):
         raise StartRefusedError(f"{names} {verb} required when binding the non-loopback host {cfg.host!r}")
+    if len(missing) == 1:
+        print(f"seller-mcp-server: warning: {names} is not set, so basic auth is off", file=sys.stderr)
 
 
 def create_server(
