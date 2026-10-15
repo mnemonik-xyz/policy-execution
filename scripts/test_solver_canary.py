@@ -3,11 +3,14 @@
 Run from the repository root: python3 scripts/test_solver_canary.py
 """
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -57,7 +60,9 @@ class CanaryChain:
         self.gas_used, self.gas_price = 100_000, 20 * 10**9
         self.logs = None
         self.code_hashes = dict(CODE_HASHES)
-        self.image_id, self.token = IMAGE_ID, st["token"]
+        self.image_id, self.token, self.verifier = IMAGE_ID, st["token"], VERIFIER
+        self.buyer_onchain, self.amount_onchain = st["addresses"]["buyer"], st["amount"]
+        self.probe_problems, self.probes = [], []
         self.on_send = None
         self.balances = {ESCROW: st["amount"], st["addresses"]["buyer"]: 1_000_000}
         self.commands, self.simulated, self.sent = [], [], []
@@ -65,7 +70,7 @@ class CanaryChain:
 
     def terms(self):
         q, a = self.st["quote"], self.st["addresses"]
-        values = [a["buyer"], a["seller"], "0x" + "8" * 64, "1", f"{self.st['amount']} [2e6]",
+        values = [self.buyer_onchain, a["seller"], "0x" + "8" * 64, "1", f"{self.amount_onchain} [2e6]",
                   str(q["accept_by"]), str(q["settle_by"]), str(self.state)]
         return "\n".join(values)
 
@@ -74,6 +79,8 @@ class CanaryChain:
         self.commands.append(args)
         if args[0] == str(canary.NATIVE):
             return "0x" + "8" * 64
+        if args[0] == sys.executable and args[1].endswith("check-arc-solver.py"):
+            return self.probe(args)
         head = tuple(args[:2])
         if head == ("cast", "chain-id"):
             return str(self.chain_id)
@@ -101,10 +108,22 @@ class CanaryChain:
             return self.image_id
         if signature == "token()(address)":
             return self.token
-        if signature in ("refund(bytes32)", "accept(bytes32)"):
+        if signature == "verifier()(address)":
+            return self.verifier
+        if signature in ("refund(bytes32)", "accept(bytes32)", "approve(address,uint256)(bool)"):
             self.simulated.append((signature, args[args.index("--from") + 1]))
             return "0x"
         raise AssertionError(f"unexpected call {args}")
+
+    def probe(self, args):
+        """The read-only probe: record its input and write a report, or fail as the real probe does."""
+        self.probes.append((args, json.loads(pathlib.Path(args[3]).read_text())))
+        verdict = "failed" if self.probe_problems else "ok"
+        pathlib.Path(args[args.index("--out") + 1]).write_text(
+            json.dumps({"phase": "after", "verdict": verdict, "problems": self.probe_problems}))
+        if self.probe_problems:
+            raise canary.CanaryError("python3 after failed:\n" + "\n".join(self.probe_problems))
+        return f"after: {verdict}"
 
     def send(self, args):
         self.sent.append(args)
@@ -210,8 +229,8 @@ class StepTests(TempCase):
 
     def ordered(self):
         """The state after a confirmed offer: the seller can now accept."""
-        self.st.update(escrow=ESCROW, quote={"task": TASK, "policy_hash": "0x" + "8" * 64, "accept_by": 10_000,
-                                                 "settle_by": 20_000})
+        self.st.update(escrow=ESCROW, quote={"task": TASK, "salt": "0x" + "7" * 64, "policy_hash": "0x" + "8" * 64,
+                                             "accept_by": 10_000, "settle_by": 20_000})
         self.st["tx"]["offer"] = {"intent_at": "t", "hash": "0x" + "3" * 64}
         canary.save(self.dir, self.st)
 
@@ -220,14 +239,41 @@ class StepTests(TempCase):
         chain = CanaryChain(self.st, now=10_000 - 119)
         with patch.object(canary, "run", chain), self.assertRaises(canary.CanaryError) as ctx:
             canary.cmd_accept(spend_args(self.dir, role=None))
-        self.assertIn("acceptBy", str(ctx.exception))
+        self.assertIn("Less than 120 s remain before acceptBy", str(ctx.exception))
         self.assertEqual(chain.simulated, [])
         self.assertNotIn("accept", canary.load(self.dir)["tx"])
-        chain = CanaryChain(self.st, now=10_000 - 121)
-        with patch.object(canary, "run", chain):
+        for now in (10_000 - 120, 10_000 - 121):  # exactly 120 s left is still allowed
+            chain = CanaryChain(self.st, now=now)
+            with self.subTest(now=now), patch.object(canary, "run", chain):
+                canary.cmd_accept(spend_args(self.dir, role=None))
+            self.assertEqual(chain.simulated, [("accept(bytes32)", C)])
+            self.assertEqual(chain.sent, [])
+
+    def test_accept_retry_is_reported_before_the_margin(self):
+        self.ordered()
+        self.st["tx"]["accept"] = {"intent_at": "t"}
+        canary.save(self.dir, self.st)
+        with patch.object(canary, "run", CanaryChain(self.st, now=10_000 - 1)), \
+                self.assertRaises(canary.CanaryError) as ctx:
             canary.cmd_accept(spend_args(self.dir, role=None))
-        self.assertEqual(chain.simulated, [("accept(bytes32)", C)])
-        self.assertEqual(chain.sent, [])
+        self.assertIn("accept was already attempted", str(ctx.exception))
+
+    def test_offer_refuses_within_120_seconds_of_accept_by(self):
+        self.ordered()
+        del self.st["tx"]["offer"]
+        canary.save(self.dir, self.st)
+        chain = CanaryChain(self.st, now=10_000 - 119)
+        with patch.object(canary, "run", chain), self.assertRaises(canary.CanaryError) as ctx:
+            canary.cmd_offer(spend_args(self.dir, role=None))
+        self.assertIn("too old to offer", str(ctx.exception))
+        self.assertEqual(chain.simulated, [])
+        for now in (10_000 - 120, 10_000 - 121):
+            chain = CanaryChain(self.st, now=now)
+            with self.subTest(now=now), patch.object(canary, "run", chain):
+                canary.cmd_offer(spend_args(self.dir, role=None))
+            self.assertEqual(chain.simulated, [("approve(address,uint256)(bool)", B)])
+            self.assertEqual(chain.sent, [])
+        self.assertEqual(canary.load(self.dir)["tx"], {})
 
     def test_accept_and_settle_refuse_after_refund(self):
         self.ordered()
@@ -315,8 +361,9 @@ class RefundTests(TempCase):
 
     def test_refund_by_buyer_on_gas_token_allows_the_fee(self):
         fee_units = 100_000 * 20 * 10**9 // 10**12  # gasUsed * effectiveGasPrice in 18 decimals, as 6-decimal units
-        cases = (("buyer", 2_000_000 - fee_units, True), ("buyer", 2_000_000 - fee_units - 2, False),
-                 ("relayer", 2_000_000, True))
+        cases = (("buyer", 2_000_000 - fee_units, True), ("buyer", 2_000_000 - fee_units - 1, True),
+                 ("buyer", 2_000_000 - fee_units + 1, True), ("buyer", 2_000_000 - fee_units - 2, False),
+                 ("buyer", 2_000_000 - fee_units + 2, False), ("relayer", 2_000_000, True))
         for role, gain, passes in cases:
             directory, st = self.ordered(name=f"{role}-{gain}")
             chain = CanaryChain(st, state=1, now=10_001, buyer_gain=gain)
@@ -353,7 +400,8 @@ class RefundTests(TempCase):
             self.assertNotIn("refunded", saved.get("checks", {}))
 
     def test_refund_post_check_fails_when_the_escrow_or_state_is_wrong(self):
-        for change, message in (({"escrow_drop": 1_999_999}, "escrow balance"), ({"state_after": 2}, "state")):
+        cases = (({"escrow_drop": 1_999_999}, "escrow balance"), ({"state_after": 2}, "the task state is not Refunded"))
+        for change, message in cases:
             directory, st = self.ordered(chain_id=31337, token=SHOWCASE, name=next(iter(change)))
             chain = CanaryChain(st, state=2, now=20_001, **change)
             with self.subTest(change=change), patch.object(canary, "run", chain), \
@@ -361,6 +409,46 @@ class RefundTests(TempCase):
                 canary.cmd_refund(spend_args(directory, **self.go(st)))
             self.assertIn(message, str(ctx.exception))
             self.assertNotIn("checks", canary.load(directory))
+
+    def test_refund_post_check_refuses_a_receipt_without_gas_fields(self):
+        directory, st = self.ordered()
+        chain = CanaryChain(st, state=1, now=10_001)
+        send = chain.send
+        chain.send = lambda args: json.dumps({k: v for k, v in json.loads(send(args)).items() if k != "gasUsed"})
+        with patch.object(canary, "run", chain), self.assertRaises(canary.CanaryError) as ctx:
+            canary.cmd_refund(spend_args(directory, **self.go(st)))
+        self.assertIn("gasUsed", str(ctx.exception))
+        self.assertEqual(canary.load(directory)["tx"]["refund"]["hash"], "0x" + "4" * 64)
+
+    def test_refund_run_never_shows_the_password_path(self):
+        directory, st = self.ordered(chain_id=31337, token=SHOWCASE)
+        out = io.StringIO()
+        chain = CanaryChain(st, state=2, now=20_001)
+        with patch.dict(os.environ, {"ETH_PASSWORD": PASSWORD_FILE}), patch.object(canary, "run", chain), \
+                contextlib.redirect_stdout(out):
+            canary.cmd_refund(spend_args(directory, **self.go(st)))
+        self.assertIn("post-checks passed", out.getvalue())
+        for text in (out.getvalue(), *(p.read_text() for p in pathlib.Path(directory).iterdir())):
+            self.assertNotIn(PASSWORD_FILE, text)
+
+    def test_refund_refuses_another_buyer_or_amount_on_chain(self):
+        directory, st = self.ordered()
+        for change in ({"buyer_onchain": C}, {"amount_onchain": 1_000_000}):
+            chain = CanaryChain(st, state=1, now=10_001, **change)
+            with self.subTest(change=change), patch.object(canary, "run", chain), \
+                    self.assertRaises(canary.CanaryError) as ctx:
+                canary.cmd_refund(spend_args(directory, **self.go(st)))
+            self.assertIn("another buyer or amount", str(ctx.exception))
+            self.assertEqual((chain.simulated, chain.sent), ([], []))
+            self.assertNotIn("refund", canary.load(directory)["tx"])
+
+    def test_refund_hash_is_saved_when_the_receipt_file_cannot_be_written(self):
+        directory, st = self.ordered(chain_id=31337, token=SHOWCASE)
+        (pathlib.Path(directory) / "refund.json").write_text("{}")  # write_new refuses to overwrite it
+        chain = CanaryChain(st, state=2, now=20_001)
+        with patch.object(canary, "run", chain), self.assertRaises(FileExistsError):
+            canary.cmd_refund(spend_args(directory, **self.go(st)))
+        self.assertEqual(canary.load(directory)["tx"]["refund"]["hash"], "0x" + "4" * 64)
 
     def test_refund_refuses_states_that_cannot_refund(self):
         cases = ((0, 20_001, "buyer"), (3, 20_001, "buyer"), (4, 20_001, "buyer"),
@@ -434,6 +522,42 @@ class ReuseTests(TempCase):
         self.assertEqual((new / "deployment.json").read_bytes(), (self.old / "deployment.json").read_bytes())
         self.assertEqual(self.snapshot(self.old), before)
 
+    def test_reuse_runs_the_read_only_probe_and_keeps_its_report(self):
+        for chain_id, allow in ((5042, []), (31337, ["--allow-chain", "31337"])):
+            if chain_id != 5042:
+                self.old_st.update(chain_id=chain_id, roles={r: f"unlocked:{a}" for r, a in
+                                                             zip(canary.ROLES, (A, B, C, D), strict=True)})
+                canary.save(self.old, self.old_st)
+            chain = CanaryChain(self.old_st)
+            with self.subTest(chain_id=chain_id):
+                signers = {} if chain_id == 5042 else self.old_st["roles"]
+                new = pathlib.Path(self.reuse(name=f"new-{chain_id}", chain=chain, chain_id=chain_id, **signers))
+                (args, manifest), = chain.probes
+                self.assertEqual(args[2], "after")
+                self.assertEqual([a for a in args if a == "--allow-chain"], allow[:1])
+                if allow:
+                    self.assertEqual(args[-2:], allow)
+                self.assertEqual(manifest, {"escrow": ESCROW, "verifier": VERIFIER, "image_id": IMAGE_ID,
+                                            "code_hashes": CODE_HASHES, "chain_id": chain_id,
+                                            "token": canary.ARC_USDC})
+                self.assertEqual(json.loads((new / "reuse-probe.json").read_text())["verdict"], "ok")
+
+    def test_reuse_refuses_when_the_probe_fails(self):
+        for problem in ("an order is already funded (totalReserved != 0); the probe refuses to proceed",
+                        "SolverBountyEscrow code on chain differs from the local build outside the immutable slots"):
+            chain = CanaryChain(self.old_st, probe_problems=[problem])
+            with self.subTest(problem=problem), self.assertRaises(canary.CanaryError) as ctx:
+                self.reuse(chain=chain)
+            self.assertIn("read-only probe", str(ctx.exception))
+            self.assertIn(problem, str(ctx.exception))
+            self.assertFalse((self.root / "new").exists())
+
+    def test_reuse_refuses_another_verifier_on_the_escrow(self):
+        with self.assertRaises(canary.CanaryError) as ctx:
+            self.reuse(chain=CanaryChain(self.old_st, verifier=SHOWCASE))
+        self.assertIn("verifier", str(ctx.exception))
+        self.assertFalse((self.root / "new").exists())
+
     def test_reused_run_manifest_keeps_deploy_hashes(self):
         new = pathlib.Path(self.reuse())
         with patch.object(canary.subprocess, "run", side_effect=fake_git()):
@@ -462,22 +586,29 @@ class ReuseTests(TempCase):
 
     def test_reuse_refuses_an_undeployed_or_mismatched_run(self):
         undeployed = pathlib.Path(self.init(name="undeployed"))
-        cases = (("undeployed", {"reuse_deployment": str(undeployed)}, None),
-                 ("missing", {"reuse_deployment": str(self.root / "nothing")}, None),
-                 ("itself", {"reuse_deployment": str(self.root / "new-itself")}, None),
-                 ("chain", dict(chain_id=31337, **{r: f"unlocked:{a}" for r, a in zip(canary.ROLES, (A, B, C, D),
-                                                                                       strict=True)}), None),
-                 ("token", {"token": SHOWCASE}, None),
-                 ("rpc", {}, CanaryChain(self.old_st, chain_id=1)),
-                 ("onchain-token", {}, CanaryChain(self.old_st, token=SHOWCASE)))
-        for name, change, chain in cases:
+        empty = self.root / "empty"
+        empty.mkdir()
+        bad_hashes = pathlib.Path(self.init(name="bad-hashes"))
+        canary.save(bad_hashes, dict(self.old_st, code_hashes="0x" + "a1" * 32))
+        local = {r: f"unlocked:{a}" for r, a in zip(canary.ROLES, (A, B, C, D), strict=True)}
+        cases = (("undeployed", {"reuse_deployment": str(undeployed)}, None, "holds no complete deployment"),
+                 ("bad-hashes", {"reuse_deployment": str(bad_hashes)}, None, "holds no complete deployment"),
+                 ("missing", {"reuse_deployment": str(self.root / "nothing")}, None, "No state.json"),
+                 ("empty", {"reuse_deployment": str(empty)}, None, "No state.json"),
+                 ("itself", {"reuse_deployment": str(self.root / "new-itself")}, None, "No state.json"),
+                 ("chain", dict(chain_id=31337, **local), None, "was deployed for chain 5042"),
+                 ("token", {"token": SHOWCASE}, None, "was deployed for chain 5042"),
+                 ("rpc", {}, CanaryChain(self.old_st, chain_id=1), "RPC reports chain 1"),
+                 ("onchain-token", {}, CanaryChain(self.old_st, token=SHOWCASE), "different token"))
+        for name, change, chain, message in cases:
             chain = chain or CanaryChain(self.old_st)
             change.setdefault("reuse_deployment", str(self.old))
             with self.subTest(case=name), patch.object(canary, "run", chain), \
-                    self.assertRaises(canary.CanaryError):
+                    self.assertRaises(canary.CanaryError) as ctx:
                 self.init(name=f"new-{name}", **change)
+            self.assertIn(message, str(ctx.exception))
             self.assertFalse((self.root / f"new-{name}").exists())
-            self.assertEqual(chain.sent, [])
+            self.assertEqual((chain.sent, chain.probes), ([], []))
 
     def test_deploy_refuses_in_a_reused_directory(self):
         new = self.reuse()
@@ -506,6 +637,9 @@ class EnvTests(unittest.TestCase):
     def test_rayon_threads_default_to_four(self):
         self.assertEqual(self.child_env({})["RAYON_NUM_THREADS"], "4")
 
+    def test_empty_rayon_threads_fall_back_to_four(self):
+        self.assertEqual(self.child_env({"RAYON_NUM_THREADS": ""})["RAYON_NUM_THREADS"], "4")
+
     def test_rayon_threads_come_from_the_environment(self):
         env = self.child_env({"RAYON_NUM_THREADS": "2"})
         self.assertEqual(env["RAYON_NUM_THREADS"], "2")
@@ -522,6 +656,13 @@ class EnvTests(unittest.TestCase):
         for child in run.call_args_list:
             self.assertEqual(child.kwargs["env"]["ETH_PASSWORD"], PASSWORD_FILE)
             self.assertNotIn(PASSWORD_FILE, " ".join(child.args[0]))
+
+    def test_eth_password_path_does_not_reach_other_children(self):
+        with patch.dict(os.environ, {"ETH_PASSWORD": PASSWORD_FILE}):
+            module = fresh_canary()
+            with patch.object(module.subprocess, "run", return_value=self.OK) as run:
+                module.run("cargo", "build")
+        self.assertNotIn("ETH_PASSWORD", run.call_args.kwargs["env"])
 
     def test_eth_password_path_is_redacted_from_errors(self):
         rpc = "https://rpc.example/KEY123"
@@ -546,6 +687,38 @@ class EnvTests(unittest.TestCase):
                 module.run("cast", "chain-id")
         self.assertIn("plain failure", str(ctx.exception))
         self.assertNotIn("<password-file>", str(ctx.exception))
+
+
+class ParserTests(unittest.TestCase):
+    """The CLI surface pinned by lead decision D18. The rehearse role and the pinned-checkout grep depend on it."""
+
+    INIT = ("init", "--dir", "new", "--amount", "2000000", "--max-cost", "14", "--instance", "i.json",
+            "--deployer", "a", "--buyer", "b", "--seller", "c", "--relayer", "d")
+
+    def parse(self, *argv):
+        return canary.parser().parse_args(list(argv))
+
+    def test_refund_defaults_to_a_dry_run_by_the_buyer(self):
+        args = self.parse("refund", "--dir", "run")
+        self.assertEqual((args.handler, args.dir, args.role, args.execute, args.confirm_chain, args.confirm_amount),
+                         (canary.cmd_refund, "run", "buyer", False, None, None))
+
+    def test_refund_takes_the_spending_flags_and_a_role(self):
+        args = self.parse("refund", "--dir", "run", "--role", "relayer", "--execute", "--confirm-chain", "5042",
+                          "--confirm-amount", "2000000")
+        self.assertEqual((args.role, args.execute, args.confirm_chain, args.confirm_amount),
+                         ("relayer", True, 5042, 2_000_000))
+
+    def test_refund_role_choices_are_buyer_seller_relayer(self):
+        for role in ("buyer", "seller", "relayer"):
+            self.assertEqual(self.parse("refund", "--dir", "run", "--role", role).role, role)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("refund", "--dir", "run", "--role", "deployer")
+
+    def test_init_takes_reuse_deployment(self):
+        self.assertIsNone(self.parse(*self.INIT).reuse_deployment)
+        args = self.parse(*self.INIT, "--reuse-deployment", "mainnet/20261015T120000Z")
+        self.assertEqual((args.handler, args.reuse_deployment), (canary.cmd_init, "mainnet/20261015T120000Z"))
 
 
 class RunTests(unittest.TestCase):

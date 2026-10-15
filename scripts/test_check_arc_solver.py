@@ -256,6 +256,13 @@ class AfterTests(ProbeCase):
         self.assertTrue(any("records a approve transaction" in p for p in self.report()["problems"]))
         self.assertNotIn("code", self.report())
 
+    def test_order_step_in_tx_is_refused_beside_empty_transactions(self):
+        self.write_state({"offer": {"intent_at": "t", "hash": "0x" + "5" * 64}})
+        state = json.loads(self.manifest.read_text())
+        self.manifest.write_text(json.dumps(dict(state, transactions={})))
+        self.assertEqual(self.after(), 1)
+        self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
+
     def test_reused_run_state_with_empty_tx_is_accepted(self):
         self.write_state({})
         self.assertEqual(self.after(), 0)

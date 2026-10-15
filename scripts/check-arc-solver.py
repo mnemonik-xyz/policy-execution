@@ -18,8 +18,8 @@ Nothing is broadcast, no key is read and no account is funded.
       totalReserved() == 0 on the escrow.
       Keys used (schema: solver-bounty/canary/manifest.schema.json; missing keys are reported):
       escrow, verifier, image_id, code_hashes {escrow, verifier}, token (default Arc USDC when absent),
-      chain_id (default 5042 when absent), and transactions (a manifest) or tx (a run state.json, used when
-      transactions is absent). Neither must hold an order step (approve, offer, accept, settle) yet.
+      chain_id (default 5042 when absent), and transactions (a manifest) or tx (a run state.json).
+      Neither must hold an order step (approve, offer, accept, settle) yet.
 
 The RPC URL comes from the WARRANT_CANARY_RPC variable. It is never put in arguments, reports or errors.
 Any other chain than 5042 is refused unless --allow-chain N names it for a local rehearsal.
@@ -223,12 +223,9 @@ def input_problems(manifest, addresses, image_id):
         if not isinstance(value, str) or not value.startswith("0x"):
             problems.append(f"manifest lacks a hex {key!r} field")
     # A manifest lists steps under transactions; a run state.json lists them under tx, where an entry such as
-    # {intent_at} without a hash is still an attempt. An empty tx, as in a reused run, holds no step.
-    steps = manifest_value(manifest, "transactions")
-    if steps is None:
-        steps = manifest_value(manifest, "tx")
+    # {intent_at} without a hash is still an attempt. Both are checked. An empty tx, as in a reused run, holds no step.
     for step in ORDER_STEPS:
-        if manifest_value(steps, step):
+        if any(manifest_value(manifest, source, step) for source in ("transactions", "tx")):
             problems.append(f"manifest already records a {step} transaction; the probe runs before any order")
     return problems
 

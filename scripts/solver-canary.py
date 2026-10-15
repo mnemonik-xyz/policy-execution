@@ -27,7 +27,7 @@ ROLES = ("deployer", "buyer", "seller", "relayer")
 RPC_ENV = "WARRANT_CANARY_RPC"
 # The caller's environment reaches every child, including ETH_PASSWORD (Foundry reads it as the path of a password
 # file) and FOUNDRY_KEYSTORE_DIR. RAYON_NUM_THREADS defaults to 4 to stop proving from swapping.
-ENV = dict(os.environ, RISC0_BUILD_LOCKED="1", RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS", "4"),
+ENV = dict(os.environ, RISC0_BUILD_LOCKED="1", RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS") or "4",
            DOCKER_DEFAULT_PLATFORM="linux/amd64")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 HASH32 = re.compile(r"0x[0-9a-fA-F]{64}")
@@ -70,7 +70,10 @@ def rpc_url():
 
 
 def run(*args, cwd=ROOT, interactive=False, stdin=None):
-    env = dict(ENV, ETH_RPC_URL=rpc_url()) if args[0] in ("cast", "forge") else ENV
+    if args[0] in ("cast", "forge"):
+        env = dict(ENV, ETH_RPC_URL=rpc_url())
+    else:  # Only cast and forge sign, so only they get the password file path.
+        env = {key: value for key, value in ENV.items() if key != "ETH_PASSWORD"}
     extra = {"input": stdin} if stdin is not None else {} if interactive else {"stdin": subprocess.DEVNULL}
     try:
         p = subprocess.run([str(a) for a in args], cwd=cwd, env=env, text=True,
@@ -196,11 +199,13 @@ def cmd_init(args):
         raise CanaryError("Use different signers: four on mainnet, and at least different buyer and seller")
     instance = json.loads(pathlib.Path(args.instance).read_text())
     d = pathlib.Path(args.dir)
-    reused = reused_deployment(args) if args.reuse_deployment else {}
+    reused, probe = reused_deployment(args) if args.reuse_deployment else ({}, None)
     d.mkdir(parents=True)
     write_new(d / "instance.json", instance)
-    if reused and (pathlib.Path(args.reuse_deployment) / "deployment.json").is_file():
-        shutil.copyfile(pathlib.Path(args.reuse_deployment) / "deployment.json", d / "deployment.json")
+    if reused:
+        write_new(d / "reuse-probe.json", probe)
+        if (pathlib.Path(args.reuse_deployment) / "deployment.json").is_file():
+            shutil.copyfile(pathlib.Path(args.reuse_deployment) / "deployment.json", d / "deployment.json")
     save(d, dict(version=1, created_at=now_iso(), chain_id=args.chain_id, token=args.token, amount=args.amount,
                  max_cost=args.max_cost, accept_window=args.accept_window, settle_window=args.settle_window,
                  roles={role: getattr(args, role) for role in ROLES}, addresses=addresses, **reused, tx={}))
@@ -211,11 +216,32 @@ def same_hex(a, b):
     return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
 
 
+def probe_deployment(old, args):
+    """Run the read-only probe check-arc-solver.py after on the reused contracts and return its report.
+
+    The probe compares the code on chain with the local build outside the immutable slots, so the check does not
+    rest only on the hashes in the old state.json. It also checks the getters and refuses a live reservation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest, out = pathlib.Path(tmp) / "manifest.json", pathlib.Path(tmp) / "report.json"
+        keys = {key: old[key] for key in ("escrow", "verifier", "image_id", "code_hashes")}
+        manifest.write_text(json.dumps(dict(keys, chain_id=args.chain_id, token=args.token)))
+        allow = [] if args.chain_id in MAINNET_IDS else ["--allow-chain", args.chain_id]
+        try:
+            run(sys.executable, ROOT / "scripts/check-arc-solver.py", "after", manifest, "--out", out, *allow)
+        except CanaryError as exc:
+            raise CanaryError(f"The reused deployment failed the read-only probe:\n{exc}") from exc
+        return json.loads(out.read_text())
+
+
 def reused_deployment(args):
-    """Check an earlier run's contracts on chain again and return the keys a new run copies. Creates nothing."""
+    """Check an earlier run's contracts on chain again. Return the keys a new run copies and the probe report.
+
+    Creates nothing on disk.
+    """
     old_dir = pathlib.Path(args.reuse_deployment)
     old = load(old_dir)
-    if any(key not in old for key in REUSED_KEYS):
+    if any(key not in old for key in REUSED_KEYS) or not isinstance(old["code_hashes"], dict):
         raise CanaryError(f"{old_dir} holds no complete deployment: it needs {', '.join(REUSED_KEYS)}")
     if old["chain_id"] != args.chain_id or not same_hex(old["token"], args.token):
         raise CanaryError(f"{old_dir} was deployed for chain {old['chain_id']} and token {old['token']}, "
@@ -228,7 +254,10 @@ def reused_deployment(args):
         raise CanaryError(f"The escrow on chain holds a different image ID than {old_dir} records")
     if not same_hex(call(old["escrow"], "token()(address)"), args.token):
         raise CanaryError("The escrow on chain holds a different token than this run")
-    return dict({key: old[key] for key in REUSED_KEYS}, reused_from=old_dir.resolve().name)
+    if not same_hex(call(old["escrow"], "verifier()(address)"), old["verifier"]):
+        raise CanaryError(f"The escrow on chain uses a different verifier than {old_dir} records")
+    probe = probe_deployment(old, args)
+    return dict({key: old[key] for key in REUSED_KEYS}, reused_from=old_dir.resolve().name), probe
 
 
 def cmd_check(args):
@@ -389,6 +418,7 @@ def cmd_accept(args):
     expected = [buyer, seller, q["policy_hash"], "1", str(st["amount"]), str(q["accept_by"]), str(q["settle_by"]), "1"]
     if [line.split()[0].lower() for line in onchain.splitlines()] != [value.lower() for value in expected]:
         raise CanaryError("The seller rejects the on-chain terms")
+    refuse_retry(st, "accept")  # A lost-response retry says so before the margin message can hide it.
     if block_time() + ACCEPT_MARGIN > q["accept_by"]:
         raise CanaryError(f"Less than {ACCEPT_MARGIN} s remain before acceptBy, so accept could land too late. "
                           "Do not accept. Wait until after acceptBy, run refund, then init --reuse-deployment.")
@@ -503,8 +533,13 @@ def cmd_settle(args):
         raise CanaryError("Replay passed simulation. Stop and investigate.")
 
 
+def task_terms(st):
+    """The on-chain task tuple as first words: customer, recipient, policy hash, version, amount, ..., state."""
+    return [line.split()[0] for line in call(st["escrow"], TASK_TERMS, st["quote"]["task"]).splitlines()]
+
+
 def task_state(st):
-    return int(call(st["escrow"], TASK_TERMS, st["quote"]["task"]).splitlines()[-1].split()[0])
+    return int(task_terms(st)[-1])
 
 
 def refund_refusal(st, state, now, sender):
@@ -528,7 +563,10 @@ def expected_buyer_gain(st, receipt, sender):
     """The buyer gain and its tolerance. On Arc, USDC is the gas token, so a buyer who sends pays the fee in it."""
     if sender != st["addresses"]["buyer"] or not same_hex(st["token"], ARC_USDC):
         return st["amount"], 0
-    fee = int(receipt["gasUsed"], 16) * int(receipt["effectiveGasPrice"], 16)  # native units, 18 decimals
+    try:
+        fee = int(receipt["gasUsed"], 16) * int(receipt["effectiveGasPrice"], 16)  # native units, 18 decimals
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CanaryError("Refund post-check: the receipt lacks a hex gasUsed or effectiveGasPrice") from exc
     return st["amount"] - fee // 10**12, 1  # token units, 6 decimals; 1 unit for rounding
 
 
@@ -537,8 +575,8 @@ def check_refund(st, receipt, before, sender):
     if task_state(st) != 4:
         raise CanaryError("Refund post-check: the task state is not Refunded")
     topic = run("cast", "keccak", "Refunded(bytes32)")
-    logs = [x for x in receipt["logs"] if same_hex(x["address"], escrow) and len(x["topics"]) > 1
-            and same_hex(x["topics"][0], topic) and same_hex(x["topics"][1], task)]
+    logs = [x for x in receipt.get("logs") or [] if isinstance(x, dict) and same_hex(x.get("address"), escrow)
+            and len(x.get("topics") or []) > 1 and same_hex(x["topics"][0], topic) and same_hex(x["topics"][1], task)]
     if len(logs) != 1:
         raise CanaryError("Refund post-check: the receipt does not hold exactly one Refunded event for this task")
     after = balances(st)
@@ -556,21 +594,25 @@ def cmd_refund(args):
     refuse_retry(st, "refund")
     connect(st)
     escrow, task, sender = st["escrow"], st["quote"]["task"], st["addresses"][args.role]
-    refusal = refund_refusal(st, task_state(st), block_time(), sender)
+    terms = task_terms(st)
+    if not same_hex(terms[0], st["addresses"]["buyer"]) or terms[4] != str(st["amount"]):
+        raise CanaryError("The on-chain task names another buyer or amount than state.json. Stop and investigate.")
+    refusal = refund_refusal(st, int(terms[-1]), block_time(), sender)
     if refusal:
         raise CanaryError(refusal)
-    before = balances(st)
+    before, sent = balances(st), {}
 
     def execute():
-        receipt = send_tx(st, args.role, escrow, "refund(bytes32)", task)
-        write_new(d / "refund.json", receipt)
-        return {"hash": receipt["transactionHash"], "block": receipt["blockNumber"]}
+        sent["receipt"] = send_tx(st, args.role, escrow, "refund(bytes32)", task)
+        return {"hash": sent["receipt"]["transactionHash"], "block": sent["receipt"]["blockNumber"]}
 
     if not step(d, st, "refund", args, lambda: call(escrow, "refund(bytes32)", task, sender=sender), execute):
         return
-    check_refund(st, json.loads((d / "refund.json").read_text()), before, sender)
+    write_new(d / "refund.json", sent["receipt"])  # After step() saved the hash, so a failed write cannot lose it.
+    check_refund(st, sent["receipt"], before, sender)
     st.setdefault("checks", {})["refunded"] = True
     save(d, st)
+    print("refund: post-checks passed (state Refunded, one Refunded event, escrow and buyer balances)", flush=True)
 
 
 def evidence_folder(d, chain_id):
