@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,10 @@ ARC_USDC = "0x3600000000000000000000000000000000000000"
 HARD_CAP = 10_000_000  # 10 USDC in six-decimal units. Raising it needs a code change and a review.
 ROLES = ("deployer", "buyer", "seller", "relayer")
 RPC_ENV = "WARRANT_CANARY_RPC"
-ENV = dict(os.environ, RISC0_BUILD_LOCKED="1", RAYON_NUM_THREADS="4", DOCKER_DEFAULT_PLATFORM="linux/amd64")
+# The caller's environment reaches every child, including ETH_PASSWORD (Foundry reads it as the path of a password
+# file) and FOUNDRY_KEYSTORE_DIR. RAYON_NUM_THREADS defaults to 4 to stop proving from swapping.
+ENV = dict(os.environ, RISC0_BUILD_LOCKED="1", RAYON_NUM_THREADS=os.environ.get("RAYON_NUM_THREADS", "4"),
+           DOCKER_DEFAULT_PLATFORM="linux/amd64")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 HASH32 = re.compile(r"0x[0-9a-fA-F]{64}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -39,7 +43,17 @@ BUILDER_IMAGE = "risczero/risc0-guest-builder"
 DEFAULT_BUILDER_TAG = "r0.1.88.0"  # DEFAULT_DOCKER_TAG in risc0-build 3.0.5; RISC0_DOCKER_CONTAINER_TAG overrides it
 BUILDER = re.compile(r"risczero/risc0-guest-builder:[A-Za-z0-9._-]+|local")
 WORKER_REPOSITORY = "ghcr.io/mnemonik-xyz/warrant-transcription"
-TX_NAMES = ("deploy", "deploy_verifier", "approve", "offer", "accept", "settle")
+TX_NAMES = ("deploy", "deploy_verifier", "approve", "offer", "accept", "settle", "refund")
+ACCEPT_MARGIN = 120  # seconds before acceptBy after which offer and accept refuse, so neither lands too late
+TASK_TERMS = "tasks(bytes32)(address,address,bytes32,uint64,uint64,uint64,uint64,uint8)"
+TASK_STATES = ("Missing", "Offered", "Accepted", "Paid", "Refunded")  # TaskEscrow.State
+REUSED_KEYS = ("escrow", "verifier", "image_id", "code_hashes", "image_builder")
+REFUNDED = "This run was refunded. Start a new run with init --reuse-deployment."
+BASE_NOTE = "The checker proves a modelled cost, not a cloud bill. Settlement does not start any cloud run."
+# The reference wording. The README and the evidence PR body copy this sentence; they do not define their own.
+SCRIPTED_CANARY_NOTE = ("Scripted canary: all four roles (deployer, buyer, seller, relayer) are held by the team and "
+                        "the quote comes from the heuristic scripts/solver-agent.py. An agent-driven proven deal and "
+                        "a separate proving service are the next feature.")
 MANIFEST_KEYS = ("source_commit", "source_dirty", "compiler", "dependencies", "chain_id", "token", "escrow",
                  "verifier", "image_id", "image_builder", "code_hashes", "transactions", "addresses", "created_at")
 
@@ -65,6 +79,7 @@ def run(*args, cwd=ROOT, interactive=False, stdin=None):
         raise CanaryError(f"Command not found: {args[0]}. Install it or build it first.") from exc
     if p.returncode:
         text = (p.stderr + p.stdout).replace(os.environ.get(RPC_ENV) or "\0", "<rpc>")
+        text = text.replace(os.environ.get("ETH_PASSWORD") or "\0", "<password-file>")
         raise CanaryError(f"{args[0]} {args[1] if len(args) > 1 else ''} failed:\n{text[-1500:]}")
     return p.stdout.strip()
 
@@ -137,11 +152,15 @@ def confirmed(st, args):
     return True
 
 
-def step(d, st, name, args, simulate, execute):
-    """Simulate first. Broadcast only with --execute. Save the intent first and never retry."""
+def refuse_retry(st, name):
     if name in st["tx"]:
         raise CanaryError(f"{name} was already attempted: {st['tx'][name]}. "
                           "Inspect the chain before any manual change.")
+
+
+def step(d, st, name, args, simulate, execute):
+    """Simulate first. Broadcast only with --execute. Save the intent first and never retry."""
+    refuse_retry(st, name)
     simulate()
     print(f"{name}: dry run passed", flush=True)
     if not confirmed(st, args):
@@ -177,12 +196,39 @@ def cmd_init(args):
         raise CanaryError("Use different signers: four on mainnet, and at least different buyer and seller")
     instance = json.loads(pathlib.Path(args.instance).read_text())
     d = pathlib.Path(args.dir)
+    reused = reused_deployment(args) if args.reuse_deployment else {}
     d.mkdir(parents=True)
     write_new(d / "instance.json", instance)
+    if reused and (pathlib.Path(args.reuse_deployment) / "deployment.json").is_file():
+        shutil.copyfile(pathlib.Path(args.reuse_deployment) / "deployment.json", d / "deployment.json")
     save(d, dict(version=1, created_at=now_iso(), chain_id=args.chain_id, token=args.token, amount=args.amount,
                  max_cost=args.max_cost, accept_window=args.accept_window, settle_window=args.settle_window,
-                 roles={role: getattr(args, role) for role in ROLES}, addresses=addresses, tx={}))
-    print("Created", d)
+                 roles={role: getattr(args, role) for role in ROLES}, addresses=addresses, **reused, tx={}))
+    print("Created", d, *([f"(reusing the deployment of {reused['reused_from']})"] if reused else []))
+
+
+def same_hex(a, b):
+    return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
+
+
+def reused_deployment(args):
+    """Check an earlier run's contracts on chain again and return the keys a new run copies. Creates nothing."""
+    old_dir = pathlib.Path(args.reuse_deployment)
+    old = load(old_dir)
+    if any(key not in old for key in REUSED_KEYS):
+        raise CanaryError(f"{old_dir} holds no complete deployment: it needs {', '.join(REUSED_KEYS)}")
+    if old["chain_id"] != args.chain_id or not same_hex(old["token"], args.token):
+        raise CanaryError(f"{old_dir} was deployed for chain {old['chain_id']} and token {old['token']}, "
+                          "not for the chain and token of this run")
+    connect({"chain_id": args.chain_id})
+    for name in ("escrow", "verifier"):
+        if not same_hex(run("cast", "keccak", run("cast", "code", old[name])), old["code_hashes"].get(name)):
+            raise CanaryError(f"The {name} code on chain differs from the code hash recorded in {old_dir}")
+    if not same_hex(call(old["escrow"], "imageId()(bytes32)"), old["image_id"]):
+        raise CanaryError(f"The escrow on chain holds a different image ID than {old_dir} records")
+    if not same_hex(call(old["escrow"], "token()(address)"), args.token):
+        raise CanaryError("The escrow on chain holds a different token than this run")
+    return dict({key: old[key] for key in REUSED_KEYS}, reused_from=old_dir.resolve().name)
 
 
 def cmd_check(args):
@@ -305,7 +351,7 @@ def cmd_offer(args):
     q, escrow, token = st.get("quote"), st.get("escrow"), st["token"]
     if not q:
         raise CanaryError("Run quote first")
-    if int(run("cast", "block", "latest", "--field", "timestamp")) + 120 > q["accept_by"]:
+    if block_time() + ACCEPT_MARGIN > q["accept_by"]:
         raise CanaryError("The quote is too old to offer. Run quote again.")
     buyer, amount = st["addresses"]["buyer"], str(st["amount"])
     if "approve" in st["tx"] and "hash" not in st["tx"]["approve"]:
@@ -324,8 +370,14 @@ def cmd_offer(args):
          lambda: {"hash": send_tx(st, "buyer", escrow, OFFER, *terms)["transactionHash"]})
 
 
+def block_time():
+    return int(run("cast", "block", "latest", "--field", "timestamp"))
+
+
 def cmd_accept(args):
     d, st = args.dir, load(args.dir)
+    if "refund" in st["tx"]:
+        raise CanaryError(REFUNDED)
     connect(st)
     q, escrow = st.get("quote"), st.get("escrow")
     if not q or "hash" not in st["tx"].get("offer", {}):
@@ -333,10 +385,13 @@ def cmd_accept(args):
     if run(NATIVE, "policy-hash", pathlib.Path(d) / "policy.json") != q["policy_hash"]:
         raise CanaryError("policy.json no longer matches the quoted policy hash")
     seller, buyer = st["addresses"]["seller"], st["addresses"]["buyer"]
-    onchain = call(escrow, "tasks(bytes32)(address,address,bytes32,uint64,uint64,uint64,uint64,uint8)", q["task"])
+    onchain = call(escrow, TASK_TERMS, q["task"])
     expected = [buyer, seller, q["policy_hash"], "1", str(st["amount"]), str(q["accept_by"]), str(q["settle_by"]), "1"]
     if [line.split()[0].lower() for line in onchain.splitlines()] != [value.lower() for value in expected]:
         raise CanaryError("The seller rejects the on-chain terms")
+    if block_time() + ACCEPT_MARGIN > q["accept_by"]:
+        raise CanaryError(f"Less than {ACCEPT_MARGIN} s remain before acceptBy, so accept could land too late. "
+                          "Do not accept. Wait until after acceptBy, run refund, then init --reuse-deployment.")
     done = step(d, st, "accept", args, lambda: call(escrow, "accept(bytes32)", q["task"], sender=seller),
                 lambda: {"hash": send_tx(st, "seller", escrow, "accept(bytes32)", q["task"])["transactionHash"]})
     if done:
@@ -400,6 +455,8 @@ SETTLE = "settleWithResult(bytes,bytes,bytes)"
 
 def cmd_settle(args):
     d, st = pathlib.Path(args.dir), load(args.dir)
+    if "refund" in st["tx"]:
+        raise CanaryError(REFUNDED)
     connect(st)
     if "proof" not in st:
         raise CanaryError("Run prove first")
@@ -444,6 +501,76 @@ def cmd_settle(args):
         save(str(d), st)
     else:
         raise CanaryError("Replay passed simulation. Stop and investigate.")
+
+
+def task_state(st):
+    return int(call(st["escrow"], TASK_TERMS, st["quote"]["task"]).splitlines()[-1].split()[0])
+
+
+def refund_refusal(st, state, now, sender):
+    """The rules of TaskEscrow.refund, so that a refund that would revert is refused before the dry run."""
+    q = st["quote"]
+    if state == 1 and now <= q["accept_by"] and sender != st["addresses"]["buyer"]:
+        return "Before acceptBy only the buyer can cancel an unaccepted offer. Use --role buyer"
+    if state == 2 and now <= q["settle_by"]:
+        return "The seller accepted. A refund is possible only after settleBy"
+    if state not in (1, 2):
+        return f"The task is {TASK_STATES[state] if state < len(TASK_STATES) else state} and cannot be refunded"
+    return None
+
+
+def balances(st):
+    return {name: uint(call(st["token"], "balanceOf(address)(uint256)", address))
+            for name, address in (("escrow", st["escrow"]), ("buyer", st["addresses"]["buyer"]))}
+
+
+def expected_buyer_gain(st, receipt, sender):
+    """The buyer gain and its tolerance. On Arc, USDC is the gas token, so a buyer who sends pays the fee in it."""
+    if sender != st["addresses"]["buyer"] or not same_hex(st["token"], ARC_USDC):
+        return st["amount"], 0
+    fee = int(receipt["gasUsed"], 16) * int(receipt["effectiveGasPrice"], 16)  # native units, 18 decimals
+    return st["amount"] - fee // 10**12, 1  # token units, 6 decimals; 1 unit for rounding
+
+
+def check_refund(st, receipt, before, sender):
+    escrow, task, amount = st["escrow"], st["quote"]["task"], st["amount"]
+    if task_state(st) != 4:
+        raise CanaryError("Refund post-check: the task state is not Refunded")
+    topic = run("cast", "keccak", "Refunded(bytes32)")
+    logs = [x for x in receipt["logs"] if same_hex(x["address"], escrow) and len(x["topics"]) > 1
+            and same_hex(x["topics"][0], topic) and same_hex(x["topics"][1], task)]
+    if len(logs) != 1:
+        raise CanaryError("Refund post-check: the receipt does not hold exactly one Refunded event for this task")
+    after = balances(st)
+    if before["escrow"] - after["escrow"] != amount:
+        raise CanaryError("Refund post-check: the escrow balance did not fall by the bounty amount")
+    expected, tolerance = expected_buyer_gain(st, receipt, sender)
+    if abs(after["buyer"] - before["buyer"] - expected) > tolerance:
+        raise CanaryError(f"Refund post-check: the buyer balance did not rise by {expected} token units")
+
+
+def cmd_refund(args):
+    d, st = pathlib.Path(args.dir), load(args.dir)
+    if not st.get("quote") or "hash" not in st["tx"].get("offer", {}):
+        raise CanaryError("The offer is not confirmed, so there is nothing to refund")
+    refuse_retry(st, "refund")
+    connect(st)
+    escrow, task, sender = st["escrow"], st["quote"]["task"], st["addresses"][args.role]
+    refusal = refund_refusal(st, task_state(st), block_time(), sender)
+    if refusal:
+        raise CanaryError(refusal)
+    before = balances(st)
+
+    def execute():
+        receipt = send_tx(st, args.role, escrow, "refund(bytes32)", task)
+        write_new(d / "refund.json", receipt)
+        return {"hash": receipt["transactionHash"], "block": receipt["blockNumber"]}
+
+    if not step(d, st, "refund", args, lambda: call(escrow, "refund(bytes32)", task, sender=sender), execute):
+        return
+    check_refund(st, json.loads((d / "refund.json").read_text()), before, sender)
+    st.setdefault("checks", {})["refunded"] = True
+    save(d, st)
 
 
 def evidence_folder(d, chain_id):
@@ -547,8 +674,8 @@ def cmd_evidence(args):
                    image_id=st.get("image_id"), code_hashes=st.get("code_hashes"), amount=st["amount"],
                    addresses=st["addresses"], quote=st.get("quote"), delivery=st.get("delivery"),
                    transactions=st["tx"], checks=st.get("checks", {}), realProof="proof" in st, mockVerifier=False,
-                   note="The checker proves a modelled cost, not a cloud bill. "
-                        "Settlement does not start any cloud run.")
+                   reused_from=st.get("reused_from"),
+                   note=BASE_NOTE + (" " + SCRIPTED_CANARY_NOTE if st["chain_id"] in MAINNET_IDS else ""))
     write_new(d / "manifest.json", manifest)
     write_new(d / "result.json", summary)
     print(json.dumps(summary, indent=2))
@@ -578,6 +705,8 @@ def parser():
     init.add_argument("--settle-window", type=int, default=14400)
     for role in ROLES:
         init.add_argument(f"--{role}", required=True, help="account:NAME, ledger:0xADDRESS or unlocked:0xADDRESS")
+    init.add_argument("--reuse-deployment", metavar="DIR",
+                      help="Earlier run directory whose deployed contracts this run uses again. No redeploy")
     add("check", cmd_check)
     deploy = add("deploy", cmd_deploy, spends=True)
     deploy.add_argument("--allow-local-image-id", action="store_true")
@@ -587,6 +716,9 @@ def parser():
         "--worker-digest", help="GHCR digest of the worker image, sha256:<64 hex>, read at deploy time of the GPU run")
     for name, handler in (("offer", cmd_offer), ("accept", cmd_accept), ("settle", cmd_settle)):
         add(name, handler, spends=True)
+    add("refund", cmd_refund, spends=True).add_argument(
+        "--role", choices=("buyer", "seller", "relayer"), default="buyer",
+        help="Sender of the refund (default buyer). Funds always return to the buyer")
     return top
 
 

@@ -10,13 +10,16 @@ Nothing is broadcast, no key is read and no account is funded.
       Groth16 seal from PROOF.json (the evm.json written by `warrant-host export-evm`: seal, imageId,
       journalDigest), rejects a changed journal digest and constructs SolverBountyEscrow.
 
-  after MANIFEST.json --out report.json
-      Reads the code of the deployed escrow and verifier, hashes it with keccak256 and compares the hashes
-      with the manifest. Masks the immutable slots and compares the code with the local build artifacts in
-      contracts/out. Checks token(), verifier(), imageId() and totalReserved() == 0 on the escrow.
-      Manifest keys used (schema: solver-bounty/canary/manifest.schema.json; missing keys are reported):
+  after STATE_OR_MANIFEST.json --out report.json
+      Accepts a run state.json written by solver-canary.py or a manifest.json. Checks only the solver set:
+      SolverBountyEscrow and RiscZeroGroth16Verifier. Reads the code of the deployed escrow and verifier,
+      hashes it with keccak256 and compares the hashes with the input. Masks the immutable slots and compares
+      the code with the local build artifacts in contracts/out. Checks token(), verifier(), imageId() and
+      totalReserved() == 0 on the escrow.
+      Keys used (schema: solver-bounty/canary/manifest.schema.json; missing keys are reported):
       escrow, verifier, image_id, code_hashes {escrow, verifier}, token (default Arc USDC when absent),
-      chain_id (default 5042 when absent) and transactions, which must not yet hold an order step.
+      chain_id (default 5042 when absent), and transactions (a manifest) or tx (a run state.json, used when
+      transactions is absent). Neither must hold an order step (approve, offer, accept, settle) yet.
 
 The RPC URL comes from the WARRANT_CANARY_RPC variable. It is never put in arguments, reports or errors.
 Any other chain than 5042 is refused unless --allow-chain N names it for a local rehearsal.
@@ -214,6 +217,22 @@ def manifest_value(manifest, *keys):
     return value
 
 
+def input_problems(manifest, addresses, image_id):
+    problems = []
+    for key, value in [*addresses.items(), ("image_id", image_id)]:
+        if not isinstance(value, str) or not value.startswith("0x"):
+            problems.append(f"manifest lacks a hex {key!r} field")
+    # A manifest lists steps under transactions; a run state.json lists them under tx, where an entry such as
+    # {intent_at} without a hash is still an attempt. An empty tx, as in a reused run, holds no step.
+    steps = manifest_value(manifest, "transactions")
+    if steps is None:
+        steps = manifest_value(manifest, "tx")
+    for step in ORDER_STEPS:
+        if manifest_value(steps, step):
+            problems.append(f"manifest already records a {step} transaction; the probe runs before any order")
+    return problems
+
+
 def cmd_after(args):
     report, problems = {"phase": "after", "read_only": True}, []
     manifest = json.loads(pathlib.Path(args.manifest).read_text())
@@ -226,12 +245,7 @@ def cmd_after(args):
     token = manifest_value(manifest, "token") or args.token
     addresses = {"escrow": manifest_value(manifest, "escrow"), "verifier": manifest_value(manifest, "verifier")}
     image_id = manifest_value(manifest, "image_id")
-    for key, value in list(addresses.items()) + [("image_id", image_id)]:
-        if not isinstance(value, str) or not value.startswith("0x"):
-            problems.append(f"manifest lacks a hex {key!r} field")
-    for step in ORDER_STEPS:
-        if manifest_value(manifest, "transactions", step):
-            problems.append(f"manifest already records a {step} transaction; the probe runs before any order")
+    problems.extend(input_problems(manifest, addresses, image_id))
     if problems:
         return finish(args, report, problems)
     report["manifest"] = {"escrow": addresses["escrow"], "verifier": addresses["verifier"], "image_id": image_id,
@@ -291,7 +305,7 @@ def parser():
 
     before = add("before", cmd_before, "proof", "evm.json from `warrant-host export-evm`")
     before.add_argument("--image-id", help="Expected guest image ID (hex), as printed by warrant-host solver-image-id")
-    add("after", cmd_after, "manifest", "Deployment manifest JSON")
+    add("after", cmd_after, "manifest", "Run state.json from solver-canary.py, or a deployment manifest.json")
     return top
 
 
