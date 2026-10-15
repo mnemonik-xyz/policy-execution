@@ -516,8 +516,8 @@ class WarrantTranscriptionService:
         budget_cap_usd: str | float | None = "1.00",
     ) -> dict:
         logger.info(
-            "Tool called: propose_deployment with hardware_id=%s, customer_address=%s, location_id=%s, "
-            "duration_hours=%s, budget_cap_usd=%s",
+            "Tool called: propose_deployment with hardware_id=%.80r, customer_address=%.80r, location_id=%.80r, "
+            "duration_hours=%.80r, budget_cap_usd=%.80r",
             hardware_id,
             customer_address,
             location_id,
@@ -693,6 +693,10 @@ class WarrantTranscriptionService:
             except Exception as e:
                 raise ToolError(f"Failed to accept TaskEscrow task '{task_id}' on-chain: {e}") from e
 
+    def _ionet_state_path(self, deployment_id: str) -> pathlib.Path:
+        """The io.net deploy state file; adapter.deploy writes it before the remote deploy call."""
+        return self.state_dir / f"{deployment_id}.json"
+
     async def _provision_container(self, proposal: dict, deployment_id: str, worker_token: str) -> str | None:
         if self.local_server:
             # 1. Clean up any existing container on SSH host
@@ -788,7 +792,7 @@ class WarrantTranscriptionService:
             "gpus_per_container": 1,
             "replica_count": 1,
         }
-        state_file = self.state_dir / f"{deployment_id}.json"
+        state_file = self._ionet_state_path(deployment_id)
 
         async def op(cloud):
             est = await cloud.call("caas_get_price_estimate", price_args)
@@ -846,7 +850,7 @@ class WarrantTranscriptionService:
             session = self._lookup_session(task_id) or {}
             session["status"] = "failed"
             session["error"] = str(exc)
-            if self.mainnet and (self.state_dir / f"{deployment_id}.json").exists():
+            if self.mainnet and self._ionet_state_path(deployment_id).exists():
                 # deploy() saves its state file before the remote call, so a billable io.net deployment can
                 # exist although provisioning failed. Keep the deal slot closed until that lease can have ended.
                 session["deployment_may_exist"] = True
@@ -889,6 +893,7 @@ class WarrantTranscriptionService:
         max_amount = int(MAINNET_MAX_DEAL_USD * 1_000_000)
         if (
             proposal.get("chain_id") != MAINNET_CHAIN_ID
+            or type(proposal.get("duration_hours")) is not int
             or proposal.get("duration_hours") != MAINNET_DURATION_HOURS
             or type(amount) is not int
             or not 0 < amount <= max_amount
@@ -980,7 +985,7 @@ class WarrantTranscriptionService:
         return proposal, session
 
     async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
-        logger.info("Tool called: deploy_with_escrow with task_id=%s", task_id)
+        logger.info("Tool called: deploy_with_escrow with task_id=%.80r", task_id)
         try:
             task_id = self._require_task_id(task_id)
             if self.mainnet:
@@ -1223,7 +1228,7 @@ class WarrantTranscriptionService:
             raise safe_tool_error(exc) from None
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
-        logger.info("Tool called: get_deployment_status with task_id=%s", task_id)
+        logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
         # On chain 5042 the caller must name the task: the status includes the worker token.
         task_id = self._require_task_id(task_id)
         session = self._lookup_session(task_id)
@@ -1372,7 +1377,7 @@ class WarrantTranscriptionService:
     ) -> dict:
         """Verify buyer acceptance evidence off-chain, approve journal, and settle TaskEscrow on-chain."""
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
-        logger.info("Tool called: submit_acceptance with task_id=%s, signature_length=%d", task_id, sig_len)
+        logger.info("Tool called: submit_acceptance with task_id=%.80r, signature_length=%d", task_id, sig_len)
         try:
             task_id = self._require_task_id(task_id)
             session = self._lookup_session(task_id)

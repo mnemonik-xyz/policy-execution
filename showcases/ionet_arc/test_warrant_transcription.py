@@ -131,6 +131,39 @@ SELLER_TOOLS = {
     "get_deployment_status",
     "submit_acceptance",
 }
+# Tool descriptions on origin/main before Task 2; chains other than 5042 keep them exactly.
+TESTNET_DESCRIPTIONS = {
+    "list_suitable_hardware": (
+        "List available io.net GPU hardware options suitable for faster-whisper-small transcription.\n"
+        "Filters for single-GPU configurations with live availability and sorts by price ascending."
+    ),
+    "propose_deployment": (
+        "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
+        "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
+        "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
+    ),
+    "deploy_with_escrow": (
+        "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision the "
+        "io.net container in the background for 1 hour duration.\n"
+        "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
+    ),
+    "transcribe_audio": (
+        "Transcribe audio (passed as base64-encoded bytes in audio_base64) using an active 1-hour "
+        "Whisper deployment on io.net.\n"
+        "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be "
+        "expired.\n"
+        "Optionally provide task_id to target a specific deployment when multiple tasks exist."
+    ),
+    "get_deployment_status": (
+        "Check status of active 1-hour transcription deployment and remaining duration.\n"
+        "Optionally provide task_id to inspect a specific deployment session."
+    ),
+    "submit_acceptance": (
+        "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
+        "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, and "
+        "settles payment on TaskEscrow on-chain."
+    ),
+}
 LABELLED_TOOLS = {"propose_deployment", "deploy_with_escrow", "submit_acceptance"}
 MAINNET_BUYER = "0x" + "77" * 20
 MAINNET_HARDWARE = [
@@ -976,6 +1009,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(client.instructions)
                     tools = (await client.list_tools()).tools
                 self.assertEqual({t.name for t in tools}, SELLER_TOOLS)
+                self.assertEqual({t.name: t.description for t in tools}, TESTNET_DESCRIPTIONS)
                 for tool in tools:
                     self.assertNotIn(LABEL, tool.description)
                     self.assertNotIn("anyone can trigger payout", tool.description)
@@ -1133,6 +1167,11 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         path.write_text(json.dumps(session))
         return path
 
+    async def wait_background(self, server=None):
+        """Wait until the background provisioning tasks of the server have finished."""
+        tasks = list(self.service_of(server or self.mcp)._bg_tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def provision_ready(self, server=None):
         """Replace the io.net provisioning with an immediate ready container."""
         return patch.object(
@@ -1245,10 +1284,20 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Invalid budget_cap_usd", str(ctx.exception))
 
     async def test_mainnet_refuses_hardware_without_valid_price(self):
-        self.cloud.hardware = [{**MAINNET_HARDWARE[0], "price": float("nan")}]
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("propose_deployment")
-        self.assertIn("no valid price", str(ctx.exception))
+        # The policy refuses non-finite prices; filter_suitable_gpus already drops zero and negative prices,
+        # and a text price fails in the existing filter. Every case ends without a proposal.
+        expected = {
+            float("nan"): "no valid price",
+            float("inf"): "no valid price",
+            0: "No available suitable GPUs",
+            -0.5: "No available suitable GPUs",
+            "0.49": "not supported between instances",
+        }
+        for price, message in expected.items():
+            self.cloud.hardware = [{**MAINNET_HARDWARE[0], "price": price}]
+            with self.subTest(price=price), self.assertRaises(ToolError) as ctx:
+                await self.call("propose_deployment")
+            self.assertIn(message, str(ctx.exception))
         self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
 
     async def test_mainnet_cheapest_gpu_above_cap_is_refused(self):
@@ -1469,7 +1518,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.mock_escrow.accept.assert_called_once_with(p1["task_id"], sender=p1["recipient"])
             finally:
                 release.set()
-                await asyncio.sleep(0.02)
+                await self.wait_background()
 
     async def test_mainnet_failed_session_with_ionet_deployment_blocks_until_lease_ends(self):
         p1, policy1 = await self.offered_proposal()
@@ -1483,7 +1532,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(service, "_provision_container", side_effect=deploy_then_fail):
             await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-            await asyncio.sleep(0.05)
+            await self.wait_background()
         session_path = self.state_dir / "sessions" / f"{p1['task_id']}.json"
         session = json.loads(session_path.read_text())
         self.assertEqual(session["status"], "failed")
