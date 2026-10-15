@@ -22,6 +22,7 @@ from showcases.ionet_arc.adapter import PilotError
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, compile_buyer_policy, find_warrant_binary
 from showcases.ionet_arc.init import ensure_key_file, get_public_key_hex
 from showcases.ionet_arc.seller_mcp_server import (
+    ChainDetectionError,
     MainnetPolicyError,
     SellerServerConfig,
     ServerConfig,
@@ -114,6 +115,92 @@ def write_vendor_credential(directory: Path, escrow, chain_id: int, keys: dict) 
     }))
     sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
     return cred_path, sig_path
+
+
+LABEL = "after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD"
+LIMITS_SENTENCES = (
+    "Settlement uses a test-double verifier that accepts any digest the seller approves.",
+    "The 1 USD cap and the one-hour lease are seller policy, not contract rules.",
+    "One deal at a time.",
+    "The mainnet seller path has not been exercised with money before this listing.",
+    "Any holder of the basic-auth credential can read the current deployment status, including its worker token.",
+)
+SELLER_TOOLS = {
+    "list_suitable_hardware",
+    "propose_deployment",
+    "deploy_with_escrow",
+    "transcribe_audio",
+    "get_deployment_status",
+    "submit_acceptance",
+}
+LABELLED_TOOLS = {"propose_deployment", "deploy_with_escrow", "submit_acceptance"}
+MAINNET_BUYER = "0x" + "77" * 20
+MAINNET_HARDWARE = [
+    {
+        "hardware_id": 21,
+        "hardware_name": "RTX A6000",
+        "price": 0.49,
+        "available": 3,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+    {
+        "hardware_id": 40,
+        "hardware_name": "L40",
+        "price": 1.00,
+        "available": 2,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+    {
+        "hardware_id": 41,
+        "hardware_name": "A100",
+        "price": 1.01,
+        "available": 2,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+    {
+        "hardware_id": 30,
+        "hardware_name": "H100",
+        "price": 1.50,
+        "available": 2,
+        "max_gpus_per_container": 1,
+        "location": "US",
+    },
+]
+EXAMPLE_MANIFEST = Path(__file__).resolve().parent / "config" / "mainnet-manifest.example.yaml"
+
+
+def credit_status_response(balance: str) -> dict:
+    """PROVISIONAL io.net get_credit_status result until the real shape is read (Task 2 step 2).
+
+    The fixture pairs it with provisional_credit_parser; both are replaced by the real shape and the real parser.
+    """
+    return {"provisional_balance": balance}
+
+
+def provisional_credit_parser(status) -> Decimal:
+    return Decimal(str(status["provisional_balance"]))
+
+
+class FakeCloud:
+    """Answers the io.net cloud calls that the seller makes on chain 5042."""
+
+    def __init__(self):
+        self.hardware = list(MAINNET_HARDWARE)
+        self.credit_result: dict | Exception = credit_status_response("10.00")
+        self.calls: list[str] = []
+
+    async def call(self, name, arguments):
+        self.calls.append(name)
+        if name == "caas_get_hardware_ids":
+            return {"data": {"data": list(self.hardware)}}
+        if name == "get_credit_status":
+            if isinstance(self.credit_result, Exception):
+                raise self.credit_result
+            return self.credit_result
+        raise AssertionError(f"unexpected io.net call {name}")
 
 
 class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
@@ -910,6 +997,25 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest["task_id"], proposal["task_id"])
         self.assertEqual(latest["status"], "ready")
 
+    async def test_testnet_live_mode_has_no_credit_check_or_cap(self):
+        cloud = FakeCloud()
+
+        async def fake_connected(operation):
+            return await operation(cloud)
+
+        with (
+            patch.dict(os.environ, {"IO_NET_API_KEY": "test-dummy-key"}),
+            patch("showcases.ionet_arc.seller_mcp_server.connected", side_effect=fake_connected),
+            patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
+        ):
+            live = create_server(self.state_dir, mock_ionet=False)
+            res = await live.call_tool(
+                "propose_deployment", {"hardware_id": 30, "duration_hours": 2, "budget_cap_usd": None}
+            )
+        proposal = json.loads(res.content[0].text)
+        self.assertEqual(proposal["amount"], 3_000_000)
+        self.assertEqual(cloud.calls, ["caas_get_hardware_ids"])
+
     def test_main_exits_with_status_1_on_mainnet_policy_error(self):
         stderr = io.StringIO()
         refusal = MainnetPolicyError("mock mode is refused on chain 5042")
@@ -923,6 +1029,18 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("mock mode is refused on chain 5042", stderr.getvalue())
 
+    def test_main_exits_with_status_1_when_chain_unknown(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(seller_module, "run_server", side_effect=ChainDetectionError("cannot determine the chain")),
+            patch("sys.argv", ["seller_mcp_server"]),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            seller_module.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("cannot determine the chain", stderr.getvalue())
+
     def test_main_keeps_other_errors(self):
         with (
             patch.object(seller_module, "run_server", side_effect=RuntimeError("other failure")),
@@ -930,76 +1048,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(RuntimeError),
         ):
             seller_module.main()
-
-LABEL = "after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD"
-LIMITS_SENTENCES = (
-    "Settlement uses a test-double verifier that accepts any digest the seller approves.",
-    "The 1 USD cap and the one-hour lease are seller policy, not contract rules.",
-    "One deal at a time.",
-    "The mainnet seller path has not been exercised with money before this listing.",
-    "Any holder of the basic-auth credential can read the current deployment status, including its worker token.",
-)
-SELLER_TOOLS = {
-    "list_suitable_hardware",
-    "propose_deployment",
-    "deploy_with_escrow",
-    "transcribe_audio",
-    "get_deployment_status",
-    "submit_acceptance",
-}
-LABELLED_TOOLS = {"propose_deployment", "deploy_with_escrow", "submit_acceptance"}
-MAINNET_BUYER = "0x" + "77" * 20
-MAINNET_HARDWARE = [
-    {
-        "hardware_id": 21,
-        "hardware_name": "RTX A6000",
-        "price": 0.49,
-        "available": 3,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-    {
-        "hardware_id": 30,
-        "hardware_name": "H100",
-        "price": 1.50,
-        "available": 2,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-]
-EXAMPLE_MANIFEST = Path(__file__).resolve().parent / "config" / "mainnet-manifest.example.yaml"
-
-
-def credit_status_response(balance: str) -> dict:
-    """PROVISIONAL io.net get_credit_status result until the real shape is read (Task 2 step 2).
-
-    The fixture pairs it with provisional_credit_parser; both are replaced by the real shape and the real parser.
-    """
-    return {"provisional_balance": balance}
-
-
-def provisional_credit_parser(status) -> Decimal:
-    return Decimal(str(status["provisional_balance"]))
-
-
-class FakeCloud:
-    """Answers the io.net cloud calls that the seller makes on chain 5042."""
-
-    def __init__(self):
-        self.hardware = list(MAINNET_HARDWARE)
-        self.credit_result: dict | Exception = credit_status_response("10.00")
-        self.calls: list[str] = []
-
-    async def call(self, name, arguments):
-        self.calls.append(name)
-        if name == "caas_get_hardware_ids":
-            return {"data": {"data": list(self.hardware)}}
-        if name == "get_credit_status":
-            if isinstance(self.credit_result, Exception):
-                raise self.credit_result
-            return self.credit_result
-        raise AssertionError(f"unexpected io.net call {name}")
-
 
 class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     """Decision 6: the seller policy on RPC chain 5042."""
@@ -1060,6 +1108,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def service_of(server):
+        # The only place that reaches into mcp 2.3.0 private attributes; the existing tests use the same path.
         return server._tool_manager._tools["deploy_with_escrow"].fn.__self__
 
     async def call(self, tool_name: str, arguments: dict | None = None, server=None) -> dict:
@@ -1132,9 +1181,10 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_start_refused_when_rpc_chain_unreadable(self):
         self.mock_escrow.rpc.chain_id.side_effect = RuntimeError("connection refused")
-        with self.assertRaises(MainnetPolicyError) as ctx:
+        with self.assertRaises(ChainDetectionError) as ctx:
             self.build()
-        self.assertIn("chain id", str(ctx.exception))
+        self.assertIn("cannot determine the chain", str(ctx.exception))
+        self.assertNotIn("connection refused", str(ctx.exception))
 
     # Label and limits through the protocol
 
@@ -1171,6 +1221,15 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["duration_hours"], 1)
         self.assertEqual(proposal["chain_id"], 5042)
 
+    async def test_mainnet_cap_boundary_is_one_usd(self):
+        at_cap = await self.call("propose_deployment", {"hardware_id": 40})
+        self.assertEqual(at_cap["amount"], 1_000_000)
+        explicit = await self.call("propose_deployment", {"hardware_id": 21, "budget_cap_usd": "1.00"})
+        self.assertEqual(explicit["amount"], 490_000)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"hardware_id": 41, "budget_cap_usd": "1.01"})
+        self.assertIn("1.00", str(ctx.exception))
+
     async def test_mainnet_budget_cap_below_one_usd_is_respected(self):
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment", {"hardware_id": 21, "budget_cap_usd": "0.40"})
@@ -1180,8 +1239,15 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
                 await self.call("propose_deployment", {"budget_cap_usd": invalid})
             self.assertIn("Invalid budget_cap_usd", str(ctx.exception))
 
+    async def test_mainnet_refuses_hardware_without_valid_price(self):
+        self.cloud.hardware = [{**MAINNET_HARDWARE[0], "price": float("nan")}]
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment")
+        self.assertIn("no valid price", str(ctx.exception))
+        self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
+
     async def test_mainnet_cheapest_gpu_above_cap_is_refused(self):
-        self.cloud.hardware = [MAINNET_HARDWARE[1]]
+        self.cloud.hardware = [hw for hw in MAINNET_HARDWARE if hw["price"] > 1.00]
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment")
         self.assertIn("1.00", str(ctx.exception))
@@ -1191,6 +1257,12 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         for hours in (2, 0):
             with self.subTest(duration_hours=hours), self.assertRaises(ToolError) as ctx:
                 await self.call("propose_deployment", {"duration_hours": hours})
+            self.assertIn("1 hour", str(ctx.exception))
+        # The tool schema coerces protocol input to int; the service also refuses a direct non-int value.
+        service = self.service_of(self.mcp)
+        for hours in (True, 1.0):
+            with self.subTest(direct_duration_hours=hours), self.assertRaises(ToolError) as ctx:
+                await service.propose_deployment(duration_hours=hours)
             self.assertIn("1 hour", str(ctx.exception))
         # Refused before the hardware call and before the credit call.
         self.assertEqual(self.cloud.calls, [])
@@ -1212,8 +1284,22 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("get_credit_status", self.cloud.calls)
         self.assertTrue((self.state_dir / "proposals" / f"{proposal['task_id']}.json").exists())
 
+    async def test_mainnet_credits_exactly_at_floor_allow_proposal(self):
+        self.cloud.credit_result = credit_status_response("2.00")
+        proposal = await self.call("propose_deployment")
+        self.assertEqual(proposal["status"], "proposed")
+
     async def test_mainnet_unreadable_credits_refuse_proposal(self):
-        for result in ({}, {"unexpected": "shape"}, credit_status_response("not-a-number"), PilotError("io.net down")):
+        unreadable = (
+            {},
+            {"unexpected": "shape"},
+            credit_status_response("not-a-number"),
+            credit_status_response("NaN"),
+            credit_status_response("Infinity"),
+            credit_status_response("-5"),
+            PilotError("io.net down"),
+        )
+        for result in unreadable:
             self.cloud.credit_result = result
             with self.subTest(result=repr(result)), self.assertRaises(ToolError) as ctx:
                 await self.call("propose_deployment")
@@ -1314,7 +1400,9 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(successes), 1, results)
         self.assertEqual(len(errors), 1, results)
         self.assertIsInstance(errors[0], ToolError)
+        self.assertIn("One deal at a time", str(errors[0]))
         self.mock_escrow.accept.assert_called_once()
+        self.assertEqual(self.mock_escrow.accept.call_args.args[0], successes[0]["task_id"])
 
     async def test_mainnet_failed_step_before_save_releases_slot(self):
         p1, policy1 = await self.offered_proposal()
@@ -1325,6 +1413,132 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         with self.provision_ready():
             result = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
         self.assertEqual(result["status"], "ready")
+
+    async def test_mainnet_session_written_by_deploy_while_provisioning_blocks(self):
+        p1, policy1 = await self.offered_proposal()
+        p2, policy2 = await self.offered_proposal()
+        release = asyncio.Event()
+
+        async def slow_provision(*_args):
+            await release.wait()
+            return "https://worker.example.invalid"
+
+        with patch.object(self.service_of(self.mcp), "_provision_container", side_effect=slow_provision):
+            try:
+                first = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
+                self.assertEqual(first["status"], "provisioning")
+                written = json.loads((self.state_dir / "sessions" / f"{p1['task_id']}.json").read_text())
+                self.assertEqual(written["status"], "provisioning")
+                self.assertNotIn("expires_at", written)
+                self.assertIsNone(written["public_url"])
+                with self.assertRaises(ToolError) as ctx:
+                    await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
+                self.assertIn(p1["task_id"], str(ctx.exception))
+                self.mock_escrow.accept.assert_called_once_with(p1["task_id"], sender=p1["recipient"])
+            finally:
+                release.set()
+                await asyncio.sleep(0.02)
+
+    async def test_mainnet_failed_session_with_ionet_deployment_blocks_until_lease_ends(self):
+        p1, policy1 = await self.offered_proposal()
+        p2, policy2 = await self.offered_proposal()
+        service = self.service_of(self.mcp)
+
+        async def deploy_then_fail(proposal, deployment_id, worker_token):
+            # deploy() saves its state file before the remote call; then the provisioning fails.
+            (self.state_dir / f"{deployment_id}.json").write_text(json.dumps({"phase": "submission_unknown"}))
+            raise PilotError("io.net timeout after submission")
+
+        with patch.object(service, "_provision_container", side_effect=deploy_then_fail):
+            await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
+            await asyncio.sleep(0.05)
+        session_path = self.state_dir / "sessions" / f"{p1['task_id']}.json"
+        session = json.loads(session_path.read_text())
+        self.assertEqual(session["status"], "failed")
+        self.assertTrue(session["deployment_may_exist"])
+        self.assertGreater(session["expires_at"], time.time() + 3500)
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
+        self.assertIn(p1["task_id"], str(ctx.exception))
+        self.assertEqual(self.mock_escrow.accept.call_count, 1)
+
+        # After the lease could have ended, the slot opens again.
+        session_path.write_text(json.dumps({**session, "expires_at": int(time.time()) - 1}))
+        with self.provision_ready():
+            await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
+        self.assertEqual(self.mock_escrow.accept.call_count, 2)
+
+    async def test_mainnet_stored_proposal_outside_limits_is_not_accepted(self):
+        proposal, policy = await self.offered_proposal()
+        prop_path = self.state_dir / "proposals" / f"{proposal['task_id']}.json"
+        stored = json.loads(prop_path.read_text())
+        tampered = (
+            {"amount": 2_000_000},
+            {"duration_hours": 2},
+            {"chain_id": 5042002},
+            {"amount": "490000"},
+        )
+        for change in tampered:
+            prop_path.write_text(json.dumps({**stored, **change}))
+            with self.subTest(change=change), self.assertRaises(ToolError) as ctx:
+                await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": policy})
+            self.assertIn("limits", str(ctx.exception))
+        self.mock_escrow.accept.assert_not_called()
+
+    async def test_mainnet_doubtful_session_files_block(self):
+        future = int(time.time()) + 600
+        cases = {
+            "non-dict JSON": "[1, 2]",
+            "unknown status": json.dumps({"task_id": "0x01", "status": "paused", "expires_at": future}),
+            "ready without expires_at": json.dumps({"task_id": "0x02", "status": "ready"}),
+            "settled with text expires_at": json.dumps({"task_id": "0x03", "status": "settled", "expires_at": "soon"}),
+            "ready with boolean expires_at": json.dumps({"task_id": "0x04", "status": "ready", "expires_at": True}),
+        }
+        proposal, policy = await self.offered_proposal()
+        doubtful = self.state_dir / "sessions" / "doubtful.json"
+        for case, content in cases.items():
+            doubtful.write_text(content)
+            with self.subTest(case=case), self.assertRaises(ToolError) as ctx:
+                await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": policy})
+            self.assertIn("One deal at a time", str(ctx.exception))
+        self.mock_escrow.accept.assert_not_called()
+
+    async def test_mainnet_full_deal_with_task_id(self):
+        from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
+
+        proposal, buyer_policy = await self.offered_proposal()
+        task_id = proposal["task_id"]
+        self.assertRegex(task_id, r"^0x[0-9a-f]{64}$")
+        with self.provision_ready():
+            await self.call("deploy_with_escrow", {"task_id": task_id, "policy": buyer_policy})
+        status = await self.call("get_deployment_status", {"task_id": task_id})
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["task_id"], task_id)
+        # Upper-case hex names the same task.
+        upper = await self.call("get_deployment_status", {"task_id": "0x" + task_id[2:].upper()})
+        self.assertEqual(upper["task_id"], task_id)
+
+        acceptance = {
+            "scope": {
+                "chain_id": 5042,
+                "vault": list(address20(proposal["escrow_address"])),
+                "token": list(address20(proposal["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(status["deliverable_hash"])),
+            "recipient": list(address20(proposal["recipient"])),
+            "amount": proposal["amount"],
+            "accepted": True,
+            "valid_after": buyer_policy["valid_after"],
+            "valid_until": buyer_policy["valid_until"],
+        }
+        sig = sign_acceptance(acceptance, key_path=self.keys["acceptance_key"])
+        settled = await self.call(
+            "submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig}
+        )
+        self.assertEqual(settled["status"], "settled")
+        self.mock_escrow.settle_mock.assert_called_once()
 
     # task_id required
 

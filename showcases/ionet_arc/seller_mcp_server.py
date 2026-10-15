@@ -86,6 +86,10 @@ class MainnetPolicyError(RuntimeError):
     """The server must not start: the configuration breaks the chain 5042 policy."""
 
 
+class ChainDetectionError(MainnetPolicyError):
+    """The server must not start: the RPC chain is unknown, so the chain policy cannot be chosen."""
+
+
 class BasicAuthMiddleware:
     """Lightweight ASGI middleware enforcing HTTP Basic Authentication."""
 
@@ -308,6 +312,7 @@ class WarrantTranscriptionService:
         self.chain_id = chain_id
         self.mainnet = chain_id == MAINNET_CHAIN_ID
         # Held on chain 5042 from the single-session check to the save of the provisioning session.
+        # It serialises one server process only: the deployment runs one seller container per state dir.
         self._deal_lock = asyncio.Lock()
 
         manifest = load_manifest(self.manifest_path)
@@ -439,14 +444,16 @@ class WarrantTranscriptionService:
                 "Specify token_address in config/manifest.yaml."
             )
 
-    def _require_task_id(self, task_id: str | None):
+    def _require_task_id(self, task_id: str | None) -> str | None:
+        """On chain 5042, require a TaskEscrow task id and return it in lower case; elsewhere return it as is."""
         if not self.mainnet:
-            return
+            return task_id
         if not task_id:
             raise ToolError(f"task_id is required on chain {MAINNET_CHAIN_ID}.")
         # task_id names state files, so the public service accepts only a TaskEscrow task id.
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
             raise ToolError(f"task_id must be a 0x-prefixed 32-byte hex string on chain {MAINNET_CHAIN_ID}.")
+        return task_id.lower()
 
     @staticmethod
     def _mainnet_budget_cap(budget_cap_usd: str | float | None) -> Decimal:
@@ -466,6 +473,8 @@ class WarrantTranscriptionService:
         try:
             status = await connected(lambda cloud: cloud.call("get_credit_status", {}))
             balance = parse_credit_balance(status)
+            if not isinstance(balance, Decimal) or not balance.is_finite() or balance < 0:
+                raise ValueError("the credit balance is not a finite amount of 0 or more")
         except Exception as exc:
             logger.warning("io.net credit status could not be read: %s", type(exc).__name__)
             raise ToolError(
@@ -500,7 +509,7 @@ class WarrantTranscriptionService:
             mainnet_cap = None
             if self.mainnet:
                 # Checked before the hardware call and the credit call.
-                if duration_hours != MAINNET_DURATION_HOURS:
+                if type(duration_hours) is not int or duration_hours != MAINNET_DURATION_HOURS:
                     raise ToolError(
                         f"duration_hours must be {MAINNET_DURATION_HOURS} hour on chain {MAINNET_CHAIN_ID}, "
                         f"got {duration_hours}"
@@ -531,6 +540,8 @@ class WarrantTranscriptionService:
             cost_usd = price_per_hour * duration
 
             if mainnet_cap is not None:
+                if not price_per_hour.is_finite() or price_per_hour <= 0:
+                    raise ToolError(f"Selected hardware '{selected_hw['hardware_name']}' has no valid price.")
                 if cost_usd > mainnet_cap:
                     logger.warning("Hardware cost $%.2f exceeds mainnet cap $%.2f", cost_usd, mainnet_cap)
                     raise ToolError(
@@ -816,6 +827,11 @@ class WarrantTranscriptionService:
             session = self._lookup_session(task_id) or {}
             session["status"] = "failed"
             session["error"] = str(exc)
+            if self.mainnet and (self.state_dir / f"{deployment_id}.json").exists():
+                # deploy() saves its state file before the remote call, so a billable io.net deployment can
+                # exist although provisioning failed. Keep the deal slot closed until that lease can have ended.
+                session["deployment_may_exist"] = True
+                session["expires_at"] = int(time.time()) + proposal.get("duration_hours", 1) * 3600
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
@@ -835,15 +851,33 @@ class WarrantTranscriptionService:
                 return f"session file {path.name} is unreadable"
             status = session.get("status")
             task = session.get("task_id") or path.stem
+            expires_at = session.get("expires_at")
+            expired = isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= now
             if status == "failed":
-                continue
-            if status in ("ready", "settled"):
-                expires_at = session.get("expires_at")
-                if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= now:
+                if not session.get("deployment_may_exist") or expired:
                     continue
+                return f"task {task} failed, but its io.net deployment can still run until its lease ends"
+            if status in ("ready", "settled") and expired:
+                continue
             # provisioning (with or without expires_at), a running lease, or an unknown state
             return f"task {task} is {status or 'in an unknown state'}"
         return None
+
+    @staticmethod
+    def _check_mainnet_terms(proposal: dict):
+        """Refuse a stored proposal whose terms break the chain 5042 limits (for example one from another run)."""
+        amount = proposal.get("amount")
+        max_amount = int(MAINNET_MAX_DEAL_USD * 1_000_000)
+        if (
+            proposal.get("chain_id") != MAINNET_CHAIN_ID
+            or proposal.get("duration_hours") != MAINNET_DURATION_HOURS
+            or type(amount) is not int
+            or not 0 < amount <= max_amount
+        ):
+            raise ToolError(
+                f"The stored proposal does not match the chain {MAINNET_CHAIN_ID} limits "
+                f"(1 hour, at most ${MAINNET_MAX_DEAL_USD:.2f}); the offer is not accepted."
+            )
 
     async def _commit_deal(self, task_id: str, policy: dict | None) -> tuple[dict, dict]:
         """Verify the offer, accept it on-chain and save the provisioning session."""
@@ -853,6 +887,8 @@ class WarrantTranscriptionService:
             raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
         proposal = read_json(prop_path)
+        if self.mainnet:
+            self._check_mainnet_terms(proposal)
         target_policy = policy or proposal.get("policy")
         if not target_policy:
             logger.warning("Buyer policy must be provided for task '%s'", task_id)
@@ -927,11 +963,18 @@ class WarrantTranscriptionService:
     async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
         logger.info("Tool called: deploy_with_escrow with task_id=%s", task_id)
         try:
-            self._require_task_id(task_id)
+            task_id = self._require_task_id(task_id)
             if self.mainnet:
                 # One deal at a time. The lock makes the check and the save of the provisioning session atomic
                 # for concurrent calls; a failure before the save releases the slot. The check comes before
                 # the on-chain accept, so that the buyer can still refund an unaccepted offer.
+                if self._deal_lock.locked():
+                    # Another deal is between its check and its session save (the on-chain accept can take
+                    # about 30 s); refuse at once instead of making the caller wait for that.
+                    raise ToolError(
+                        f"One deal at a time on chain {MAINNET_CHAIN_ID}: another deal is being accepted. "
+                        "The offer is not accepted; try again after the active deal ends."
+                    )
                 async with self._deal_lock:
                     blocking = self._blocking_session()
                     if blocking:
@@ -1163,7 +1206,7 @@ class WarrantTranscriptionService:
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%s", task_id)
         # On chain 5042 the caller must name the task: the status includes the worker token.
-        self._require_task_id(task_id)
+        task_id = self._require_task_id(task_id)
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
@@ -1312,7 +1355,7 @@ class WarrantTranscriptionService:
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
         logger.info("Tool called: submit_acceptance with task_id=%s, signature_length=%d", task_id, sig_len)
         try:
-            self._require_task_id(task_id)
+            task_id = self._require_task_id(task_id)
             session = self._lookup_session(task_id)
             if not session:
                 logger.warning("No deployment session found for task '%s'", task_id)
@@ -1531,9 +1574,8 @@ def detect_rpc_chain(escrow_client: EscrowClient) -> int:
         return int(escrow_client.rpc.chain_id())
     except Exception as exc:
         # The RPC URL can carry an API key, so the message names the error type only.
-        raise MainnetPolicyError(
-            f"cannot read the chain id from the configured RPC ({type(exc).__name__}); "
-            "the seller does not start without it"
+        raise ChainDetectionError(
+            f"cannot determine the chain: the configured RPC did not answer eth_chainId ({type(exc).__name__})"
         ) from None
 
 
