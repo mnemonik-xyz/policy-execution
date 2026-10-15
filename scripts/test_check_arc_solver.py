@@ -263,6 +263,16 @@ class AfterTests(ProbeCase):
         self.assertEqual(self.after(), 1)
         self.assertTrue(any("records a offer transaction" in p for p in self.report()["problems"]))
 
+    def test_reuse_probe_manifest_is_accepted(self):
+        """The exact six keys that solver-canary.py init --reuse-deployment passes to the probe, with no steps."""
+        self.manifest.write_text(json.dumps({"escrow": ESCROW, "verifier": VERIFIER, "image_id": IMAGE,
+                                             "code_hashes": {"escrow": HASH_OK, "verifier": HASH_OK},
+                                             "chain_id": 5042, "token": probe.ARC_USDC}))
+        self.assertEqual(self.after(), 0)
+        report = self.report()
+        self.assertEqual((report["verdict"], report["problems"]), ("ok", []))
+        self.assertNotIn(RPC, self.out.read_text())
+
     def test_reused_run_state_with_empty_tx_is_accepted(self):
         self.write_state({})
         self.assertEqual(self.after(), 0)
