@@ -1,0 +1,51 @@
+# Build context filter for Dockerfile.seller (BuildKit reads <Dockerfile>.dockerignore
+# next to the Dockerfile; the legacy builder ignores this file, so always build
+# with DOCKER_BUILDKIT=1). The context is the repository root.
+#
+# Deny everything, then allow only what Dockerfile.seller copies. This keeps
+# target/ (many GB), .git, .venv, artifacts/, contracts/ build output and every
+# key or env file out of the context.
+*
+
+# Cargo workspace for the BIN_SOURCE=build stage: every member must be present
+# for cargo to load the workspace, and methods/build.rs needs the guest sources
+# (methods/guest, methods/invoice-guest, methods/solver-guest).
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!core
+!methods
+!host
+!ids
+!verified
+!solver-cli
+!swap-verified
+!swap-core
+
+# Seller application: the explicit COPY list plus requirements.txt.
+!showcases/ionet_arc/__init__.py
+!showcases/ionet_arc/seller_mcp_server.py
+!showcases/ionet_arc/adapter.py
+!showcases/ionet_arc/escrow.py
+!showcases/ionet_arc/worker.py
+!showcases/ionet_arc/mock_hardware.json
+!showcases/ionet_arc/requirements.txt
+
+# Never send build output, keys, env files or bytecode, even inside allowed paths.
+**/target
+**/.keys
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/__pycache__
+**/*.pyc
+**/.venv
+**/node_modules
+artifacts
+showcases/ionet_arc/config/mainnet-*
+solver-bounty/canary/*/
+
+# BIN_SOURCE=host: the two release binaries built on the VM (after **/target).
+!target/release/warrant-host
+!target/release/warrant-policy

@@ -22,13 +22,16 @@ from showcases.ionet_arc.adapter import PilotError
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, compile_buyer_policy, find_warrant_binary
 from showcases.ionet_arc.init import ensure_key_file, get_public_key_hex
 from showcases.ionet_arc.seller_mcp_server import (
+    BasicAuthMiddleware,
     ChainDetectionError,
     MainnetPolicyError,
     SellerServerConfig,
     ServerConfig,
+    StartRefusedError,
     create_app,
     create_server,
     filter_suitable_gpus,
+    is_loopback_host,
     parse_credit_balance,
 )
 
@@ -1091,6 +1094,94 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ):
             seller_module.main()
 
+    # HTTP basic-auth start policy off chain 5042 (chain 31337 here)
+
+    def http_config(self, **overrides) -> ServerConfig:
+        fields = {
+            "state_dir": self.state_dir,
+            "rpc_url": "http://127.0.0.1:8545",
+            "escrow_address": "0x" + "11" * 20,
+            "token_address": "0x" + "22" * 20,
+            "mock_ionet": True,
+            "vendor_credential_path": self.cred_path,
+            "vendor_signature_path": self.sig_path,
+        }
+        fields.update(overrides)
+        return ServerConfig(**fields)
+
+    def build_app(self, **overrides):
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            return create_app(self.http_config(**overrides))
+
+    def test_loopback_host_without_auth_still_starts_off_mainnet(self):
+        for host in ("localhost", "127.0.0.1", "::1"):
+            with self.subTest(host=host):
+                app = self.build_app(host=host)
+                self.assertNotIsInstance(app, BasicAuthMiddleware)
+
+    def test_non_loopback_host_without_auth_is_refused_off_mainnet(self):
+        cases = {
+            "both unset": ({}, "MCP_AUTH_USER and MCP_AUTH_PASS are required"),
+            "user unset": ({"auth_pass": "p"}, "MCP_AUTH_USER is required"),
+            "pass unset": ({"auth_user": "u"}, "MCP_AUTH_PASS is required"),
+            "pass empty": ({"auth_user": "u", "auth_pass": ""}, "MCP_AUTH_PASS is required"),
+            "pass blank": ({"auth_user": "u", "auth_pass": "  "}, "MCP_AUTH_PASS is required"),
+        }
+        for host in ("0.0.0.0", "10.0.0.5", "seller.example.invalid"):
+            for name, (auth, message) in cases.items():
+                with self.subTest(host=host, case=name), self.assertRaises(StartRefusedError) as ctx:
+                    self.build_app(host=host, **auth)
+                self.assertNotIsInstance(ctx.exception, MainnetPolicyError)
+                self.assertIn(message, str(ctx.exception))
+                self.assertIn("non-loopback host", str(ctx.exception))
+
+    def test_non_loopback_host_with_auth_starts_behind_basic_auth(self):
+        app = self.build_app(host="0.0.0.0", auth_user="u", auth_pass="p")
+        self.assertIsInstance(app, BasicAuthMiddleware)
+
+    def test_default_host_is_loopback(self):
+        # The auth policy lets a default start run without auth only because the default bind is loopback.
+        self.assertTrue(is_loopback_host(ServerConfig.host))
+        with patch.dict(os.environ, {}, clear=True), patch("sys.argv", ["seller_mcp_server"]):
+            with patch.object(seller_module, "run_server") as run_server:
+                seller_module.main()
+        self.assertTrue(is_loopback_host(run_server.call_args.args[0].host))
+
+    def test_partial_auth_on_loopback_warns(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            app = self.build_app(host="127.0.0.1", auth_user="u")
+        self.assertNotIsInstance(app, BasicAuthMiddleware)
+        self.assertIn("warning: MCP_AUTH_PASS is not set, so basic auth is off", stderr.getvalue())
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.build_app(host="127.0.0.1")
+        self.assertNotIn("warning", stderr.getvalue())
+
+    def test_is_loopback_host(self):
+        for host in ("localhost", "LOCALHOST", "127.0.0.1", "127.1.2.3", "::1", "[::1]"):
+            with self.subTest(host=host):
+                self.assertTrue(is_loopback_host(host))
+        for host in ("0.0.0.0", "::", "10.0.0.5", "localhost.example.invalid", "", None):
+            with self.subTest(host=host):
+                self.assertFalse(is_loopback_host(host))
+
+    def test_main_refuses_public_bind_without_auth(self):
+        stderr = io.StringIO()
+        env = {"HOST": "0.0.0.0", "MOCK_IONET": "1", "IONET_STATE_DIR": str(self.state_dir)}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
+            patch.object(seller_module.uvicorn, "run") as uvicorn_run,
+            patch("sys.argv", ["seller_mcp_server"]),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            seller_module.main()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("MCP_AUTH_USER and MCP_AUTH_PASS are required", stderr.getvalue())
+        uvicorn_run.assert_not_called()
+
 class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     """Decision 6: the seller policy on RPC chain 5042."""
 
@@ -1229,6 +1320,46 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.build()
         self.assertIn("cannot determine the chain", str(ctx.exception))
         self.assertNotIn("connection refused", str(ctx.exception))
+
+    # HTTP basic-auth start policy on chain 5042
+
+    def build_app(self, **overrides):
+        kwargs = {
+            "mock_ionet": False,
+            "vendor_credential_path": self.cred_path,
+            "vendor_signature_path": self.sig_path,
+            "manifest_path": self.manifest_path,
+            "buyer_account": MAINNET_BUYER,
+            "state_dir": self.state_dir,
+        }
+        kwargs.update(overrides)
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            return create_app(**kwargs)
+
+    def test_mainnet_http_refuses_missing_auth_on_any_host(self):
+        cases = {
+            "both unset": ({}, "MCP_AUTH_USER and MCP_AUTH_PASS are required on chain 5042"),
+            "user unset": ({"auth_pass": "p"}, "MCP_AUTH_USER is required on chain 5042"),
+            "pass unset": ({"auth_user": "u"}, "MCP_AUTH_PASS is required on chain 5042"),
+            "user empty": ({"auth_user": "", "auth_pass": "p"}, "MCP_AUTH_USER is required on chain 5042"),
+            "pass blank": ({"auth_user": "u", "auth_pass": " "}, "MCP_AUTH_PASS is required on chain 5042"),
+        }
+        for host in ("127.0.0.1", "0.0.0.0"):
+            for name, (auth, message) in cases.items():
+                with self.subTest(host=host, case=name), self.assertRaises(MainnetPolicyError) as ctx:
+                    self.build_app(host=host, **auth)
+                self.assertIn(message, str(ctx.exception))
+        self.connected.assert_not_called()
+
+    def test_mainnet_http_starts_with_both_auth_variables(self):
+        app = self.build_app(host="0.0.0.0", auth_user="u", auth_pass="p")
+        self.assertIsInstance(app, BasicAuthMiddleware)
+        self.connected.assert_not_called()
+
+    def test_mainnet_ionet_key_refusal_comes_before_auth(self):
+        with patch.dict(os.environ, clear=True), self.assertRaises(MainnetPolicyError) as ctx:
+            self.build_app(host="0.0.0.0")
+        self.assertIn("IO_NET_API_KEY is required on chain 5042", str(ctx.exception))
 
     # Label and limits through the protocol
 
