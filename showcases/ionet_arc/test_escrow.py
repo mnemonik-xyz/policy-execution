@@ -1,7 +1,12 @@
 import asyncio
+import contextlib
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
+import rlp
 from eth_abi import encode
 from eth_account import Account
 from eth_utils import function_signature_to_4byte_selector, to_checksum_address
@@ -500,6 +505,111 @@ class EscrowClientTests(unittest.TestCase):
                 max_amount=1_000_000,
                 manifest_path=Path("/nonexistent/manifest.yaml"),
             )
+
+
+class FakeNonceRpc:
+    """Fake EthRpc for the signed send path that can expose a nonce race.
+
+    The pending nonce read returns base + number of sent transactions after a 50 ms delay,
+    so two unserialised senders read the same nonce.
+    """
+
+    def __init__(self, base: int = 7, nonce_delay: float = 0.05):
+        self.base = base
+        self.nonce_delay = nonce_delay
+        self.sent_nonces: list[int] = []
+        self._lock = threading.Lock()
+        self.block_receipt_for: str | None = None
+        self.receipt_waiting = threading.Event()
+        self.release_receipt = threading.Event()
+
+    def chain_id(self) -> int:
+        return 31337
+
+    def rpc(self, method, params=None):
+        if method == "eth_getTransactionCount":
+            self.assert_pending(params)
+            with self._lock:
+                nonce = self.base + len(self.sent_nonces)
+            # The pending count is taken before the delay, so any overlap of two reads gives the same nonce.
+            time.sleep(self.nonce_delay)
+            return hex(nonce)
+        if method == "eth_gasPrice":
+            return "0x3b9aca00"
+        if method == "eth_estimateGas":
+            return "0x5208"
+        if method == "eth_sendRawTransaction":
+            fields = rlp.decode(bytes.fromhex(params[0][2:]))
+            nonce = int.from_bytes(fields[0], "big")
+            with self._lock:
+                self.sent_nonces.append(nonce)
+                return "0x" + f"{len(self.sent_nonces):064x}"
+        if method == "eth_getTransactionReceipt":
+            tx_hash = params[0]
+            if tx_hash == self.block_receipt_for:
+                self.receipt_waiting.set()
+                if not self.release_receipt.wait(timeout=5):
+                    raise RuntimeError("receipt gate was never released")
+            return {"transactionHash": tx_hash, "status": "0x1"}
+        raise AssertionError(f"unexpected RPC method {method}")
+
+    @staticmethod
+    def assert_pending(params):
+        if params[1] != "pending":
+            raise AssertionError("nonce must be read with the pending tag")
+
+
+class SendTransactionNonceLockTests(unittest.TestCase):
+    def setUp(self):
+        self.client = EscrowClient(rpc_url="http://127.0.0.1:8545", escrow_address="0x" + "11" * 20)
+        self.fake = FakeNonceRpc()
+        self.client.rpc = self.fake
+        self.account = Account.create()
+        self.client.register_key(self.account.address, self.account.key.hex())
+        self.to_address = "0x" + "bb" * 20
+        # Warm up the signing backend so that first-use imports do not serialise the threads.
+        warm_up = {"to": to_checksum_address(self.to_address), "value": 0, "nonce": 0, "chainId": 31337}
+        self.account.sign_transaction({**warm_up, "gas": 21000, "gasPrice": 1})
+
+    def _send(self):
+        return self.client.send_transaction(self.account.address, self.to_address, b"\x12\x34")
+
+    def _send_twice_concurrently(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self._send) for _ in range(2)]
+            for fut in futures:
+                fut.result(timeout=10)
+
+    def test_send_transaction_nonce_lock_serialises_concurrent_sends(self):
+        self._send_twice_concurrently()
+        base = self.fake.base
+        self.assertEqual(sorted(self.fake.sent_nonces), [base, base + 1])
+
+    def test_send_transaction_without_lock_duplicates_nonce(self):
+        self.client._tx_lock = contextlib.nullcontext()
+        self._send_twice_concurrently()
+        self.assertEqual(len(self.fake.sent_nonces), 2)
+        self.assertEqual(self.fake.sent_nonces[0], self.fake.sent_nonces[1])
+
+    def test_wait_for_receipt_runs_outside_nonce_lock(self):
+        first_hash = "0x" + f"{1:064x}"
+        self.fake.block_receipt_for = first_hash
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            try:
+                first = pool.submit(self._send)
+                self.assertTrue(self.fake.receipt_waiting.wait(timeout=5), "send 1 never reached its receipt wait")
+                second = pool.submit(self._send)
+                # Send 2 must read its nonce and send while send 1 still waits for its receipt.
+                second_receipt = second.result(timeout=3)
+                self.assertFalse(first.done())
+                self.assertEqual(len(self.fake.sent_nonces), 2)
+            finally:
+                self.fake.release_receipt.set()
+            first_receipt = first.result(timeout=5)
+        self.assertEqual(first_receipt["transactionHash"], first_hash)
+        self.assertEqual(second_receipt["transactionHash"], "0x" + f"{2:064x}")
+        base = self.fake.base
+        self.assertEqual(self.fake.sent_nonces, [base, base + 1])
 
 
 if __name__ == "__main__":
