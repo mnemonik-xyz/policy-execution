@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import secrets
 import subprocess
 import sys
@@ -62,6 +63,27 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
 from showcases.ionet_arc.worker import Worker, handler  # noqa: E402
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/warrant-transcription:pilot"
+
+# Mainnet policy (tech-spec Decision 6). Every branch keys on the chain that the RPC reports at construction,
+# never on the manifest alone: a manifest-only guard is bypassable through WARRANT_RPC_URL.
+MAINNET_CHAIN_ID = 5042
+MAINNET_LABEL = "after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD"
+MAINNET_LIMITS = (
+    "Settlement uses a test-double verifier that accepts any digest the seller approves.",
+    "The 1 USD cap and the one-hour lease are seller policy, not contract rules.",
+    "One deal at a time.",
+    "The mainnet seller path has not been exercised with money before this listing.",
+    "Any holder of the basic-auth credential can read the current deployment status, including its worker token.",
+)
+MAINNET_INSTRUCTIONS = MAINNET_LABEL + ".\n" + " ".join(MAINNET_LIMITS)
+MAINNET_MAX_DEAL_USD = Decimal("1.00")
+MAINNET_DURATION_HOURS = 1
+MAINNET_MIN_CREDIT_USD = Decimal("2")
+TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
+
+
+class MainnetPolicyError(RuntimeError):
+    """The server must not start: the configuration breaks the chain 5042 policy."""
 
 
 class BasicAuthMiddleware:
@@ -200,6 +222,15 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
     return suitable
 
 
+def parse_credit_balance(status) -> Decimal:
+    """Return the USD balance from an io.net get_credit_status result. Raise ValueError when unreadable.
+
+    The real response shape has not been read yet (Task 2 step 2). Until it is, every result is unreadable,
+    so propose_deployment on chain 5042 fails closed.
+    """
+    raise ValueError("the io.net get_credit_status response shape is not confirmed")
+
+
 class LocalMockWorker:
     """Mock in-process transcription worker for offline testing when IO_NET_API_KEY is unset."""
 
@@ -256,6 +287,7 @@ class WarrantTranscriptionService:
         vendor_signature_path: pathlib.Path | None = None,
         buyer_account: str | None = None,
         manifest_path: pathlib.Path | None = None,
+        chain_id: int | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -271,6 +303,12 @@ class WarrantTranscriptionService:
         self.vendor_credential_path = pathlib.Path(vendor_credential_path) if vendor_credential_path else None
         self.vendor_signature_path = pathlib.Path(vendor_signature_path) if vendor_signature_path else None
         self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
+        # The chain read from the RPC at construction. The tools use it for the policy decision and do not
+        # read the chain again, so an RPC failure later cannot switch the mainnet policy off.
+        self.chain_id = chain_id
+        self.mainnet = chain_id == MAINNET_CHAIN_ID
+        # Held on chain 5042 from the single-session check to the save of the provisioning session.
+        self._deal_lock = asyncio.Lock()
 
         manifest = load_manifest(self.manifest_path)
         self.buyer_account = buyer_account or get_manifest_parameter(
@@ -347,10 +385,13 @@ class WarrantTranscriptionService:
 
     async def _resolve_addresses_and_chain(self, customer_address: str | None) -> tuple[str, int]:
         escrow_client = self.escrow_client
-        try:
-            chain_id = await asyncio.to_thread(escrow_client.rpc.chain_id)
-        except Exception:
-            chain_id = DEFAULT_CHAIN_ID
+        if self.mainnet:
+            chain_id = self.chain_id
+        else:
+            try:
+                chain_id = await asyncio.to_thread(escrow_client.rpc.chain_id)
+            except Exception:
+                chain_id = DEFAULT_CHAIN_ID
 
         if not customer_address:
             customer_address = self.buyer_account
@@ -398,6 +439,46 @@ class WarrantTranscriptionService:
                 "Specify token_address in config/manifest.yaml."
             )
 
+    def _require_task_id(self, task_id: str | None):
+        if not self.mainnet:
+            return
+        if not task_id:
+            raise ToolError(f"task_id is required on chain {MAINNET_CHAIN_ID}.")
+        # task_id names state files, so the public service accepts only a TaskEscrow task id.
+        if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
+            raise ToolError(f"task_id must be a 0x-prefixed 32-byte hex string on chain {MAINNET_CHAIN_ID}.")
+
+    @staticmethod
+    def _mainnet_budget_cap(budget_cap_usd: str | float | None) -> Decimal:
+        """The effective cap on chain 5042: the caller's cap if lower, never above 1.00 USD."""
+        if budget_cap_usd is None:
+            return MAINNET_MAX_DEAL_USD
+        try:
+            cap = Decimal(str(budget_cap_usd))
+        except (ValueError, InvalidOperation):
+            raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}") from None
+        if not cap.is_finite():
+            raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}")
+        return min(cap, MAINNET_MAX_DEAL_USD)
+
+    async def _require_credits(self):
+        """Refuse a proposal when io.net credits are below the floor or cannot be read (fail closed)."""
+        try:
+            status = await connected(lambda cloud: cloud.call("get_credit_status", {}))
+            balance = parse_credit_balance(status)
+        except Exception as exc:
+            logger.warning("io.net credit status could not be read: %s", type(exc).__name__)
+            raise ToolError(
+                "The io.net credit balance cannot be read, so no deal is proposed on chain "
+                f"{MAINNET_CHAIN_ID}."
+            ) from None
+        if balance < MAINNET_MIN_CREDIT_USD:
+            logger.warning("io.net credits %s USD are below the floor of %s USD", balance, MAINNET_MIN_CREDIT_USD)
+            raise ToolError(
+                f"The seller's io.net credits are below {MAINNET_MIN_CREDIT_USD} USD, so no deal is proposed. "
+                "Try again later."
+            )
+
     async def propose_deployment(
         self,
         hardware_id: str | int | None = None,
@@ -416,6 +497,16 @@ class WarrantTranscriptionService:
             budget_cap_usd,
         )
         try:
+            mainnet_cap = None
+            if self.mainnet:
+                # Checked before the hardware call and the credit call.
+                if duration_hours != MAINNET_DURATION_HOURS:
+                    raise ToolError(
+                        f"duration_hours must be {MAINNET_DURATION_HOURS} hour on chain {MAINNET_CHAIN_ID}, "
+                        f"got {duration_hours}"
+                    )
+                mainnet_cap = self._mainnet_budget_cap(budget_cap_usd)
+
             if duration_hours <= 0:
                 logger.warning("Invalid duration_hours: %s", duration_hours)
                 raise ToolError(f"duration_hours must be at least 1, got {duration_hours}")
@@ -434,6 +525,21 @@ class WarrantTranscriptionService:
                 selected_hw["price_per_hour_usd"],
                 selected_hw.get("location"),
             )
+            # Dynamic pricing based on real hardware cost and duration
+            price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
+            duration = Decimal(str(duration_hours))
+            cost_usd = price_per_hour * duration
+
+            if mainnet_cap is not None:
+                if cost_usd > mainnet_cap:
+                    logger.warning("Hardware cost $%.2f exceeds mainnet cap $%.2f", cost_usd, mainnet_cap)
+                    raise ToolError(
+                        f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} exceeds the "
+                        f"budget cap of ${mainnet_cap:.2f} (chain {MAINNET_CHAIN_ID} deals are capped at "
+                        f"${MAINNET_MAX_DEAL_USD:.2f})."
+                    )
+                await self._require_credits()
+
             customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
             self._ensure_escrow_contracts(chain_id)
 
@@ -441,12 +547,7 @@ class WarrantTranscriptionService:
             task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
             logger.info("Derived taskIdFor(%s, salt=%s): %s", customer_address, salt, task_id)
 
-            # Dynamic pricing based on real hardware cost and duration
-            price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
-            duration = Decimal(str(duration_hours))
-            cost_usd = price_per_hour * duration
-
-            if budget_cap_usd is not None:
+            if mainnet_cap is None and budget_cap_usd is not None:
                 try:
                     cap = Decimal(str(budget_cap_usd))
                     if cost_usd > cap:
@@ -718,84 +819,132 @@ class WarrantTranscriptionService:
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
+    def _blocking_session(self) -> str | None:
+        """Describe a session that blocks a new deal on chain 5042, or return None.
+
+        Scans every file in sessions/: active_session.json holds the latest session only, and
+        _lookup_session treats a session without expires_at as expired. Fails closed on any doubt.
+        """
+        now = time.time()
+        for path in sorted(self.sessions_dir.glob("*.json")):
+            try:
+                session = read_json(path)
+            except Exception:
+                return f"session file {path.name} is unreadable"
+            if not isinstance(session, dict):
+                return f"session file {path.name} is unreadable"
+            status = session.get("status")
+            task = session.get("task_id") or path.stem
+            if status == "failed":
+                continue
+            if status in ("ready", "settled"):
+                expires_at = session.get("expires_at")
+                if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= now:
+                    continue
+            # provisioning (with or without expires_at), a running lease, or an unknown state
+            return f"task {task} is {status or 'in an unknown state'}"
+        return None
+
+    async def _commit_deal(self, task_id: str, policy: dict | None) -> tuple[dict, dict]:
+        """Verify the offer, accept it on-chain and save the provisioning session."""
+        prop_path = self.proposals_dir / f"{task_id}.json"
+        if not prop_path.exists():
+            logger.warning("No proposal record found for task_id '%s' at %s", task_id, prop_path)
+            raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
+
+        proposal = read_json(prop_path)
+        target_policy = policy or proposal.get("policy")
+        if not target_policy:
+            logger.warning("Buyer policy must be provided for task '%s'", task_id)
+            raise ToolError(f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'.")
+
+        # 1. Verify on-chain escrow state and commercial terms
+        logger.info("Verifying on-chain TaskEscrow offer for task_id=%s", task_id)
+        task_data = await self._verify_task_offered(task_id, proposal)
+
+        # 2. Hash policy received from buyer and verify against on-chain policyHash
+        logger.info("Verifying buyer policy hash against on-chain policyHash for task_id=%s", task_id)
+        computed_policy_hash = await asyncio.to_thread(hash_policy, target_policy)
+        onchain_policy_hash = str(task_data.get("policy_hash", ""))
+        if onchain_policy_hash.lower() != computed_policy_hash.lower():
+            logger.warning(
+                "Policy hash mismatch for task_id=%s: onchain=%s, computed=%s",
+                task_id,
+                onchain_policy_hash,
+                computed_policy_hash,
+            )
+            raise ToolError(
+                f"On-chain policyHash ({onchain_policy_hash}) does not match "
+                f"provided policy hash ({computed_policy_hash})."
+            )
+
+        proposal["policy"] = target_policy
+        proposal["policy_hash"] = computed_policy_hash
+        save(prop_path, proposal)
+
+        now = int(time.time())
+
+        # 3. Accept task on-chain first to commit agreement before spinning up hardware
+        logger.info("Accepting task_id=%s on-chain in TaskEscrow", task_id)
+        await self._accept_task(task_id, proposal, task_data.get("state"))
+
+        # 3. Generate capability token and deliverable hash
+        worker_token = secrets.token_hex(24)
+        deliverable_hash = "0x" + hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
+        deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
+        logger.info(
+            "Generated worker_token, deliverable_hash=%s, deployment_id=%s for task_id=%s",
+            deliverable_hash,
+            deployment_id,
+            task_id,
+        )
+
+        # 4. Save active deployment session (provisioning)
+        session = {
+            "status": "provisioning",
+            "task_id": task_id,
+            "deployment_id": deployment_id,
+            "worker_token": worker_token,
+            "deliverable_hash": deliverable_hash,
+            "hardware_id": proposal["hardware_id"],
+            "recipient": proposal["recipient"],
+            "amount": proposal["amount"],
+            "chain_id": proposal["chain_id"],
+            "escrow_address": proposal["escrow_address"],
+            "token_address": proposal["token_address"],
+            "policy_hash": proposal["policy_hash"],
+            "policy": proposal.get("policy"),
+            "duration_hours": proposal.get("duration_hours", 1),
+            "started_at": now,
+            "public_url": None,
+            "settlement_tx": None,
+            "error": None,
+        }
+        save(self.state_dir / "active_session.json", session)
+        save(self.state_dir / "sessions" / f"{task_id}.json", session)
+        return proposal, session
+
     async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
         logger.info("Tool called: deploy_with_escrow with task_id=%s", task_id)
         try:
-            prop_path = self.proposals_dir / f"{task_id}.json"
-            if not prop_path.exists():
-                logger.warning("No proposal record found for task_id '%s' at %s", task_id, prop_path)
-                raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
-
-            proposal = read_json(prop_path)
-            target_policy = policy or proposal.get("policy")
-            if not target_policy:
-                logger.warning("Buyer policy must be provided for task '%s'", task_id)
-                raise ToolError(f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'.")
-
-            # 1. Verify on-chain escrow state and commercial terms
-            logger.info("Verifying on-chain TaskEscrow offer for task_id=%s", task_id)
-            task_data = await self._verify_task_offered(task_id, proposal)
-
-            # 2. Hash policy received from buyer and verify against on-chain policyHash
-            logger.info("Verifying buyer policy hash against on-chain policyHash for task_id=%s", task_id)
-            computed_policy_hash = await asyncio.to_thread(hash_policy, target_policy)
-            onchain_policy_hash = str(task_data.get("policy_hash", ""))
-            if onchain_policy_hash.lower() != computed_policy_hash.lower():
-                logger.warning(
-                    "Policy hash mismatch for task_id=%s: onchain=%s, computed=%s",
-                    task_id,
-                    onchain_policy_hash,
-                    computed_policy_hash,
-                )
-                raise ToolError(
-                    f"On-chain policyHash ({onchain_policy_hash}) does not match "
-                    f"provided policy hash ({computed_policy_hash})."
-                )
-
-            proposal["policy"] = target_policy
-            proposal["policy_hash"] = computed_policy_hash
-            save(prop_path, proposal)
-
-            now = int(time.time())
-
-            # 3. Accept task on-chain first to commit agreement before spinning up hardware
-            logger.info("Accepting task_id=%s on-chain in TaskEscrow", task_id)
-            await self._accept_task(task_id, proposal, task_data.get("state"))
-
-            # 3. Generate capability token and deliverable hash
-            worker_token = secrets.token_hex(24)
-            deliverable_hash = "0x" + hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
-            deployment_id = f"dep-{now}-{uuid.uuid4().hex[:8]}"
-            logger.info(
-                "Generated worker_token, deliverable_hash=%s, deployment_id=%s for task_id=%s",
-                deliverable_hash,
-                deployment_id,
-                task_id,
-            )
-
-            # 4. Save active deployment session (provisioning)
-            session = {
-                "status": "provisioning",
-                "task_id": task_id,
-                "deployment_id": deployment_id,
-                "worker_token": worker_token,
-                "deliverable_hash": deliverable_hash,
-                "hardware_id": proposal["hardware_id"],
-                "recipient": proposal["recipient"],
-                "amount": proposal["amount"],
-                "chain_id": proposal["chain_id"],
-                "escrow_address": proposal["escrow_address"],
-                "token_address": proposal["token_address"],
-                "policy_hash": proposal["policy_hash"],
-                "policy": proposal.get("policy"),
-                "duration_hours": proposal.get("duration_hours", 1),
-                "started_at": now,
-                "public_url": None,
-                "settlement_tx": None,
-                "error": None,
-            }
-            save(self.state_dir / "active_session.json", session)
-            save(self.state_dir / "sessions" / f"{task_id}.json", session)
+            self._require_task_id(task_id)
+            if self.mainnet:
+                # One deal at a time. The lock makes the check and the save of the provisioning session atomic
+                # for concurrent calls; a failure before the save releases the slot. The check comes before
+                # the on-chain accept, so that the buyer can still refund an unaccepted offer.
+                async with self._deal_lock:
+                    blocking = self._blocking_session()
+                    if blocking:
+                        raise ToolError(
+                            f"One deal at a time on chain {MAINNET_CHAIN_ID}: {blocking}. "
+                            "The offer is not accepted; try again after the active deal ends."
+                        )
+                    proposal, session = await self._commit_deal(task_id, policy)
+            else:
+                proposal, session = await self._commit_deal(task_id, policy)
+            deployment_id = session["deployment_id"]
+            worker_token = session["worker_token"]
+            deliverable_hash = session["deliverable_hash"]
 
             # 5. Spawn background provisioning
             logger.info("Spawning background container provisioning for deployment_id=%s", deployment_id)
@@ -1013,6 +1162,8 @@ class WarrantTranscriptionService:
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%s", task_id)
+        # On chain 5042 the caller must name the task: the status includes the worker token.
+        self._require_task_id(task_id)
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
@@ -1161,6 +1312,7 @@ class WarrantTranscriptionService:
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
         logger.info("Tool called: submit_acceptance with task_id=%s, signature_length=%d", task_id, sig_len)
         try:
+            self._require_task_id(task_id)
             session = self._lookup_session(task_id)
             if not session:
                 logger.warning("No deployment session found for task '%s'", task_id)
@@ -1373,15 +1525,48 @@ def _normalize_config(
     return ServerConfig(**kwargs)
 
 
+def detect_rpc_chain(escrow_client: EscrowClient) -> int:
+    """Read the chain from the RPC once at construction. An unreadable chain refuses the start."""
+    try:
+        return int(escrow_client.rpc.chain_id())
+    except Exception as exc:
+        # The RPC URL can carry an API key, so the message names the error type only.
+        raise MainnetPolicyError(
+            f"cannot read the chain id from the configured RPC ({type(exc).__name__}); "
+            "the seller does not start without it"
+        ) from None
+
+
+def enforce_mainnet_start_policy(cfg: ServerConfig, chain_id: int, has_ionet_key: bool):
+    """Refuse a start on chain 5042 that would run a stub or a mismatched manifest (Decision 6)."""
+    if cfg.mock_ionet:
+        raise MainnetPolicyError(f"mock mode is refused on chain {chain_id}")
+    if cfg.local_server:
+        raise MainnetPolicyError(f"local mode is refused on chain {chain_id}")
+    if not has_ionet_key:
+        raise MainnetPolicyError(f"IO_NET_API_KEY is required on chain {chain_id}")
+    # Same call and default as ServerConfig and the service. load_manifest returns {} for a missing or
+    # unparseable file, so a manifest without chain_id is refused (fail closed).
+    manifest = load_manifest(cfg.manifest_path)
+    raw_chain = manifest.get("chain_id")
+    try:
+        manifest_chain = int(raw_chain)
+    except (TypeError, ValueError):
+        manifest_chain = None
+    if manifest_chain != chain_id:
+        raise MainnetPolicyError(
+            f"manifest chain_id {raw_chain!r} does not match the RPC chain {chain_id} "
+            f"(manifest: {cfg.manifest_path or DEFAULT_MANIFEST_PATH})"
+        )
+
+
 def create_server(
     config: ServerConfig | pathlib.Path | str | None = None,
     **kwargs,
 ) -> MCPServer:
     """Create and configure the Warrant Transcription MCP server."""
     cfg = _normalize_config(config, **kwargs)
-    server = MCPServer("seller-mcp-server")
     has_ionet_key = bool(os.environ.get("IO_NET_API_KEY"))
-    use_mock_ionet = cfg.mock_ionet or not has_ionet_key
 
     escrow_client = cfg.escrow_client or EscrowClient(
         rpc_url=cfg.rpc_url,
@@ -1390,6 +1575,15 @@ def create_server(
         verifier_address=cfg.verifier_address,
         server_account=cfg.server_account,
     )
+    chain_id = detect_rpc_chain(escrow_client)
+    mainnet = chain_id == MAINNET_CHAIN_ID
+    if mainnet:
+        enforce_mainnet_start_policy(cfg, chain_id, has_ionet_key)
+        # No silent fallback to mock mode on chain 5042: the guard above requires the key.
+        use_mock_ionet = False
+    else:
+        use_mock_ionet = cfg.mock_ionet or not has_ionet_key
+    server = MCPServer("seller-mcp-server", instructions=MAINNET_INSTRUCTIONS if mainnet else None)
     if cfg.seller_private_key:
         if cfg.server_account:
             escrow_client.register_key(cfg.server_account, cfg.seller_private_key)
@@ -1409,7 +1603,12 @@ def create_server(
         vendor_signature_path=cfg.vendor_signature_path,
         buyer_account=cfg.buyer_account,
         manifest_path=cfg.manifest_path,
+        chain_id=chain_id,
     )
+
+    def describe(text: str, deal_tool: bool = False) -> str:
+        # On chain 5042 the three deal tools start with the honest label; other chains keep their text.
+        return f"{MAINNET_LABEL}.\n{text}" if mainnet and deal_tool else text
 
     server.tool(
         name="list_suitable_hardware",
@@ -1421,19 +1620,21 @@ def create_server(
 
     server.tool(
         name="propose_deployment",
-        description=(
+        description=describe(
             "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
-            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
+            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient).",
+            deal_tool=True,
         ),
     )(service.propose_deployment)
 
     server.tool(
         name="deploy_with_escrow",
-        description=(
+        description=describe(
             "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision "
             "the io.net container in the background for 1 hour duration.\n"
-            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
+            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain.",
+            deal_tool=True,
         ),
     )(service.deploy_with_escrow)
 
@@ -1457,10 +1658,11 @@ def create_server(
 
     server.tool(
         name="submit_acceptance",
-        description=(
+        description=describe(
             "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
             "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, "
-            "and settles payment on TaskEscrow on-chain."
+            "and settles payment on TaskEscrow on-chain.",
+            deal_tool=True,
         ),
     )(service.submit_acceptance)
 
@@ -1592,7 +1794,11 @@ def main():
     args = parser.parse_args()
 
     config = ServerConfig(**vars(args))
-    run_server(config)
+    try:
+        run_server(config)
+    except MainnetPolicyError as exc:
+        print(f"seller-mcp-server: refused to start: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

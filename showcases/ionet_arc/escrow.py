@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -553,6 +554,9 @@ class EscrowClient:
         self.server_account = server_account
         self.private_keys = {k.lower(): v for k, v in (private_keys or {}).items()}
         self._task_id_cache: dict[tuple[str, str, bytes], str] = {}
+        # One seller key serves all tools: hold this lock from the pending nonce read to the send,
+        # so that concurrent transactions never reuse a nonce. The receipt wait stays outside.
+        self._tx_lock = threading.Lock()
 
     def register_key(self, address: str, private_key: str):
         self.private_keys[address.lower()] = private_key
@@ -597,32 +601,33 @@ class EscrowClient:
 
         if pk:
             acc = Account.from_key(pk)
-            nonce = int(self.rpc.rpc("eth_getTransactionCount", [acc.address, "pending"]), 16)
-            chain_id = int(self.rpc.chain_id())
-            gas_price = int(self.rpc.rpc("eth_gasPrice", []), 16)
-            try:
-                gas_est = int(
-                    self.rpc.rpc(
-                        "eth_estimateGas",
-                        [{"from": acc.address, "to": to_addr, "data": "0x" + calldata.hex()}],
-                    ),
-                    16,
-                )
-                gas = int(gas_est * 1.2)
-            except Exception:
-                gas = 500_000
+            with self._tx_lock:
+                nonce = int(self.rpc.rpc("eth_getTransactionCount", [acc.address, "pending"]), 16)
+                chain_id = int(self.rpc.chain_id())
+                gas_price = int(self.rpc.rpc("eth_gasPrice", []), 16)
+                try:
+                    gas_est = int(
+                        self.rpc.rpc(
+                            "eth_estimateGas",
+                            [{"from": acc.address, "to": to_addr, "data": "0x" + calldata.hex()}],
+                        ),
+                        16,
+                    )
+                    gas = int(gas_est * 1.2)
+                except Exception:
+                    gas = 500_000
 
-            tx = {
-                "to": to_addr,
-                "value": 0,
-                "data": calldata,
-                "nonce": nonce,
-                "chainId": chain_id,
-                "gas": gas,
-                "gasPrice": gas_price,
-            }
-            signed = acc.sign_transaction(tx)
-            tx_hash = self.rpc.rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+                tx = {
+                    "to": to_addr,
+                    "value": 0,
+                    "data": calldata,
+                    "nonce": nonce,
+                    "chainId": chain_id,
+                    "gas": gas,
+                    "gasPrice": gas_price,
+                }
+                signed = acc.sign_transaction(tx)
+                tx_hash = self.rpc.rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
         else:
             # Unlocked account (e.g. local Anvil)
             tx_params = {
@@ -631,7 +636,8 @@ class EscrowClient:
                 "data": "0x" + calldata.hex(),
             }
             try:
-                tx_hash = self.rpc.rpc("eth_sendTransaction", [tx_params])
+                with self._tx_lock:
+                    tx_hash = self.rpc.rpc("eth_sendTransaction", [tx_params])
             except Exception as e:
                 err_str = str(e)
                 if "-32601" in err_str or "not supported" in err_str or "unsupported" in err_str:
