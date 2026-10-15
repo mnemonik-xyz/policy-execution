@@ -6,6 +6,7 @@ import atexit
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -82,7 +83,11 @@ MAINNET_MIN_CREDIT_USD = Decimal("2")
 TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
 
 
-class MainnetPolicyError(RuntimeError):
+class StartRefusedError(RuntimeError):
+    """The server must not start: the configuration would run it unsafely."""
+
+
+class MainnetPolicyError(StartRefusedError):
     """The server must not start: the configuration breaks the chain 5042 policy."""
 
 
@@ -1628,11 +1633,46 @@ def enforce_mainnet_start_policy(cfg: ServerConfig, chain_id: int, has_ionet_key
         )
 
 
+def missing_auth_variables(cfg: ServerConfig) -> list[str]:
+    """Names of the basic-auth settings that are unset, empty or whitespace only."""
+    values = {"MCP_AUTH_USER": cfg.auth_user, "MCP_AUTH_PASS": cfg.auth_pass}
+    return [name for name, value in values.items() if not (value and value.strip())]
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """True only for localhost and loopback IP literals; any other name fails closed."""
+    name = (host or "").strip().lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def enforce_http_auth_policy(cfg: ServerConfig, chain_id: int):
+    """Refuse to serve /mcp without basic auth on chain 5042, or on a non-loopback address on any chain."""
+    missing = missing_auth_variables(cfg)
+    if not missing:
+        return
+    names = " and ".join(missing)
+    verb = "is" if len(missing) == 1 else "are"
+    if chain_id == MAINNET_CHAIN_ID:
+        raise MainnetPolicyError(f"{names} {verb} required on chain {chain_id}")
+    if not is_loopback_host(cfg.host):
+        raise StartRefusedError(f"{names} {verb} required when binding the non-loopback host {cfg.host!r}")
+
+
 def create_server(
     config: ServerConfig | pathlib.Path | str | None = None,
+    *,
+    serve_http: bool = False,
     **kwargs,
 ) -> MCPServer:
-    """Create and configure the Warrant Transcription MCP server."""
+    """Create and configure the Warrant Transcription MCP server.
+
+    serve_http=True (create_app) also applies the HTTP basic-auth start policy once the chain is known.
+    """
     cfg = _normalize_config(config, **kwargs)
     has_ionet_key = bool(os.environ.get("IO_NET_API_KEY"))
 
@@ -1647,10 +1687,10 @@ def create_server(
     mainnet = chain_id == MAINNET_CHAIN_ID
     if mainnet:
         enforce_mainnet_start_policy(cfg, chain_id, has_ionet_key)
-        # No silent fallback to mock mode on chain 5042: the guard above requires the key.
-        use_mock_ionet = False
-    else:
-        use_mock_ionet = cfg.mock_ionet or not has_ionet_key
+    if serve_http:
+        enforce_http_auth_policy(cfg, chain_id)
+    # No silent fallback to mock mode on chain 5042: the start policy above requires the key.
+    use_mock_ionet = False if mainnet else (cfg.mock_ionet or not has_ionet_key)
     server = MCPServer("seller-mcp-server", instructions=MAINNET_INSTRUCTIONS if mainnet else None)
     if cfg.seller_private_key:
         if cfg.server_account:
@@ -1743,11 +1783,11 @@ def create_app(
 ):
     """Build ASGI app with streamable HTTP transport and basic auth."""
     cfg = _normalize_config(config, **kwargs)
-    server = create_server(cfg)
+    server = create_server(cfg, serve_http=True)
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     app = server.streamable_http_app(transport_security=sec)
 
-    if cfg.auth_user and cfg.auth_pass:
+    if not missing_auth_variables(cfg):
         print(f"HTTP Basic Auth enabled for user '{cfg.auth_user}'", file=sys.stderr)
         app = BasicAuthMiddleware(app, cfg.auth_user, cfg.auth_pass)
     return app
@@ -1864,7 +1904,7 @@ def main():
     config = ServerConfig(**vars(args))
     try:
         run_server(config)
-    except MainnetPolicyError as exc:
+    except StartRefusedError as exc:
         print(f"seller-mcp-server: refused to start: {exc}", file=sys.stderr)
         sys.exit(1)
 

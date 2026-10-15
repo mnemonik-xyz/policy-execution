@@ -266,7 +266,8 @@ the host, and config and keys are mounted at runtime.
 
 The build context is the repository root. BuildKit is required. The legacy builder ignores
 [`Dockerfile.seller.dockerignore`](Dockerfile.seller.dockerignore) and would send the whole
-repository, `.keys/` included. With BuildKit the context is about 12 MB.
+repository, `.keys/` included. With BuildKit the context is a few MB. `BIN_SOURCE=host` adds
+the two release binaries, which carry debug info, so tens of MB.
 
 ```sh
 # Laptop or CI (default BIN_SOURCE=build): compiles both binaries with RISC0_SKIP_BUILD=1,
@@ -284,6 +285,8 @@ DOCKER_BUILDKIT=1 docker build --build-arg BIN_SOURCE=host \
 * `BIN_SOURCE=host` is for the Linux VM only. On macOS `target/release` holds Mach-O binaries,
   which do not run in the image. When the binaries are missing, the build fails with
   `"/target/release/warrant-policy": not found`.
+* The build runs both binaries once. A binary that does not run in the image (Mach-O, wrong
+  architecture, missing library) fails the build at the step that greps for `Usage: warrant-policy`.
 * Any other value fails with `load metadata for docker.io/library/bins-<value>`, because no
   stage `bins-<value>` exists.
 * Never pass a secret as `--build-arg`. Secrets arrive only at runtime.
@@ -294,6 +297,13 @@ Check the binaries and the user:
 docker run --rm warrant-seller:dev warrant-policy --help   # exits 1 and prints "Usage: warrant-policy ..."
 docker run --rm --entrypoint id warrant-seller:dev -u      # 10001
 docker run --rm --entrypoint cat warrant-seller:dev /usr/share/warrant-seller/pip-freeze.txt
+```
+
+The Linux binaries must match the host build. Run `warrant-policy hash` on a policy JSON that a
+host test produced, and compare the hash:
+
+```sh
+docker run --rm -v "$PWD/policy.json:/tmp/p.json:ro" warrant-seller:dev warrant-policy hash /tmp/p.json
 ```
 
 ### Container user and paths
@@ -337,39 +347,53 @@ docker run --rm --name warrant-seller \
   -p 127.0.0.1:8000:8000 warrant-seller:dev
 ```
 
-For a laptop smoke, start Anvil (`anvil --host 0.0.0.0`), use a scratch chain-31337 manifest
-whose `rpc_url` is `http://host.docker.internal:8545`, and set `MOCK_IONET=1`. Keep the scratch
-manifest and key out of the checkout.
+For a laptop smoke, start Anvil on loopback (`anvil`, which binds `127.0.0.1:8545`), use a
+scratch chain-31337 manifest whose `rpc_url` is `http://host.docker.internal:8545`, and set
+`MOCK_IONET=1`. Docker Desktop forwards `host.docker.internal` to the host loopback, so Anvil
+does not need `--host 0.0.0.0`. On Linux Docker Engine, add
+`--add-host host.docker.internal:host-gateway` and bind Anvil to the bridge address
+(`anvil --host 172.17.0.1`), not to every interface. Keep the scratch manifest and key out of the
+checkout.
 
 On chain 5042 the server refuses to start, exit code 1, in these cases:
 * `IO_NET_API_KEY` is missing (`IO_NET_API_KEY is required on chain 5042`);
 * `MOCK_IONET` or `LOCAL_SERVER` is set;
 * the manifest `chain_id` is not 5042;
-* the RPC does not answer.
+* the RPC does not answer;
+* `MCP_AUTH_USER` or `MCP_AUTH_PASS` is missing, empty or blank
+  (`MCP_AUTH_PASS is required on chain 5042`).
+
+On any other chain, the server refuses to start without both auth variables when `HOST` is not a
+loopback address (`... required when binding the non-loopback host '0.0.0.0'`). The image sets
+`HOST=0.0.0.0`, so the container always needs both variables.
 
 ### MCP handshake
 
 The endpoint is `/mcp`. Responses are server-sent events: the JSON is on the `data:` line.
 
+The credential never goes on the command line. `printf` is a shell builtin, and curl reads the
+`user` line from a config on stdin (`-K -`). A password must not contain `"` or `\`.
+
 ```sh
 U=http://127.0.0.1:8000/mcp
 H='Accept: application/json, text/event-stream'
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+mcp() {
+  printf 'user = "%s:%s"\n' "$MCP_AUTH_USER" "$MCP_AUTH_PASS" |
+    curl -s -K - -H "$H" -H 'Content-Type: application/json' "$@" "$U"
+}
 
 # 1. initialize: 200 and an mcp-session-id header
-curl -s -D headers.txt -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
-  -H 'Content-Type: application/json' -d "$INIT" "$U"
+mcp -D headers.txt -d "$INIT"
 SID=$(grep -i '^mcp-session-id:' headers.txt | cut -d' ' -f2 | tr -d '\r')
 
 # 2. notifications/initialized: 202
-curl -s -o /dev/null -w '%{http_code}\n' -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
-  -H 'Content-Type: application/json' -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$U"
+mcp -o /dev/null -w '%{http_code}\n' -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 # 3. tools/list: 200
-curl -s -u "$MCP_AUTH_USER:$MCP_AUTH_PASS" -H "$H" \
-  -H 'Content-Type: application/json' -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$U"
+mcp -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 
 # 4. initialize without auth: 401
 curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H 'Content-Type: application/json' -d "$INIT" "$U"

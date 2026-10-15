@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # Seller MCP server image (showcases/ionet_arc/seller_mcp_server.py).
 #
@@ -12,7 +12,14 @@
 #   build (default) compiles them here with RISC0_SKIP_BUILD=1 (no RISC Zero needed);
 #   host            copies target/release/{warrant-host,warrant-policy} from the
 #                   context; Linux VM only (the configure action builds them there).
-# Any other value fails at the FROM bins-${BIN_SOURCE} line below.
+# Any other value fails at the FROM bins-${BIN_SOURCE} line below with
+# "load metadata for docker.io/library/bins-<value>" / "pull access denied":
+# that message means a wrong BIN_SOURCE, not a registry problem.
+#
+# Base images are pinned by multi-arch index digest; apt packages are not
+# pinned, so a digest pins the base layer only. Bump deliberately before a
+# mainnet rebuild: docker buildx imagetools inspect <tag> --format '{{json .Manifest.Digest}}'
+# and replace the digest after the tag in each FROM line (and in the syntax line).
 #
 # Secrets (IO_NET_API_KEY, MCP_AUTH_PASS, the seller key) are runtime-only:
 # env file and read-only mount. Never pass them as build arguments.
@@ -85,6 +92,12 @@ RUN userdel --remove ubuntu \
     && install -d -o 10001 -g 10001 -m 0700 /var/lib/warrant-seller
 
 COPY --from=bins --chmod=0755 /out/warrant-host /out/warrant-policy /usr/local/bin/
+# Fail the build, not the VM run, on a wrong-arch, Mach-O or broken binary. Both
+# print their usage and exit 1 without arguments, so assert the text, not the code
+# (pipefail would turn that designed exit 1 into a failure, hence DL4006 ignored).
+# hadolint ignore=DL4006
+RUN warrant-policy 2>&1 | grep -q 'Usage: warrant-policy' \
+    && warrant-host 2>&1 | grep -q 'Usage: warrant-host'
 COPY --from=python-deps /opt/venv /opt/venv
 COPY --from=python-deps --chmod=0644 /opt/pip-freeze.txt /usr/share/warrant-seller/pip-freeze.txt
 
