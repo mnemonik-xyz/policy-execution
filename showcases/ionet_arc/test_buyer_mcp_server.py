@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
-from showcases.ionet_arc.buyer_mcp_server import BuyerServerConfig, ServerConfig, create_app, create_server
+from showcases.ionet_arc.buyer_mcp_server import (
+    BuyerServerConfig,
+    ServerConfig,
+    create_app,
+    create_server,
+)
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
 
 
@@ -379,6 +384,14 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"WARRANT_BUYER_KEY": "0x" + "22" * 32}):
             config = ServerConfig(state_dir=self.state_dir, buyer_key_path=Path("/nonexistent"))
             self.assertEqual(config.buyer_private_key, "0x" + "22" * 32)
+
+    def test_run_server_passes_log_level_to_uvicorn(self):
+        from showcases.ionet_arc import buyer_mcp_server
+
+        with patch.object(buyer_mcp_server.uvicorn, "run") as mock_run:
+            buyer_mcp_server.run_server(ServerConfig(transport="http", state_dir=self.state_dir))
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args.kwargs["log_level"], buyer_mcp_server.logger.getEffectiveLevel())
 
 
 if __name__ == "__main__":

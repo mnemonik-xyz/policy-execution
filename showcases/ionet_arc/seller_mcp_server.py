@@ -1662,7 +1662,7 @@ def enforce_http_auth_policy(cfg: ServerConfig, chain_id: int):
     if not is_loopback_host(cfg.host):
         raise StartRefusedError(f"{names} {verb} required when binding the non-loopback host {cfg.host!r}")
     if len(missing) == 1:
-        print(f"seller-mcp-server: warning: {names} is not set, so basic auth is off", file=sys.stderr)
+        logger.warning("seller-mcp-server: warning: %s is not set, so basic auth is off", names)
 
 
 def create_server(
@@ -1790,7 +1790,7 @@ def create_app(
     app = server.streamable_http_app(transport_security=sec)
 
     if not missing_auth_variables(cfg):
-        print(f"HTTP Basic Auth enabled for user '{cfg.auth_user}'", file=sys.stderr)
+        logger.info("HTTP Basic Auth enabled for user '%s'", cfg.auth_user)
         app = BasicAuthMiddleware(app, cfg.auth_user, cfg.auth_pass)
     return app
 
@@ -1802,7 +1802,7 @@ def run_server(
     """Run MCP server with uvicorn."""
     cfg = _normalize_config(config, **kwargs)
     app = create_app(cfg)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=logger.getEffectiveLevel())
 
 
 def main():
@@ -1907,7 +1907,7 @@ def main():
     try:
         run_server(config)
     except StartRefusedError as exc:
-        print(f"seller-mcp-server: refused to start: {exc}", file=sys.stderr)
+        logger.error("seller-mcp-server: refused to start: %s", exc)
         sys.exit(1)
 
 

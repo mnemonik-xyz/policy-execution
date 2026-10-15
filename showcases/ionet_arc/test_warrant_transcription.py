@@ -2,8 +2,6 @@
 
 import asyncio
 import base64
-import contextlib
-import io
 import json
 import os
 import tempfile
@@ -1062,29 +1060,27 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cloud.calls, ["caas_get_hardware_ids"])
 
     def test_main_exits_with_status_1_on_mainnet_policy_error(self):
-        stderr = io.StringIO()
         refusal = MainnetPolicyError("mock mode is refused on chain 5042")
         with (
             patch.object(seller_module, "run_server", side_effect=refusal),
             patch("sys.argv", ["seller_mcp_server"]),
-            contextlib.redirect_stderr(stderr),
+            self.assertLogs(seller_module.logger, level="ERROR") as cm,
             self.assertRaises(SystemExit) as ctx,
         ):
             seller_module.main()
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("mock mode is refused on chain 5042", stderr.getvalue())
+        self.assertTrue(any("mock mode is refused on chain 5042" in msg for msg in cm.output))
 
     def test_main_exits_with_status_1_when_chain_unknown(self):
-        stderr = io.StringIO()
         with (
             patch.object(seller_module, "run_server", side_effect=ChainDetectionError("cannot determine the chain")),
             patch("sys.argv", ["seller_mcp_server"]),
-            contextlib.redirect_stderr(stderr),
+            self.assertLogs(seller_module.logger, level="ERROR") as cm,
             self.assertRaises(SystemExit) as ctx,
         ):
             seller_module.main()
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("cannot determine the chain", stderr.getvalue())
+        self.assertTrue(any("cannot determine the chain" in msg for msg in cm.output))
 
     def test_main_keeps_other_errors(self):
         with (
@@ -1148,15 +1144,12 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_loopback_host(run_server.call_args.args[0].host))
 
     def test_partial_auth_on_loopback_warns(self):
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with self.assertLogs(seller_module.logger, level="WARNING") as cm:
             app = self.build_app(host="127.0.0.1", auth_user="u")
         self.assertNotIsInstance(app, BasicAuthMiddleware)
-        self.assertIn("warning: MCP_AUTH_PASS is not set, so basic auth is off", stderr.getvalue())
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        self.assertTrue(any("warning: MCP_AUTH_PASS is not set, so basic auth is off" in msg for msg in cm.output))
+        with self.assertNoLogs(seller_module.logger, level="WARNING"):
             self.build_app(host="127.0.0.1")
-        self.assertNotIn("warning", stderr.getvalue())
 
     def test_is_loopback_host(self):
         for host in ("localhost", "LOCALHOST", "127.0.0.1", "127.1.2.3", "::1", "[::1]"):
@@ -1167,20 +1160,25 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(is_loopback_host(host))
 
     def test_main_refuses_public_bind_without_auth(self):
-        stderr = io.StringIO()
         env = {"HOST": "0.0.0.0", "MOCK_IONET": "1", "IONET_STATE_DIR": str(self.state_dir)}
         with (
             patch.dict(os.environ, env, clear=True),
             patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
             patch.object(seller_module.uvicorn, "run") as uvicorn_run,
             patch("sys.argv", ["seller_mcp_server"]),
-            contextlib.redirect_stderr(stderr),
+            self.assertLogs(seller_module.logger, level="ERROR") as cm,
             self.assertRaises(SystemExit) as ctx,
         ):
             seller_module.main()
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("MCP_AUTH_USER and MCP_AUTH_PASS are required", stderr.getvalue())
+        self.assertTrue(any("MCP_AUTH_USER and MCP_AUTH_PASS are required" in msg for msg in cm.output))
         uvicorn_run.assert_not_called()
+
+    def test_run_server_passes_log_level_to_uvicorn(self):
+        with patch.object(seller_module, "create_app"), patch.object(seller_module.uvicorn, "run") as mock_run:
+            seller_module.run_server(self.http_config())
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args.kwargs["log_level"], seller_module.logger.getEffectiveLevel())
 
 class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     """Decision 6: the seller policy on RPC chain 5042."""

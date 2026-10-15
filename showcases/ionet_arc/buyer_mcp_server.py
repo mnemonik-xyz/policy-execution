@@ -839,7 +839,7 @@ def run_server(
         server.run(transport="stdio")
     else:
         app = create_app(cfg)
-        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info")
+        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=logger.getEffectiveLevel())
 
 
 def main():
