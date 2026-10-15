@@ -42,6 +42,8 @@ following design trade-offs:
      a two-step workflow: the seller accepts the task on-chain to commit terms, provisions the
      container in the background, and can only claim escrow payment after the buyer verifies
      `/health` and signs an `Acceptance` evidence struct off-chain.
+   - On Arc mainnet, this protection does not hold: after seller acceptance, anyone can
+     trigger payout. See [Arc mainnet seller (canary)](#arc-mainnet-seller-canary).
 4. **Trust Boundary**:
    - The local Buyer Guardrail strictly prevents unauthorized transactions or spending cap
      violations before funds ever leave the buyer's wallet.
@@ -321,13 +323,14 @@ Run every command from the repository root.
    finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
    Without the build, it fails with "Could not find compiled binary".
 2. Copy [`config/mainnet-manifest.example.yaml`](config/mainnet-manifest.example.yaml) to
-   your own file outside git. Set the fields of the table below.
+   your own file outside git. Set the fields of the manifest table after step 7.
 3. Give the guardrail your own funded Arc wallet key. Use one of these inputs:
    - the flag `--key-file <path>`;
    - the manifest field `private_key_files.buyer_key`;
    - the environment variable `WARRANT_BUYER_KEY`.
 
-   Use `--key-file` or `private_key_files.buyer_key` with a file of mode 0600. Never put
+   Use `--key-file` or `private_key_files.buyer_key` with a file of mode 0600. Give an
+   absolute path: a relative path resolves against the repository root. Never put
    the key in the desktop configuration. Do not use `--private-key`, because the process
    list shows its value.
 4. Generate your own acceptance key. Never use a key that another person gave you.
@@ -368,7 +371,7 @@ Run every command from the repository root.
 | `validity_seconds` | `900` |
 | `buyer_address` | Your own funded Arc wallet. Add this field: the example file does not have it. |
 | `public_files.public_keys` | Absolute path of your own public keys file (step 6) |
-| `private_key_files.buyer_key` | Optional. Path of your wallet key file (step 3) |
+| `private_key_files.buyer_key` | Optional. Absolute path of your wallet key file (step 3) |
 
 The guardrail does not read the other entries of the example file. `seller_address`,
 `vendor_validity_days`, `public_files.vendor_credential` and `public_files.vendor_signature`
@@ -405,7 +408,8 @@ read on the VM. Ignore them or delete them.
 `${AUTH_HEADER}`. The header argument has no space after the colon, because some clients
 split arguments on spaces. Set `AUTH_HEADER` to `Basic` and the base64 form of
 `user:password` from the operator. The configuration file then holds the credential:
-keep it at mode 0600 and out of git. Unverified on 2026-10-15: this form follows the
+keep it at mode 0600 and out of git. If your client passes the shell environment to
+`mcp-remote`, export `AUTH_HEADER` in that shell and remove the `env` block. Unverified on 2026-10-15: this form follows the
 `mcp-remote` documentation, and it has not run against this endpoint.
 
 ### Operator notes

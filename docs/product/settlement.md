@@ -88,9 +88,9 @@ Recorded 2026-10-14. Decision of the core team on 2026-10-09, in the
 - CHAIN-6 for the task set: the deployment record `task-escrow.json` holds the Foundry
   broadcast and the `cast` checks, and the deployment PR publishes it. No settlement
   evidence exists before the first buyer deal, so CHAIN-6 stays open for the task set.
-- Evidence in place of CHAIN-1: real Groth16 settlement on private Anvil in CI
-  (`solver-bounty/ci-result.json`), the read-only mainnet probe of the canary plan item 4,
-  and the local rehearsal record `solver-bounty/canary/local/<UTC timestamp>/rehearsal.md`
-  with its `rehearsal.json`.
+- Evidence in place of CHAIN-1 has three parts. The first is the real Groth16 settlement on
+  private Anvil in CI (`solver-bounty/ci-result.json`). The second is the read-only mainnet
+  probe of the canary plan item 4. The third is the local rehearsal record
+  `solver-bounty/canary/local/<UTC timestamp>/rehearsal.md` with its `rehearsal.json`.
 
 Sources: [Arc network configuration](https://docs.arc.io/arc/references/connect-to-arc), [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses), [Arc EVM differences](https://docs.arc.io/integrate/evm-differences).
