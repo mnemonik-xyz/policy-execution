@@ -29,6 +29,8 @@ def _check_prerequisites() -> None:
             raise unittest.SkipTest(f"{name} binary not found; skipping end-to-end tests")
     if not (ROOT / "contracts" / "node_modules").exists():
         raise unittest.SkipTest("contracts/node_modules not found; skipping end-to-end tests")
+    if not os.environ.get("IO_NET_API_KEY"):
+        raise unittest.SkipTest("IO_NET_API_KEY not set; skipping end-to-end tests")
 
 
 def _clean_env() -> dict:
@@ -178,7 +180,6 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             str(cls.vendor_cred_path),
             "--vendor-signature",
             str(cls.vendor_sig_path),
-            "--mock-ionet",
         ]
         env = _clean_env()
         cls.server_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

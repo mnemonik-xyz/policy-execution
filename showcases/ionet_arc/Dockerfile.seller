@@ -109,8 +109,6 @@ COPY --chmod=0644 \
     showcases/ionet_arc/seller_mcp_server.py \
     showcases/ionet_arc/adapter.py \
     showcases/ionet_arc/escrow.py \
-    showcases/ionet_arc/worker.py \
-    showcases/ionet_arc/mock_hardware.json \
     /app/showcases/ionet_arc/
 
 ENV PATH="/opt/venv/bin:${PATH}" \

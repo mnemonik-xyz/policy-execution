@@ -27,8 +27,6 @@
 !showcases/ionet_arc/seller_mcp_server.py
 !showcases/ionet_arc/adapter.py
 !showcases/ionet_arc/escrow.py
-!showcases/ionet_arc/worker.py
-!showcases/ionet_arc/mock_hardware.json
 !showcases/ionet_arc/requirements.txt
 
 # Never send build output, keys, env files or bytecode, even inside allowed paths.
