@@ -129,11 +129,11 @@ SELLER_TOOLS = {
 # Tool descriptions on origin/main before Task 2; chains other than 5042 keep them exactly.
 TESTNET_DESCRIPTIONS = {
     "list_suitable_hardware": (
-        "List available io.net GPU hardware options suitable for faster-whisper-small transcription.\n"
+        "List available io.net single-GPU hardware options for container deployment.\n"
         "Filters for single-GPU configurations with live availability and sorts by price ascending."
     ),
     "propose_deployment": (
-        "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
+        "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
         "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
         "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
     ),
@@ -143,7 +143,7 @@ TESTNET_DESCRIPTIONS = {
         "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
     ),
     "get_deployment_status": (
-        "Check status of active 1-hour transcription deployment and remaining duration.\n"
+        "Check status of active 1-hour container deployment and remaining duration.\n"
         "Optionally provide task_id to inspect a specific deployment session."
     ),
     "submit_acceptance": (
@@ -267,7 +267,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         patch_conn.start()
         self.addCleanup(patch_conn.stop)
 
-        orig_provision = seller_module.WarrantTranscriptionService._provision_container
+        orig_provision = seller_module.SellerWarrantService._provision_container
 
         async def fake_provision(service_self, proposal, deployment_id, worker_token):
             if service_self.local_server:
@@ -275,7 +275,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             return "http://127.0.0.1:8080"
 
         patch_prov = patch.object(
-            seller_module.WarrantTranscriptionService,
+            seller_module.SellerWarrantService,
             "_provision_container",
             autospec=True,
             side_effect=fake_provision,
@@ -747,7 +747,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             # Check first call: docker rm -f
             first_cmd = ssh_calls[0][0][0]
             self.assertEqual(first_cmd[:5], ["ssh", "petertower", "docker", "rm", "-f"])
-            self.assertEqual(first_cmd[5], "warrant-transcription")
+            self.assertEqual(first_cmd[5], "warrant-worker")
 
             # Check second call: docker run
             second_cmd = ssh_calls[1][0][0]
@@ -766,7 +766,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             service._cleanup_ssh_container()
             mock_subproc.assert_called_once()
             teardown_cmd = mock_subproc.call_args[0][0]
-            self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-transcription"])
+            self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-worker"])
 
     async def test_local_server_ssh_deployment_run_failure(self):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):

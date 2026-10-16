@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autonomous User Agent client for Warrant io.net transcription showcase.
+"""Autonomous User Agent client for Warrant io.net container deployment showcase.
 
 Demonstrates the capability-based two-step escrow lifecycle:
 1. Query available hardware via list_suitable_hardware.
@@ -9,18 +9,15 @@ Demonstrates the capability-based two-step escrow lifecycle:
 5. Poll get_deployment_status until the worker container is ready.
 6. Verify container health endpoint (/health) with worker bearer token.
 7. Sign Acceptance evidence and call submit_acceptance to settle TaskEscrow on-chain.
-8. Submit the audio file directly to the worker HTTP endpoint (/job) and print the transcript.
-9. Inspect final deployment status via get_deployment_status.
+8. Inspect final deployment status via get_deployment_status.
 """
 
 import argparse
 import asyncio
 import base64
-import hashlib
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -198,62 +195,9 @@ async def _sign_acceptance(
     )
 
 
-async def transcribe_via_worker(
-    public_url: str,
-    worker_token: str,
-    audio_path: Path,
-    language: str = "en",
-) -> dict:
-    """Upload audio bytes directly to the worker HTTP endpoint (/job) and poll until completion."""
-    audio_bytes = audio_path.read_bytes()
-    audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
-    worker_base = public_url.rstrip("/")
-    req_url = f"{worker_base}/job?language={language}" if language else f"{worker_base}/job"
-    headers = {
-        "Authorization": f"Bearer {worker_token}",
-        "Content-Type": "application/octet-stream",
-        "X-Audio-SHA256": audio_sha256,
-        "Content-Length": str(len(audio_bytes)),
-        "User-Agent": "Mozilla/5.0",
-    }
-    trust_env = should_trust_env(worker_base)
-    async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
-        resp = await client.post(req_url, content=audio_bytes, headers=headers)
-        if resp.is_error:
-            sys.exit(f"Worker rejected upload with HTTP {resp.status_code}: {resp.text}")
-        job_id = resp.json().get("job_id")
-        if not job_id:
-            sys.exit(f"Unexpected worker response: {resp.text}")
-
-        poll_url = f"{worker_base}/job/{job_id}"
-        poll_headers = {"Authorization": f"Bearer {worker_token}", "User-Agent": "Mozilla/5.0"}
-        for _ in range(120):
-            poll_resp = await client.get(poll_url, headers=poll_headers, timeout=10.0)
-            if poll_resp.status_code == 200:
-                job_status = poll_resp.json()
-                st = job_status.get("status")
-                if st == "complete":
-                    res = job_status.get("result", {})
-                    segments = res.get("segments", [])
-                    return {
-                        "status": "complete",
-                        "job_id": job_id,
-                        "text": " ".join(s.get("text", "").strip() for s in segments),
-                        "language": res.get("language"),
-                        "audio_seconds": res.get("audio_seconds"),
-                        "segments": segments,
-                        "elapsed_seconds": job_status.get("elapsed_seconds"),
-                    }
-                if st in ("failed", "interrupted"):
-                    sys.exit(f"Transcription job failed: {job_status.get('error') or st}")
-            await asyncio.sleep(0.5)
-    sys.exit("Transcription timed out waiting for worker.")
-
-
 async def run_client(
     mcp_url: str,
     rpc_url: str,
-    audio_path: Path,
     auth_user: str | None = None,
     auth_pass: str | None = None,
     max_budget_usdc: float = 1.00,
@@ -261,14 +205,13 @@ async def run_client(
     manifest_path: Path | None = None,
 ):
     print("=" * 70)
-    print("  WARRANT AUTONOMOUS TRANSCRIPTION AGENT")
+    print("  WARRANT AUTONOMOUS BUYER AGENT")
     print("=" * 70)
 
     # 1. Inspect on-chain environment
     customer, agent = await _resolve_buyer_account(rpc_url, manifest_path, buyer_mcp_url)
     print(f"Customer wallet: {customer}")
     print(f"Agent wallet:    {agent}")
-    print(f"Audio file:      {audio_path} ({audio_path.stat().st_size} bytes)")
 
     headers = {}
     if auth_user and auth_pass:
@@ -384,40 +327,16 @@ async def run_client(
                     sys.exit(f"submit_acceptance failed: {settle_info.get('error')}")
                 print(f" TaskEscrow settled on-chain: tx {settle_info.get('settlement_transaction')}")
 
-                # Step 8: Direct Worker Transcription
-                print(f"\n[Step 8] Submitting audio file '{audio_path.name}' directly to worker ({public_url}/job)...")
-                start_t = time.time()
-                trans_result = await transcribe_via_worker(
-                    public_url=public_url,
-                    worker_token=worker_token,
-                    audio_path=audio_path,
-                    language="en",
-                )
-                elapsed = time.time() - start_t
-
-                print("\n" + "=" * 70)
-                print("  TRANSCRIPTION RESULT")
-                print("=" * 70)
-                print(f"Status:        {trans_result.get('status')}")
-                print(f"Language:      {trans_result.get('language')}")
-                print(f"Audio length:  {trans_result.get('audio_seconds')}s")
-                print(f"Latency:       {elapsed:.2f}s")
-                print(f'Text:\n\n"{trans_result.get("text")}"\n')
-                if trans_result.get("segments"):
-                    print("Segments:")
-                    for seg in trans_result["segments"]:
-                        print(f"  [{seg['start']:.2f}s - {seg['end']:.2f}s] {seg['text'].strip()}")
-                print("=" * 70)
-
-                # Step 9: Final inspection of live deployment session status
-                print("\n[Step 9] Inspecting final deployment session status...")
+                # Step 8: Final inspection of live deployment session status
+                print("\n[Step 8] Inspecting final deployment session status...")
                 res_stat = await session.call_tool("get_deployment_status", {"task_id": proposal["task_id"]})
                 stat = extract_result(res_stat)
                 print(f"Active session:    {stat.get('active')}")
                 print(f"Status:            {stat.get('status')}")
+                print(f"Public URL:        {stat.get('public_url')}")
                 print(f"Remaining time:    {stat.get('remaining_seconds')} seconds in 1h window")
                 print(f"Settlement tx:     {stat.get('settlement_transaction')}")
-                print("\n Autonomous Warrant transcription showcase completed successfully!")
+                print("\n Autonomous Warrant container deployment completed successfully!")
 
 
 def main():
@@ -427,12 +346,6 @@ def main():
         "--rpc-url",
         default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
         help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
-    )
-    parser.add_argument(
-        "--audio",
-        type=Path,
-        default=ROOT / "adv.mp3" if (ROOT / "adv.mp3").exists() else None,
-        help="Audio file to transcribe (e.g. sample.mp3)",
     )
     parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
     parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
@@ -451,11 +364,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.audio:
-        sys.exit("Error: Please provide an audio file with --audio <path_to_audio>.")
-    if not args.audio.exists():
-        sys.exit(f"Error: audio file '{args.audio}' does not exist.")
-
     rpc_url = args.rpc_url
     if not rpc_url:
         manifest = load_manifest(args.manifest_path or DEFAULT_MANIFEST_PATH)
@@ -465,7 +373,6 @@ def main():
         run_client(
             mcp_url=args.mcp_url,
             rpc_url=rpc_url,
-            audio_path=args.audio,
             auth_user=args.auth_user,
             auth_pass=args.auth_pass,
             max_budget_usdc=args.max_budget,

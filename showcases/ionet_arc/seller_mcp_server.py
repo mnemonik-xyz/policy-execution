@@ -1,4 +1,4 @@
-"""Streamable HTTP MCP server for Warrant GPU transcription on io.net CaaS."""
+"""Streamable HTTP MCP server for Warrant GPU container deployment on io.net CaaS."""
 
 import argparse
 import asyncio
@@ -143,15 +143,15 @@ def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
     return bool(isinstance(hw_id, int))
 
 
-def _is_whisper_friendly(hw_name: str, hw_id: str | int | None) -> bool:
-    friendly_names = ["3090", "4090", "L40", "A6000", "A100", "H100", "T4", "V100", "A40", "A30", "L4", "ADA"]
-    if any(g in hw_name for g in friendly_names):
+def _is_supported_gpu(hw_name: str, hw_id: str | int | None) -> bool:
+    supported_names = ["3090", "4090", "L40", "A6000", "A100", "H100", "T4", "V100", "A40", "A30", "L4", "ADA"]
+    if any(g in hw_name for g in supported_names):
         return True
     return isinstance(hw_id, int)
 
 
 def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
-    """Filter suitable single GPUs for faster-whisper-small inference, sorted by price."""
+    """Filter suitable single GPUs for container deployment, sorted by price."""
     suitable = []
     for item in hardware_items:
         hw_id = item.get("hardware_id")
@@ -164,7 +164,7 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
             continue
         if not _is_single_gpu(hw_id, max_gpus):
             continue
-        if not _is_whisper_friendly(hw_name, hw_id):
+        if not _is_supported_gpu(hw_name, hw_id):
             continue
 
         suitable.append(
@@ -209,8 +209,8 @@ def parse_credit_balance(status) -> Decimal:
     return spendable
 
 
-class WarrantTranscriptionService:
-    """Encapsulates tool implementations and state for Warrant transcription server."""
+class SellerWarrantService:
+    """Encapsulates tool implementations and state for the Seller Warrant MCP server."""
 
     def __init__(
         self,
@@ -270,7 +270,7 @@ class WarrantTranscriptionService:
         if self.local_server and self._ssh_container_started:
             with contextlib.suppress(Exception):
                 subprocess.run(
-                    ["ssh", self.ssh_host, "docker", "stop", "warrant-transcription"],
+                    ["ssh", self.ssh_host, "docker", "stop", "warrant-worker"],
                     capture_output=True,
                     timeout=10,
                     check=False,
@@ -288,7 +288,7 @@ class WarrantTranscriptionService:
 
             raw_items = await connected(op)
 
-            logger.info("Filtering %d raw hardware options for Whisper transcription", len(raw_items))
+            logger.info("Filtering %d raw hardware options", len(raw_items))
             filtered = filter_suitable_gpus(raw_items)
             candidate_summary = [
                 {"id": hw["hardware_id"], "name": hw["hardware_name"], "price_hr": hw["price_per_hour_usd"]}
@@ -529,8 +529,8 @@ class WarrantTranscriptionService:
                     "acceptBy, settleBy) on-chain.\n"
                     "Call deploy_with_escrow(task_id, policy) to commit agreement and begin provisioning.\n"
                     "Poll get_deployment_status until ready, verify container /health, and sign Acceptance evidence.\n"
-                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then submit audio directly "
-                    "to <public_url>/job with Bearer <worker_token>."
+                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then operate the container "
+                    "at <public_url> with Bearer <worker_token>."
                 ),
             }
 
@@ -606,7 +606,7 @@ class WarrantTranscriptionService:
             # 1. Clean up any existing container on SSH host
             await asyncio.to_thread(
                 subprocess.run,
-                ["ssh", self.ssh_host, "docker", "rm", "-f", "warrant-transcription"],
+                ["ssh", self.ssh_host, "docker", "rm", "-f", "warrant-worker"],
                 capture_output=True,
                 check=False,
             )
@@ -620,7 +620,7 @@ class WarrantTranscriptionService:
                 "-d",
                 "--rm",
                 "--name",
-                "warrant-transcription",
+                "warrant-worker",
                 "--gpus",
                 "all",
                 "-p",
@@ -674,7 +674,7 @@ class WarrantTranscriptionService:
             "duration_hours": duration,
             "gpus_per_container": 1,
             "replica_count": 1,
-            "resource_private_name": f"warrant-whisper-{proposal['task_id'][-8:]}",
+            "resource_private_name": f"warrant-worker-{proposal['task_id'][-8:]}",
             "image_url": PILOT_IMAGE,
             "traffic_port": 8080,
             "env_variables": {"WARRANT_WORKER_TOKEN": worker_token},
@@ -1407,7 +1407,7 @@ def create_server(
     serve_http: bool = False,
     **kwargs,
 ) -> MCPServer:
-    """Create and configure the Warrant Transcription MCP server.
+    """Create and configure the Seller Warrant MCP server.
 
     serve_http=True (create_app) also applies the HTTP basic-auth start policy once the chain is known.
     """
@@ -1436,7 +1436,7 @@ def create_server(
             derived_addr = Account.from_key(cfg.seller_private_key).address
             escrow_client.register_key(derived_addr, cfg.seller_private_key)
 
-    service = WarrantTranscriptionService(
+    service = SellerWarrantService(
         state_dir=cfg.state_dir,
         escrow_client=escrow_client,
         local_server=cfg.local_server,
@@ -1456,7 +1456,7 @@ def create_server(
     server.tool(
         name="list_suitable_hardware",
         description=(
-            "List available io.net GPU hardware options suitable for faster-whisper-small transcription.\n"
+            "List available io.net single-GPU hardware options for container deployment.\n"
             "Filters for single-GPU configurations with live availability and sorts by price ascending."
         ),
     )(service.list_suitable_hardware)
@@ -1464,7 +1464,7 @@ def create_server(
     server.tool(
         name="propose_deployment",
         description=describe(
-            "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
+            "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
             "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient).",
             deal_tool=True,
@@ -1484,7 +1484,7 @@ def create_server(
     server.tool(
         name="get_deployment_status",
         description=(
-            "Check status of active 1-hour transcription deployment and remaining duration.\n"
+            "Check status of active 1-hour container deployment and remaining duration.\n"
             "Optionally provide task_id to inspect a specific deployment session."
         ),
     )(service.get_deployment_status)
@@ -1529,7 +1529,7 @@ def run_server(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the Warrant GPU transcription MCP server over Streamable HTTP.")
+    parser = argparse.ArgumentParser(description="Run the Seller Warrant MCP server over Streamable HTTP.")
     parser.add_argument(
         "--host",
         default=os.environ.get("HOST", "localhost"),
