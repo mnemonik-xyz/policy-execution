@@ -228,6 +228,37 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["acceptance"]["accepted"])
         self.assertEqual(len(res["signature"]), 64)
 
+    async def test_warrant_sign_acceptance_missing_policy_validity(self):
+        proposal = {
+            "task_id": "0x" + "55" * 32,
+            "amount": 1_000_000,
+            "amount_usd": "1.00",
+            "duration_hours": 1,
+            "salt": "0x" + "66" * 32,
+            "recipient": "0x" + "44" * 20,
+            "category": DEFAULT_CATEGORY,
+            "escrow_address": self.mock_escrow.escrow,
+            "token_address": self.mock_escrow.token,
+        }
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+
+        task_path = self.state_dir / "tasks" / f"{proposal['task_id']}.json"
+        data = json.loads(task_path.read_text())
+        del data["policy"]["valid_after"]
+        task_path.write_text(json.dumps(data))
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
     async def test_warrant_evaluate_and_offer_insufficient_balance_no_automint(self):
         server = create_server(
             state_dir=self.state_dir,
