@@ -397,6 +397,13 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("propose_deployment", {"duration_hours": 0})
         self.assertIn("duration_hours must be at least 1", str(ctx.exception))
 
+    async def test_propose_deployment_default_does_not_cap_below_manifest_budget(self):
+        # Default manifest config/manifest.yaml allows up to $2.00; calling without budget_cap_usd
+        # allows hardware costing $1.50 without being capped at $1.00.
+        proposal = await self.call("propose_deployment", {"hardware_id": 30})
+        self.assertEqual(proposal["amount_usd"], "1.50")
+        self.assertEqual(proposal["amount"], 1_500_000)
+
     async def test_deploy_with_escrow_fails_if_unfunded_on_chain(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
@@ -1364,6 +1371,38 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["duration_hours"], 1)
         self.assertEqual(proposal["chain_id"], 5042)
 
+    async def test_mainnet_respects_custom_manifest_budget_cap(self):
+        custom_manifest = Path(self.tmp.name) / "custom_mainnet_manifest.yaml"
+        base_manifest = yaml.safe_load(self.manifest_path.read_text())
+        base_manifest["max_budget_usd"] = 2.00
+        custom_manifest.write_text(yaml.dump(base_manifest))
+        mcp = self.build(manifest_path=custom_manifest)
+
+        # H100 costs $1.50/hr, which exceeds $1.00 but is under the manifest cap of $2.00
+        prop = await self.call("propose_deployment", {"hardware_id": 30}, server=mcp)
+        self.assertEqual(prop["amount"], 1_500_000)
+        self.assertEqual(prop["amount_usd"], "1.50")
+
+        # Exceeding the manifest cap of 2.00 (e.g. caller passes cap 1.20)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"hardware_id": 30, "budget_cap_usd": 1.20}, server=mcp)
+        self.assertIn("exceeds", str(ctx.exception))
+
+    async def test_mainnet_respects_custom_manifest_duration_hours(self):
+        custom_manifest = Path(self.tmp.name) / "custom_mainnet_duration_manifest.yaml"
+        base_manifest = yaml.safe_load(self.manifest_path.read_text())
+        base_manifest["duration_hours"] = 2
+        base_manifest["max_budget_usd"] = 2.00
+        custom_manifest.write_text(yaml.dump(base_manifest))
+        mcp = self.build(manifest_path=custom_manifest)
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 1}, server=mcp)
+        self.assertIn("2 hours", str(ctx.exception))
+
+        prop = await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 2}, server=mcp)
+        self.assertEqual(prop["duration_hours"], 2)
+
     async def test_mainnet_cap_boundary_is_one_usd(self):
         at_cap = await self.call("propose_deployment", {"hardware_id": 40})
         self.assertEqual(at_cap["amount"], 1_000_000)
@@ -1424,7 +1463,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     # Credits
 
     async def test_mainnet_low_credits_refuse_proposal(self):
-        self.cloud.credit_result = credit_status_response(1.99)
+        self.cloud.credit_result = credit_status_response(0.48)
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment")
         self.assertIn("credit", str(ctx.exception).lower())
@@ -1439,7 +1478,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.state_dir / "proposals" / f"{proposal['task_id']}.json").exists())
 
     async def test_mainnet_credits_exactly_at_floor_allow_proposal(self):
-        self.cloud.credit_result = credit_status_response(2.0)
+        self.cloud.credit_result = credit_status_response(0.49)
         proposal = await self.call("propose_deployment")
         self.assertEqual(proposal["status"], "proposed")
 
@@ -1461,17 +1500,28 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
 
     async def test_mainnet_courtesy_credits_do_not_count(self):
-        # 3.00 credits of which 1.50 are courtesy: 1.50 spendable is below the floor.
-        self.cloud.credit_result = credit_status_response(3.0, courtesy_balance=1.5)
+        # 1.98 credits of which 1.50 are courtesy: 0.48 spendable is below 0.49 cost.
+        self.cloud.credit_result = credit_status_response(1.98, courtesy_balance=1.5)
         with self.assertRaises(ToolError) as ctx:
             await self.call("propose_deployment")
-        self.assertIn("below 2 USD", str(ctx.exception))
-        # Spendable exactly 2.00 after courtesy is allowed; 1.99 is refused.
-        self.cloud.credit_result = credit_status_response(3.5, courtesy_balance=1.5)
+        self.assertIn("below 0.49 USD", str(ctx.exception))
+        # Spendable exactly 0.49 after courtesy is allowed; 0.48 is refused.
+        self.cloud.credit_result = credit_status_response(1.99, courtesy_balance=1.5)
         self.assertEqual((await self.call("propose_deployment"))["status"], "proposed")
-        self.cloud.credit_result = credit_status_response(3.49, courtesy_balance=1.5)
+        self.cloud.credit_result = credit_status_response(1.98, courtesy_balance=1.5)
         with self.assertRaises(ToolError):
             await self.call("propose_deployment")
+
+    async def test_mainnet_credit_check_scales_with_hardware_cost(self):
+        # L40 costs $1.00/hr. With $0.99 credits it is refused; with $1.00 it succeeds.
+        self.cloud.credit_result = credit_status_response(0.99)
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("propose_deployment", {"hardware_id": 40})
+        self.assertIn("below 1.00 USD", str(ctx.exception))
+
+        self.cloud.credit_result = credit_status_response(1.00)
+        prop = await self.call("propose_deployment", {"hardware_id": 40})
+        self.assertEqual(prop["status"], "proposed")
 
     def test_parse_credit_balance_real_shape(self):
         self.assertEqual(parse_credit_balance(credit_status_response(8.68)), Decimal("8.68"))

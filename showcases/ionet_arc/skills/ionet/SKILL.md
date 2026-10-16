@@ -94,7 +94,7 @@ Selects the cheapest suitable GPU (or requested hardware) and generates a bindin
 calculated from actual hardware hourly pricing and duration.
 - Arguments:
   - `customer_address` (optional string): EVM address of payer. Defaults to first RPC account.
-  - `budget_cap_usd` (optional string): Maximum budget ceiling in USD (default: `"1.00"`).
+  - `budget_cap_usd` (optional string): Maximum budget ceiling in USD (default: from manifest).
   - `hardware_id` (optional string/int): Specific hardware ID to select.
   - `duration_hours` (optional int): Deployment duration in hours (default: `1`).
   - `location_id` (optional string): Region identifier (default: `"US"`).

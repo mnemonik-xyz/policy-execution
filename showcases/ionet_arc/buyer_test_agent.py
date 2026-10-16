@@ -200,10 +200,19 @@ async def run_client(
     rpc_url: str,
     auth_user: str | None = None,
     auth_pass: str | None = None,
-    max_budget_usdc: float = 1.00,
+    max_budget_usdc: float | None = None,
     buyer_mcp_url: str | None = None,
     manifest_path: Path | None = None,
 ):
+    if max_budget_usdc is None:
+        m = load_manifest(manifest_path or DEFAULT_MANIFEST_PATH)
+        raw_budget = get_manifest_parameter(m, "max_budget_usd", "max-budget-usd")
+        if raw_budget is not None:
+            max_budget_usdc = float(raw_budget)
+        else:
+            raw_amount = get_manifest_parameter(m, "max_amount", "max-amount")
+            max_budget_usdc = float(raw_amount) / 1_000_000 if raw_amount is not None else 1.00
+
     print("=" * 70)
     print("  WARRANT AUTONOMOUS BUYER AGENT")
     print("=" * 70)
@@ -349,7 +358,12 @@ def main():
     )
     parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
     parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
-    parser.add_argument("--max-budget", type=float, default=1.00, help="Max budget ceiling in USDC (default: 1.00)")
+    parser.add_argument(
+        "--max-budget",
+        type=float,
+        default=None,
+        help="Max budget ceiling in USDC (default: from manifest.yaml)",
+    )
     parser.add_argument(
         "--buyer-mcp-url",
         default=os.environ.get("BUYER_MCP_URL"),

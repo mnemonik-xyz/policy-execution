@@ -74,9 +74,6 @@ MAINNET_LIMITS = (
     "Any holder of the basic-auth credential can read the current deployment status, including its worker token.",
 )
 MAINNET_INSTRUCTIONS = MAINNET_LABEL + ".\n" + " ".join(MAINNET_LIMITS)
-MAINNET_MAX_DEAL_USD = Decimal("1.00")
-MAINNET_DURATION_HOURS = 1
-MAINNET_MIN_CREDIT_USD = Decimal("2")
 TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
 
 
@@ -224,6 +221,8 @@ class SellerWarrantService:
         buyer_account: str | None = None,
         manifest_path: pathlib.Path | None = None,
         chain_id: int | None = None,
+        max_budget_usd: Decimal | float | str | None = None,
+        duration_hours: int | None = None,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -247,6 +246,29 @@ class SellerWarrantService:
         self._deal_lock = asyncio.Lock()
 
         manifest = load_manifest(self.manifest_path)
+        if max_budget_usd is not None:
+            self.max_budget_usd = Decimal(str(max_budget_usd))
+        else:
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            if raw_budget is not None:
+                self.max_budget_usd = Decimal(str(raw_budget))
+            else:
+                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
+                if raw_amount is not None:
+                    self.max_budget_usd = Decimal(str(raw_amount)) / Decimal(1_000_000)
+                elif self.mainnet:
+                    self.max_budget_usd = Decimal("1.00")
+                else:
+                    self.max_budget_usd = Decimal("2.00")
+
+        if duration_hours is not None:
+            self.duration_hours = int(duration_hours)
+        else:
+            raw_duration = get_manifest_parameter(
+                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
+            )
+            self.duration_hours = int(raw_duration) if raw_duration is not None else 1
+
         self.buyer_account = buyer_account or get_manifest_parameter(
             manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
         )
@@ -375,21 +397,20 @@ class SellerWarrantService:
             raise ToolError(f"task_id must be a 0x-prefixed 32-byte hex string on chain {MAINNET_CHAIN_ID}.")
         return task_id.lower()
 
-    @staticmethod
-    def _mainnet_budget_cap(budget_cap_usd: str | float | None) -> Decimal:
-        """The effective cap on chain 5042: the caller's cap if lower, never above 1.00 USD."""
+    def _mainnet_budget_cap(self, budget_cap_usd: str | float | None) -> Decimal:
+        """The effective cap on chain 5042: the caller's cap if lower, never above manifest max_budget_usd."""
         if budget_cap_usd is None:
-            return MAINNET_MAX_DEAL_USD
+            return self.max_budget_usd
         try:
             cap = Decimal(str(budget_cap_usd))
         except (ValueError, InvalidOperation):
             raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}") from None
         if not cap.is_finite():
             raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}")
-        return min(cap, MAINNET_MAX_DEAL_USD)
+        return min(cap, self.max_budget_usd)
 
-    async def _require_credits(self):
-        """Refuse a proposal when io.net credits are below the floor or cannot be read (fail closed)."""
+    async def _require_credits(self, required_usd: Decimal):
+        """Refuse a proposal when io.net credits are below the required cost or cannot be read (fail closed)."""
         try:
             status = await connected(lambda cloud: cloud.call("get_credit_status", {}))
             balance = parse_credit_balance(status)
@@ -400,13 +421,12 @@ class SellerWarrantService:
             detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
             logger.warning("io.net credit status could not be read: %s", detail)
             raise ToolError(
-                "The io.net credit balance cannot be read, so no deal is proposed on chain "
-                f"{MAINNET_CHAIN_ID}."
+                f"The io.net credit balance cannot be read, so no deal is proposed on chain {MAINNET_CHAIN_ID}."
             ) from None
-        if balance < MAINNET_MIN_CREDIT_USD:
-            logger.warning("io.net credits %s USD are below the floor of %s USD", balance, MAINNET_MIN_CREDIT_USD)
+        if balance < required_usd:
+            logger.warning("io.net credits %s USD are below required %s USD", balance, required_usd)
             raise ToolError(
-                f"The seller's io.net credits are below {MAINNET_MIN_CREDIT_USD} USD, so no deal is proposed. "
+                f"The seller's io.net credits are below {required_usd:.2f} USD, so no deal is proposed. "
                 "Try again later."
             )
 
@@ -416,7 +436,7 @@ class SellerWarrantService:
         customer_address: str | None = None,
         location_id: str = "US",
         duration_hours: int = 1,
-        budget_cap_usd: str | float | None = "1.00",
+        budget_cap_usd: str | float | None = None,
     ) -> dict:
         logger.info(
             "Tool called: propose_deployment with hardware_id=%.80r, customer_address=%.80r, location_id=%.80r, "
@@ -431,9 +451,10 @@ class SellerWarrantService:
             mainnet_cap = None
             if self.mainnet:
                 # Checked before the hardware call and the credit call.
-                if type(duration_hours) is not int or duration_hours != MAINNET_DURATION_HOURS:
+                if type(duration_hours) is not int or duration_hours != self.duration_hours:
+                    hour_label = "hour" if self.duration_hours == 1 else "hours"
                     raise ToolError(
-                        f"duration_hours must be {MAINNET_DURATION_HOURS} hour on chain {MAINNET_CHAIN_ID}, "
+                        f"duration_hours must be {self.duration_hours} {hour_label} on chain {MAINNET_CHAIN_ID}, "
                         f"got {duration_hours}"
                     )
                 mainnet_cap = self._mainnet_budget_cap(budget_cap_usd)
@@ -469,9 +490,9 @@ class SellerWarrantService:
                     raise ToolError(
                         f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} exceeds the "
                         f"budget cap of ${mainnet_cap:.2f} (chain {MAINNET_CHAIN_ID} deals are capped at "
-                        f"${MAINNET_MAX_DEAL_USD:.2f})."
+                        f"${self.max_budget_usd:.2f})."
                     )
-                await self._require_credits()
+                await self._require_credits(cost_usd)
 
             customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
             self._ensure_escrow_contracts(chain_id)
@@ -781,21 +802,21 @@ class SellerWarrantService:
             return f"task {task} is {status or 'in an unknown state'}"
         return None
 
-    @staticmethod
-    def _check_mainnet_terms(proposal: dict):
+    def _check_mainnet_terms(self, proposal: dict):
         """Refuse a stored proposal whose terms break the chain 5042 limits (for example one from another run)."""
         amount = proposal.get("amount")
-        max_amount = int(MAINNET_MAX_DEAL_USD * 1_000_000)
+        max_amount = int(self.max_budget_usd * 1_000_000)
+        hour_label = "hour" if self.duration_hours == 1 else "hours"
         if (
             proposal.get("chain_id") != MAINNET_CHAIN_ID
             or type(proposal.get("duration_hours")) is not int
-            or proposal.get("duration_hours") != MAINNET_DURATION_HOURS
+            or proposal.get("duration_hours") != self.duration_hours
             or type(amount) is not int
             or not 0 < amount <= max_amount
         ):
             raise ToolError(
                 f"The stored proposal does not match the chain {MAINNET_CHAIN_ID} limits "
-                f"(1 hour, at most ${MAINNET_MAX_DEAL_USD:.2f}); the offer is not accepted."
+                f"({self.duration_hours} {hour_label}, at most ${self.max_budget_usd:.2f}); the offer is not accepted."
             )
 
     async def _commit_deal(self, task_id: str, policy: dict | None) -> tuple[dict, dict]:
@@ -1260,6 +1281,8 @@ class ServerConfig:
     vendor_signature_path: pathlib.Path | None = None
     manifest_path: pathlib.Path | None = None
     escrow_client: EscrowClient | None = None
+    max_budget_usd: Decimal | float | str | None = None
+    duration_hours: int | None = None
 
     def _resolve_paths(self):
         if isinstance(self.state_dir, str):
@@ -1290,6 +1313,20 @@ class ServerConfig:
             self.server_account = get_manifest_parameter(
                 manifest, "seller_address", "seller-address", "server_account", "server-account"
             )
+        if self.max_budget_usd is None:
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            if raw_budget is not None:
+                self.max_budget_usd = Decimal(str(raw_budget))
+            else:
+                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
+                if raw_amount is not None:
+                    self.max_budget_usd = Decimal(str(raw_amount)) / Decimal(1_000_000)
+        if self.duration_hours is None:
+            raw_duration = get_manifest_parameter(
+                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
+            )
+            if raw_duration is not None:
+                self.duration_hours = int(raw_duration)
 
     def _resolve_key(self, manifest: dict):
         if self.seller_key_path is None:
@@ -1433,6 +1470,7 @@ def create_server(
             escrow_client.register_key(cfg.server_account, cfg.seller_private_key)
         with contextlib.suppress(Exception):
             from eth_account import Account
+
             derived_addr = Account.from_key(cfg.seller_private_key).address
             escrow_client.register_key(derived_addr, cfg.seller_private_key)
 
@@ -1447,6 +1485,8 @@ def create_server(
         buyer_account=cfg.buyer_account,
         manifest_path=cfg.manifest_path,
         chain_id=chain_id,
+        max_budget_usd=cfg.max_budget_usd,
+        duration_hours=cfg.duration_hours,
     )
 
     def describe(text: str, deal_tool: bool = False) -> str:
