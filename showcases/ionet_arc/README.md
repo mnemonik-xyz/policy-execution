@@ -100,7 +100,7 @@ guardrail sidecar:
    - Supports `stdio` (for Claude Desktop / Cursor / Antigravity) and Streamable HTTP (port 8001).
 3. **Arc `TaskEscrow` Contract**: Holds buyer USDC in escrow until valid terms and deliverable
    settlement are executed.
-4. **Transcription Worker (`worker.py`)**: CUDA/FP16 `faster-whisper` container exposing HTTP
+4. **[Transcription Worker](https://github.com/mnemonik-xyz/transcription)**: CUDA/FP16 `faster-whisper` container exposing HTTP
    endpoints (`/health`, `/job`, `/jobs`) with structured operational logs and GPU telemetry.
 
 ---
@@ -623,7 +623,7 @@ run the scripted test agent:
 
 ## Worker HTTP API and Operational Logs
 
-The Whisper container HTTP service (`worker.py`) exposes the following endpoints:
+The [transcription worker](https://github.com/mnemonik-xyz/transcription) HTTP service exposes the following endpoints:
 
 | Request | Authentication | Result |
 | --- | --- | --- |
@@ -666,9 +666,6 @@ Run test suite:
 
 # TaskEscrow Web3 client unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_escrow -v
-
-# Whisper worker unit tests (queue, model caching, telemetry)
-.venv/bin/python -m unittest showcases.ionet_arc.test_worker -v
 
 # Core io.net CaaS pilot unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_pilot -v

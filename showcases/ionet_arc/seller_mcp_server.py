@@ -60,7 +60,7 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     should_trust_env,
 )
 
-PILOT_IMAGE = "ghcr.io/mnemonik-xyz/warrant-transcription:pilot"
+PILOT_IMAGE = "ghcr.io/mnemonik-xyz/transcription:pilot"
 
 # Mainnet policy (tech-spec Decision 6). Every branch keys on the chain that the RPC reports at construction,
 # never on the manifest alone: a manifest-only guard is bypassable through WARRANT_RPC_URL.

@@ -6,12 +6,8 @@ import json
 import os
 import socket
 import tempfile
-import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -29,7 +25,6 @@ from showcases.ionet_arc.adapter import (
 )
 from showcases.ionet_arc.arc import preflight
 from showcases.ionet_arc.funding import SOLANA, payment_plan
-from showcases.ionet_arc.worker import Worker, handler
 
 ARGS = {
     "billing_model": "duration",
@@ -340,89 +335,6 @@ class ArcAndPaymentTests(unittest.TestCase):
                 read_json('{"invalid": json')
         finally:
             os.unlink(path)
-
-
-class WorkerTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.calls = []
-        self.done = threading.Event()
-
-        def engine(audio, model_dir, language=None):
-            self.calls.append(audio.read_bytes())
-            self.done.set()
-            return {"language": "en", "segments": [{"start": 0, "end": 1, "text": "test fixture"}]}
-
-        self.worker = Worker(self.tmp.name, "test-token-" * 4, engine)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.worker))
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
-
-    def request(self, path, body=None, auth=True, checksum=None, extra_headers=None):
-        headers = {}
-        if auth:
-            headers["Authorization"] = "Bearer " + self.worker.token
-        if body is not None:
-            headers["X-Audio-SHA256"] = checksum or hashlib.sha256(body).hexdigest()
-        if extra_headers:
-            headers.update(extra_headers)
-        request = urllib.request.Request(self.url + path, body, headers)
-        try:
-            response = urllib.request.urlopen(request, timeout=3)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            return response.status, json.load(response)
-
-    def test_language_argument_and_validation(self):
-        code, _err = self.request("/job?language=invalid_lang", b"audio")
-        self.assertEqual(code, 400)
-        code, _err = self.request("/job", b"audio", extra_headers={"X-Language": "invalid_lang"})
-        self.assertEqual(code, 400)
-
-    def test_upload_poll_duplicate_and_persistent_results(self):
-        first_audio = b"fake audio for unit test"
-        code, first = self.request("/job", first_audio)
-        self.assertEqual(code, 202)
-        self.assertTrue(self.done.wait(2))
-        for _ in range(100):
-            code, job = self.request(f"/job/{first['job_id']}")
-            if job["status"] == "complete":
-                break
-            time.sleep(0.01)
-        self.assertEqual(job["status"], "complete")
-        data = json.dumps(job["result"], sort_keys=True, separators=(",", ":")).encode()
-        self.assertEqual(job["result_sha256"], hashlib.sha256(data).hexdigest())
-        self.assertEqual(self.request("/job", first_audio)[0], 200)
-
-        second_audio = b"different audio"
-        code, second = self.request("/job", second_audio)
-        self.assertEqual(code, 202)
-        self.assertNotEqual(first["job_id"], second["job_id"])
-        for _ in range(100):
-            code, second_result = self.request(f"/job/{second['job_id']}")
-            if second_result["status"] == "complete":
-                break
-            time.sleep(0.01)
-        self.assertEqual(second_result["status"], "complete")
-        self.assertEqual(self.request("/job")[0], 404)
-        code, listing = self.request("/jobs")
-        self.assertEqual(code, 200)
-        self.assertEqual({job["job_id"] for job in listing["jobs"]}, {first["job_id"], second["job_id"]})
-        self.assertEqual(len(self.calls), 2)
-        restored = Worker(self.tmp.name, self.worker.token)
-        self.assertEqual(restored.get(first["job_id"])["status"], "complete")
-        self.assertEqual(restored.get(second["job_id"])["status"], "complete")
-
-    def test_auth_hash_and_health(self):
-        self.assertEqual(self.request("/health", auth=False)[0], 200)
-        self.assertEqual(self.request("/job", auth=False)[0], 401)
-        self.assertEqual(self.request("/job", b"audio", auth=False)[0], 401)
-        self.assertEqual(self.request("/job", b"audio", checksum="0" * 64)[0], 400)
-        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
