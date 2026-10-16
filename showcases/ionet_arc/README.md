@@ -291,17 +291,6 @@ The endpoint has no authentication.
 > - Put the endpoint behind a network control (firewall allowlist, VPN or reverse proxy
 >   with auth) if you need any access limit.
 
-The seller puts this label in its `initialize` instructions and at the start of the
-descriptions of `propose_deployment`, `deploy_with_escrow` and `submit_acceptance`:
-
-> after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD
-
-The `initialize` instructions also state these limits:
-
-> Settlement uses a test-double verifier that accepts any digest the seller approves. The 1 USD cap
-> and the one-hour lease are seller policy, not contract rules. One deal at a time. The mainnet
-> seller path has not been exercised with money before this listing.
-
 The seller path on mainnet (funding, acceptance, GPU provisioning, settlement) has not run
 with money. The first buyer is therefore the first test.
 
@@ -316,9 +305,6 @@ Further limits for the buyer:
 - On chain 5042, `deploy_with_escrow`, `get_deployment_status` and `submit_acceptance` need
   the `task_id`. It is the `TaskEscrow` task ID that `propose_deployment` returns: `0x`
   and 64 hex digits.
-- While the seller accepts one deal (up to about 30 seconds), it refuses a second
-  `deploy_with_escrow` with "another deal is being accepted". Try again after the active
-  deal ends. The buyer can still refund an offer that the seller did not accept.
 
 ### Mainnet addresses
 
@@ -562,7 +548,7 @@ On live networks like Arc Testnet, the seller agent signs `TaskEscrow.accept()` 
 `TaskEscrow.settle()` on-chain. Configure the seller private key via any of:
 - File: save to `showcases/ionet_arc/.keys/seller.key` (or reference in `manifest.yaml`
   under `private_key_files.seller_key`)
-- Environment variable: `export WARRANT_SELLER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- Environment variable: `export WARRANT_SELLER_KEY="0x..."`
 - CLI flag: `--private-key 0x...` or `--key-file <path>`
 
 Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`,
@@ -586,7 +572,7 @@ On live networks such as Arc Testnet, the buyer agent signs on-chain transaction
 and `TaskEscrow.offer`) locally. Configure the buyer private key via any of:
 - File: save the key to `showcases/ionet_arc/.keys/buyer.key` (or reference in `manifest.yaml`
   under `private_key_files.buyer_key`)
-- Environment variable: `export WARRANT_BUYER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- Environment variable: `export WARRANT_BUYER_KEY="0x..."`
 - CLI flag: `--private-key 0x...` or `--key-file <path>`
 
 Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`, `--private-key <hex>`,

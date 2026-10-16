@@ -354,11 +354,8 @@ Desktop forwards `host.docker.internal` to the host loopback, so Anvil does not 
 bind Anvil to the bridge address (`anvil --host 172.17.0.1`), not to every interface. Keep the
 scratch manifest and key out of the checkout.
 
-On chain 5042 the server refuses to start, exit code 1, in these cases:
-* `IO_NET_API_KEY` is missing (`IO_NET_API_KEY is required on chain 5042`);
-* `LOCAL_SERVER` is set;
-* the manifest `chain_id` is not 5042;
-* the RPC does not answer.
+The server refuses to start with exit code 1 if the RPC does not answer, or if binding a
+non-loopback host without basic-auth credentials (`MCP_AUTH_USER` and `MCP_AUTH_PASS`).
 
 ### MCP handshake
 
@@ -383,14 +380,8 @@ mcp -o /dev/null -w '%{http_code}\n' -H "mcp-session-id: $SID" -H 'MCP-Protocol-
 # 3. tools/list: 200
 mcp -H "mcp-session-id: $SID" -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-
-# 4. initialize without auth: 401
-curl -s -o /dev/null -w '%{http_code}\n' -H "$H" -H 'Content-Type: application/json' -d "$INIT" "$U"
 ```
 
-On chain 5042 the `initialize` instructions and the `propose_deployment`, `deploy_with_escrow`
-and `submit_acceptance` descriptions start with the label
-"after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD". On other
-chains there is no label. `initialize` and `tools/list` make no io.net call.
+`initialize` and `tools/list` make no io.net call.
 
 The image has a port-only `HEALTHCHECK`. It sends no credential.

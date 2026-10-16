@@ -850,7 +850,7 @@ def main():
     parser.add_argument(
         "--private-key",
         default=None,
-        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY / WARRANT_PRIVATE_KEY)",
+        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY)",
     )
     parser.add_argument(
         "--key-file",

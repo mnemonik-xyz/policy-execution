@@ -1391,7 +1391,7 @@ def main():
         "--private-key",
         dest="seller_private_key",
         default=None,
-        help="Private key for seller account to sign transactions (or set WARRANT_SELLER_KEY / WARRANT_PRIVATE_KEY)",
+        help="Private key for seller account to sign transactions (or set WARRANT_SELLER_KEY)",
     )
     parser.add_argument(
         "--key-file",
