@@ -100,13 +100,17 @@ def write_vendor_credential(directory: Path, escrow, chain_id: int, keys: dict) 
     sig_bytes = sign_vendor_credential(cred_obj, key_path=keys["registry_key"])
     cred_path = directory / "vendor_credential.yaml"
     sig_path = directory / "vendor_signature.yaml"
-    cred_path.write_text(yaml.dump({
-        "scope": {"chain_id": chain_id, "vault": escrow.escrow, "token": escrow.token},
-        "recipient": escrow.server_account,
-        "category": DEFAULT_CATEGORY,
-        "valid_after": cred_obj["valid_after"],
-        "valid_until": cred_obj["valid_until"],
-    }))
+    cred_path.write_text(
+        yaml.dump(
+            {
+                "scope": {"chain_id": chain_id, "vault": escrow.escrow, "token": escrow.token},
+                "recipient": escrow.server_account,
+                "category": DEFAULT_CATEGORY,
+                "valid_after": cred_obj["valid_after"],
+                "valid_until": cred_obj["valid_until"],
+            }
+        )
+    )
     sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
     return cred_path, sig_path
 
@@ -722,6 +726,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         mock_health_resp = MagicMock(status_code=200)
 
         import subprocess as real_subprocess
+
         real_run = real_subprocess.run
 
         def mock_ssh_run(cmd, *args, **kwargs):
@@ -799,6 +804,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         import subprocess as real_subprocess
+
         real_run = real_subprocess.run
 
         def mock_ssh_fail_run(cmd, *args, **kwargs):
@@ -892,22 +898,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.buyer_account, "0x9793Dd93D46F153a2A879165cd163A01b54d8A00")
         self.assertEqual(config.rpc_url, "https://rpc.testnet.arc.io")
 
-    def test_read_initial_parameters_from_custom_manifest_kebab_case(self):
-        import yaml
-
-        custom_manifest = Path(self.state_dir) / "custom_manifest.yaml"
-        custom_manifest.write_text(yaml.dump({
-            "rpc-url": "https://custom.rpc.io",
-            "escrow-address": "0x" + "12" * 20,
-            "verifier-address": "0x" + "34" * 20,
-            "buyer-account": "0x" + "56" * 20,
-        }))
-        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
-        self.assertEqual(config.rpc_url, "https://custom.rpc.io")
-        self.assertEqual(config.escrow_address, "0x" + "12" * 20)
-        self.assertEqual(config.verifier_address, "0x" + "34" * 20)
-        self.assertEqual(config.buyer_account, "0x" + "56" * 20)
-
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
             state_dir=self.state_dir,
@@ -971,7 +961,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "Server payout account is not configured in config/manifest.yaml",
             str(ctx.exception),
         )
-
 
     async def test_registry_key_generated_per_run(self):
         for name in ("registry_key", "acceptance_key"):
@@ -1167,6 +1156,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         mock_run.assert_called_once()
         self.assertEqual(mock_run.call_args.kwargs["log_level"], seller_module.logger.getEffectiveLevel())
 
+
 class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
     """Decision 6: the seller policy on RPC chain 5042."""
 
@@ -1289,6 +1279,24 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(manifest=manifest_path.name), self.assertRaises(MainnetPolicyError) as ctx:
                 self.build(manifest_path=manifest_path)
             self.assertIn("chain_id", str(ctx.exception))
+
+    def test_mainnet_refuses_manifest_without_max_budget_usd(self):
+        no_budget = Path(self.tmp.name) / "no-budget.yaml"
+        manifest_data = yaml.safe_load(self.manifest_path.read_text())
+        manifest_data.pop("max_budget_usd", None)
+        no_budget.write_text(yaml.dump(manifest_data))
+        with self.assertRaises(MainnetPolicyError) as ctx:
+            self.build(manifest_path=no_budget)
+        self.assertIn("max_budget_usd is required", str(ctx.exception))
+
+    def test_mainnet_refuses_manifest_without_duration_hours(self):
+        no_duration = Path(self.tmp.name) / "no-duration.yaml"
+        manifest_data = yaml.safe_load(self.manifest_path.read_text())
+        manifest_data.pop("duration_hours", None)
+        no_duration.write_text(yaml.dump(manifest_data))
+        with self.assertRaises(MainnetPolicyError) as ctx:
+            self.build(manifest_path=no_duration)
+        self.assertIn("duration_hours is required", str(ctx.exception))
 
     def test_start_refused_when_rpc_chain_unreadable(self):
         self.mock_escrow.rpc.chain_id.side_effect = RuntimeError("connection refused")
@@ -1723,6 +1731,49 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("limits", str(ctx.exception))
         self.mock_escrow.accept.assert_not_called()
 
+    async def test_mainnet_check_terms_fails_when_service_limits_unconfigured(self):
+        service = self.service_of(self.mcp)
+        proposal = {
+            "chain_id": 5042,
+            "duration_hours": 1,
+            "amount": 1_000_000,
+        }
+        orig_budget = service.max_budget_usd
+        orig_duration = service.duration_hours
+        try:
+            service.max_budget_usd = None
+            with self.assertRaises(ToolError) as ctx:
+                service._check_mainnet_terms(proposal)
+            self.assertIn("max_budget_usd is not configured in config/manifest.yaml", str(ctx.exception))
+
+            service.max_budget_usd = orig_budget
+            service.duration_hours = None
+            with self.assertRaises(ToolError) as ctx:
+                service._check_mainnet_terms(proposal)
+            self.assertIn("duration_hours is not configured in config/manifest.yaml", str(ctx.exception))
+        finally:
+            service.max_budget_usd = orig_budget
+            service.duration_hours = orig_duration
+
+    async def test_mainnet_propose_fails_when_service_limits_unconfigured(self):
+        service = self.service_of(self.mcp)
+        orig_budget = service.max_budget_usd
+        orig_duration = service.duration_hours
+        try:
+            service.max_budget_usd = None
+            with self.assertRaises(ToolError) as ctx:
+                await service.propose_deployment()
+            self.assertIn("max_budget_usd is not configured in config/manifest.yaml", str(ctx.exception))
+
+            service.max_budget_usd = orig_budget
+            service.duration_hours = None
+            with self.assertRaises(ToolError) as ctx:
+                await service.propose_deployment()
+            self.assertIn("duration_hours is not configured in config/manifest.yaml", str(ctx.exception))
+        finally:
+            service.max_budget_usd = orig_budget
+            service.duration_hours = orig_duration
+
     async def test_mainnet_doubtful_session_files_block(self):
         future = int(time.time()) + 600
         cases = {
@@ -1771,9 +1822,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             "valid_until": buyer_policy["valid_until"],
         }
         sig = sign_acceptance(acceptance, key_path=self.keys["acceptance_key"])
-        settled = await self.call(
-            "submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig}
-        )
+        settled = await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
         self.assertEqual(settled["status"], "settled")
         self.mock_escrow.settle_mock.assert_called_once()
 

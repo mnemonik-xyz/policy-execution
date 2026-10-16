@@ -249,39 +249,24 @@ class SellerWarrantService:
         if max_budget_usd is not None:
             self.max_budget_usd = Decimal(str(max_budget_usd))
         else:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
-            if raw_budget is not None:
-                self.max_budget_usd = Decimal(str(raw_budget))
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                if raw_amount is not None:
-                    self.max_budget_usd = Decimal(str(raw_amount)) / Decimal(1_000_000)
-                elif self.mainnet:
-                    self.max_budget_usd = Decimal("1.00")
-                else:
-                    self.max_budget_usd = Decimal("2.00")
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
+            self.max_budget_usd = Decimal(str(raw_budget)) if raw_budget is not None else None
 
         if duration_hours is not None:
             self.duration_hours = int(duration_hours)
         else:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
-            self.duration_hours = int(raw_duration) if raw_duration is not None else 1
+            raw_duration = get_manifest_parameter(manifest, "duration_hours")
+            self.duration_hours = int(raw_duration) if raw_duration is not None else None
 
-        self.buyer_account = buyer_account or get_manifest_parameter(
-            manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
-        )
+        self.buyer_account = buyer_account or get_manifest_parameter(manifest, "buyer_address")
         if not self.escrow_client.escrow:
-            self.escrow_client.escrow = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+            self.escrow_client.escrow = get_manifest_parameter(manifest, "escrow_address")
         if not self.escrow_client.token:
-            self.escrow_client.token = get_manifest_parameter(manifest, "token_address", "token-address")
+            self.escrow_client.token = get_manifest_parameter(manifest, "token_address")
         if not self.escrow_client.verifier:
-            self.escrow_client.verifier = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+            self.escrow_client.verifier = get_manifest_parameter(manifest, "verifier_address")
         if not self.escrow_client.server_account:
-            self.escrow_client.server_account = get_manifest_parameter(
-                manifest, "seller_address", "seller-address", "server_account", "server-account"
-            )
+            self.escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
 
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
@@ -350,9 +335,7 @@ class SellerWarrantService:
             manifest = load_manifest(self.manifest_path)
             manifest_chain = manifest.get("chain_id")
             if manifest_chain is None or manifest_chain == chain_id:
-                escrow_client.server_account = get_manifest_parameter(
-                    manifest, "seller_address", "seller-address", "server_account", "server-account"
-                )
+                escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
 
         if not escrow_client.server_account:
             raise ToolError("Server payout account is not configured in config/manifest.yaml.")
@@ -365,15 +348,9 @@ class SellerWarrantService:
             manifest = load_manifest(self.manifest_path)
             manifest_chain = manifest.get("chain_id")
             if manifest_chain is None or manifest_chain == chain_id:
-                escrow_client.escrow = escrow_client.escrow or get_manifest_parameter(
-                    manifest, "escrow_address", "escrow-address"
-                )
-                escrow_client.token = escrow_client.token or get_manifest_parameter(
-                    manifest, "token_address", "token-address"
-                )
-                escrow_client.verifier = escrow_client.verifier or get_manifest_parameter(
-                    manifest, "verifier_address", "verifier-address"
-                )
+                escrow_client.escrow = escrow_client.escrow or get_manifest_parameter(manifest, "escrow_address")
+                escrow_client.token = escrow_client.token or get_manifest_parameter(manifest, "token_address")
+                escrow_client.verifier = escrow_client.verifier or get_manifest_parameter(manifest, "verifier_address")
 
         if not escrow_client.escrow:
             raise ToolError(
@@ -399,6 +376,8 @@ class SellerWarrantService:
 
     def _mainnet_budget_cap(self, budget_cap_usd: str | float | None) -> Decimal:
         """The effective cap on chain 5042: the caller's cap if lower, never above manifest max_budget_usd."""
+        if self.max_budget_usd is None:
+            raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
         if budget_cap_usd is None:
             return self.max_budget_usd
         try:
@@ -451,12 +430,16 @@ class SellerWarrantService:
             mainnet_cap = None
             if self.mainnet:
                 # Checked before the hardware call and the credit call.
+                if self.duration_hours is None:
+                    raise ToolError("duration_hours is not configured in config/manifest.yaml.")
                 if type(duration_hours) is not int or duration_hours != self.duration_hours:
                     hour_label = "hour" if self.duration_hours == 1 else "hours"
                     raise ToolError(
                         f"duration_hours must be {self.duration_hours} {hour_label} on chain {MAINNET_CHAIN_ID}, "
                         f"got {duration_hours}"
                     )
+                if self.max_budget_usd is None:
+                    raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
                 mainnet_cap = self._mainnet_budget_cap(budget_cap_usd)
 
             if duration_hours <= 0:
@@ -804,6 +787,10 @@ class SellerWarrantService:
 
     def _check_mainnet_terms(self, proposal: dict):
         """Refuse a stored proposal whose terms break the chain 5042 limits (for example one from another run)."""
+        if self.max_budget_usd is None:
+            raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
+        if self.duration_hours is None:
+            raise ToolError("duration_hours is not configured in config/manifest.yaml.")
         amount = proposal.get("amount")
         max_amount = int(self.max_budget_usd * 1_000_000)
         hour_label = "hour" if self.duration_hours == 1 else "hours"
@@ -1298,33 +1285,23 @@ class ServerConfig:
 
     def _resolve_parameters(self, manifest: dict):
         if self.rpc_url is None:
-            self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+            self.rpc_url = get_manifest_parameter(manifest, "rpc_url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
-            self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+            self.escrow_address = get_manifest_parameter(manifest, "escrow_address")
         if self.verifier_address is None:
-            self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+            self.verifier_address = get_manifest_parameter(manifest, "verifier_address")
         if self.buyer_account is None:
-            self.buyer_account = get_manifest_parameter(
-                manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
-            )
+            self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
         if self.token_address is None:
-            self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
+            self.token_address = get_manifest_parameter(manifest, "token_address")
         if self.server_account is None:
-            self.server_account = get_manifest_parameter(
-                manifest, "seller_address", "seller-address", "server_account", "server-account"
-            )
+            self.server_account = get_manifest_parameter(manifest, "seller_address")
         if self.max_budget_usd is None:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
             if raw_budget is not None:
                 self.max_budget_usd = Decimal(str(raw_budget))
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                if raw_amount is not None:
-                    self.max_budget_usd = Decimal(str(raw_amount)) / Decimal(1_000_000)
         if self.duration_hours is None:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
+            raw_duration = get_manifest_parameter(manifest, "duration_hours")
             if raw_duration is not None:
                 self.duration_hours = int(raw_duration)
 
@@ -1404,6 +1381,10 @@ def enforce_mainnet_start_policy(cfg: ServerConfig, chain_id: int, has_ionet_key
             f"manifest chain_id {raw_chain!r} does not match the RPC chain {chain_id} "
             f"(manifest: {cfg.manifest_path or DEFAULT_MANIFEST_PATH})"
         )
+    if cfg.max_budget_usd is None:
+        raise MainnetPolicyError(f"max_budget_usd is required in {cfg.manifest_path or DEFAULT_MANIFEST_PATH}")
+    if cfg.duration_hours is None:
+        raise MainnetPolicyError(f"duration_hours is required in {cfg.manifest_path or DEFAULT_MANIFEST_PATH}")
 
 
 def missing_auth_variables(cfg: ServerConfig) -> list[str]:

@@ -363,21 +363,31 @@ class EscrowClientTests(unittest.TestCase):
             man_path = tmp / "manifest.yaml"
             tpl_path = tmp / "template.yaml"
 
-            man_path.write_text(yaml.dump({
-                "chain_id": 31337,
-                "escrow_address": "0x" + "11" * 20,
-                "token_address": "0x" + "22" * 20,
-                "category": 42,
-                "max_amount": 1_000_000,
-                "public_keys": {
-                    "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
-                    "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
-                },
-            }))
-            tpl_path.write_text(yaml.dump({
-                "version": 1,
-                "rule": {"all": ["accepted"]},
-            }))
+            reg_key = "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5"
+            acc_key = "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57"
+            man_path.write_text(
+                yaml.dump(
+                    {
+                        "chain_id": 31337,
+                        "escrow_address": "0x" + "11" * 20,
+                        "token_address": "0x" + "22" * 20,
+                        "category": 42,
+                        "max_budget_usd": 1.00,
+                        "public_keys": {
+                            "registry_key": reg_key,
+                            "buyer_acceptance_key": acc_key,
+                        },
+                    }
+                )
+            )
+            tpl_path.write_text(
+                yaml.dump(
+                    {
+                        "version": 1,
+                        "rule": {"all": ["accepted"]},
+                    }
+                )
+            )
 
             # Notice: no private keys exist in tmp_dir!
             policy, pol_hash = compile_buyer_policy(
@@ -406,24 +416,36 @@ class EscrowClientTests(unittest.TestCase):
             tpl_path = tmp / "template.yaml"
             pub_path = tmp / "public_keys.yaml"
 
-            man_path.write_text(yaml.dump({
-                "chain_id": 31337,
-                "escrow_address": "0x" + "11" * 20,
-                "token_address": "0x" + "22" * 20,
-                "category": 42,
-                "max_amount": 1_000_000,
-                "public_files": {
-                    "public_keys": str(pub_path),
-                },
-            }))
-            pub_path.write_text(yaml.dump({
-                "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
-                "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
-            }))
-            tpl_path.write_text(yaml.dump({
-                "version": 1,
-                "rule": {"all": ["accepted"]},
-            }))
+            man_path.write_text(
+                yaml.dump(
+                    {
+                        "chain_id": 31337,
+                        "escrow_address": "0x" + "11" * 20,
+                        "token_address": "0x" + "22" * 20,
+                        "category": 42,
+                        "max_budget_usd": 1.00,
+                        "public_files": {
+                            "public_keys": str(pub_path),
+                        },
+                    }
+                )
+            )
+            pub_path.write_text(
+                yaml.dump(
+                    {
+                        "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
+                        "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
+                    }
+                )
+            )
+            tpl_path.write_text(
+                yaml.dump(
+                    {
+                        "version": 1,
+                        "rule": {"all": ["accepted"]},
+                    }
+                )
+            )
 
             policy, pol_hash = compile_buyer_policy(
                 template_path=tpl_path,
@@ -450,17 +472,23 @@ class EscrowClientTests(unittest.TestCase):
             man_path = tmp / "manifest.yaml"
             tpl_path = tmp / "template.yaml"
 
-            man_path.write_text(yaml.dump({
-                "chain_id": 31337,
-                "escrow_address": "0x" + "11" * 20,
-                "token_address": "0x" + "22" * 20,
-                "category": 42,
-                "max_budget_usd": 2.50,
-                "public_keys": {
-                    "registry_key": "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5",
-                    "buyer_acceptance_key": "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57",
-                },
-            }))
+            reg_key = "0x03292900f425be9a0ef0c3f74f22792243f047a7cb4b7fc864fb5b98c21b519ae5"
+            acc_key = "0x02933a9f1f375230c8721c5840697173ac2eadeae7c77a651a6bcfcb7656ff6d57"
+            man_path.write_text(
+                yaml.dump(
+                    {
+                        "chain_id": 31337,
+                        "escrow_address": "0x" + "11" * 20,
+                        "token_address": "0x" + "22" * 20,
+                        "category": 42,
+                        "max_budget_usd": 2.50,
+                        "public_keys": {
+                            "registry_key": reg_key,
+                            "buyer_acceptance_key": acc_key,
+                        },
+                    }
+                )
+            )
             tpl_path.write_text(yaml.dump({"version": 1}))
 
             policy, _ = compile_buyer_policy(
@@ -480,12 +508,17 @@ class EscrowClientTests(unittest.TestCase):
             man_path = tmp / "manifest.yaml"
             tpl_path = tmp / "template.yaml"
 
-            man_path.write_text(yaml.dump({
-                "chain_id": 31337,
-                "escrow_address": "0x" + "11" * 20,
-                "token_address": "0x" + "22" * 20,
-                # No public_keys or private_keys
-            }))
+            man_path.write_text(
+                yaml.dump(
+                    {
+                        "chain_id": 31337,
+                        "escrow_address": "0x" + "11" * 20,
+                        "token_address": "0x" + "22" * 20,
+                        "max_budget_usd": 2.00,
+                        # No public_keys or private_keys
+                    }
+                )
+            )
             tpl_path.write_text(yaml.dump({"version": 1}))
 
             with self.assertRaises(FileNotFoundError) as ctx:
@@ -495,8 +528,38 @@ class EscrowClientTests(unittest.TestCase):
                 )
             self.assertIn("registry_key' missing", str(ctx.exception))
 
+    def test_compile_buyer_policy_fails_when_budget_missing(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            man_path = tmp / "manifest.yaml"
+            tpl_path = tmp / "template.yaml"
+
+            man_path.write_text(
+                yaml.dump(
+                    {
+                        "chain_id": 31337,
+                        "escrow_address": "0x" + "11" * 20,
+                        "token_address": "0x" + "22" * 20,
+                    }
+                )
+            )
+            tpl_path.write_text(yaml.dump({"version": 1}))
+
+            with self.assertRaises(ValueError) as ctx:
+                compile_buyer_policy(
+                    template_path=tpl_path,
+                    manifest_path=man_path,
+                )
+            self.assertIn("max_budget_usd must be specified", str(ctx.exception))
+
     def test_ensure_policy_hash_fails_loudly_on_missing_config(self):
         from pathlib import Path
+
         with self.assertRaises(FileNotFoundError):
             ensure_policy_hash(
                 escrow_address="0x" + "11" * 20,

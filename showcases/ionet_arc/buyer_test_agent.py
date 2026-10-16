@@ -117,8 +117,8 @@ def _resolve_agent_wallets(rpc_url: str, manifest_path: Path | None = None) -> t
         Path(os.environ["WARRANT_MANIFEST"]) if "WARRANT_MANIFEST" in os.environ else DEFAULT_MANIFEST_PATH
     )
     manifest = load_manifest(m_path)
-    customer = get_manifest_parameter(manifest, "buyer_address", "buyer-address", "buyer_account", "buyer-account")
-    agent = get_manifest_parameter(manifest, "seller_address", "seller-address", "server_account", "server-account")
+    customer = get_manifest_parameter(manifest, "buyer_address")
+    agent = get_manifest_parameter(manifest, "seller_address")
 
     if not customer or not agent:
         try:
@@ -206,12 +206,10 @@ async def run_client(
 ):
     if max_budget_usdc is None:
         m = load_manifest(manifest_path or DEFAULT_MANIFEST_PATH)
-        raw_budget = get_manifest_parameter(m, "max_budget_usd", "max-budget-usd")
-        if raw_budget is not None:
-            max_budget_usdc = float(raw_budget)
-        else:
-            raw_amount = get_manifest_parameter(m, "max_amount", "max-amount")
-            max_budget_usdc = float(raw_amount) / 1_000_000 if raw_amount is not None else 1.00
+        raw_budget = get_manifest_parameter(m, "max_budget_usd")
+        if raw_budget is None:
+            sys.exit(f"max_budget_usd is not configured in {manifest_path or DEFAULT_MANIFEST_PATH}")
+        max_budget_usdc = float(raw_budget)
 
     print("=" * 70)
     print("  WARRANT AUTONOMOUS BUYER AGENT")
@@ -381,7 +379,7 @@ def main():
     rpc_url = args.rpc_url
     if not rpc_url:
         manifest = load_manifest(args.manifest_path or DEFAULT_MANIFEST_PATH)
-        rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+        rpc_url = get_manifest_parameter(manifest, "rpc_url") or "http://127.0.0.1:8545"
 
     asyncio.run(
         run_client(

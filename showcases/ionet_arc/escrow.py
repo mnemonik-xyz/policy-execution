@@ -82,13 +82,10 @@ def load_manifest(manifest_path: Path | str | None = None) -> dict:
 
 
 def get_manifest_parameter(manifest: dict, *keys: str):
-    """Retrieve first matching parameter from manifest supporting snake_case and kebab-case."""
+    """Retrieve first matching parameter from manifest."""
     for k in keys:
         if k in manifest and manifest[k] is not None:
             return manifest[k]
-        k_alt = k.replace("_", "-") if "_" in k else k.replace("-", "_")
-        if k_alt in manifest and manifest[k_alt] is not None:
-            return manifest[k_alt]
     return None
 
 
@@ -345,9 +342,7 @@ def _resolve_authority_public_key(
         if pub_path.exists():
             return parse_public_key(pub_path.read_text().strip())
 
-    raise FileNotFoundError(
-        f"Authority public key '{key_name}' missing: not provided in arguments or public_keys.yaml"
-    )
+    raise FileNotFoundError(f"Authority public key '{key_name}' missing: not provided in arguments or public_keys.yaml")
 
 
 def compile_buyer_policy(
@@ -370,23 +365,20 @@ def compile_buyer_policy(
     template = yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
 
     chain_id = chain_id or manifest.get("chain_id", DEFAULT_CHAIN_ID)
-    escrow_address = escrow_address or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
-    token_address = token_address or get_manifest_parameter(manifest, "token_address", "token-address")
+    escrow_address = escrow_address or get_manifest_parameter(manifest, "escrow_address")
+    token_address = token_address or get_manifest_parameter(manifest, "token_address")
     if max_amount is None:
-        raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+        raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
         if raw_budget is not None:
             max_amount = int(Decimal(str(raw_budget)) * Decimal(1_000_000))
         else:
-            raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-            max_amount = int(raw_amount) if raw_amount is not None else 2_000_000
+            raise ValueError("max_budget_usd must be specified")
     validity_seconds = int(manifest.get("validity_seconds", validity_seconds))
 
     if not escrow_address or not token_address:
         raise ValueError("escrow_address and token_address must be specified")
 
-    reg_pub = _resolve_authority_public_key(
-        registry_public_key, "registry_key", manifest, manifest_path=manifest_path
-    )
+    reg_pub = _resolve_authority_public_key(registry_public_key, "registry_key", manifest, manifest_path=manifest_path)
     acc_pub = _resolve_authority_public_key(
         acceptance_public_key, "buyer_acceptance_key", manifest, manifest_path=manifest_path
     )
@@ -962,4 +954,3 @@ def ensure_policy_hash(
         max_amount=max_amount,
     )
     return pol_hash
-

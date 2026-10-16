@@ -91,28 +91,18 @@ class BuyerWarrantService:
         if max_duration_hours is not None:
             self.max_duration_hours = int(max_duration_hours)
         else:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
-            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+            raw_duration = get_manifest_parameter(manifest, "duration_hours")
+            self.max_duration_hours = int(raw_duration) if raw_duration is not None else None
 
         if max_budget_usd is not None:
             self.max_budget_usd = float(max_budget_usd)
         else:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
-            if raw_budget is not None:
-                self.max_budget_usd = float(raw_budget)
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
-        self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
-        self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address", "token-address")
-        self.buyer_account = buyer_account or get_manifest_parameter(
-            manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
-        )
-        self.verifier_address = verifier_address or get_manifest_parameter(
-            manifest, "verifier_address", "verifier-address"
-        )
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
+            self.max_budget_usd = float(raw_budget) if raw_budget is not None else None
+        self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address")
+        self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address")
+        self.buyer_account = buyer_account or get_manifest_parameter(manifest, "buyer_address")
+        self.verifier_address = verifier_address or get_manifest_parameter(manifest, "verifier_address")
 
         if not self.escrow_client.escrow and self.pinned_escrow:
             self.escrow_client.escrow = self.pinned_escrow
@@ -163,6 +153,10 @@ class BuyerWarrantService:
         token_addr: str,
         chain_id: int,
     ):
+        if self.max_budget_usd is None:
+            logger.warning("Policy rejection: max_budget_usd is not configured in config/manifest.yaml")
+            raise ToolError("Policy rejection: max_budget_usd is not configured in config/manifest.yaml")
+
         if cost_usd > self.max_budget_usd:
             logger.warning(
                 "Policy rejection: proposed cost $%.4f exceeds max budget cap $%.4f",
@@ -195,6 +189,9 @@ class BuyerWarrantService:
         if duration_hours is None or duration_hours <= 0:
             logger.warning("Policy rejection: duration_hours is required and must be at least 1")
             raise ToolError("Policy rejection: duration_hours is required and must be at least 1")
+        if self.max_duration_hours is None:
+            logger.warning("Policy rejection: duration_hours is not configured in config/manifest.yaml")
+            raise ToolError("Policy rejection: duration_hours is not configured in config/manifest.yaml")
         if duration_hours > self.max_duration_hours:
             logger.warning(
                 "Policy rejection: proposed duration %dh exceeds max duration %dh",
@@ -341,7 +338,7 @@ class BuyerWarrantService:
         escrow_address: str | None = None,
         token_address: str | None = None,
         category: int = DEFAULT_CATEGORY,
-        duration_hours: int | None = 1,
+        duration_hours: int | None = None,
         policy_version: int = 1,
         chain_id: int | None = None,
     ) -> dict:
@@ -353,7 +350,7 @@ class BuyerWarrantService:
         effective_salt = salt or prop.get("salt")
         effective_recipient = recipient or prop.get("recipient")
         effective_category = prop.get("category", category) if category == DEFAULT_CATEGORY else category
-        effective_duration = prop.get("duration_hours", duration_hours) if duration_hours == 1 else duration_hours
+        effective_duration = prop.get("duration_hours") if "duration_hours" in prop else duration_hours
 
         logger.info(
             "Tool called: warrant_evaluate_and_offer with task_id=%s, amount=%s, amount_usd=%s, "
@@ -668,29 +665,23 @@ class ServerConfig:
 
     def _resolve_parameters(self, manifest: dict):
         if self.rpc_url is None:
-            self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+            self.rpc_url = get_manifest_parameter(manifest, "rpc_url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
-            self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+            self.escrow_address = get_manifest_parameter(manifest, "escrow_address")
         if self.buyer_account is None:
-            self.buyer_account = get_manifest_parameter(
-                manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
-            )
+            self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
         if self.verifier_address is None:
-            self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+            self.verifier_address = get_manifest_parameter(manifest, "verifier_address")
         if self.token_address is None:
-            self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
+            self.token_address = get_manifest_parameter(manifest, "token_address")
         if self.max_budget_usd is None:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
             if raw_budget is not None:
                 self.max_budget_usd = float(raw_budget)
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
         if self.max_duration_hours is None:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
-            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+            raw_duration = get_manifest_parameter(manifest, "duration_hours")
+            if raw_duration is not None:
+                self.max_duration_hours = int(raw_duration)
 
     def _resolve_key(self, manifest: dict):
         if self.buyer_key_path is None:
@@ -756,6 +747,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
             escrow_client.register_key(cfg.buyer_account, cfg.buyer_private_key)
         with contextlib.suppress(Exception):
             from eth_account import Account
+
             derived_addr = Account.from_key(cfg.buyer_private_key).address
             escrow_client.register_key(derived_addr, cfg.buyer_private_key)
 
