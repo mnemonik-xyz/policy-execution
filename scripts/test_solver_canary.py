@@ -674,6 +674,7 @@ class EnvTests(unittest.TestCase):
         for child in run.call_args_list:
             self.assertNotIn("ETH_PASSWORD", child.kwargs["env"])
             self.assertEqual(child.kwargs["env"]["ETH_RPC_URL"], "https://rpc.example/KEY")
+            self.assertEqual(child.kwargs["env"]["FOUNDRY_ETH_RPC_URL"], "https://rpc.example/KEY")
 
     def test_eth_password_path_is_redacted_from_errors(self):
         rpc = "https://rpc.example/KEY123"
