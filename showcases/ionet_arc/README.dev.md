@@ -327,7 +327,6 @@ Nothing else is written at runtime, so the root filesystem can be read-only.
 
 | Variable | Notes |
 | --- | --- |
-| `MCP_AUTH_USER`, `MCP_AUTH_PASS` | HTTP basic auth for `/mcp`. Secret; env file only. |
 | `WARRANT_MANIFEST` | Manifest path, for example `showcases/ionet_arc/config/manifest.yaml`. |
 | `WARRANT_RPC_URL` | Optional; overrides the manifest `rpc_url`. The RPC must answer at start. |
 | `IO_NET_API_KEY` | Required on chain 5042. Secret; env file only. |
@@ -359,28 +358,18 @@ On chain 5042 the server refuses to start, exit code 1, in these cases:
 * `IO_NET_API_KEY` is missing (`IO_NET_API_KEY is required on chain 5042`);
 * `LOCAL_SERVER` is set;
 * the manifest `chain_id` is not 5042;
-* the RPC does not answer;
-* `MCP_AUTH_USER` or `MCP_AUTH_PASS` is missing, empty or blank
-  (`MCP_AUTH_PASS is required on chain 5042`).
-
-On any other chain, the server refuses to start without both auth variables when `HOST` is not a
-loopback address (`... required when binding the non-loopback host '0.0.0.0'`). The image sets
-`HOST=0.0.0.0`, so the container always needs both variables.
+* the RPC does not answer.
 
 ### MCP handshake
 
 The endpoint is `/mcp`. Responses are server-sent events: the JSON is on the `data:` line.
-
-The credential never goes on the command line. `printf` is a shell builtin, and curl reads the
-`user` line from a config on stdin (`-K -`). A password must not contain `"` or `\`.
 
 ```sh
 U=http://127.0.0.1:8000/mcp
 H='Accept: application/json, text/event-stream'
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
 mcp() {
-  printf 'user = "%s:%s"\n' "$MCP_AUTH_USER" "$MCP_AUTH_PASS" |
-    curl -s -K - -H "$H" -H 'Content-Type: application/json' "$@" "$U"
+  curl -s -H "$H" -H 'Content-Type: application/json' "$@" "$U"
 }
 
 # 1. initialize: 200 and an mcp-session-id header

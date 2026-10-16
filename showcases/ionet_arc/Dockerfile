@@ -21,7 +21,7 @@
 # mainnet rebuild: docker buildx imagetools inspect <tag> --format '{{json .Manifest.Digest}}'
 # and replace the digest after the tag in each FROM line (and in the syntax line).
 #
-# Secrets (IO_NET_API_KEY, MCP_AUTH_PASS, the seller key) are runtime-only:
+# Secrets (IO_NET_API_KEY, the seller key) are runtime-only:
 # env file and read-only mount. Never pass them as build arguments.
 
 ARG BIN_SOURCE=build
@@ -122,7 +122,7 @@ USER 10001:10001
 WORKDIR /app
 EXPOSE 8000
 
-# Port-only probe: /mcp needs basic auth, and no credential belongs in the image.
+# Port-only probe: no credential belongs in the image.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python3", "-c", "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ.get('PORT', '8000'))), 3).close()"]
 

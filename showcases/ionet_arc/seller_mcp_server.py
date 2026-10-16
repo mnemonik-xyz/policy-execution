@@ -3,10 +3,8 @@
 import argparse
 import asyncio
 import atexit
-import base64
 import contextlib
 import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -36,7 +34,6 @@ import uvicorn  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
-from starlette.responses import Response  # noqa: E402
 
 from showcases.ionet_arc.adapter import (  # noqa: E402
     PilotError,
@@ -68,34 +65,8 @@ class StartRefusedError(RuntimeError):
     """The server must not start: the configuration would run it unsafely."""
 
 
-class MainnetPolicyError(StartRefusedError):
-    """Backwards compatibility alias for start refusal errors."""
-
-
 class ChainDetectionError(StartRefusedError):
     """The server must not start: the RPC chain is unknown."""
-
-
-class BasicAuthMiddleware:
-    """Lightweight ASGI middleware enforcing HTTP Basic Authentication."""
-
-    def __init__(self, app, username: str, password: str):
-        self.app = app
-        self.expected_auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            auth_val = headers.get(b"authorization", b"").decode("latin-1")
-            if not secrets.compare_digest(auth_val, self.expected_auth):
-                response = Response(
-                    "Unauthorized",
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Basic realm="MCP"'},
-                )
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
 
 
 def unwrap_error(exc: Exception) -> Exception | None:
@@ -732,9 +703,6 @@ class SellerWarrantService:
                 f"(at most ${self.max_budget_usd:.2f}); the offer is not accepted."
             )
 
-    # Backwards compatibility alias
-    _check_mainnet_terms = _check_proposal_terms
-
     async def _commit_deal(self, task_id: str, policy: dict | None) -> tuple[dict, dict]:
         """Verify the offer, accept it on-chain and save the provisioning session."""
         prop_path = self.proposals_dir / f"{task_id}.json"
@@ -1157,8 +1125,6 @@ class ServerConfig:
     state_dir: pathlib.Path = pathlib.Path("artifacts/state")
     host: str = "localhost"
     port: int = 8000
-    auth_user: str | None = None
-    auth_pass: str | None = None
     rpc_url: str | None = None
     escrow_address: str | None = None
     token_address: str | None = None
@@ -1265,46 +1231,11 @@ def detect_rpc_chain(escrow_client: EscrowClient) -> int:
         ) from None
 
 
-def missing_auth_variables(cfg: ServerConfig) -> list[str]:
-    """Names of the basic-auth settings that are unset, empty or whitespace only."""
-    values = {"MCP_AUTH_USER": cfg.auth_user, "MCP_AUTH_PASS": cfg.auth_pass}
-    return [name for name, value in values.items() if not (value and value.strip())]
-
-
-def is_loopback_host(host: str | None) -> bool:
-    """True only for localhost and loopback IP literals; any other name fails closed."""
-    name = (host or "").strip().lower()
-    if name == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(name.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
-def enforce_http_auth_policy(cfg: ServerConfig, chain_id: int):
-    """Refuse to serve /mcp without basic auth on a non-loopback address on any chain."""
-    missing = missing_auth_variables(cfg)
-    if not missing:
-        return
-    names = " and ".join(missing)
-    verb = "is" if len(missing) == 1 else "are"
-    if not is_loopback_host(cfg.host):
-        raise StartRefusedError(f"{names} {verb} required when binding the non-loopback host {cfg.host!r}")
-    if len(missing) == 1:
-        logger.warning("seller-mcp-server: warning: %s is not set, so basic auth is off", names)
-
-
 def create_server(
     config: ServerConfig | pathlib.Path | str | None = None,
-    *,
-    serve_http: bool = False,
     **kwargs,
 ) -> MCPServer:
-    """Create and configure the Seller Warrant MCP server.
-
-    serve_http=True (create_app) also applies the HTTP basic-auth start policy once the chain is known.
-    """
+    """Create and configure the Seller Warrant MCP server."""
     cfg = _normalize_config(config, **kwargs)
 
     escrow_client = cfg.escrow_client or EscrowClient(
@@ -1315,8 +1246,6 @@ def create_server(
         server_account=cfg.server_account,
     )
     chain_id = detect_rpc_chain(escrow_client)
-    if serve_http:
-        enforce_http_auth_policy(cfg, chain_id)
     server = MCPServer("seller-mcp-server")
     if cfg.seller_private_key:
         if cfg.server_account:
@@ -1392,16 +1321,11 @@ def create_app(
     config: ServerConfig | pathlib.Path | str | None = None,
     **kwargs,
 ):
-    """Build ASGI app with streamable HTTP transport and basic auth."""
+    """Build ASGI app with streamable HTTP transport."""
     cfg = _normalize_config(config, **kwargs)
-    server = create_server(cfg, serve_http=True)
+    server = create_server(cfg)
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    app = server.streamable_http_app(transport_security=sec)
-
-    if not missing_auth_variables(cfg):
-        logger.info("HTTP Basic Auth enabled for user '%s'", cfg.auth_user)
-        app = BasicAuthMiddleware(app, cfg.auth_user, cfg.auth_pass)
-    return app
+    return server.streamable_http_app(transport_security=sec)
 
 
 def run_server(
@@ -1432,16 +1356,6 @@ def main():
         type=pathlib.Path,
         default=pathlib.Path(os.environ.get("IONET_STATE_DIR", "artifacts/state")),
         help="Directory to persist state journals (default: artifacts/state)",
-    )
-    parser.add_argument(
-        "--auth-user",
-        default=os.environ.get("MCP_AUTH_USER"),
-        help="HTTP Basic Auth username (or set MCP_AUTH_USER)",
-    )
-    parser.add_argument(
-        "--auth-pass",
-        default=os.environ.get("MCP_AUTH_PASS"),
-        help="HTTP Basic Auth password (or set MCP_AUTH_PASS)",
     )
     parser.add_argument(
         "--rpc-url",

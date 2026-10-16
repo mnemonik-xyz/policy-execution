@@ -14,7 +14,6 @@ Demonstrates the capability-based two-step escrow lifecycle:
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -198,8 +197,6 @@ async def _sign_acceptance(
 async def run_client(
     mcp_url: str,
     rpc_url: str,
-    auth_user: str | None = None,
-    auth_pass: str | None = None,
     max_budget_usdc: float | None = None,
     buyer_mcp_url: str | None = None,
     manifest_path: Path | None = None,
@@ -220,12 +217,7 @@ async def run_client(
     print(f"Customer wallet: {customer}")
     print(f"Agent wallet:    {agent}")
 
-    headers = {}
-    if auth_user and auth_pass:
-        creds = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode("ascii")
-        headers["Authorization"] = f"Basic {creds}"
-
-    async with httpx2.AsyncClient(headers=headers, timeout=60, trust_env=should_trust_env(mcp_url)) as http_client:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(mcp_url)) as http_client:
         async with streamable_http_client(mcp_url, http_client=http_client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=60) as session:
                 await session.initialize()
@@ -354,8 +346,6 @@ def main():
         default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
         help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
     )
-    parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
-    parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
     parser.add_argument(
         "--max-budget",
         type=float,
@@ -385,8 +375,6 @@ def main():
         run_client(
             mcp_url=args.mcp_url,
             rpc_url=rpc_url,
-            auth_user=args.auth_user,
-            auth_pass=args.auth_pass,
             max_budget_usdc=args.max_budget,
             buyer_mcp_url=args.buyer_mcp_url,
             manifest_path=args.manifest_path,
