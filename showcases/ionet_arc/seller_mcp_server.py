@@ -859,6 +859,7 @@ class SellerWarrantService:
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
+        task_id = self._require_task_id(task_id, required=False)
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."

@@ -835,9 +835,20 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st_default["status"], "ready")
 
         # Nonexistent task_id returns missing status
-        st_missing = await self.call("get_deployment_status", {"task_id": "0xnonexistent"})
+        nonexistent_id = "0x" + "00" * 32
+        st_missing = await self.call("get_deployment_status", {"task_id": nonexistent_id})
         self.assertEqual(st_missing["status"], "missing")
-        self.assertIn("No deployment session found for task '0xnonexistent'", st_missing["message"])
+        self.assertIn(f"No deployment session found for task '{nonexistent_id}'", st_missing["message"])
+
+        # Upper-case hex names the same task
+        st_upper = await self.call("get_deployment_status", {"task_id": "0x" + t1[2:].upper()})
+        self.assertEqual(st_upper["task_id"], t1)
+        self.assertEqual(st_upper["status"], "ready")
+
+        # Invalid task_id raises ToolError
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("get_deployment_status", {"task_id": "0xnonexistent"})
+        self.assertIn("32-byte hex", str(ctx.exception))
 
     def test_create_server_and_app_with_config(self):
         config = ServerConfig(
@@ -947,6 +958,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": "", "acceptance": {}, "signature": []})
+        self.assertIn("task_id is required", str(ctx.exception))
+
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("get_deployment_status", {"task_id": ""})
         self.assertIn("task_id is required", str(ctx.exception))
 
         missing = await self.call("get_deployment_status")
@@ -1302,8 +1317,11 @@ class SellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_task_id_must_be_a_task_hash(self):
         for task_id in ("../active_session", "0x1234", "0x" + "zz" * 32):
-            with self.subTest(task_id=task_id), self.assertRaises(ToolError) as ctx:
+            with self.subTest(tool="deploy_with_escrow", task_id=task_id), self.assertRaises(ToolError) as ctx:
                 await self.call("deploy_with_escrow", {"task_id": task_id, "policy": {"version": 1}})
+            self.assertIn("32-byte hex", str(ctx.exception))
+            with self.subTest(tool="get_deployment_status", task_id=task_id), self.assertRaises(ToolError) as ctx:
+                await self.call("get_deployment_status", {"task_id": task_id})
             self.assertIn("32-byte hex", str(ctx.exception))
 
 
