@@ -1,0 +1,9 @@
+{
+  "commit": "fac8b909893cf168157d84e51ce103fdb0351299",
+  "image_id": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+  "instance_hash": "0x48ed79b023d0ca12bcfea54afb9146e4262cb43c18df89fc77579f740118a6e0",
+  "build_seconds": 123,
+  "prove_seconds": 332,
+  "real_proof": true,
+  "refund_ok": true
+}
