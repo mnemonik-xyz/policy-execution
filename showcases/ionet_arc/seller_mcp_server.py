@@ -336,13 +336,9 @@ class SellerWarrantService:
             balance = parse_credit_balance(status)
             if not isinstance(balance, Decimal) or not balance.is_finite() or balance < 0:
                 raise ValueError("the credit balance is not a finite amount of 0 or more")
-        except Exception as exc:
-            # A ValueError from the parser names the field only, never an amount or an account identifier.
-            detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-            logger.warning("io.net credit status could not be read: %s", detail)
+        except Exception:
             raise ToolError("The io.net credit balance cannot be read, so no deal is proposed.") from None
         if balance < required_usd:
-            logger.warning("io.net credits %s USD are below required %s USD", balance, required_usd)
             raise ToolError(
                 f"The seller's io.net credits are below {required_usd:.2f} USD, so no deal is proposed. "
                 "Try again later."
@@ -389,7 +385,6 @@ class SellerWarrantService:
             logger.info("Querying suitable hardware candidates for proposal...")
             candidates = await self.list_suitable_hardware()
             if not candidates:
-                logger.warning("No suitable hardware candidates found")
                 raise ToolError("No available suitable GPUs found.")
 
             selected_hw = self._select_hardware(candidates, hardware_id)
@@ -408,7 +403,6 @@ class SellerWarrantService:
             cost_usd = price_per_hour * duration
 
             if cost_usd > effective_cap:
-                logger.warning("Hardware cost $%.2f exceeds budget cap $%.2f", cost_usd, effective_cap)
                 raise ToolError(
                     f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
                     f"exceeds budget cap of ${effective_cap:.2f}."
@@ -705,14 +699,12 @@ class SellerWarrantService:
         """Verify the offer, accept it on-chain and save the provisioning session."""
         prop_path = self.proposals_dir / f"{task_id}.json"
         if not prop_path.exists():
-            logger.warning("No proposal record found for task_id '%s' at %s", task_id, prop_path)
             raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
         proposal = read_json(prop_path)
         self._check_proposal_terms(proposal)
         target_policy = policy or proposal.get("policy")
         if not target_policy:
-            logger.warning("Buyer policy must be provided for task '%s'", task_id)
             raise ToolError(f"Buyer policy must be provided to deploy_with_escrow for task '{task_id}'.")
 
         # 1. Verify on-chain escrow state and commercial terms
@@ -724,12 +716,6 @@ class SellerWarrantService:
         computed_policy_hash = await asyncio.to_thread(hash_policy, target_policy)
         onchain_policy_hash = str(task_data.get("policy_hash", ""))
         if onchain_policy_hash.lower() != computed_policy_hash.lower():
-            logger.warning(
-                "Policy hash mismatch for task_id=%s: onchain=%s, computed=%s",
-                task_id,
-                onchain_policy_hash,
-                computed_policy_hash,
-            )
             raise ToolError(
                 f"On-chain policyHash ({onchain_policy_hash}) does not match "
                 f"provided policy hash ({computed_policy_hash})."
@@ -1009,7 +995,6 @@ class SellerWarrantService:
             task_id = self._require_task_id(task_id, required=True)
             session = self._lookup_session(task_id)
             if not session:
-                logger.warning("No deployment session found for task '%s'", task_id)
                 raise ToolError(f"No deployment session found for task '{task_id}'.")
 
             if session.get("status") == "settled" and session.get("settlement_tx"):
@@ -1028,7 +1013,6 @@ class SellerWarrantService:
 
             logger.info("Verifying deliverable hash match: expected=%s, acceptance=%s", expected_deliv, acc_deliv_hex)
             if expected_deliv and acc_deliv_hex != expected_deliv.lower():
-                logger.warning("Deliverable hash mismatch: provided %s != worker %s", acc_deliv_hex, expected_deliv)
                 raise ToolError(
                     f"Deliverable hash mismatch: acceptance provided {acc_deliv_hex} "
                     f"but worker generated {expected_deliv}"
@@ -1037,7 +1021,6 @@ class SellerWarrantService:
             # Resolve policy
             policy = session.get("policy")
             if not policy:
-                logger.warning("No policy associated with deployment session for task '%s'", task_id)
                 raise ToolError(f"No policy associated with deployment session for task '{task_id}'.")
 
             # Build Request struct

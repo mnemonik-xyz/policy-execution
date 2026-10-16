@@ -169,87 +169,44 @@ class BuyerWarrantService:
         chain_id: int,
     ):
         if self.max_budget_usd is None:
-            logger.warning("Policy rejection: max_budget_usd is not configured in config/manifest.yaml")
             raise ToolError("Policy rejection: max_budget_usd is not configured in config/manifest.yaml")
 
         if cost_usd > self.max_budget_usd:
-            logger.warning(
-                "Policy rejection: proposed cost $%.4f exceeds max budget cap $%.4f",
-                cost_usd,
-                self.max_budget_usd,
-            )
             raise ToolError(
                 f"Policy rejection: proposed cost ${cost_usd:.4f} exceeds max budget cap ${self.max_budget_usd:.4f}"
             )
         max_atomic = round(self.max_budget_usd * 1_000_000)
         if atomic_amount > max_atomic:
-            logger.warning(
-                "Policy rejection: proposed amount %d exceeds budget limit %d",
-                atomic_amount,
-                max_atomic,
-            )
             raise ToolError(
                 f"Policy rejection: proposed amount {atomic_amount} atomic units exceeds budget limit {max_atomic}"
             )
         expected_atomic = round(cost_usd * 1_000_000)
         if abs(atomic_amount - expected_atomic) > 1:
-            logger.warning(
-                "Policy rejection: atomic amount %d does not match amount_usd $%.4f",
-                atomic_amount,
-                cost_usd,
-            )
             raise ToolError(
                 f"Policy rejection: atomic amount {atomic_amount} does not match amount_usd ${cost_usd:.4f}"
             )
         if duration_hours is None or duration_hours <= 0:
-            logger.warning("Policy rejection: duration_hours is required and must be at least 1")
             raise ToolError("Policy rejection: duration_hours is required and must be at least 1")
         if self.max_duration_hours is None:
-            logger.warning("Policy rejection: duration_hours is not configured in config/manifest.yaml")
             raise ToolError("Policy rejection: duration_hours is not configured in config/manifest.yaml")
         if duration_hours > self.max_duration_hours:
-            logger.warning(
-                "Policy rejection: proposed duration %dh exceeds max duration %dh",
-                duration_hours,
-                self.max_duration_hours,
-            )
             raise ToolError(
                 f"Policy rejection: proposed duration {duration_hours}h exceeds max duration {self.max_duration_hours}h"
             )
         if category not in self.allowed_categories:
-            logger.warning(
-                "Policy rejection: category %s not in allowed %s",
-                category,
-                self.allowed_categories,
-            )
             raise ToolError(
                 f"Policy rejection: category {category} is not in allowed categories {self.allowed_categories}"
             )
         if self.pinned_escrow and escrow_addr.lower() != self.pinned_escrow.lower():
-            logger.warning(
-                "Policy rejection: escrow address %s != pinned %s",
-                escrow_addr,
-                self.pinned_escrow,
-            )
             raise ToolError(
                 f"Policy rejection: escrow address {escrow_addr} does not match pinned escrow {self.pinned_escrow}"
             )
         if self.pinned_token and token_addr.lower() != self.pinned_token.lower():
-            logger.warning(
-                "Policy rejection: token address %s != pinned %s",
-                token_addr,
-                self.pinned_token,
-            )
             raise ToolError(
                 f"Policy rejection: token address {token_addr} does not match pinned token {self.pinned_token}"
             )
         active_chain = self._resolve_chain_id()
         if chain_id != active_chain:
-            logger.warning(
-                "Policy rejection: proposed chain_id %s != active chain_id %s",
-                chain_id,
-                active_chain,
-            )
             raise ToolError(
                 f"Policy rejection: proposed chain_id {chain_id} does not match RPC chain_id {active_chain}"
             )
@@ -296,7 +253,6 @@ class BuyerWarrantService:
                         f"Insufficient balance ({balance} < {atomic_amount}) and auto-mint failed: {e}"
                     ) from e
             else:
-                logger.warning("Insufficient balance: %d < %d for buyer %s", balance, atomic_amount, buyer_account)
                 raise ToolError(f"Insufficient token balance ({balance} < {atomic_amount}) for buyer {buyer_account}.")
 
         try:
@@ -412,7 +368,6 @@ class BuyerWarrantService:
         if not token_addr:
             missing.append("token_address")
         if missing:
-            logger.warning("Missing required proposal fields: %s", ", ".join(missing))
             raise ToolError(f"Missing required proposal fields: {', '.join(missing)}")
 
         cost_usd = float(Decimal(str(amount_usd)))
@@ -447,7 +402,6 @@ class BuyerWarrantService:
             raise ToolError(f"Failed to derive taskIdFor({buyer_account}, {salt}): {e}") from e
 
         if str(task_id).lower() != str(expected_task_id).lower():
-            logger.warning("Proposed task_id '%s' != derived taskIdFor '%s'", task_id, expected_task_id)
             raise ToolError(
                 f"Policy rejection: proposed task_id '{task_id}' does not match "
                 f"derived taskIdFor('{buyer_account}', '{salt}'): '{expected_task_id}'"
@@ -547,7 +501,6 @@ class BuyerWarrantService:
         )
         task_path = self.tasks_dir / f"{task_id}.json"
         if not task_path.exists():
-            logger.warning("Task '%s' not found in buyer state at %s", task_id, task_path)
             raise ToolError(f"Task '{task_id}' not found in buyer state. Offer must be created first.")
 
         task_data = json.loads(task_path.read_text())
@@ -555,16 +508,10 @@ class BuyerWarrantService:
 
         atomic_amount = int(amount)
         if atomic_amount != int(task_data.get("amount", 0)):
-            logger.warning("Acceptance amount %d != offered task amount %s", atomic_amount, task_data.get("amount"))
             raise ToolError(
                 f"Acceptance amount {atomic_amount} does not match offered task amount {task_data.get('amount')}"
             )
         if recipient.lower() != str(task_data.get("recipient", "")).lower():
-            logger.warning(
-                "Acceptance recipient %s != offered task recipient %s",
-                recipient,
-                task_data.get("recipient"),
-            )
             raise ToolError(
                 f"Acceptance recipient {recipient} does not match offered task recipient {task_data.get('recipient')}"
             )
