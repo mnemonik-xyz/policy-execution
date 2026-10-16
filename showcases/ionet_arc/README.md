@@ -540,11 +540,6 @@ Start the Seller MCP daemon:
 .venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
   --host 0.0.0.0 --port 8000 \
   --local-server --ssh-host petertower
-
-# Offline mock mode (no GPU/Docker or io.net API key required):
-.venv/bin/python -m showcases.ionet_arc.seller_mcp_server \
-  --host 0.0.0.0 --port 8000 \
-  --mock-ionet
 ```
 
 Execution modes:
@@ -553,9 +548,6 @@ Execution modes:
 - **Local / Remote Server (`--local-server`)**: Deploys the Whisper container via SSH to a GPU
   server (`docker run --gpus all -p 8080:8080`). Accepts `--ssh-host <host>` (default: `localhost`)
   and `--worker-url <url>` (default: `http://<ssh-host>:8080`).
-- **Offline Mock (`--mock-ionet`)**: Runs an in-process mock worker for offline testing without
-  external GPU hardware or io.net credentials. When `--rpc-url` targets local Anvil
-  (`http://127.0.0.1:8545`), escrow contracts are deployed automatically.
 
 On live networks like Arc Testnet, the seller agent signs `TaskEscrow.accept()` and
 `TaskEscrow.settle()` on-chain. Configure the seller private key via any of:

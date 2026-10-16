@@ -331,7 +331,6 @@ Nothing else is written at runtime, so the root filesystem can be read-only.
 | `IO_NET_API_KEY` | Required on chain 5042. Secret; env file only. |
 | `IONET_STATE_DIR` | Set by the image to `/var/lib/warrant-seller`. |
 | `HOST`, `PORT` | Set by the image to `0.0.0.0` and `8000`. |
-| `MOCK_IONET` | Laptops only (`1`). Mock mode is refused on chain 5042. |
 
 ### Run
 
@@ -347,17 +346,16 @@ docker run --rm --name warrant-seller \
   -p 127.0.0.1:8000:8000 warrant-seller:dev
 ```
 
-For a laptop smoke, start Anvil on loopback (`anvil`, which binds `127.0.0.1:8545`), use a
-scratch chain-31337 manifest whose `rpc_url` is `http://host.docker.internal:8545`, and set
-`MOCK_IONET=1`. Docker Desktop forwards `host.docker.internal` to the host loopback, so Anvil
-does not need `--host 0.0.0.0`. On Linux Docker Engine, add
-`--add-host host.docker.internal:host-gateway` and bind Anvil to the bridge address
-(`anvil --host 172.17.0.1`), not to every interface. Keep the scratch manifest and key out of the
-checkout.
+For a laptop smoke, start Anvil on loopback (`anvil`, which binds `127.0.0.1:8545`), and use a
+scratch chain-31337 manifest whose `rpc_url` is `http://host.docker.internal:8545`. Docker
+Desktop forwards `host.docker.internal` to the host loopback, so Anvil does not need
+`--host 0.0.0.0`. On Linux Docker Engine, add `--add-host host.docker.internal:host-gateway` and
+bind Anvil to the bridge address (`anvil --host 172.17.0.1`), not to every interface. Keep the
+scratch manifest and key out of the checkout.
 
 On chain 5042 the server refuses to start, exit code 1, in these cases:
 * `IO_NET_API_KEY` is missing (`IO_NET_API_KEY is required on chain 5042`);
-* `MOCK_IONET` or `LOCAL_SERVER` is set;
+* `LOCAL_SERVER` is set;
 * the manifest `chain_id` is not 5042;
 * the RPC does not answer;
 * `MCP_AUTH_USER` or `MCP_AUTH_PASS` is missing, empty or blank

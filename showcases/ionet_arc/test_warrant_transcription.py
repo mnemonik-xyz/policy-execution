@@ -5,9 +5,11 @@ import base64
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from decimal import Decimal
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +34,7 @@ from showcases.ionet_arc.seller_mcp_server import (
     is_loopback_host,
     parse_credit_balance,
 )
+from showcases.ionet_arc.worker import Worker, handler
 
 KEYS_DIR = Path(__file__).resolve().parent / ".keys"
 
@@ -226,6 +229,47 @@ def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
     }
 
 
+class TestMockWorker:
+    """Mock in-process transcription worker for offline test suite execution."""
+
+    def __init__(self, work_dir: Path, token: str):
+        self.work_dir = work_dir
+        self.token = token
+        self.server = None
+        self.port = 0
+        self.thread = None
+        self.worker = None
+
+    def start(self):
+        def dummy_engine(audio, model_dir, language=None):
+            return {
+                "language": language or "en",
+                "audio_seconds": 3.5,
+                "segments": [
+                    {"start": 0.0, "end": 1.5, "text": "Warrant autonomous transcription pilot."},
+                    {"start": 1.5, "end": 3.5, "text": "io.net container compute verified on-chain."},
+                ],
+            }
+
+        self.worker = Worker(self.work_dir, self.token, engine=dummy_engine)
+        try:
+            self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.worker))
+            self.port = self.server.server_port
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+            return f"http://127.0.0.1:{self.port}"
+        except OSError:
+            self.port = 8080
+            return f"http://127.0.0.1:{self.port}"
+
+    def stop(self):
+        if self.worker:
+            self.worker.close()
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+
+
 class FakeCloud:
     """Answers the io.net cloud calls that the seller makes on chain 5042."""
 
@@ -271,11 +315,49 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         # Create valid stored test credential and signature matching the mock escrow scope
         self.cred_path, self.sig_path = write_vendor_credential(self.state_dir, self.mock_escrow, 31337, self.keys)
 
-        # Create server with mock EscrowClient, mock_ionet=True, and stored credential paths
+        self.test_workers = {}
+        self.cloud = FakeCloud()
+
+        async def fake_connected(op):
+            return await op(self.cloud)
+
+        patch_conn = patch("showcases.ionet_arc.seller_mcp_server.connected", side_effect=fake_connected)
+        patch_conn.start()
+        self.addCleanup(patch_conn.stop)
+
+        orig_provision = seller_module.WarrantTranscriptionService._provision_container
+
+        async def fake_provision(service_self, proposal, deployment_id, worker_token):
+            if service_self.local_server:
+                return await orig_provision(service_self, proposal, deployment_id, worker_token)
+            task_id = proposal.get("task_id", deployment_id)
+            if task_id in self.test_workers:
+                self.test_workers[task_id].stop()
+            worker_data = self.state_dir / "worker_data" / task_id
+            w = TestMockWorker(worker_data, worker_token)
+            self.test_workers[task_id] = w
+            return w.start()
+
+        patch_prov = patch.object(
+            seller_module.WarrantTranscriptionService,
+            "_provision_container",
+            autospec=True,
+            side_effect=fake_provision,
+        )
+        patch_prov.start()
+        self.addCleanup(patch_prov.stop)
+
+        def cleanup_workers():
+            for w in list(self.test_workers.values()):
+                w.stop()
+            self.test_workers.clear()
+
+        self.addCleanup(cleanup_workers)
+
+        # Create server with mock EscrowClient and stored credential paths
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             self.mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 vendor_credential_path=self.cred_path,
                 vendor_signature_path=self.sig_path,
             )
@@ -346,8 +428,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["status"], "proposed")
         self.assertEqual(proposal["duration_hours"], 1)
         self.assertEqual(proposal["billing_model"], "duration")
-        self.assertEqual(proposal["amount"], 270_000)
-        self.assertEqual(proposal["amount_usd"], "0.27")
+        self.assertEqual(proposal["amount"], 490_000)
+        self.assertEqual(proposal["amount_usd"], "0.49")
         self.assertEqual(proposal["category"], DEFAULT_CATEGORY)
         self.assertTrue(proposal["task_id"].startswith("0x"))
         self.assertTrue(proposal["salt"].startswith("0x"))
@@ -355,29 +437,29 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TaskEscrow.offer", proposal["instructions"])
 
     async def test_propose_deployment_calculates_real_hardware_pricing(self):
-        # Specific GPU: RTX 4090 ($0.30/hr)
-        p4090 = await self.call("propose_deployment", {"hardware_id": 12})
-        self.assertEqual(p4090["amount"], 300_000)
-        self.assertEqual(p4090["amount_usd"], "0.30")
-        self.assertEqual(p4090["duration_hours"], 1)
+        # Specific GPU: L40 ($1.00/hr)
+        p_l40 = await self.call("propose_deployment", {"hardware_id": 40})
+        self.assertEqual(p_l40["amount"], 1_000_000)
+        self.assertEqual(p_l40["amount_usd"], "1.00")
+        self.assertEqual(p_l40["duration_hours"], 1)
 
-        # Multi-hour duration: 2 hours on RTX 4090 ($0.60 total)
-        p2h = await self.call("propose_deployment", {"hardware_id": 12, "duration_hours": 2})
-        self.assertEqual(p2h["amount"], 600_000)
-        self.assertEqual(p2h["amount_usd"], "0.60")
+        # Multi-hour duration: 2 hours on RTX A6000 ($0.49/hr -> $0.98 total)
+        p2h = await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 2})
+        self.assertEqual(p2h["amount"], 980_000)
+        self.assertEqual(p2h["amount_usd"], "0.98")
         self.assertEqual(p2h["duration_hours"], 2)
 
     async def test_propose_deployment_enforces_budget_cap(self):
-        # Budget cap lower than cheapest available ($0.27)
+        # Budget cap lower than cheapest available ($0.49)
         with self.assertRaises(ToolError) as ctx:
-            await self.call("propose_deployment", {"budget_cap_usd": "0.20"})
+            await self.call("propose_deployment", {"budget_cap_usd": "0.40"})
         self.assertIn("exceeds budget cap", str(ctx.exception))
 
-        # Budget cap lower than selected GPU ($0.66 > $0.50)
+        # Budget cap lower than selected GPU ($1.00 > $0.80)
         with self.assertRaises(ToolError) as ctx:
             await self.call(
                 "propose_deployment",
-                {"hardware_id": "gpu_1x_l40", "budget_cap_usd": "0.50"},
+                {"hardware_id": 40, "budget_cap_usd": "0.80"},
             )
         self.assertIn("exceeds budget cap", str(ctx.exception))
 
@@ -698,7 +780,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 local_server=True,
                 ssh_host="petertower",
             )
@@ -778,7 +859,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 local_server=True,
                 ssh_host="petertower",
             )
@@ -883,7 +963,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             rpc_url="http://127.0.0.1:8545",
             escrow_address="0x" + "11" * 20,
             token_address="0x" + "22" * 20,
-            mock_ionet=True,
             auth_user="testuser",
             auth_pass="testpass",
         )
@@ -935,7 +1014,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 buyer_account=custom_buyer,
                 vendor_credential_path=self.cred_path,
                 vendor_signature_path=self.sig_path,
@@ -950,7 +1028,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             local_mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 vendor_credential_path=self.cred_path,
                 vendor_signature_path=self.sig_path,
                 manifest_path=empty_manifest,
@@ -971,7 +1048,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=mock_client):
             local_mcp = create_server(
                 self.state_dir,
-                mock_ionet=True,
                 vendor_credential_path=self.cred_path,
                 vendor_signature_path=self.sig_path,
                 manifest_path=empty_manifest,
@@ -1003,7 +1079,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         testnet.verifier, testnet.server_account = self.mock_escrow.verifier, self.mock_escrow.server_account
         testnet.rpc.chain_id.return_value = 5042002
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=testnet):
-            servers[5042002] = create_server(self.state_dir / "testnet", mock_ionet=True)
+            servers[5042002] = create_server(self.state_dir / "testnet")
         for chain_id, server in servers.items():
             with self.subTest(chain_id=chain_id):
                 async with Client(server) as client:
@@ -1051,7 +1127,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             patch("showcases.ionet_arc.seller_mcp_server.connected", side_effect=fake_connected),
             patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
         ):
-            live = create_server(self.state_dir, mock_ionet=False)
+            live = create_server(self.state_dir)
             res = await live.call_tool(
                 "propose_deployment", {"hardware_id": 30, "duration_hours": 2, "budget_cap_usd": None}
             )
@@ -1060,7 +1136,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cloud.calls, ["caas_get_hardware_ids"])
 
     def test_main_exits_with_status_1_on_mainnet_policy_error(self):
-        refusal = MainnetPolicyError("mock mode is refused on chain 5042")
+        refusal = MainnetPolicyError("local mode is refused on chain 5042")
         with (
             patch.object(seller_module, "run_server", side_effect=refusal),
             patch("sys.argv", ["seller_mcp_server"]),
@@ -1069,7 +1145,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         ):
             seller_module.main()
         self.assertEqual(ctx.exception.code, 1)
-        self.assertTrue(any("mock mode is refused on chain 5042" in msg for msg in cm.output))
+        self.assertTrue(any("local mode is refused on chain 5042" in msg for msg in cm.output))
 
     def test_main_exits_with_status_1_when_chain_unknown(self):
         with (
@@ -1098,7 +1174,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "rpc_url": "http://127.0.0.1:8545",
             "escrow_address": "0x" + "11" * 20,
             "token_address": "0x" + "22" * 20,
-            "mock_ionet": True,
             "vendor_credential_path": self.cred_path,
             "vendor_signature_path": self.sig_path,
         }
@@ -1160,7 +1235,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(is_loopback_host(host))
 
     def test_main_refuses_public_bind_without_auth(self):
-        env = {"HOST": "0.0.0.0", "MOCK_IONET": "1", "IONET_STATE_DIR": str(self.state_dir)}
+        env = {"HOST": "0.0.0.0", "IONET_STATE_DIR": str(self.state_dir)}
         with (
             patch.dict(os.environ, env, clear=True),
             patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
@@ -1224,7 +1299,6 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     def build(self, **overrides):
         kwargs = {
-            "mock_ionet": False,
             "vendor_credential_path": self.cred_path,
             "vendor_signature_path": self.sig_path,
             "manifest_path": self.manifest_path,
@@ -1278,17 +1352,9 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_mainnet_starts_with_ionet_key(self):
         service = self.service_of(self.build())
-        self.assertFalse(service.use_mock_ionet)
         self.assertTrue(service.mainnet)
         self.assertEqual(service.chain_id, 5042)
         self.connected.assert_not_called()
-
-    def test_mainnet_refuses_mock_ionet(self):
-        with self.assertRaises(MainnetPolicyError) as ctx:
-            self.build(mock_ionet=True)
-        self.assertIn("mock mode is refused on chain 5042", str(ctx.exception))
-        with patch.dict(os.environ, clear=True), self.assertRaises(MainnetPolicyError):
-            self.build(mock_ionet=True)
 
     def test_mainnet_refuses_local_server(self):
         with self.assertRaises(MainnetPolicyError) as ctx:
@@ -1323,7 +1389,6 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     def build_app(self, **overrides):
         kwargs = {
-            "mock_ionet": False,
             "vendor_credential_path": self.cred_path,
             "vendor_signature_path": self.sig_path,
             "manifest_path": self.manifest_path,

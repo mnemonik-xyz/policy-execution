@@ -15,12 +15,10 @@ import re
 import secrets
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from http.server import ThreadingHTTPServer
 
 # Ensure repository root is on sys.path
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -61,7 +59,6 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     load_manifest,
     should_trust_env,
 )
-from showcases.ionet_arc.worker import Worker, handler  # noqa: E402
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/warrant-transcription:pilot"
 
@@ -135,53 +132,6 @@ def safe_tool_error(exc: Exception) -> ToolError:
     if pilot:
         return ToolError(str(pilot))
     return ToolError(f"Operation failed: {exc!s}")
-
-
-DEFAULT_MOCK_HARDWARE = [
-    {
-        "hardware_id": 3,
-        "hardware_name": "GeForce RTX 3090",
-        "price": 0.27,
-        "available": 5,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-    {
-        "hardware_id": 12,
-        "hardware_name": "GeForce RTX 4090",
-        "price": 0.30,
-        "available": 100,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-    {
-        "hardware_id": "gpu_1x_l40",
-        "hardware_name": "L40",
-        "price": 0.66,
-        "available": 10,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-]
-
-
-def load_cached_hardware() -> list[dict]:
-    """Fallback hardware list when running offline or without live credentials."""
-    for cand in [
-        REPO_ROOT / "showcases" / "ionet_arc" / "mock_hardware.json",
-        REPO_ROOT / "artifacts" / "io-hardware.json",
-    ]:
-        if cand.exists():
-            try:
-                data = json.loads(cand.read_text())
-                if isinstance(data, list):
-                    return data
-                res = data.get("result", {})
-                if "data" in res and "data" in res["data"]:
-                    return res["data"]["data"]
-            except Exception:
-                pass
-    return DEFAULT_MOCK_HARDWARE
 
 
 def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
@@ -259,47 +209,6 @@ def parse_credit_balance(status) -> Decimal:
     return spendable
 
 
-class LocalMockWorker:
-    """Mock in-process transcription worker for offline testing when IO_NET_API_KEY is unset."""
-
-    def __init__(self, work_dir: pathlib.Path, token: str):
-        self.work_dir = work_dir
-        self.token = token
-        self.server = None
-        self.port = 0
-        self.thread = None
-        self.worker = None
-
-    def start(self):
-        def dummy_engine(audio, model_dir, language=None):
-            return {
-                "language": language or "en",
-                "audio_seconds": 3.5,
-                "segments": [
-                    {"start": 0.0, "end": 1.5, "text": "Warrant autonomous transcription pilot."},
-                    {"start": 1.5, "end": 3.5, "text": "io.net container compute verified on-chain."},
-                ],
-            }
-
-        self.worker = Worker(self.work_dir, self.token, engine=dummy_engine)
-        try:
-            self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.worker))
-            self.port = self.server.server_port
-            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-            self.thread.start()
-            return f"http://127.0.0.1:{self.port}"
-        except OSError:
-            self.port = 8080
-            return f"http://127.0.0.1:{self.port}"
-
-    def stop(self):
-        if self.worker:
-            self.worker.close()
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-
-
 class WarrantTranscriptionService:
     """Encapsulates tool implementations and state for Warrant transcription server."""
 
@@ -307,7 +216,6 @@ class WarrantTranscriptionService:
         self,
         state_dir: pathlib.Path,
         escrow_client: EscrowClient,
-        use_mock_ionet: bool,
         local_server: bool = False,
         ssh_host: str = "localhost",
         worker_url: str | None = None,
@@ -324,7 +232,6 @@ class WarrantTranscriptionService:
         self.sessions_dir = self.state_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.escrow_client = escrow_client
-        self.use_mock_ionet = use_mock_ionet
         self.local_server = local_server
         self.ssh_host = ssh_host
         self.worker_url = worker_url
@@ -354,17 +261,10 @@ class WarrantTranscriptionService:
                 manifest, "seller_address", "seller-address", "server_account", "server-account"
             )
 
-        self.local_mock_workers: dict[str, LocalMockWorker] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
         if self.local_server:
             atexit.register(self._cleanup_ssh_container)
-        atexit.register(self.stop)
-
-    def stop(self):
-        for worker in list(self.local_mock_workers.values()):
-            worker.stop()
-        self.local_mock_workers.clear()
 
     def _cleanup_ssh_container(self):
         if self.local_server and self._ssh_container_started:
@@ -377,20 +277,16 @@ class WarrantTranscriptionService:
                 )
 
     async def list_suitable_hardware(self) -> list[dict]:
-        logger.info("Tool called: list_suitable_hardware (use_mock_ionet=%s)", self.use_mock_ionet)
+        logger.info("Tool called: list_suitable_hardware")
         try:
-            if self.use_mock_ionet:
-                logger.info("Loading cached hardware configurations")
-                raw_items = load_cached_hardware()
-            else:
-                logger.info("Calling io.net CaaS API to list available hardware")
+            logger.info("Calling io.net CaaS API to list available hardware")
 
-                async def op(cloud):
-                    res = await cloud.call("caas_get_hardware_ids", {})
-                    data = res.get("data", {})
-                    return data.get("data", []) if isinstance(data, dict) else []
+            async def op(cloud):
+                res = await cloud.call("caas_get_hardware_ids", {})
+                data = res.get("data", {})
+                return data.get("data", []) if isinstance(data, dict) else []
 
-                raw_items = await connected(op)
+            raw_items = await connected(op)
 
             logger.info("Filtering %d raw hardware options for Whisper transcription", len(raw_items))
             filtered = filter_suitable_gpus(raw_items)
@@ -769,15 +665,6 @@ class WarrantTranscriptionService:
 
             return target_url
 
-        if self.use_mock_ionet:
-            task_id = proposal.get("task_id", deployment_id)
-            if task_id in self.local_mock_workers:
-                self.local_mock_workers[task_id].stop()
-            worker_data = self.state_dir / "worker_data" / task_id
-            mock_worker = LocalMockWorker(worker_data, worker_token)
-            self.local_mock_workers[task_id] = mock_worker
-            return mock_worker.start()
-
         duration = proposal.get("duration_hours", 1)
         deploy_args = {
             "billing_model": "duration",
@@ -1026,7 +913,6 @@ class WarrantTranscriptionService:
             self._bg_tasks.add(bg_task)
             bg_task.add_done_callback(self._bg_tasks.discard)
 
-            # Brief pause to allow instant local mock workers to complete
             await asyncio.sleep(0.02)
 
             curr = self._lookup_session(task_id) or session
@@ -1514,7 +1400,6 @@ class ServerConfig:
     seller_private_key: str | None = None
     seller_key_path: pathlib.Path | None = None
     buyer_account: str | None = None
-    mock_ionet: bool = False
     local_server: bool = False
     ssh_host: str = "localhost"
     worker_url: str | None = None
@@ -1612,8 +1497,6 @@ def detect_rpc_chain(escrow_client: EscrowClient) -> int:
 
 def enforce_mainnet_start_policy(cfg: ServerConfig, chain_id: int, has_ionet_key: bool):
     """Refuse a start on chain 5042 that would run a stub or a mismatched manifest (Decision 6)."""
-    if cfg.mock_ionet:
-        raise MainnetPolicyError(f"mock mode is refused on chain {chain_id}")
     if cfg.local_server:
         raise MainnetPolicyError(f"local mode is refused on chain {chain_id}")
     if not has_ionet_key:
@@ -1691,8 +1574,6 @@ def create_server(
         enforce_mainnet_start_policy(cfg, chain_id, has_ionet_key)
     if serve_http:
         enforce_http_auth_policy(cfg, chain_id)
-    # No silent fallback to mock mode on chain 5042: the start policy above requires the key.
-    use_mock_ionet = False if mainnet else (cfg.mock_ionet or not has_ionet_key)
     server = MCPServer("seller-mcp-server", instructions=MAINNET_INSTRUCTIONS if mainnet else None)
     if cfg.seller_private_key:
         if cfg.server_account:
@@ -1705,7 +1586,6 @@ def create_server(
     service = WarrantTranscriptionService(
         state_dir=cfg.state_dir,
         escrow_client=escrow_client,
-        use_mock_ionet=use_mock_ionet,
         local_server=cfg.local_server,
         ssh_host=cfg.ssh_host,
         worker_url=cfg.worker_url,
@@ -1850,12 +1730,6 @@ def main():
         "--server-account",
         default=os.environ.get("WARRANT_SERVER_ACCOUNT"),
         help="Server recipient / agent account address",
-    )
-    parser.add_argument(
-        "--mock-ionet",
-        action="store_true",
-        default=os.environ.get("MOCK_IONET", "").lower() in ("1", "true"),
-        help="Run using local mock worker instead of live io.net CaaS",
     )
     parser.add_argument(
         "--local-server",
