@@ -308,8 +308,8 @@ Further limits for the buyer:
 
 | Role / Contract | Address or key |
 | --- | --- |
-| **TaskEscrow** (no-proof escrow) | `<TASK_ESCROW_ADDRESS>` |
-| **JournalVerifier** (test double) | `<JOURNAL_VERIFIER_ADDRESS>` |
+| **TaskEscrow** (no-proof escrow) | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
+| **JournalVerifier** (test double) | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` |
 | **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
 | **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
@@ -364,8 +364,8 @@ Run every command from the repository root.
 | --- | --- |
 | `chain_id` | `5042` |
 | `rpc_url` | `https://rpc.mainnet.arc.io`, or your own Arc mainnet RPC |
-| `escrow_address` | `<TASK_ESCROW_ADDRESS>` |
-| `verifier_address` | `<JOURNAL_VERIFIER_ADDRESS>` |
+| `escrow_address` | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
+| `verifier_address` | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
 | `token_address` | `0x3600000000000000000000000000000000000000` |
 | `category` | `42` |
 | `max_budget_usd` | `1.00` |
