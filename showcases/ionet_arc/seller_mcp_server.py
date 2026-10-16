@@ -529,7 +529,8 @@ class WarrantTranscriptionService:
                     "acceptBy, settleBy) on-chain.\n"
                     "Call deploy_with_escrow(task_id, policy) to commit agreement and begin provisioning.\n"
                     "Poll get_deployment_status until ready, verify container /health, and sign Acceptance evidence.\n"
-                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then call transcribe_audio."
+                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then submit audio directly "
+                    "to <public_url>/job with Bearer <worker_token>."
                 ),
             }
 
@@ -943,51 +944,6 @@ class WarrantTranscriptionService:
             logger.error("deploy_with_escrow failed for task_id=%s: %s", task_id, exc)
             raise safe_tool_error(exc) from None
 
-    @staticmethod
-    def _transcription_result(job_id: str, job_status: dict) -> dict:
-        res = job_status.get("result", {})
-        segments = res.get("segments", [])
-        return {
-            "status": "complete",
-            "job_id": job_id,
-            "text": " ".join(s.get("text", "").strip() for s in segments),
-            "language": res.get("language"),
-            "audio_seconds": res.get("audio_seconds"),
-            "segments": segments,
-            "elapsed_seconds": job_status.get("elapsed_seconds"),
-        }
-
-    async def _poll_job_status(
-        self,
-        poll_fn,
-        job_id: str,
-        timeout_error: str = "Transcription timed out waiting for worker.",
-    ) -> dict:
-        for _ in range(120):  # poll up to 60 seconds
-            try:
-                job_status = poll_fn()
-                if asyncio.iscoroutine(job_status):
-                    job_status = await job_status
-                if job_status:
-                    st = job_status.get("status")
-                    if st == "complete":
-                        return self._transcription_result(job_id, job_status)
-                    elif st in ("failed", "interrupted"):
-                        err_msg = job_status.get("error") or st
-                        raise ToolError(f"Transcription job failed: {err_msg}")
-            except httpx2.HTTPError:
-                pass
-            await asyncio.sleep(0.5)
-
-        raise ToolError(timeout_error)
-
-    async def _poll_transcription(self, client: httpx2.AsyncClient, poll_url: str, headers: dict, job_id: str) -> dict:
-        async def fetch():
-            resp = await client.get(poll_url, headers=headers, timeout=10.0)
-            return resp.json() if resp.status_code == 200 else None
-
-        return await self._poll_job_status(fetch, job_id)
-
     def _find_latest_unexpired_session(self) -> dict | None:
         now = time.time()
         sessions_dir = self.state_dir / "sessions"
@@ -1016,109 +972,6 @@ class WarrantTranscriptionService:
             if time.time() <= candidate.get("expires_at", 0):
                 return candidate
         return self._find_latest_unexpired_session()
-
-    def _active_session(self, task_id: str | None = None) -> dict:
-        session = self._lookup_session(task_id)
-        if session is None:
-            if task_id:
-                raise ToolError(f"No deployment session found for task '{task_id}'.")
-            raise ToolError(
-                "No active deployment session found. "
-                "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
-            )
-
-        if time.time() > session.get("expires_at", 0):
-            target = f"for task '{task_id}' " if task_id else ""
-            raise ToolError(
-                f"Deployment session {target}expired at {session.get('expires_at')}. "
-                "The 1-hour duration window has ended. A new proposal and deployment are required."
-            )
-
-        if not session.get("public_url"):
-            raise ToolError("Deployment public URL is not ready yet.")
-        return session
-
-    async def transcribe_audio(
-        self,
-        audio_base64: str,
-        language: str | None = None,
-        task_id: str | None = None,
-    ) -> dict:
-        logger.info(
-            "Tool called: transcribe_audio with audio length=%d base64 chars, language=%s, task_id=%s",
-            len(audio_base64) if audio_base64 else 0,
-            language,
-            task_id,
-        )
-        try:
-            session = self._active_session(task_id)
-            public_url = session["public_url"]
-            worker_token = session.get("worker_token")
-            logger.info("Found active session for task_id=%s: worker public_url=%s", session.get("task_id"), public_url)
-
-            try:
-                audio_bytes = base64.b64decode(audio_base64, validate=True)
-            except ValueError as exc:
-                logger.warning("Invalid base64 payload provided to transcribe_audio")
-                raise ToolError("audio_base64 is not valid base64.") from exc
-            if len(audio_bytes) == 0:
-                logger.warning("Empty audio payload provided to transcribe_audio")
-                raise ToolError("Audio file is empty.")
-
-            worker_base = public_url.rstrip("/")
-            audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
-            query = f"?language={language.strip().lower()}" if language else ""
-            req_url = f"{worker_base}/job{query}"
-
-            headers = {
-                "Authorization": f"Bearer {worker_token}",
-                "Content-Type": "application/octet-stream",
-                "X-Audio-SHA256": audio_sha256,
-                "Content-Length": str(len(audio_bytes)),
-            }
-
-            trust_env = should_trust_env(worker_base)
-            logger.info(
-                "Submitting audio (%d bytes, sha256=%s) to worker endpoint %s",
-                len(audio_bytes),
-                audio_sha256,
-                req_url,
-            )
-
-            try:
-                async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
-                    resp = await client.post(req_url, content=audio_bytes, headers=headers)
-                    if resp.is_error:
-                        logger.error("Worker rejected upload HTTP %d: %s", resp.status_code, resp.text)
-                        raise ToolError(f"Worker rejected upload with HTTP {resp.status_code}: {resp.text}")
-                    resp_data = resp.json()
-                    job_id = resp_data.get("job_id")
-                    if not job_id:
-                        logger.error("Unexpected worker response: %s", resp_data)
-                        raise ToolError(f"Unexpected worker response: {resp_data}")
-
-                    logger.info("Worker accepted job (job_id=%s). Polling for transcription completion...", job_id)
-                    poll_url = f"{worker_base}/job/{job_id}"
-                    poll_headers = {"Authorization": f"Bearer {worker_token}"}
-                    result = await self._poll_transcription(client, poll_url, poll_headers, job_id)
-                    text = result.get("text", "")
-                    text_preview = (text[:80] + "...") if len(text) > 80 else text
-                    logger.info(
-                        "transcribe_audio returning: job_id=%s, status=%s, language=%s, "
-                        "text_preview=%r, elapsed_seconds=%s",
-                        result.get("job_id"),
-                        result.get("status"),
-                        result.get("language"),
-                        text_preview,
-                        result.get("elapsed_seconds"),
-                    )
-                    return result
-            except (httpx2.HTTPError, OSError) as net_err:
-                logger.error("Worker connection failed during transcribe_audio: %s", net_err)
-                raise ToolError(f"Worker connection failed: {net_err}") from net_err
-        except Exception as exc:
-            logger.error("transcribe_audio failed: %s", exc)
-            raise safe_tool_error(exc) from None
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
@@ -1627,16 +1480,6 @@ def create_server(
             deal_tool=True,
         ),
     )(service.deploy_with_escrow)
-
-    server.tool(
-        name="transcribe_audio",
-        description=(
-            "Transcribe audio (passed as base64-encoded bytes in audio_base64) using an active "
-            "1-hour Whisper deployment on io.net.\n"
-            "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be expired.\n"
-            "Optionally provide task_id to target a specific deployment when multiple tasks exist."
-        ),
-    )(service.transcribe_audio)
 
     server.tool(
         name="get_deployment_status",

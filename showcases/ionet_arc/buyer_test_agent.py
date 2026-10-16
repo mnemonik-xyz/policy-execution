@@ -9,13 +9,14 @@ Demonstrates the capability-based two-step escrow lifecycle:
 5. Poll get_deployment_status until the worker container is ready.
 6. Verify container health endpoint (/health) with worker bearer token.
 7. Sign Acceptance evidence and call submit_acceptance to settle TaskEscrow on-chain.
-8. Call transcribe_audio on given audio file (adv.mp3) and print the transcript.
+8. Submit the audio file directly to the worker HTTP endpoint (/job) and print the transcript.
 9. Inspect final deployment status via get_deployment_status.
 """
 
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -197,6 +198,58 @@ async def _sign_acceptance(
     )
 
 
+async def transcribe_via_worker(
+    public_url: str,
+    worker_token: str,
+    audio_path: Path,
+    language: str = "en",
+) -> dict:
+    """Upload audio bytes directly to the worker HTTP endpoint (/job) and poll until completion."""
+    audio_bytes = audio_path.read_bytes()
+    audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
+    worker_base = public_url.rstrip("/")
+    req_url = f"{worker_base}/job?language={language}" if language else f"{worker_base}/job"
+    headers = {
+        "Authorization": f"Bearer {worker_token}",
+        "Content-Type": "application/octet-stream",
+        "X-Audio-SHA256": audio_sha256,
+        "Content-Length": str(len(audio_bytes)),
+        "User-Agent": "Mozilla/5.0",
+    }
+    trust_env = should_trust_env(worker_base)
+    async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
+        resp = await client.post(req_url, content=audio_bytes, headers=headers)
+        if resp.is_error:
+            sys.exit(f"Worker rejected upload with HTTP {resp.status_code}: {resp.text}")
+        job_id = resp.json().get("job_id")
+        if not job_id:
+            sys.exit(f"Unexpected worker response: {resp.text}")
+
+        poll_url = f"{worker_base}/job/{job_id}"
+        poll_headers = {"Authorization": f"Bearer {worker_token}", "User-Agent": "Mozilla/5.0"}
+        for _ in range(120):
+            poll_resp = await client.get(poll_url, headers=poll_headers, timeout=10.0)
+            if poll_resp.status_code == 200:
+                job_status = poll_resp.json()
+                st = job_status.get("status")
+                if st == "complete":
+                    res = job_status.get("result", {})
+                    segments = res.get("segments", [])
+                    return {
+                        "status": "complete",
+                        "job_id": job_id,
+                        "text": " ".join(s.get("text", "").strip() for s in segments),
+                        "language": res.get("language"),
+                        "audio_seconds": res.get("audio_seconds"),
+                        "segments": segments,
+                        "elapsed_seconds": job_status.get("elapsed_seconds"),
+                    }
+                if st in ("failed", "interrupted"):
+                    sys.exit(f"Transcription job failed: {job_status.get('error') or st}")
+            await asyncio.sleep(0.5)
+    sys.exit("Transcription timed out waiting for worker.")
+
+
 async def run_client(
     mcp_url: str,
     rpc_url: str,
@@ -331,20 +384,15 @@ async def run_client(
                     sys.exit(f"submit_acceptance failed: {settle_info.get('error')}")
                 print(f" TaskEscrow settled on-chain: tx {settle_info.get('settlement_transaction')}")
 
-                # Step 8: transcribe_audio
-                print(f"\n[Step 8] Transcribing audio file '{audio_path.name}' via MCP...")
+                # Step 8: Direct Worker Transcription
+                print(f"\n[Step 8] Submitting audio file '{audio_path.name}' directly to worker ({public_url}/job)...")
                 start_t = time.time()
-                res_trans = await session.call_tool(
-                    "transcribe_audio",
-                    {
-                        "audio_base64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
-                        "language": "en",
-                        "task_id": proposal["task_id"],
-                    },
+                trans_result = await transcribe_via_worker(
+                    public_url=public_url,
+                    worker_token=worker_token,
+                    audio_path=audio_path,
+                    language="en",
                 )
-                trans_result = extract_result(res_trans)
-                if trans_result.get("status") == "ERROR":
-                    sys.exit(f"transcribe_audio failed: {trans_result.get('error')}")
                 elapsed = time.time() - start_t
 
                 print("\n" + "=" * 70)
