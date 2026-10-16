@@ -24,10 +24,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Lint seller Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: showcases/ionet_arc/Dockerfile
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install -r showcases/ionet_arc/requirements-dev.txt
+      - name: Lint Python sources
+        run: ruff check showcases
       - name: Install pinned Rust and prover
         run: |
           rustup toolchain install 1.98.1 --profile minimal
@@ -46,8 +52,6 @@ jobs:
           "$HOME/.foundry/bin/foundryup" --install v1.8.4
           echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
           npm ci --prefix contracts --ignore-scripts
-      - name: Lint Python sources
-        run: ruff check showcases
       - name: Prepare test authority keys and credentials
         run: python showcases/ionet_arc/init.py
       - name: Run io.net Arc showcase test suite

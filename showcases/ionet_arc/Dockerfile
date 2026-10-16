@@ -3,10 +3,10 @@
 # Seller MCP server image (showcases/ionet_arc/seller_mcp_server.py).
 #
 # Build from the repository root with BuildKit (required: the per-Dockerfile
-# ignore file Dockerfile.seller.dockerignore and the BIN_SOURCE stage selection
+# ignore file Dockerfile.dockerignore and the BIN_SOURCE stage selection
 # both depend on it):
 #
-#   DOCKER_BUILDKIT=1 docker build -f showcases/ionet_arc/Dockerfile.seller -t warrant-seller:dev .
+#   DOCKER_BUILDKIT=1 docker build -f showcases/ionet_arc/Dockerfile -t warrant-seller:dev .
 #
 # BIN_SOURCE selects where warrant-host and warrant-policy come from:
 #   build (default) compiles them here with RISC0_SKIP_BUILD=1 (no RISC Zero needed);

@@ -257,7 +257,7 @@ Verify your credit balance after destruction:
 
 ## Seller MCP container
 
-[`Dockerfile.seller`](Dockerfile.seller) packages the seller MCP server
+[`Dockerfile`](Dockerfile) packages the seller MCP server
 ([`seller_mcp_server.py`](seller_mcp_server.py)) for the VM, behind Caddy, and for a laptop
 smoke test. The image holds the seller modules, a Python 3.12 venv from
 [`requirements.txt`](requirements.txt), and the `warrant-host` and `warrant-policy` binaries in
@@ -267,19 +267,19 @@ the host, and config and keys are mounted at runtime.
 ### Build
 
 The build context is the repository root. BuildKit is required. The legacy builder ignores
-[`Dockerfile.seller.dockerignore`](Dockerfile.seller.dockerignore) and would send the whole
+[`Dockerfile.dockerignore`](Dockerfile.dockerignore) and would send the whole
 repository, `.keys/` included. With BuildKit the context is a few MB. `BIN_SOURCE=host` adds
 the two release binaries, which carry debug info, so tens of MB.
 
 ```sh
 # Laptop or CI (default BIN_SOURCE=build): compiles both binaries with RISC0_SKIP_BUILD=1,
 # so no RISC Zero toolchain is needed.
-DOCKER_BUILDKIT=1 docker build -f showcases/ionet_arc/Dockerfile.seller -t warrant-seller:dev .
+DOCKER_BUILDKIT=1 docker build -f showcases/ionet_arc/Dockerfile -t warrant-seller:dev .
 
 # Linux VM only: copy target/release/warrant-host and target/release/warrant-policy, built on
 # the host by the configure action with RISC0_USE_DOCKER=1.
 DOCKER_BUILDKIT=1 docker build --build-arg BIN_SOURCE=host \
-  -f showcases/ionet_arc/Dockerfile.seller -t warrant-seller:host .
+  -f showcases/ionet_arc/Dockerfile -t warrant-seller:host .
 ```
 
 * `BIN_SOURCE=build` is the default. The binaries it builds embed laptop guest image IDs. The

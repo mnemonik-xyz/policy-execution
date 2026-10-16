@@ -1,8 +1,8 @@
-# Build context filter for Dockerfile.seller (BuildKit reads <Dockerfile>.dockerignore
+# Build context filter for Dockerfile (BuildKit reads <Dockerfile>.dockerignore
 # next to the Dockerfile; the legacy builder ignores this file, so always build
 # with DOCKER_BUILDKIT=1). The context is the repository root.
 #
-# Deny everything, then allow only what Dockerfile.seller copies. This keeps
+# Deny everything, then allow only what Dockerfile copies. This keeps
 # target/ (many GB), .git, .venv, artifacts/, contracts/ build output and every
 # key or env file out of the context.
 *
