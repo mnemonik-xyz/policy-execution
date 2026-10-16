@@ -70,10 +70,12 @@ def rpc_url():
 
 
 def run(*args, cwd=ROOT, interactive=False, stdin=None):
+    # Only a cast or forge call with a keystore signs, so only it gets the password file path. Foundry rejects
+    # ETH_PASSWORD without --account or --keystore (the forge script dry run of deploy has no signer).
+    env = dict(ENV) if args[0] in ("cast", "forge") and "--account" in args else \
+        {key: value for key, value in ENV.items() if key != "ETH_PASSWORD"}
     if args[0] in ("cast", "forge"):
-        env = dict(ENV, ETH_RPC_URL=rpc_url())
-    else:  # Only cast and forge sign, so only they get the password file path.
-        env = {key: value for key, value in ENV.items() if key != "ETH_PASSWORD"}
+        env["ETH_RPC_URL"] = rpc_url()
     extra = {"input": stdin} if stdin is not None else {} if interactive else {"stdin": subprocess.DEVNULL}
     try:
         p = subprocess.run([str(a) for a in args], cwd=cwd, env=env, text=True,
