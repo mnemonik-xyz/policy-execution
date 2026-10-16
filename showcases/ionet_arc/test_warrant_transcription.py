@@ -229,34 +229,6 @@ def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
     }
 
 
-DEFAULT_TEST_HARDWARE = [
-    {
-        "hardware_id": 3,
-        "hardware_name": "GeForce RTX 3090",
-        "price": 0.27,
-        "available": 5,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-    {
-        "hardware_id": 12,
-        "hardware_name": "GeForce RTX 4090",
-        "price": 0.30,
-        "available": 100,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-    {
-        "hardware_id": "gpu_1x_l40",
-        "hardware_name": "L40",
-        "price": 0.66,
-        "available": 10,
-        "max_gpus_per_container": 1,
-        "location": "US",
-    },
-]
-
-
 class TestMockWorker:
     """Mock in-process transcription worker for offline test suite execution."""
 
@@ -344,17 +316,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.cred_path, self.sig_path = write_vendor_credential(self.state_dir, self.mock_escrow, 31337, self.keys)
 
         self.test_workers = {}
+        self.cloud = FakeCloud()
 
         async def fake_connected(op):
-            cloud = MagicMock()
-
-            async def call(method, args):
-                if method == "caas_get_hardware_ids":
-                    return {"data": {"data": list(DEFAULT_TEST_HARDWARE)}}
-                return {}
-
-            cloud.call = call
-            return await op(cloud)
+            return await op(self.cloud)
 
         patch_conn = patch("showcases.ionet_arc.seller_mcp_server.connected", side_effect=fake_connected)
         patch_conn.start()
@@ -463,8 +428,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proposal["status"], "proposed")
         self.assertEqual(proposal["duration_hours"], 1)
         self.assertEqual(proposal["billing_model"], "duration")
-        self.assertEqual(proposal["amount"], 270_000)
-        self.assertEqual(proposal["amount_usd"], "0.27")
+        self.assertEqual(proposal["amount"], 490_000)
+        self.assertEqual(proposal["amount_usd"], "0.49")
         self.assertEqual(proposal["category"], DEFAULT_CATEGORY)
         self.assertTrue(proposal["task_id"].startswith("0x"))
         self.assertTrue(proposal["salt"].startswith("0x"))
@@ -472,29 +437,29 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TaskEscrow.offer", proposal["instructions"])
 
     async def test_propose_deployment_calculates_real_hardware_pricing(self):
-        # Specific GPU: RTX 4090 ($0.30/hr)
-        p4090 = await self.call("propose_deployment", {"hardware_id": 12})
-        self.assertEqual(p4090["amount"], 300_000)
-        self.assertEqual(p4090["amount_usd"], "0.30")
-        self.assertEqual(p4090["duration_hours"], 1)
+        # Specific GPU: L40 ($1.00/hr)
+        p_l40 = await self.call("propose_deployment", {"hardware_id": 40})
+        self.assertEqual(p_l40["amount"], 1_000_000)
+        self.assertEqual(p_l40["amount_usd"], "1.00")
+        self.assertEqual(p_l40["duration_hours"], 1)
 
-        # Multi-hour duration: 2 hours on RTX 4090 ($0.60 total)
-        p2h = await self.call("propose_deployment", {"hardware_id": 12, "duration_hours": 2})
-        self.assertEqual(p2h["amount"], 600_000)
-        self.assertEqual(p2h["amount_usd"], "0.60")
+        # Multi-hour duration: 2 hours on RTX A6000 ($0.49/hr -> $0.98 total)
+        p2h = await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 2})
+        self.assertEqual(p2h["amount"], 980_000)
+        self.assertEqual(p2h["amount_usd"], "0.98")
         self.assertEqual(p2h["duration_hours"], 2)
 
     async def test_propose_deployment_enforces_budget_cap(self):
-        # Budget cap lower than cheapest available ($0.27)
+        # Budget cap lower than cheapest available ($0.49)
         with self.assertRaises(ToolError) as ctx:
-            await self.call("propose_deployment", {"budget_cap_usd": "0.20"})
+            await self.call("propose_deployment", {"budget_cap_usd": "0.40"})
         self.assertIn("exceeds budget cap", str(ctx.exception))
 
-        # Budget cap lower than selected GPU ($0.66 > $0.50)
+        # Budget cap lower than selected GPU ($1.00 > $0.80)
         with self.assertRaises(ToolError) as ctx:
             await self.call(
                 "propose_deployment",
-                {"hardware_id": "gpu_1x_l40", "budget_cap_usd": "0.50"},
+                {"hardware_id": 40, "budget_cap_usd": "0.80"},
             )
         self.assertIn("exceeds budget cap", str(ctx.exception))
 
