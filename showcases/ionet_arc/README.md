@@ -324,8 +324,8 @@ Run every command from the repository root.
 1. Build the binaries with `cargo build --release -p warrant-host`. The buyer guardrail
    finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
    Without the build, it fails with "Could not find compiled binary".
-2. Copy [`config/mainnet-manifest.example.yaml`](config/mainnet-manifest.example.yaml) to
-   your own file outside git. Set the fields of the manifest table after step 7.
+2. Copy [`config/manifest.yaml`](config/manifest.yaml) to your own file outside git. Set the
+   fields of the manifest table after step 7.
 3. Give the guardrail your own funded Arc wallet key. Use one of these inputs:
    - the flag `--key-file <path>`;
    - the manifest field `private_key_files.buyer_key`;
@@ -391,7 +391,7 @@ read on the VM. Ignore them or delete them.
       "args": [
         "-m", "showcases.ionet_arc.buyer_mcp_server",
         "--transport", "stdio",
-        "--manifest", "/path/to/your/mainnet-manifest.yaml",
+        "--manifest", "/path/to/your/manifest.yaml",
         "--key-file", "/path/to/your/buyer.key"
       ]
     },

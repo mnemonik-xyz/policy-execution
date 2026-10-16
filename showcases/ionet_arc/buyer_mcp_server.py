@@ -87,22 +87,37 @@ class BuyerWarrantService:
             REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
         )
 
-        manifest = load_manifest(self.manifest_path)
-        if max_duration_hours is not None:
-            self.max_duration_hours = int(max_duration_hours)
-        else:
-            raw_duration = get_manifest_parameter(manifest, "duration_hours")
-            self.max_duration_hours = int(raw_duration) if raw_duration is not None else None
+        self.max_duration_hours = int(max_duration_hours) if max_duration_hours is not None else None
+        self.max_budget_usd = float(max_budget_usd) if max_budget_usd is not None else None
+        self.pinned_escrow = pinned_escrow
+        self.pinned_token = pinned_token
+        self.buyer_account = buyer_account
+        self.verifier_address = verifier_address
 
-        if max_budget_usd is not None:
-            self.max_budget_usd = float(max_budget_usd)
-        else:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
-            self.max_budget_usd = float(raw_budget) if raw_budget is not None else None
-        self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address")
-        self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address")
-        self.buyer_account = buyer_account or get_manifest_parameter(manifest, "buyer_address")
-        self.verifier_address = verifier_address or get_manifest_parameter(manifest, "verifier_address")
+        needs_manifest = (
+            self.max_duration_hours is None
+            or self.max_budget_usd is None
+            or not self.pinned_escrow
+            or not self.pinned_token
+            or not self.buyer_account
+            or not self.verifier_address
+        )
+        if needs_manifest:
+            manifest = load_manifest(self.manifest_path)
+            if self.max_duration_hours is None:
+                raw_duration = get_manifest_parameter(manifest, "duration_hours")
+                self.max_duration_hours = int(raw_duration) if raw_duration is not None else None
+            if self.max_budget_usd is None:
+                raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
+                self.max_budget_usd = float(raw_budget) if raw_budget is not None else None
+            if not self.pinned_escrow:
+                self.pinned_escrow = get_manifest_parameter(manifest, "escrow_address")
+            if not self.pinned_token:
+                self.pinned_token = get_manifest_parameter(manifest, "token_address")
+            if not self.buyer_account:
+                self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
+            if not self.verifier_address:
+                self.verifier_address = get_manifest_parameter(manifest, "verifier_address")
 
         if not self.escrow_client.escrow and self.pinned_escrow:
             self.escrow_client.escrow = self.pinned_escrow
@@ -685,9 +700,7 @@ class ServerConfig:
 
     def _resolve_key(self, manifest: dict):
         if self.buyer_key_path is None:
-            raw_key_path = manifest.get("private_key_files", {}).get(
-                "buyer_key", manifest.get("private_key_files", {}).get("buyer_account_key")
-            )
+            raw_key_path = manifest.get("private_key_files", {}).get("buyer_key")
             if raw_key_path:
                 cand = pathlib.Path(raw_key_path)
                 self.buyer_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
@@ -701,10 +714,9 @@ class ServerConfig:
                 with contextlib.suppress(Exception):
                     self.buyer_private_key = self.buyer_key_path.read_text().strip()
             if not self.buyer_private_key:
-                for env_var in ("WARRANT_BUYER_KEY", "BUYER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
-                    if os.environ.get(env_var):
-                        self.buyer_private_key = os.environ.get(env_var).strip()
-                        break
+                val = os.environ.get("WARRANT_BUYER_KEY")
+                if val:
+                    self.buyer_private_key = val.strip()
 
     def __post_init__(self):
         self._resolve_paths()

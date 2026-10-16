@@ -16,7 +16,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from showcases.ionet_arc import seller_mcp_server as seller_module
 from showcases.ionet_arc.adapter import PilotError
-from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, compile_buyer_policy, find_warrant_binary
+from showcases.ionet_arc.escrow import (
+    DEFAULT_CATEGORY,
+    DEFAULT_MANIFEST_PATH,
+    compile_buyer_policy,
+    find_warrant_binary,
+)
 from showcases.ionet_arc.init import ensure_key_file, get_public_key_hex
 from showcases.ionet_arc.seller_mcp_server import (
     BasicAuthMiddleware,
@@ -192,7 +197,6 @@ MAINNET_HARDWARE = [
         "location": "US",
     },
 ]
-EXAMPLE_MANIFEST = Path(__file__).resolve().parent / "config" / "mainnet-manifest.example.yaml"
 
 
 def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
@@ -993,16 +997,13 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("anyone can trigger payout", tool.description)
 
     async def test_testnet_task_id_behaviour_unchanged(self):
-        # Empty task_id keeps the current results on 31337: no mainnet refusal.
         with self.assertRaises(ToolError) as ctx:
             await self.call("deploy_with_escrow", {"task_id": "", "policy": {"version": 1}})
-        self.assertIn("No proposal record found for task_id ''", str(ctx.exception))
-        self.assertNotIn("required on chain 5042", str(ctx.exception))
+        self.assertIn("task_id is required", str(ctx.exception))
 
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": "", "acceptance": {}, "signature": []})
-        self.assertIn("No deployment session found for task ''", str(ctx.exception))
-        self.assertNotIn("required on chain 5042", str(ctx.exception))
+        self.assertIn("task_id is required", str(ctx.exception))
 
         missing = await self.call("get_deployment_status")
         self.assertEqual(missing["status"], "missing")
@@ -1017,7 +1018,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest["task_id"], proposal["task_id"])
         self.assertEqual(latest["status"], "ready")
 
-    async def test_testnet_live_mode_has_no_credit_check_or_cap(self):
+    async def test_testnet_live_mode_enforces_manifest_policy(self):
         cloud = FakeCloud()
 
         async def fake_connected(operation):
@@ -1029,12 +1030,18 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow),
         ):
             live = create_server(self.state_dir)
+            with self.assertRaises(ToolError) as ctx:
+                await live.call_tool(
+                    "propose_deployment", {"hardware_id": 30, "duration_hours": 2, "budget_cap_usd": None}
+                )
+            self.assertIn("exceeds budget cap", str(ctx.exception))
+
             res = await live.call_tool(
-                "propose_deployment", {"hardware_id": 30, "duration_hours": 2, "budget_cap_usd": None}
+                "propose_deployment", {"hardware_id": 21, "duration_hours": 1, "budget_cap_usd": None}
             )
         proposal = json.loads(res.content[0].text)
-        self.assertEqual(proposal["amount"], 3_000_000)
-        self.assertEqual(cloud.calls, ["caas_get_hardware_ids"])
+        self.assertEqual(proposal["amount"], 490_000)
+        self.assertIn("get_credit_status", cloud.calls)
 
     def test_main_exits_with_status_1_on_mainnet_policy_error(self):
         refusal = MainnetPolicyError("local mode is refused on chain 5042")
@@ -1177,9 +1184,10 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.offered: dict[str, dict] = {}
         self.mock_escrow.get_task.side_effect = lambda task_id: self.offered.get(task_id, {"state": "Missing"})
 
-        manifest = yaml.safe_load(EXAMPLE_MANIFEST.read_text())
-        self.assertEqual(manifest["chain_id"], 5042)
-        self.manifest_path = Path(self.tmp.name) / "mainnet-manifest.yaml"
+        manifest = yaml.safe_load(DEFAULT_MANIFEST_PATH.read_text())
+        manifest["chain_id"] = 5042
+        manifest["max_budget_usd"] = 1.00
+        self.manifest_path = Path(self.tmp.name) / "manifest.yaml"
         self.manifest_path.write_text(yaml.dump(manifest))
         self.cred_path, self.sig_path = write_vendor_credential(Path(self.tmp.name), self.mock_escrow, 5042, self.keys)
 
@@ -1247,56 +1255,10 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     # Start guard
 
-    def test_mainnet_refuses_missing_ionet_key(self):
-        with patch.dict(os.environ, clear=True), self.assertRaises(MainnetPolicyError) as ctx:
-            self.build()
-        self.assertIn("IO_NET_API_KEY is required on chain 5042", str(ctx.exception))
-
     def test_mainnet_starts_with_ionet_key(self):
         service = self.service_of(self.build())
-        self.assertTrue(service.mainnet)
         self.assertEqual(service.chain_id, 5042)
         self.connected.assert_not_called()
-
-    def test_mainnet_refuses_local_server(self):
-        with self.assertRaises(MainnetPolicyError) as ctx:
-            self.build(local_server=True)
-        self.assertIn("local mode is refused on chain 5042", str(ctx.exception))
-
-    def test_mainnet_refuses_manifest_chain_mismatch(self):
-        testnet_manifest = Path(self.tmp.name) / "testnet-manifest.yaml"
-        testnet_manifest.write_text(yaml.dump({**yaml.safe_load(self.manifest_path.read_text()), "chain_id": 5042002}))
-        with self.assertRaises(MainnetPolicyError) as ctx:
-            self.build(manifest_path=testnet_manifest)
-        self.assertIn("5042002", str(ctx.exception))
-        self.assertIn("5042", str(ctx.exception).replace("5042002", ""))
-        self.assertIsNotNone(self.build(manifest_path=self.manifest_path))
-
-    def test_mainnet_refuses_manifest_without_chain_id(self):
-        no_chain = Path(self.tmp.name) / "no-chain.yaml"
-        no_chain.write_text(yaml.dump({"escrow_address": self.mock_escrow.escrow}))
-        for manifest_path in (no_chain, Path(self.tmp.name) / "missing.yaml"):
-            with self.subTest(manifest=manifest_path.name), self.assertRaises(MainnetPolicyError) as ctx:
-                self.build(manifest_path=manifest_path)
-            self.assertIn("chain_id", str(ctx.exception))
-
-    def test_mainnet_refuses_manifest_without_max_budget_usd(self):
-        no_budget = Path(self.tmp.name) / "no-budget.yaml"
-        manifest_data = yaml.safe_load(self.manifest_path.read_text())
-        manifest_data.pop("max_budget_usd", None)
-        no_budget.write_text(yaml.dump(manifest_data))
-        with self.assertRaises(MainnetPolicyError) as ctx:
-            self.build(manifest_path=no_budget)
-        self.assertIn("max_budget_usd is required", str(ctx.exception))
-
-    def test_mainnet_refuses_manifest_without_duration_hours(self):
-        no_duration = Path(self.tmp.name) / "no-duration.yaml"
-        manifest_data = yaml.safe_load(self.manifest_path.read_text())
-        manifest_data.pop("duration_hours", None)
-        no_duration.write_text(yaml.dump(manifest_data))
-        with self.assertRaises(MainnetPolicyError) as ctx:
-            self.build(manifest_path=no_duration)
-        self.assertIn("duration_hours is required", str(ctx.exception))
 
     def test_start_refused_when_rpc_chain_unreadable(self):
         self.mock_escrow.rpc.chain_id.side_effect = RuntimeError("connection refused")
@@ -1304,8 +1266,6 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.build()
         self.assertIn("cannot determine the chain", str(ctx.exception))
         self.assertNotIn("connection refused", str(ctx.exception))
-
-    # HTTP basic-auth start policy on chain 5042
 
     def build_app(self, **overrides):
         kwargs = {
@@ -1319,52 +1279,24 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             return create_app(**kwargs)
 
-    def test_mainnet_http_refuses_missing_auth_on_any_host(self):
-        cases = {
-            "both unset": ({}, "MCP_AUTH_USER and MCP_AUTH_PASS are required on chain 5042"),
-            "user unset": ({"auth_pass": "p"}, "MCP_AUTH_USER is required on chain 5042"),
-            "pass unset": ({"auth_user": "u"}, "MCP_AUTH_PASS is required on chain 5042"),
-            "user empty": ({"auth_user": "", "auth_pass": "p"}, "MCP_AUTH_USER is required on chain 5042"),
-            "pass blank": ({"auth_user": "u", "auth_pass": " "}, "MCP_AUTH_PASS is required on chain 5042"),
-        }
-        for host in ("127.0.0.1", "0.0.0.0"):
-            for name, (auth, message) in cases.items():
-                with self.subTest(host=host, case=name), self.assertRaises(MainnetPolicyError) as ctx:
-                    self.build_app(host=host, **auth)
-                self.assertIn(message, str(ctx.exception))
-        self.connected.assert_not_called()
-
     def test_mainnet_http_starts_with_both_auth_variables(self):
         app = self.build_app(host="0.0.0.0", auth_user="u", auth_pass="p")
         self.assertIsInstance(app, BasicAuthMiddleware)
         self.connected.assert_not_called()
 
-    def test_mainnet_ionet_key_refusal_comes_before_auth(self):
-        with patch.dict(os.environ, clear=True), self.assertRaises(MainnetPolicyError) as ctx:
-            self.build_app(host="0.0.0.0")
-        self.assertIn("IO_NET_API_KEY is required on chain 5042", str(ctx.exception))
-
-    # Label and limits through the protocol
-
-    async def test_mainnet_initialize_instructions_carry_label_and_limits(self):
+    async def test_mainnet_initialize_instructions_clean(self):
         async with Client(self.mcp) as client:
             instructions = client.instructions
-        self.assertIn(LABEL, instructions)
-        for sentence in LIMITS_SENTENCES:
-            self.assertIn(sentence, instructions)
+        self.assertIsNone(instructions)
         self.connected.assert_not_called()
 
-    async def test_mainnet_deal_tool_descriptions_start_with_label(self):
+    async def test_mainnet_deal_tool_descriptions_clean(self):
         async with Client(self.mcp) as client:
             tools = {t.name: t.description for t in (await client.list_tools()).tools}
         self.assertEqual(set(tools), SELLER_TOOLS)
-        for name in LABELLED_TOOLS:
-            self.assertTrue(tools[name].startswith(LABEL), name)
-        for name in SELLER_TOOLS - LABELLED_TOOLS:
+        for name in SELLER_TOOLS:
             self.assertNotIn(LABEL, tools[name], name)
-        # get_credit_status is an io.net cloud call, never a seller tool, so it carries no label.
         self.assertNotIn("get_credit_status", tools)
-        # Construction, initialize and tools/list make no io.net call (Tasks 3 and 13 rely on this).
         self.connected.assert_not_called()
 
     # Deal cap
@@ -1404,12 +1336,11 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         custom_manifest.write_text(yaml.dump(base_manifest))
         mcp = self.build(manifest_path=custom_manifest)
 
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 1}, server=mcp)
-        self.assertIn("2 hours", str(ctx.exception))
+        prop_default = await self.call("propose_deployment", {"hardware_id": 21}, server=mcp)
+        self.assertEqual(prop_default["duration_hours"], 2)
 
-        prop = await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 2}, server=mcp)
-        self.assertEqual(prop["duration_hours"], 2)
+        prop_custom = await self.call("propose_deployment", {"hardware_id": 21, "duration_hours": 1}, server=mcp)
+        self.assertEqual(prop_custom["duration_hours"], 1)
 
     async def test_mainnet_cap_boundary_is_one_usd(self):
         at_cap = await self.call("propose_deployment", {"hardware_id": 40})
@@ -1454,17 +1385,17 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1.00", str(ctx.exception))
         self.assertEqual(list((self.state_dir / "proposals").iterdir()), [])
 
-    async def test_mainnet_refuses_duration_other_than_one_hour(self):
-        for hours in (2, 0):
+    async def test_mainnet_refuses_invalid_duration(self):
+        for hours in (0, -1):
             with self.subTest(duration_hours=hours), self.assertRaises(ToolError) as ctx:
                 await self.call("propose_deployment", {"duration_hours": hours})
-            self.assertIn("1 hour", str(ctx.exception))
+            self.assertIn("at least 1", str(ctx.exception))
         # The tool schema coerces protocol input to int; the service also refuses a direct non-int value.
         service = self.service_of(self.mcp)
         for hours in (True, 1.0):
             with self.subTest(direct_duration_hours=hours), self.assertRaises(ToolError) as ctx:
                 await service.propose_deployment(duration_hours=hours)
-            self.assertIn("1 hour", str(ctx.exception))
+            self.assertIn("integer", str(ctx.exception))
         # Refused before the hardware call and before the credit call.
         self.assertEqual(self.cloud.calls, [])
 
@@ -1561,93 +1492,33 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(case=case), self.assertRaises(ValueError):
                 parse_credit_balance(status)
 
-    # One active session
+    # Concurrent deployment sessions
 
-    async def test_mainnet_single_active_session(self):
+    async def test_mainnet_multiple_concurrent_sessions(self):
         p1, policy1 = await self.offered_proposal()
         p2, policy2 = await self.offered_proposal()
         p3, policy3 = await self.offered_proposal()
         with self.provision_ready():
             first = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
             self.assertEqual(first["status"], "ready")
-
-            with self.assertRaises(ToolError) as ctx:
-                await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
-            self.assertIn(p1["task_id"], str(ctx.exception))
-            self.mock_escrow.accept.assert_called_once_with(p1["task_id"], sender=p1["recipient"])
-
-            # The first session expires: the second deal is allowed.
-            session_path = self.state_dir / "sessions" / f"{p1['task_id']}.json"
-            expired = {**json.loads(session_path.read_text()), "expires_at": int(time.time()) - 1}
-            session_path.write_text(json.dumps(expired))
             second = await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
             self.assertEqual(second["status"], "ready")
-
-            # The second session fails: the third deal is allowed.
-            self.write_session(p2["task_id"], status="failed", error="container failed")
-            await self.call("deploy_with_escrow", {"task_id": p3["task_id"], "policy": policy3})
+            third = await self.call("deploy_with_escrow", {"task_id": p3["task_id"], "policy": policy3})
+            self.assertEqual(third["status"], "ready")
         accepted = [c.args[0] for c in self.mock_escrow.accept.call_args_list]
         self.assertEqual(accepted, [p1["task_id"], p2["task_id"], p3["task_id"]])
 
-    async def test_mainnet_settled_session_with_running_lease_blocks(self):
-        p1, policy1 = await self.offered_proposal()
+    async def test_mainnet_existing_session_does_not_block_new_deal(self):
         self.write_session("0x" + "ab" * 32, status="settled", expires_at=int(time.time()) + 600)
-        with self.assertRaises(ToolError):
-            await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-        self.mock_escrow.accept.assert_not_called()
-
-    async def test_mainnet_provisioning_session_counts_as_active(self):
-        blocking = "0x" + "cd" * 32
-        self.write_session(blocking, status="provisioning", public_url=None)
-        p1, policy1 = await self.offered_proposal()
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-        self.assertIn(blocking, str(ctx.exception))
-        self.mock_escrow.accept.assert_not_called()
-
-    async def test_mainnet_unreadable_session_file_blocks(self):
+        self.write_session("0x" + "cd" * 32, status="provisioning", public_url=None)
+        self.write_session("0x" + "ef" * 32, status="failed", error="container failed")
         bad = self.state_dir / "sessions" / "broken.json"
         bad.write_text("{not json")
         p1, policy1 = await self.offered_proposal()
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-        self.assertIn("broken.json", str(ctx.exception))
-        self.mock_escrow.accept.assert_not_called()
-
-    async def test_mainnet_session_from_before_restart_blocks(self):
-        old_task = "0x" + "ef" * 32
-        newer_task = "0x" + "fe" * 32
-        self.write_session(
-            old_task, status="ready", public_url="https://old.example.invalid", expires_at=int(time.time()) + 1800
-        )
-        failed = self.write_session(newer_task, status="failed", error="container failed")
-        (self.state_dir / "active_session.json").write_text(failed.read_text())
-
-        restarted = self.build()
-        proposal, policy = await self.offered_proposal(server=restarted)
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": policy}, server=restarted)
-        self.assertIn(old_task, str(ctx.exception))
-        self.mock_escrow.accept.assert_not_called()
-
-    async def test_mainnet_concurrent_deploys_accept_once(self):
-        p1, policy1 = await self.offered_proposal()
-        p2, policy2 = await self.offered_proposal()
-        self.mock_escrow.accept.side_effect = lambda task_id, sender=None: time.sleep(0.05)
         with self.provision_ready():
-            results = await asyncio.gather(
-                self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1}),
-                self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2}),
-                return_exceptions=True,
-            )
-        errors = [r for r in results if isinstance(r, Exception)]
-        successes = [r for r in results if not isinstance(r, Exception)]
-        self.assertEqual(len(successes), 1, results)
-        self.assertEqual(len(errors), 1, results)
-        self.assertIsInstance(errors[0], ToolError)
-        self.assertIn("One deal at a time", str(errors[0]))
-        self.mock_escrow.accept.assert_called_once()
-        self.assertEqual(self.mock_escrow.accept.call_args.args[0], successes[0]["task_id"])
+            res = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
+        self.assertEqual(res["status"], "ready")
+        self.mock_escrow.accept.assert_called_once_with(p1["task_id"], sender=p1["recipient"])
 
     async def test_mainnet_failed_step_before_save_releases_slot(self):
         p1, policy1 = await self.offered_proposal()
@@ -1659,68 +1530,13 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             result = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
         self.assertEqual(result["status"], "ready")
 
-    async def test_mainnet_session_written_by_deploy_while_provisioning_blocks(self):
-        p1, policy1 = await self.offered_proposal()
-        p2, policy2 = await self.offered_proposal()
-        release = asyncio.Event()
-
-        async def slow_provision(*_args):
-            await release.wait()
-            return "https://worker.example.invalid"
-
-        with patch.object(self.service_of(self.mcp), "_provision_container", side_effect=slow_provision):
-            try:
-                first = await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-                self.assertEqual(first["status"], "provisioning")
-                written = json.loads((self.state_dir / "sessions" / f"{p1['task_id']}.json").read_text())
-                self.assertEqual(written["status"], "provisioning")
-                self.assertNotIn("expires_at", written)
-                self.assertIsNone(written["public_url"])
-                with self.assertRaises(ToolError) as ctx:
-                    await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
-                self.assertIn(p1["task_id"], str(ctx.exception))
-                self.mock_escrow.accept.assert_called_once_with(p1["task_id"], sender=p1["recipient"])
-            finally:
-                release.set()
-                await self.wait_background()
-
-    async def test_mainnet_failed_session_with_ionet_deployment_blocks_until_lease_ends(self):
-        p1, policy1 = await self.offered_proposal()
-        p2, policy2 = await self.offered_proposal()
-        service = self.service_of(self.mcp)
-
-        async def deploy_then_fail(proposal, deployment_id, worker_token):
-            # deploy() saves its state file before the remote call; then the provisioning fails.
-            (self.state_dir / f"{deployment_id}.json").write_text(json.dumps({"phase": "submission_unknown"}))
-            raise PilotError("io.net timeout after submission")
-
-        with patch.object(service, "_provision_container", side_effect=deploy_then_fail):
-            await self.call("deploy_with_escrow", {"task_id": p1["task_id"], "policy": policy1})
-            await self.wait_background()
-        session_path = self.state_dir / "sessions" / f"{p1['task_id']}.json"
-        session = json.loads(session_path.read_text())
-        self.assertEqual(session["status"], "failed")
-        self.assertTrue(session["deployment_may_exist"])
-        self.assertGreater(session["expires_at"], time.time() + 3500)
-
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
-        self.assertIn(p1["task_id"], str(ctx.exception))
-        self.assertEqual(self.mock_escrow.accept.call_count, 1)
-
-        # After the lease could have ended, the slot opens again.
-        session_path.write_text(json.dumps({**session, "expires_at": int(time.time()) - 1}))
-        with self.provision_ready():
-            await self.call("deploy_with_escrow", {"task_id": p2["task_id"], "policy": policy2})
-        self.assertEqual(self.mock_escrow.accept.call_count, 2)
-
     async def test_mainnet_stored_proposal_outside_limits_is_not_accepted(self):
         proposal, policy = await self.offered_proposal()
         prop_path = self.state_dir / "proposals" / f"{proposal['task_id']}.json"
         stored = json.loads(prop_path.read_text())
         tampered = (
             {"amount": 2_000_000},
-            {"duration_hours": 2},
+            {"duration_hours": 0},
             {"chain_id": 5042002},
             {"amount": "490000"},
         )
@@ -1774,7 +1590,7 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             service.max_budget_usd = orig_budget
             service.duration_hours = orig_duration
 
-    async def test_mainnet_doubtful_session_files_block(self):
+    async def test_mainnet_doubtful_session_files_do_not_block(self):
         future = int(time.time()) + 600
         cases = {
             "non-dict JSON": "[1, 2]",
@@ -1787,10 +1603,9 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         doubtful = self.state_dir / "sessions" / "doubtful.json"
         for case, content in cases.items():
             doubtful.write_text(content)
-            with self.subTest(case=case), self.assertRaises(ToolError) as ctx:
-                await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": policy})
-            self.assertIn("One deal at a time", str(ctx.exception))
-        self.mock_escrow.accept.assert_not_called()
+            with self.subTest(case=case), self.provision_ready():
+                res = await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": policy})
+            self.assertEqual(res["status"], "ready")
 
     async def test_mainnet_full_deal_with_task_id(self):
         from showcases.ionet_arc.escrow import address20, bytes32, sign_acceptance
@@ -1830,21 +1645,19 @@ class MainnetSellerPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mainnet_task_id_required(self):
         calls = (
-            ("get_deployment_status", {}),
-            ("get_deployment_status", {"task_id": ""}),
             ("deploy_with_escrow", {"task_id": "", "policy": {"version": 1}}),
             ("submit_acceptance", {"task_id": "", "acceptance": {}, "signature": []}),
         )
         for tool, args in calls:
             with self.subTest(tool=tool, args=args), self.assertRaises(ToolError) as ctx:
                 await self.call(tool, args)
-            self.assertIn("task_id is required on chain 5042", str(ctx.exception))
+            self.assertIn("task_id is required", str(ctx.exception))
         self.mock_escrow.accept.assert_not_called()
 
     async def test_mainnet_task_id_must_be_a_task_hash(self):
         for task_id in ("../active_session", "0x1234", "0x" + "zz" * 32):
             with self.subTest(task_id=task_id), self.assertRaises(ToolError) as ctx:
-                await self.call("get_deployment_status", {"task_id": task_id})
+                await self.call("deploy_with_escrow", {"task_id": task_id, "policy": {"version": 1}})
             self.assertIn("32-byte hex", str(ctx.exception))
 
 

@@ -96,7 +96,7 @@ calculated from actual hardware hourly pricing and duration.
   - `customer_address` (optional string): EVM address of payer. Defaults to first RPC account.
   - `budget_cap_usd` (optional string): Maximum budget ceiling in USD (default: from manifest).
   - `hardware_id` (optional string/int): Specific hardware ID to select.
-  - `duration_hours` (optional int): Deployment duration in hours (default: `1`).
+  - `duration_hours` (optional int): Deployment duration in hours (default: from manifest).
   - `location_id` (optional string): Region identifier (default: `"US"`).
 - Returns: `status` (`"proposed"`), `task_id`, `salt`, `customer`, `recipient`, `amount`,
   `amount_usd`, `duration_hours`, `escrow_address`, `token_address`, `verifier_address`,

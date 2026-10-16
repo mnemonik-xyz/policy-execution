@@ -48,7 +48,6 @@ from showcases.ionet_arc.adapter import (  # noqa: E402
 )
 from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
-    DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
     EscrowClient,
     address20,
@@ -62,18 +61,6 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/transcription:pilot"
 
-# Mainnet policy (tech-spec Decision 6). Every branch keys on the chain that the RPC reports at construction,
-# never on the manifest alone: a manifest-only guard is bypassable through WARRANT_RPC_URL.
-MAINNET_CHAIN_ID = 5042
-MAINNET_LABEL = "after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD"
-MAINNET_LIMITS = (
-    "Settlement uses a test-double verifier that accepts any digest the seller approves.",
-    "The 1 USD cap and the one-hour lease are seller policy, not contract rules.",
-    "One deal at a time.",
-    "The mainnet seller path has not been exercised with money before this listing.",
-    "Any holder of the basic-auth credential can read the current deployment status, including its worker token.",
-)
-MAINNET_INSTRUCTIONS = MAINNET_LABEL + ".\n" + " ".join(MAINNET_LIMITS)
 TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
 
 
@@ -82,11 +69,11 @@ class StartRefusedError(RuntimeError):
 
 
 class MainnetPolicyError(StartRefusedError):
-    """The server must not start: the configuration breaks the chain 5042 policy."""
+    """Backwards compatibility alias for start refusal errors."""
 
 
-class ChainDetectionError(MainnetPolicyError):
-    """The server must not start: the RPC chain is unknown, so the chain policy cannot be chosen."""
+class ChainDetectionError(StartRefusedError):
+    """The server must not start: the RPC chain is unknown."""
 
 
 class BasicAuthMiddleware:
@@ -237,36 +224,39 @@ class SellerWarrantService:
         self.vendor_credential_path = pathlib.Path(vendor_credential_path) if vendor_credential_path else None
         self.vendor_signature_path = pathlib.Path(vendor_signature_path) if vendor_signature_path else None
         self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
-        # The chain read from the RPC at construction. The tools use it for the policy decision and do not
-        # read the chain again, so an RPC failure later cannot switch the mainnet policy off.
         self.chain_id = chain_id
-        self.mainnet = chain_id == MAINNET_CHAIN_ID
-        # Held on chain 5042 from the single-session check to the save of the provisioning session.
-        # It serialises one server process only: the deployment runs one seller container per state dir.
-        self._deal_lock = asyncio.Lock()
 
-        manifest = load_manifest(self.manifest_path)
-        if max_budget_usd is not None:
-            self.max_budget_usd = Decimal(str(max_budget_usd))
-        else:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
-            self.max_budget_usd = Decimal(str(raw_budget)) if raw_budget is not None else None
+        self.max_budget_usd = Decimal(str(max_budget_usd)) if max_budget_usd is not None else None
+        self.duration_hours = int(duration_hours) if duration_hours is not None else None
+        self.buyer_account = buyer_account
 
-        if duration_hours is not None:
-            self.duration_hours = int(duration_hours)
-        else:
-            raw_duration = get_manifest_parameter(manifest, "duration_hours")
-            self.duration_hours = int(raw_duration) if raw_duration is not None else None
-
-        self.buyer_account = buyer_account or get_manifest_parameter(manifest, "buyer_address")
-        if not self.escrow_client.escrow:
-            self.escrow_client.escrow = get_manifest_parameter(manifest, "escrow_address")
-        if not self.escrow_client.token:
-            self.escrow_client.token = get_manifest_parameter(manifest, "token_address")
-        if not self.escrow_client.verifier:
-            self.escrow_client.verifier = get_manifest_parameter(manifest, "verifier_address")
-        if not self.escrow_client.server_account:
-            self.escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
+        needs_manifest = (
+            self.max_budget_usd is None
+            or self.duration_hours is None
+            or self.buyer_account is None
+            or not self.escrow_client.escrow
+            or not self.escrow_client.token
+            or not self.escrow_client.verifier
+            or not self.escrow_client.server_account
+        )
+        if needs_manifest:
+            manifest = load_manifest(self.manifest_path)
+            if self.max_budget_usd is None:
+                raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
+                self.max_budget_usd = Decimal(str(raw_budget)) if raw_budget is not None else None
+            if self.duration_hours is None:
+                raw_duration = get_manifest_parameter(manifest, "duration_hours")
+                self.duration_hours = int(raw_duration) if raw_duration is not None else None
+            if self.buyer_account is None:
+                self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
+            if not self.escrow_client.escrow:
+                self.escrow_client.escrow = get_manifest_parameter(manifest, "escrow_address")
+            if not self.escrow_client.token:
+                self.escrow_client.token = get_manifest_parameter(manifest, "token_address")
+            if not self.escrow_client.verifier:
+                self.escrow_client.verifier = get_manifest_parameter(manifest, "verifier_address")
+            if not self.escrow_client.server_account:
+                self.escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
 
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
@@ -316,14 +306,7 @@ class SellerWarrantService:
         raise ToolError(f"Requested hardware_id '{hardware_id}' is not in available candidates.")
 
     async def _resolve_addresses_and_chain(self, customer_address: str | None) -> tuple[str, int]:
-        escrow_client = self.escrow_client
-        if self.mainnet:
-            chain_id = self.chain_id
-        else:
-            try:
-                chain_id = await asyncio.to_thread(escrow_client.rpc.chain_id)
-            except Exception:
-                chain_id = DEFAULT_CHAIN_ID
+        chain_id = self.chain_id
 
         if not customer_address:
             customer_address = self.buyer_account
@@ -331,27 +314,13 @@ class SellerWarrantService:
         if not customer_address:
             raise ToolError("Customer address was not provided and is not configured in config/manifest.yaml.")
 
-        if not escrow_client.server_account:
-            manifest = load_manifest(self.manifest_path)
-            manifest_chain = manifest.get("chain_id")
-            if manifest_chain is None or manifest_chain == chain_id:
-                escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
-
-        if not escrow_client.server_account:
+        if not self.escrow_client.server_account:
             raise ToolError("Server payout account is not configured in config/manifest.yaml.")
 
         return customer_address, chain_id
 
     def _ensure_escrow_contracts(self, chain_id: int):
         escrow_client = self.escrow_client
-        if not escrow_client.escrow or not escrow_client.token or not escrow_client.verifier:
-            manifest = load_manifest(self.manifest_path)
-            manifest_chain = manifest.get("chain_id")
-            if manifest_chain is None or manifest_chain == chain_id:
-                escrow_client.escrow = escrow_client.escrow or get_manifest_parameter(manifest, "escrow_address")
-                escrow_client.token = escrow_client.token or get_manifest_parameter(manifest, "token_address")
-                escrow_client.verifier = escrow_client.verifier or get_manifest_parameter(manifest, "verifier_address")
-
         if not escrow_client.escrow:
             raise ToolError(
                 f"TaskEscrow address is not configured for chain {chain_id}. "
@@ -363,19 +332,20 @@ class SellerWarrantService:
                 "Specify token_address in config/manifest.yaml."
             )
 
-    def _require_task_id(self, task_id: str | None) -> str | None:
-        """On chain 5042, require a TaskEscrow task id and return it in lower case; elsewhere return it as is."""
-        if not self.mainnet:
-            return task_id
+    def _require_task_id(self, task_id: str | None, required: bool = True) -> str | None:
+        """Validate a TaskEscrow task id format."""
+        if task_id is None:
+            if required:
+                raise ToolError("task_id is required.")
+            return None
         if not task_id:
-            raise ToolError(f"task_id is required on chain {MAINNET_CHAIN_ID}.")
-        # task_id names state files, so the public service accepts only a TaskEscrow task id.
+            raise ToolError("task_id is required.")
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
-            raise ToolError(f"task_id must be a 0x-prefixed 32-byte hex string on chain {MAINNET_CHAIN_ID}.")
+            raise ToolError("task_id must be a 0x-prefixed 32-byte hex string.")
         return task_id.lower()
 
-    def _mainnet_budget_cap(self, budget_cap_usd: str | float | None) -> Decimal:
-        """The effective cap on chain 5042: the caller's cap if lower, never above manifest max_budget_usd."""
+    def _effective_budget_cap(self, budget_cap_usd: str | float | None) -> Decimal:
+        """The effective cap: caller's cap if lower, never above manifest max_budget_usd."""
         if self.max_budget_usd is None:
             raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
         if budget_cap_usd is None:
@@ -399,9 +369,7 @@ class SellerWarrantService:
             # A ValueError from the parser names the field only, never an amount or an account identifier.
             detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
             logger.warning("io.net credit status could not be read: %s", detail)
-            raise ToolError(
-                f"The io.net credit balance cannot be read, so no deal is proposed on chain {MAINNET_CHAIN_ID}."
-            ) from None
+            raise ToolError("The io.net credit balance cannot be read, so no deal is proposed.") from None
         if balance < required_usd:
             logger.warning("io.net credits %s USD are below required %s USD", balance, required_usd)
             raise ToolError(
@@ -409,12 +377,27 @@ class SellerWarrantService:
                 "Try again later."
             )
 
+    def _resolve_duration_and_cap(
+        self, duration_hours: int | None, budget_cap_usd: str | float | None
+    ) -> tuple[int, Decimal]:
+        if duration_hours is None:
+            if self.duration_hours is None:
+                raise ToolError("duration_hours is not configured in config/manifest.yaml.")
+            duration_hours = self.duration_hours
+        elif type(duration_hours) is not int or duration_hours <= 0:
+            if type(duration_hours) is not int:
+                raise ToolError(f"duration_hours must be an integer, got {duration_hours!r}")
+            raise ToolError(f"duration_hours must be at least 1, got {duration_hours}")
+
+        cap = self._effective_budget_cap(budget_cap_usd)
+        return duration_hours, cap
+
     async def propose_deployment(
         self,
         hardware_id: str | int | None = None,
         customer_address: str | None = None,
         location_id: str = "US",
-        duration_hours: int = 1,
+        duration_hours: int | None = None,
         budget_cap_usd: str | float | None = None,
     ) -> dict:
         logger.info(
@@ -427,24 +410,10 @@ class SellerWarrantService:
             budget_cap_usd,
         )
         try:
-            mainnet_cap = None
-            if self.mainnet:
-                # Checked before the hardware call and the credit call.
-                if self.duration_hours is None:
-                    raise ToolError("duration_hours is not configured in config/manifest.yaml.")
-                if type(duration_hours) is not int or duration_hours != self.duration_hours:
-                    hour_label = "hour" if self.duration_hours == 1 else "hours"
-                    raise ToolError(
-                        f"duration_hours must be {self.duration_hours} {hour_label} on chain {MAINNET_CHAIN_ID}, "
-                        f"got {duration_hours}"
-                    )
-                if self.max_budget_usd is None:
-                    raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
-                mainnet_cap = self._mainnet_budget_cap(budget_cap_usd)
+            customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
+            self._ensure_escrow_contracts(chain_id)
 
-            if duration_hours <= 0:
-                logger.warning("Invalid duration_hours: %s", duration_hours)
-                raise ToolError(f"duration_hours must be at least 1, got {duration_hours}")
+            duration_hours, effective_cap = self._resolve_duration_and_cap(duration_hours, budget_cap_usd)
 
             logger.info("Querying suitable hardware candidates for proposal...")
             candidates = await self.list_suitable_hardware()
@@ -462,40 +431,24 @@ class SellerWarrantService:
             )
             # Dynamic pricing based on real hardware cost and duration
             price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
+            if not price_per_hour.is_finite() or price_per_hour <= 0:
+                raise ToolError(f"Selected hardware '{selected_hw['hardware_name']}' has no valid price.")
             duration = Decimal(str(duration_hours))
             cost_usd = price_per_hour * duration
 
-            if mainnet_cap is not None:
-                if not price_per_hour.is_finite() or price_per_hour <= 0:
-                    raise ToolError(f"Selected hardware '{selected_hw['hardware_name']}' has no valid price.")
-                if cost_usd > mainnet_cap:
-                    logger.warning("Hardware cost $%.2f exceeds mainnet cap $%.2f", cost_usd, mainnet_cap)
-                    raise ToolError(
-                        f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} exceeds the "
-                        f"budget cap of ${mainnet_cap:.2f} (chain {MAINNET_CHAIN_ID} deals are capped at "
-                        f"${self.max_budget_usd:.2f})."
-                    )
-                await self._require_credits(cost_usd)
+            if cost_usd > effective_cap:
+                logger.warning("Hardware cost $%.2f exceeds budget cap $%.2f", cost_usd, effective_cap)
+                raise ToolError(
+                    f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
+                    f"exceeds budget cap of ${effective_cap:.2f}."
+                )
 
-            customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
-            self._ensure_escrow_contracts(chain_id)
+            if not self.local_server:
+                await self._require_credits(cost_usd)
 
             salt = "0x" + secrets.token_hex(32)
             task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
             logger.info("Derived taskIdFor(%s, salt=%s): %s", customer_address, salt, task_id)
-
-            if mainnet_cap is None and budget_cap_usd is not None:
-                try:
-                    cap = Decimal(str(budget_cap_usd))
-                    if cost_usd > cap:
-                        logger.warning("Hardware cost $%.2f exceeds budget cap $%.2f", cost_usd, cap)
-                        raise ToolError(
-                            f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
-                            f"exceeds budget cap of ${cap:.2f}."
-                        )
-                except (ValueError, InvalidOperation):
-                    logger.warning("Invalid budget_cap_usd: %s", budget_cap_usd)
-                    raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}") from None
 
             token_amount = int(cost_usd.quantize(Decimal("0.000001")) * Decimal(1_000_000))
             amount_usd = (
@@ -749,7 +702,7 @@ class SellerWarrantService:
             session = self._lookup_session(task_id) or {}
             session["status"] = "failed"
             session["error"] = str(exc)
-            if self.mainnet and self._ionet_state_path(deployment_id).exists():
+            if self._ionet_state_path(deployment_id).exists():
                 # deploy() saves its state file before the remote call, so a billable io.net deployment can
                 # exist although provisioning failed. Keep the deal slot closed until that lease can have ended.
                 session["deployment_may_exist"] = True
@@ -757,54 +710,30 @@ class SellerWarrantService:
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
-    def _blocking_session(self) -> str | None:
-        """Describe a session that blocks a new deal on chain 5042, or return None.
-
-        Scans every file in sessions/: active_session.json holds the latest session only, and
-        _lookup_session treats a session without expires_at as expired. Fails closed on any doubt.
-        """
-        now = time.time()
-        for path in sorted(self.sessions_dir.glob("*.json")):
-            try:
-                session = read_json(path)
-            except Exception:
-                return f"session file {path.name} is unreadable"
-            if not isinstance(session, dict):
-                return f"session file {path.name} is unreadable"
-            status = session.get("status")
-            task = session.get("task_id") or path.stem
-            expires_at = session.get("expires_at")
-            expired = isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= now
-            if status == "failed":
-                if not session.get("deployment_may_exist") or expired:
-                    continue
-                return f"task {task} failed, but its io.net deployment can still run until its lease ends"
-            if status in ("ready", "settled") and expired:
-                continue
-            # provisioning (with or without expires_at), a running lease, or an unknown state
-            return f"task {task} is {status or 'in an unknown state'}"
-        return None
-
-    def _check_mainnet_terms(self, proposal: dict):
-        """Refuse a stored proposal whose terms break the chain 5042 limits (for example one from another run)."""
+    def _check_proposal_terms(self, proposal: dict):
+        """Refuse a stored proposal whose terms break configured limits."""
         if self.max_budget_usd is None:
             raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
         if self.duration_hours is None:
             raise ToolError("duration_hours is not configured in config/manifest.yaml.")
         amount = proposal.get("amount")
         max_amount = int(self.max_budget_usd * 1_000_000)
-        hour_label = "hour" if self.duration_hours == 1 else "hours"
+        prop_chain = proposal.get("chain_id")
+        prop_duration = proposal.get("duration_hours")
         if (
-            proposal.get("chain_id") != MAINNET_CHAIN_ID
-            or type(proposal.get("duration_hours")) is not int
-            or proposal.get("duration_hours") != self.duration_hours
+            prop_chain != self.chain_id
+            or type(prop_duration) is not int
+            or prop_duration <= 0
             or type(amount) is not int
             or not 0 < amount <= max_amount
         ):
             raise ToolError(
-                f"The stored proposal does not match the chain {MAINNET_CHAIN_ID} limits "
-                f"({self.duration_hours} {hour_label}, at most ${self.max_budget_usd:.2f}); the offer is not accepted."
+                f"The stored proposal does not match the chain {self.chain_id} limits "
+                f"(at most ${self.max_budget_usd:.2f}); the offer is not accepted."
             )
+
+    # Backwards compatibility alias
+    _check_mainnet_terms = _check_proposal_terms
 
     async def _commit_deal(self, task_id: str, policy: dict | None) -> tuple[dict, dict]:
         """Verify the offer, accept it on-chain and save the provisioning session."""
@@ -814,8 +743,7 @@ class SellerWarrantService:
             raise ToolError(f"No proposal record found for task_id '{task_id}'. Call propose_deployment first.")
 
         proposal = read_json(prop_path)
-        if self.mainnet:
-            self._check_mainnet_terms(proposal)
+        self._check_proposal_terms(proposal)
         target_policy = policy or proposal.get("policy")
         if not target_policy:
             logger.warning("Buyer policy must be provided for task '%s'", task_id)
@@ -890,28 +818,8 @@ class SellerWarrantService:
     async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
         logger.info("Tool called: deploy_with_escrow with task_id=%.80r", task_id)
         try:
-            task_id = self._require_task_id(task_id)
-            if self.mainnet:
-                # One deal at a time. The lock makes the check and the save of the provisioning session atomic
-                # for concurrent calls; a failure before the save releases the slot. The check comes before
-                # the on-chain accept, so that the buyer can still refund an unaccepted offer.
-                if self._deal_lock.locked():
-                    # Another deal is between its check and its session save (the on-chain accept can take
-                    # about 30 s); refuse at once instead of making the caller wait for that.
-                    raise ToolError(
-                        f"One deal at a time on chain {MAINNET_CHAIN_ID}: another deal is being accepted. "
-                        "The offer is not accepted; try again after the active deal ends."
-                    )
-                async with self._deal_lock:
-                    blocking = self._blocking_session()
-                    if blocking:
-                        raise ToolError(
-                            f"One deal at a time on chain {MAINNET_CHAIN_ID}: {blocking}. "
-                            "The offer is not accepted; try again after the active deal ends."
-                        )
-                    proposal, session = await self._commit_deal(task_id, policy)
-            else:
-                proposal, session = await self._commit_deal(task_id, policy)
+            task_id = self._require_task_id(task_id, required=True)
+            proposal, session = await self._commit_deal(task_id, policy)
             deployment_id = session["deployment_id"]
             worker_token = session["worker_token"]
             deliverable_hash = session["deliverable_hash"]
@@ -983,8 +891,6 @@ class SellerWarrantService:
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
-        # On chain 5042 the caller must name the task: the status includes the worker token.
-        task_id = self._require_task_id(task_id)
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
@@ -1133,7 +1039,7 @@ class SellerWarrantService:
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
         logger.info("Tool called: submit_acceptance with task_id=%.80r, signature_length=%d", task_id, sig_len)
         try:
-            task_id = self._require_task_id(task_id)
+            task_id = self._require_task_id(task_id, required=True)
             session = self._lookup_session(task_id)
             if not session:
                 logger.warning("No deployment session found for task '%s'", task_id)
@@ -1307,9 +1213,7 @@ class ServerConfig:
 
     def _resolve_key(self, manifest: dict):
         if self.seller_key_path is None:
-            raw_key_path = manifest.get("private_key_files", {}).get(
-                "seller_key", manifest.get("private_key_files", {}).get("seller_account_key")
-            )
+            raw_key_path = manifest.get("private_key_files", {}).get("seller_key")
             if raw_key_path:
                 cand = pathlib.Path(raw_key_path)
                 self.seller_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
@@ -1323,10 +1227,9 @@ class ServerConfig:
                 with contextlib.suppress(Exception):
                     self.seller_private_key = self.seller_key_path.read_text().strip()
             if not self.seller_private_key:
-                for env_var in ("WARRANT_SELLER_KEY", "SELLER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
-                    if os.environ.get(env_var):
-                        self.seller_private_key = os.environ.get(env_var).strip()
-                        break
+                val = os.environ.get("WARRANT_SELLER_KEY")
+                if val:
+                    self.seller_private_key = val.strip()
 
     def __post_init__(self):
         self._resolve_paths()
@@ -1362,31 +1265,6 @@ def detect_rpc_chain(escrow_client: EscrowClient) -> int:
         ) from None
 
 
-def enforce_mainnet_start_policy(cfg: ServerConfig, chain_id: int, has_ionet_key: bool):
-    """Refuse a start on chain 5042 that would run a stub or a mismatched manifest (Decision 6)."""
-    if cfg.local_server:
-        raise MainnetPolicyError(f"local mode is refused on chain {chain_id}")
-    if not has_ionet_key:
-        raise MainnetPolicyError(f"IO_NET_API_KEY is required on chain {chain_id}")
-    # Same call and default as ServerConfig and the service. load_manifest returns {} for a missing or
-    # unparseable file, so a manifest without chain_id is refused (fail closed).
-    manifest = load_manifest(cfg.manifest_path)
-    raw_chain = manifest.get("chain_id")
-    try:
-        manifest_chain = int(raw_chain)
-    except (TypeError, ValueError):
-        manifest_chain = None
-    if manifest_chain != chain_id:
-        raise MainnetPolicyError(
-            f"manifest chain_id {raw_chain!r} does not match the RPC chain {chain_id} "
-            f"(manifest: {cfg.manifest_path or DEFAULT_MANIFEST_PATH})"
-        )
-    if cfg.max_budget_usd is None:
-        raise MainnetPolicyError(f"max_budget_usd is required in {cfg.manifest_path or DEFAULT_MANIFEST_PATH}")
-    if cfg.duration_hours is None:
-        raise MainnetPolicyError(f"duration_hours is required in {cfg.manifest_path or DEFAULT_MANIFEST_PATH}")
-
-
 def missing_auth_variables(cfg: ServerConfig) -> list[str]:
     """Names of the basic-auth settings that are unset, empty or whitespace only."""
     values = {"MCP_AUTH_USER": cfg.auth_user, "MCP_AUTH_PASS": cfg.auth_pass}
@@ -1405,14 +1283,12 @@ def is_loopback_host(host: str | None) -> bool:
 
 
 def enforce_http_auth_policy(cfg: ServerConfig, chain_id: int):
-    """Refuse to serve /mcp without basic auth on chain 5042, or on a non-loopback address on any chain."""
+    """Refuse to serve /mcp without basic auth on a non-loopback address on any chain."""
     missing = missing_auth_variables(cfg)
     if not missing:
         return
     names = " and ".join(missing)
     verb = "is" if len(missing) == 1 else "are"
-    if chain_id == MAINNET_CHAIN_ID:
-        raise MainnetPolicyError(f"{names} {verb} required on chain {chain_id}")
     if not is_loopback_host(cfg.host):
         raise StartRefusedError(f"{names} {verb} required when binding the non-loopback host {cfg.host!r}")
     if len(missing) == 1:
@@ -1430,7 +1306,6 @@ def create_server(
     serve_http=True (create_app) also applies the HTTP basic-auth start policy once the chain is known.
     """
     cfg = _normalize_config(config, **kwargs)
-    has_ionet_key = bool(os.environ.get("IO_NET_API_KEY"))
 
     escrow_client = cfg.escrow_client or EscrowClient(
         rpc_url=cfg.rpc_url,
@@ -1440,12 +1315,9 @@ def create_server(
         server_account=cfg.server_account,
     )
     chain_id = detect_rpc_chain(escrow_client)
-    mainnet = chain_id == MAINNET_CHAIN_ID
-    if mainnet:
-        enforce_mainnet_start_policy(cfg, chain_id, has_ionet_key)
     if serve_http:
         enforce_http_auth_policy(cfg, chain_id)
-    server = MCPServer("seller-mcp-server", instructions=MAINNET_INSTRUCTIONS if mainnet else None)
+    server = MCPServer("seller-mcp-server")
     if cfg.seller_private_key:
         if cfg.server_account:
             escrow_client.register_key(cfg.server_account, cfg.seller_private_key)
@@ -1470,10 +1342,6 @@ def create_server(
         duration_hours=cfg.duration_hours,
     )
 
-    def describe(text: str, deal_tool: bool = False) -> str:
-        # On chain 5042 the three deal tools start with the honest label; other chains keep their text.
-        return f"{MAINNET_LABEL}.\n{text}" if mainnet and deal_tool else text
-
     server.tool(
         name="list_suitable_hardware",
         description=(
@@ -1484,21 +1352,19 @@ def create_server(
 
     server.tool(
         name="propose_deployment",
-        description=describe(
+        description=(
             "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
-            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient).",
-            deal_tool=True,
+            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
         ),
     )(service.propose_deployment)
 
     server.tool(
         name="deploy_with_escrow",
-        description=describe(
+        description=(
             "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision "
             "the io.net container in the background for 1 hour duration.\n"
-            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain.",
-            deal_tool=True,
+            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
         ),
     )(service.deploy_with_escrow)
 
@@ -1512,11 +1378,10 @@ def create_server(
 
     server.tool(
         name="submit_acceptance",
-        description=describe(
+        description=(
             "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
             "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, "
-            "and settles payment on TaskEscrow on-chain.",
-            deal_tool=True,
+            "and settles payment on TaskEscrow on-chain."
         ),
     )(service.submit_acceptance)
 

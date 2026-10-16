@@ -328,7 +328,7 @@ Nothing else is written at runtime, so the root filesystem can be read-only.
 | Variable | Notes |
 | --- | --- |
 | `MCP_AUTH_USER`, `MCP_AUTH_PASS` | HTTP basic auth for `/mcp`. Secret; env file only. |
-| `WARRANT_MANIFEST` | Manifest path, for example `showcases/ionet_arc/config/mainnet-manifest.yaml`. |
+| `WARRANT_MANIFEST` | Manifest path, for example `showcases/ionet_arc/config/manifest.yaml`. |
 | `WARRANT_RPC_URL` | Optional; overrides the manifest `rpc_url`. The RPC must answer at start. |
 | `IO_NET_API_KEY` | Required on chain 5042. Secret; env file only. |
 | `IONET_STATE_DIR` | Set by the image to `/var/lib/warrant-seller`. |
