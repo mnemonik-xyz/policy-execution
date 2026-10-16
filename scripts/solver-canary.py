@@ -75,7 +75,9 @@ def run(*args, cwd=ROOT, interactive=False, stdin=None):
     env = dict(ENV) if args[0] in ("cast", "forge") and "--account" in args else \
         {key: value for key, value in ENV.items() if key != "ETH_PASSWORD"}
     if args[0] in ("cast", "forge"):
-        env["ETH_RPC_URL"] = rpc_url()
+        # cast reads ETH_RPC_URL; forge 1.8 script ignores it and reads the eth_rpc_url config key, so without
+        # FOUNDRY_ETH_RPC_URL it simulates and broadcasts against an empty in-memory chain.
+        env["ETH_RPC_URL"] = env["FOUNDRY_ETH_RPC_URL"] = rpc_url()
     extra = {"input": stdin} if stdin is not None else {} if interactive else {"stdin": subprocess.DEVNULL}
     try:
         p = subprocess.run([str(a) for a in args], cwd=cwd, env=env, text=True,
