@@ -68,7 +68,7 @@ guardrail sidecar:
   │     1. list_suitable_hardware()           3. warrant_evaluate_and_offer()   │
   │     2. propose_deployment()                      (Local Policy Check &      │
   │     4. deploy_with_escrow()                       On-Chain Escrow Funding)  │
-  │     5. transcribe_audio()                                │                  │
+  │     5. submit_acceptance()                               │                  │
   └───────────────┬──────────────────────────────────────────┼──────────────────┘
                   │                                          │
                   ▼                                          ▼
@@ -203,7 +203,9 @@ sequenceDiagram
     %% Phase 8: Workload Execution
     rect rgb(245, 245, 245)
     Note over Buyer,Worker: Phase 8: Workload Execution (1-Hour Direct Inference)
-    Buyer->>Worker: POST /job (audio_base64) with Bearer <worker_token>
+    Buyer->>Worker: POST /job (raw audio + X-Audio-SHA256) with Bearer <worker_token>
+    Worker-->>Buyer: 202 Accepted {job_id}
+    Buyer->>Worker: GET /job/<job_id> (Authorization: Bearer <worker_token>)
     Worker-->>Buyer: Transcription text and timestamped segments
     Note over Buyer,Worker: Buyer streams audio directly to GPU for the rest of the 1-hour lease
     end
@@ -220,8 +222,8 @@ guardrail sidecar tools:
   and category whitelists, independently compiles policy hashes, submits `TaskEscrow.offer()`,
   and signs deliverable acceptance receipts (`buyer_acceptance.key`).
 * **Seller Service (`seller-mcp-server`)**: Discovers io.net GPU hardware, calculates duration
-  quotes, provisions containers, evaluates authorization off-chain via native Warrant, settles
-  payment on Arc, and handles Whisper audio transcription.
+  quotes, provisions containers, evaluates authorization off-chain via native Warrant, and
+  settles payment on Arc.
 
 Detailed tool specifications, argument schemas, verified return structures, and agent prompt
 guidelines are maintained in the agent skill definition:
@@ -602,7 +604,7 @@ The LLM autonomously drives the end-to-end lifecycle:
 5. Polls until container is online (`seller:get_deployment_status`).
 6. Verifies container `/health` and signs deliverable receipt (`buyer:warrant_sign_acceptance`).
 7. Submits acceptance to settle escrow on-chain (`seller:submit_acceptance`).
-8. Transcribes audio on the active Whisper container (`seller:transcribe_audio`).
+8. Submits audio directly to the Whisper container via `curl` (`POST /job` and `GET /job/<job_id>`).
 
 #### B. Headless Automated Test Runner
 

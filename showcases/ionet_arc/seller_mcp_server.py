@@ -1,4 +1,4 @@
-"""Streamable HTTP MCP server for Warrant GPU transcription on io.net CaaS."""
+"""Streamable HTTP MCP server for Warrant GPU container deployment on io.net CaaS."""
 
 import argparse
 import asyncio
@@ -143,15 +143,15 @@ def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
     return bool(isinstance(hw_id, int))
 
 
-def _is_whisper_friendly(hw_name: str, hw_id: str | int | None) -> bool:
-    friendly_names = ["3090", "4090", "L40", "A6000", "A100", "H100", "T4", "V100", "A40", "A30", "L4", "ADA"]
-    if any(g in hw_name for g in friendly_names):
+def _is_supported_gpu(hw_name: str, hw_id: str | int | None) -> bool:
+    supported_names = ["3090", "4090", "L40", "A6000", "A100", "H100", "T4", "V100", "A40", "A30", "L4", "ADA"]
+    if any(g in hw_name for g in supported_names):
         return True
     return isinstance(hw_id, int)
 
 
 def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
-    """Filter suitable single GPUs for faster-whisper-small inference, sorted by price."""
+    """Filter suitable single GPUs for container deployment, sorted by price."""
     suitable = []
     for item in hardware_items:
         hw_id = item.get("hardware_id")
@@ -164,7 +164,7 @@ def filter_suitable_gpus(hardware_items: list[dict]) -> list[dict]:
             continue
         if not _is_single_gpu(hw_id, max_gpus):
             continue
-        if not _is_whisper_friendly(hw_name, hw_id):
+        if not _is_supported_gpu(hw_name, hw_id):
             continue
 
         suitable.append(
@@ -209,8 +209,8 @@ def parse_credit_balance(status) -> Decimal:
     return spendable
 
 
-class WarrantTranscriptionService:
-    """Encapsulates tool implementations and state for Warrant transcription server."""
+class SellerWarrantService:
+    """Encapsulates tool implementations and state for the Seller Warrant MCP server."""
 
     def __init__(
         self,
@@ -270,7 +270,7 @@ class WarrantTranscriptionService:
         if self.local_server and self._ssh_container_started:
             with contextlib.suppress(Exception):
                 subprocess.run(
-                    ["ssh", self.ssh_host, "docker", "stop", "warrant-transcription"],
+                    ["ssh", self.ssh_host, "docker", "stop", "warrant-worker"],
                     capture_output=True,
                     timeout=10,
                     check=False,
@@ -288,7 +288,7 @@ class WarrantTranscriptionService:
 
             raw_items = await connected(op)
 
-            logger.info("Filtering %d raw hardware options for Whisper transcription", len(raw_items))
+            logger.info("Filtering %d raw hardware options", len(raw_items))
             filtered = filter_suitable_gpus(raw_items)
             candidate_summary = [
                 {"id": hw["hardware_id"], "name": hw["hardware_name"], "price_hr": hw["price_per_hour_usd"]}
@@ -529,7 +529,8 @@ class WarrantTranscriptionService:
                     "acceptBy, settleBy) on-chain.\n"
                     "Call deploy_with_escrow(task_id, policy) to commit agreement and begin provisioning.\n"
                     "Poll get_deployment_status until ready, verify container /health, and sign Acceptance evidence.\n"
-                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then call transcribe_audio."
+                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then operate the container "
+                    "at <public_url> with Bearer <worker_token>."
                 ),
             }
 
@@ -605,7 +606,7 @@ class WarrantTranscriptionService:
             # 1. Clean up any existing container on SSH host
             await asyncio.to_thread(
                 subprocess.run,
-                ["ssh", self.ssh_host, "docker", "rm", "-f", "warrant-transcription"],
+                ["ssh", self.ssh_host, "docker", "rm", "-f", "warrant-worker"],
                 capture_output=True,
                 check=False,
             )
@@ -619,7 +620,7 @@ class WarrantTranscriptionService:
                 "-d",
                 "--rm",
                 "--name",
-                "warrant-transcription",
+                "warrant-worker",
                 "--gpus",
                 "all",
                 "-p",
@@ -673,7 +674,7 @@ class WarrantTranscriptionService:
             "duration_hours": duration,
             "gpus_per_container": 1,
             "replica_count": 1,
-            "resource_private_name": f"warrant-whisper-{proposal['task_id'][-8:]}",
+            "resource_private_name": f"warrant-worker-{proposal['task_id'][-8:]}",
             "image_url": PILOT_IMAGE,
             "traffic_port": 8080,
             "env_variables": {"WARRANT_WORKER_TOKEN": worker_token},
@@ -943,51 +944,6 @@ class WarrantTranscriptionService:
             logger.error("deploy_with_escrow failed for task_id=%s: %s", task_id, exc)
             raise safe_tool_error(exc) from None
 
-    @staticmethod
-    def _transcription_result(job_id: str, job_status: dict) -> dict:
-        res = job_status.get("result", {})
-        segments = res.get("segments", [])
-        return {
-            "status": "complete",
-            "job_id": job_id,
-            "text": " ".join(s.get("text", "").strip() for s in segments),
-            "language": res.get("language"),
-            "audio_seconds": res.get("audio_seconds"),
-            "segments": segments,
-            "elapsed_seconds": job_status.get("elapsed_seconds"),
-        }
-
-    async def _poll_job_status(
-        self,
-        poll_fn,
-        job_id: str,
-        timeout_error: str = "Transcription timed out waiting for worker.",
-    ) -> dict:
-        for _ in range(120):  # poll up to 60 seconds
-            try:
-                job_status = poll_fn()
-                if asyncio.iscoroutine(job_status):
-                    job_status = await job_status
-                if job_status:
-                    st = job_status.get("status")
-                    if st == "complete":
-                        return self._transcription_result(job_id, job_status)
-                    elif st in ("failed", "interrupted"):
-                        err_msg = job_status.get("error") or st
-                        raise ToolError(f"Transcription job failed: {err_msg}")
-            except httpx2.HTTPError:
-                pass
-            await asyncio.sleep(0.5)
-
-        raise ToolError(timeout_error)
-
-    async def _poll_transcription(self, client: httpx2.AsyncClient, poll_url: str, headers: dict, job_id: str) -> dict:
-        async def fetch():
-            resp = await client.get(poll_url, headers=headers, timeout=10.0)
-            return resp.json() if resp.status_code == 200 else None
-
-        return await self._poll_job_status(fetch, job_id)
-
     def _find_latest_unexpired_session(self) -> dict | None:
         now = time.time()
         sessions_dir = self.state_dir / "sessions"
@@ -1016,109 +972,6 @@ class WarrantTranscriptionService:
             if time.time() <= candidate.get("expires_at", 0):
                 return candidate
         return self._find_latest_unexpired_session()
-
-    def _active_session(self, task_id: str | None = None) -> dict:
-        session = self._lookup_session(task_id)
-        if session is None:
-            if task_id:
-                raise ToolError(f"No deployment session found for task '{task_id}'.")
-            raise ToolError(
-                "No active deployment session found. "
-                "Prerequisites: list_suitable_hardware -> propose_deployment -> deploy_with_escrow."
-            )
-
-        if time.time() > session.get("expires_at", 0):
-            target = f"for task '{task_id}' " if task_id else ""
-            raise ToolError(
-                f"Deployment session {target}expired at {session.get('expires_at')}. "
-                "The 1-hour duration window has ended. A new proposal and deployment are required."
-            )
-
-        if not session.get("public_url"):
-            raise ToolError("Deployment public URL is not ready yet.")
-        return session
-
-    async def transcribe_audio(
-        self,
-        audio_base64: str,
-        language: str | None = None,
-        task_id: str | None = None,
-    ) -> dict:
-        logger.info(
-            "Tool called: transcribe_audio with audio length=%d base64 chars, language=%s, task_id=%s",
-            len(audio_base64) if audio_base64 else 0,
-            language,
-            task_id,
-        )
-        try:
-            session = self._active_session(task_id)
-            public_url = session["public_url"]
-            worker_token = session.get("worker_token")
-            logger.info("Found active session for task_id=%s: worker public_url=%s", session.get("task_id"), public_url)
-
-            try:
-                audio_bytes = base64.b64decode(audio_base64, validate=True)
-            except ValueError as exc:
-                logger.warning("Invalid base64 payload provided to transcribe_audio")
-                raise ToolError("audio_base64 is not valid base64.") from exc
-            if len(audio_bytes) == 0:
-                logger.warning("Empty audio payload provided to transcribe_audio")
-                raise ToolError("Audio file is empty.")
-
-            worker_base = public_url.rstrip("/")
-            audio_sha256 = hashlib.sha256(audio_bytes).hexdigest()
-            query = f"?language={language.strip().lower()}" if language else ""
-            req_url = f"{worker_base}/job{query}"
-
-            headers = {
-                "Authorization": f"Bearer {worker_token}",
-                "Content-Type": "application/octet-stream",
-                "X-Audio-SHA256": audio_sha256,
-                "Content-Length": str(len(audio_bytes)),
-            }
-
-            trust_env = should_trust_env(worker_base)
-            logger.info(
-                "Submitting audio (%d bytes, sha256=%s) to worker endpoint %s",
-                len(audio_bytes),
-                audio_sha256,
-                req_url,
-            )
-
-            try:
-                async with httpx2.AsyncClient(timeout=30.0, trust_env=trust_env) as client:
-                    resp = await client.post(req_url, content=audio_bytes, headers=headers)
-                    if resp.is_error:
-                        logger.error("Worker rejected upload HTTP %d: %s", resp.status_code, resp.text)
-                        raise ToolError(f"Worker rejected upload with HTTP {resp.status_code}: {resp.text}")
-                    resp_data = resp.json()
-                    job_id = resp_data.get("job_id")
-                    if not job_id:
-                        logger.error("Unexpected worker response: %s", resp_data)
-                        raise ToolError(f"Unexpected worker response: {resp_data}")
-
-                    logger.info("Worker accepted job (job_id=%s). Polling for transcription completion...", job_id)
-                    poll_url = f"{worker_base}/job/{job_id}"
-                    poll_headers = {"Authorization": f"Bearer {worker_token}"}
-                    result = await self._poll_transcription(client, poll_url, poll_headers, job_id)
-                    text = result.get("text", "")
-                    text_preview = (text[:80] + "...") if len(text) > 80 else text
-                    logger.info(
-                        "transcribe_audio returning: job_id=%s, status=%s, language=%s, "
-                        "text_preview=%r, elapsed_seconds=%s",
-                        result.get("job_id"),
-                        result.get("status"),
-                        result.get("language"),
-                        text_preview,
-                        result.get("elapsed_seconds"),
-                    )
-                    return result
-            except (httpx2.HTTPError, OSError) as net_err:
-                logger.error("Worker connection failed during transcribe_audio: %s", net_err)
-                raise ToolError(f"Worker connection failed: {net_err}") from net_err
-        except Exception as exc:
-            logger.error("transcribe_audio failed: %s", exc)
-            raise safe_tool_error(exc) from None
 
     async def get_deployment_status(self, task_id: str | None = None) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
@@ -1554,7 +1407,7 @@ def create_server(
     serve_http: bool = False,
     **kwargs,
 ) -> MCPServer:
-    """Create and configure the Warrant Transcription MCP server.
+    """Create and configure the Seller Warrant MCP server.
 
     serve_http=True (create_app) also applies the HTTP basic-auth start policy once the chain is known.
     """
@@ -1583,7 +1436,7 @@ def create_server(
             derived_addr = Account.from_key(cfg.seller_private_key).address
             escrow_client.register_key(derived_addr, cfg.seller_private_key)
 
-    service = WarrantTranscriptionService(
+    service = SellerWarrantService(
         state_dir=cfg.state_dir,
         escrow_client=escrow_client,
         local_server=cfg.local_server,
@@ -1603,7 +1456,7 @@ def create_server(
     server.tool(
         name="list_suitable_hardware",
         description=(
-            "List available io.net GPU hardware options suitable for faster-whisper-small transcription.\n"
+            "List available io.net single-GPU hardware options for container deployment.\n"
             "Filters for single-GPU configurations with live availability and sorts by price ascending."
         ),
     )(service.list_suitable_hardware)
@@ -1611,7 +1464,7 @@ def create_server(
     server.tool(
         name="propose_deployment",
         description=describe(
-            "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
+            "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
             "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient).",
             deal_tool=True,
@@ -1629,19 +1482,9 @@ def create_server(
     )(service.deploy_with_escrow)
 
     server.tool(
-        name="transcribe_audio",
-        description=(
-            "Transcribe audio (passed as base64-encoded bytes in audio_base64) using an active "
-            "1-hour Whisper deployment on io.net.\n"
-            "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be expired.\n"
-            "Optionally provide task_id to target a specific deployment when multiple tasks exist."
-        ),
-    )(service.transcribe_audio)
-
-    server.tool(
         name="get_deployment_status",
         description=(
-            "Check status of active 1-hour transcription deployment and remaining duration.\n"
+            "Check status of active 1-hour container deployment and remaining duration.\n"
             "Optionally provide task_id to inspect a specific deployment session."
         ),
     )(service.get_deployment_status)
@@ -1686,7 +1529,7 @@ def run_server(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the Warrant GPU transcription MCP server over Streamable HTTP.")
+    parser = argparse.ArgumentParser(description="Run the Seller Warrant MCP server over Streamable HTTP.")
     parser.add_argument(
         "--host",
         default=os.environ.get("HOST", "localhost"),

@@ -8,7 +8,7 @@ description: Verified call formats for Warrant audio transcription and buyer gua
 Guidelines and verified call formats for driving the dual-MCP Warrant audio transcription
 workflow across both servers:
 1. **Seller Service (`seller-mcp-server`)**: Hardware discovery, pricing proposals, container
-   provisioning, on-chain settlement, and Whisper inference.
+   provisioning, and on-chain settlement.
 2. **Buyer Guardrail (`buyer-warrant-guardrail`)**: Local policy validation, cryptographic policy
    hash verification, on-chain escrow funding, and deliverable sign-off.
 
@@ -19,18 +19,19 @@ workflow across both servers:
 - **Capability-Based Two-Step Escrow**: Escrow is **not** settled on deployment. The seller commits
   to the agreement on-chain (`TaskEscrow.accept`), provisions the container in the background, and
   claims escrow payment only after the buyer verifies `/health` and signs an `Acceptance` receipt.
-- **Repeatable Inference**: While the 1-hour container session is active, `transcribe_audio` can be
-  called repeatedly for multiple audio files.
+- **Direct Worker Inference**: Once provisioned, the buyer operates the container directly over
+  HTTP (`curl`) using `public_url` and `worker_token` for the duration of the 1-hour lease.
 - **Strict 8-Step Lifecycle**:
   1. `list_suitable_hardware` (Seller): Find single-GPU options for Whisper.
   2. `propose_deployment` (Seller): Obtain formal escrow payment terms.
   3. `warrant_evaluate_and_offer` (Buyer): Validate policy, verify hash, and fund escrow on-chain.
   4. `deploy_with_escrow` (Seller): Commit agreement on-chain and start background provisioning.
   5. `get_deployment_status` (Seller): Poll until status is `"ready"`, getting URL and token.
-  6. Health Check: Verify `GET /health` on the worker endpoint using the bearer token.
+  6. Health Check (`curl`): Verify `GET <public_url>/health` on the worker endpoint.
   7. Deliverable Settlement: Call `warrant_sign_acceptance` (Buyer) and `submit_acceptance`
      (Seller) to sign evidence and settle on-chain.
-  8. `transcribe_audio` (Seller): Submit audio files for Whisper inference.
+  8. Direct Transcription (`curl`): Upload audio to `POST <public_url>/job` and poll
+     `GET <public_url>/job/<job_id>` with `Authorization: Bearer <worker_token>`.
 
 ---
 
@@ -132,11 +133,39 @@ off-chain via native `warrant-host evaluate`, approves the 384-byte authorizatio
   - `signature` (array of ints or hex string, required): Buyer signature on acceptance.
 - Returns: `status` (`"settled"`), `task_id`, `settlement_transaction` (tx hash), `message`.
 
-#### 6. `transcribe_audio`
-Transcribes audio using the active 1-hour Whisper deployment on io.net.
-- Arguments:
-  - `audio_base64` (string, required): Base64-encoded audio file bytes.
-  - `language` (optional string): 2 or 3 letter ISO language code (e.g. `"en"`).
-  - `task_id` (optional string): Target task ID to route inference when multiple deployments exist.
-- Returns: `status` (`"complete"`), `job_id`, `text`, `language`, `audio_seconds`, `segments`,
-  `elapsed_seconds`.
+---
+
+### Worker Container HTTP Operations (`curl`)
+
+Once `get_deployment_status` returns `status: "ready"`, use `public_url` and `worker_token` to
+interact directly with the container via `curl`:
+
+#### 1. Health Verification (`GET /health`)
+```sh
+curl -A "Mozilla/5.0" "<public_url>/health"
+```
+
+#### 2. Submit Audio Job (`POST /job`)
+Uploads require `Content-Length`, `X-Audio-SHA256` (lowercase 64-hex SHA-256 of the raw audio
+bytes), and `Authorization: Bearer <worker_token>`:
+```sh
+AUDIO_FILE="sample.mp3"
+CHECKSUM=$(shasum -a 256 "$AUDIO_FILE" | awk '{print $1}')
+
+curl -X POST "<public_url>/job?language=en" \
+  -A "Mozilla/5.0" \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Audio-SHA256: $CHECKSUM" \
+  --data-binary @"$AUDIO_FILE"
+```
+Returns `202 Accepted` (or `200 OK` if duplicate) with `job_id` (equal to `CHECKSUM`).
+
+#### 3. Poll Transcription Result (`GET /job/<job_id>`)
+```sh
+curl -A "Mozilla/5.0" \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  "<public_url>/job/$CHECKSUM"
+```
+Poll until `status` is `"complete"`, which returns `result.language`, `result.audio_seconds`,
+`result.segments`, and `elapsed_seconds`.

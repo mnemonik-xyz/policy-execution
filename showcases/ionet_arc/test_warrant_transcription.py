@@ -1,15 +1,12 @@
 """Tests for Warrant io.net transcription MCP server."""
 
 import asyncio
-import base64
 import json
 import os
 import tempfile
-import threading
 import time
 import unittest
 from decimal import Decimal
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +31,6 @@ from showcases.ionet_arc.seller_mcp_server import (
     is_loopback_host,
     parse_credit_balance,
 )
-from showcases.ionet_arc.worker import Worker, handler
 
 KEYS_DIR = Path(__file__).resolve().parent / ".keys"
 
@@ -46,10 +42,6 @@ def keys_dir_snapshot() -> list[str] | None:
 
 # Taken at import, before any setUp runs: the tests must never create or change .keys/.
 KEYS_DIR_AT_IMPORT = keys_dir_snapshot()
-
-
-def encode_audio(path: Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
 def make_throwaway_keys(directory: Path) -> dict:
@@ -131,18 +123,17 @@ SELLER_TOOLS = {
     "list_suitable_hardware",
     "propose_deployment",
     "deploy_with_escrow",
-    "transcribe_audio",
     "get_deployment_status",
     "submit_acceptance",
 }
 # Tool descriptions on origin/main before Task 2; chains other than 5042 keep them exactly.
 TESTNET_DESCRIPTIONS = {
     "list_suitable_hardware": (
-        "List available io.net GPU hardware options suitable for faster-whisper-small transcription.\n"
+        "List available io.net single-GPU hardware options for container deployment.\n"
         "Filters for single-GPU configurations with live availability and sorts by price ascending."
     ),
     "propose_deployment": (
-        "Generate an escrow proposal to deploy the transcription container for 1 hour duration.\n"
+        "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
         "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
         "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
     ),
@@ -151,15 +142,8 @@ TESTNET_DESCRIPTIONS = {
         "io.net container in the background for 1 hour duration.\n"
         "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
     ),
-    "transcribe_audio": (
-        "Transcribe audio (passed as base64-encoded bytes in audio_base64) using an active 1-hour "
-        "Whisper deployment on io.net.\n"
-        "Prerequisite: deploy_with_escrow must have been completed and the 1-hour window must not be "
-        "expired.\n"
-        "Optionally provide task_id to target a specific deployment when multiple tasks exist."
-    ),
     "get_deployment_status": (
-        "Check status of active 1-hour transcription deployment and remaining duration.\n"
+        "Check status of active 1-hour container deployment and remaining duration.\n"
         "Optionally provide task_id to inspect a specific deployment session."
     ),
     "submit_acceptance": (
@@ -229,47 +213,6 @@ def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
     }
 
 
-class TestMockWorker:
-    """Mock in-process transcription worker for offline test suite execution."""
-
-    def __init__(self, work_dir: Path, token: str):
-        self.work_dir = work_dir
-        self.token = token
-        self.server = None
-        self.port = 0
-        self.thread = None
-        self.worker = None
-
-    def start(self):
-        def dummy_engine(audio, model_dir, language=None):
-            return {
-                "language": language or "en",
-                "audio_seconds": 3.5,
-                "segments": [
-                    {"start": 0.0, "end": 1.5, "text": "Warrant autonomous transcription pilot."},
-                    {"start": 1.5, "end": 3.5, "text": "io.net container compute verified on-chain."},
-                ],
-            }
-
-        self.worker = Worker(self.work_dir, self.token, engine=dummy_engine)
-        try:
-            self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.worker))
-            self.port = self.server.server_port
-            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-            self.thread.start()
-            return f"http://127.0.0.1:{self.port}"
-        except OSError:
-            self.port = 8080
-            return f"http://127.0.0.1:{self.port}"
-
-    def stop(self):
-        if self.worker:
-            self.worker.close()
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-
-
 class FakeCloud:
     """Answers the io.net cloud calls that the seller makes on chain 5042."""
 
@@ -315,7 +258,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         # Create valid stored test credential and signature matching the mock escrow scope
         self.cred_path, self.sig_path = write_vendor_credential(self.state_dir, self.mock_escrow, 31337, self.keys)
 
-        self.test_workers = {}
         self.cloud = FakeCloud()
 
         async def fake_connected(op):
@@ -325,34 +267,21 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         patch_conn.start()
         self.addCleanup(patch_conn.stop)
 
-        orig_provision = seller_module.WarrantTranscriptionService._provision_container
+        orig_provision = seller_module.SellerWarrantService._provision_container
 
         async def fake_provision(service_self, proposal, deployment_id, worker_token):
             if service_self.local_server:
                 return await orig_provision(service_self, proposal, deployment_id, worker_token)
-            task_id = proposal.get("task_id", deployment_id)
-            if task_id in self.test_workers:
-                self.test_workers[task_id].stop()
-            worker_data = self.state_dir / "worker_data" / task_id
-            w = TestMockWorker(worker_data, worker_token)
-            self.test_workers[task_id] = w
-            return w.start()
+            return "http://127.0.0.1:8080"
 
         patch_prov = patch.object(
-            seller_module.WarrantTranscriptionService,
+            seller_module.SellerWarrantService,
             "_provision_container",
             autospec=True,
             side_effect=fake_provision,
         )
         patch_prov.start()
         self.addCleanup(patch_prov.stop)
-
-        def cleanup_workers():
-            for w in list(self.test_workers.values()):
-                w.stop()
-            self.test_workers.clear()
-
-        self.addCleanup(cleanup_workers)
 
         # Create server with mock EscrowClient and stored credential paths
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
@@ -468,14 +397,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("propose_deployment", {"duration_hours": 0})
         self.assertIn("duration_hours must be at least 1", str(ctx.exception))
 
-    async def test_transcribe_audio_fails_without_prerequisite_deployment(self):
-        audio_file = self.state_dir / "test.mp3"
-        audio_file.write_bytes(b"dummy audio content")
-
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file)})
-        self.assertIn("No active deployment session found", str(ctx.exception))
-
     async def test_deploy_with_escrow_fails_if_unfunded_on_chain(self):
         proposal = await self.call("propose_deployment")
         task_id = proposal["task_id"]
@@ -539,18 +460,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settle_res["status"], "settled")
         self.mock_escrow.settle_mock.assert_called_once()
 
-        # 6. Transcribe audio
-        audio_file = self.state_dir / "sample.mp3"
-        audio_file.write_bytes(b"mock sample audio bytes")
-
-        trans_res = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "language": "en"})
-        self.assertEqual(trans_res["status"], "complete")
-        self.assertIn("Warrant autonomous transcription pilot", trans_res["text"])
-        self.assertEqual(trans_res["language"], "en")
-
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("transcribe_audio", {"audio_base64": "/etc/passwd"})
-        self.assertIn("not valid base64", str(ctx.exception))
+        # 6. Check post-settlement status
+        post_status = await self.call("get_deployment_status", {"task_id": task_id})
+        self.assertEqual(post_status["status"], "settled")
+        self.assertEqual(post_status["settlement_transaction"], "0x" + "aa" * 32)
 
     async def test_deploy_with_escrow_fails_on_terms_mismatch(self):
         proposal = await self.call("propose_deployment")
@@ -834,7 +747,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             # Check first call: docker rm -f
             first_cmd = ssh_calls[0][0][0]
             self.assertEqual(first_cmd[:5], ["ssh", "petertower", "docker", "rm", "-f"])
-            self.assertEqual(first_cmd[5], "warrant-transcription")
+            self.assertEqual(first_cmd[5], "warrant-worker")
 
             # Check second call: docker run
             second_cmd = ssh_calls[1][0][0]
@@ -853,7 +766,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             service._cleanup_ssh_container()
             mock_subproc.assert_called_once()
             teardown_cmd = mock_subproc.call_args[0][0]
-            self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-transcription"])
+            self.assertEqual(teardown_cmd, ["ssh", "petertower", "docker", "stop", "warrant-worker"])
 
     async def test_local_server_ssh_deployment_run_failure(self):
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
@@ -937,25 +850,17 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st2["task_id"], t2)
         self.assertTrue(st2["active"])
         self.assertEqual(st2["status"], "ready")
+        self.assertNotEqual(st1["worker_token"], st2["worker_token"])
 
-        # Check transcription routed specifically to t1 and t2
-        audio_file = self.state_dir / "sample.mp3"
-        audio_file.write_bytes(b"concurrent mock audio")
+        # Default get_deployment_status without task_id routes to latest active session
+        st_default = await self.call("get_deployment_status")
+        self.assertEqual(st_default["task_id"], t2)
+        self.assertEqual(st_default["status"], "ready")
 
-        res_trans1 = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": t1})
-        self.assertEqual(res_trans1["status"], "complete")
-
-        res_trans2 = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": t2})
-        self.assertEqual(res_trans2["status"], "complete")
-
-        # Default without task_id routes to latest active session
-        res_default = await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file)})
-        self.assertEqual(res_default["status"], "complete")
-
-        # Nonexistent task_id raises ToolError
-        with self.assertRaises(ToolError) as ctx:
-            await self.call("transcribe_audio", {"audio_base64": encode_audio(audio_file), "task_id": "0xnonexistent"})
-        self.assertIn("No deployment session found for task '0xnonexistent'", str(ctx.exception))
+        # Nonexistent task_id returns missing status
+        st_missing = await self.call("get_deployment_status", {"task_id": "0xnonexistent"})
+        self.assertEqual(st_missing["status"], "missing")
+        self.assertIn("No deployment session found for task '0xnonexistent'", st_missing["message"])
 
     def test_create_server_and_app_with_config(self):
         config = ServerConfig(
