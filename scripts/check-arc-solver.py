@@ -45,7 +45,7 @@ PROBE_GAS = 15_000_000
 ORDER_STEPS = ("approve", "offer", "accept", "settle")
 # BN254 generator G = (1, 2) and 2G, from the curve equation y^2 = x^3 + 3 over the base field (EIP-196).
 G = "0x" + "00" * 31 + "01" + "00" * 31 + "02"
-TWO_G = ("0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd3"
+TWO_G = ("0x030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd3"
          "15ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4")
 # Address, calldata and expected eth_call result. ecPairing with empty input is defined as true (EIP-197).
 PRECOMPILES = (

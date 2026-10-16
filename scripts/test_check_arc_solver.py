@@ -139,6 +139,16 @@ class BeforeTests(ProbeCase):
         encode = next(c for c in self.chain.commands if c[:2] == ["cast", "abi-encode"])
         self.assertEqual(encode[-1], "0")
 
+    def test_two_g_constant_is_the_curve_doubling_of_g(self):
+        """The expected precompile result, derived from y^2 = x^3 + 3 and not taken from the module."""
+        p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
+        x, y = 1, 2
+        slope = 3 * x * x * pow(2 * y, -1, p) % p
+        x3 = (slope * slope - 2 * x) % p
+        y3 = (slope * (x - x3) - y) % p
+        self.assertEqual(probe.TWO_G, "0x" + f"{x3:064x}" + f"{y3:064x}")
+        self.assertEqual(len(probe.TWO_G), 2 + 128)
+
     def test_precompile_result_mismatch_is_reported(self):
         ecmul = probe.PRECOMPILES[1][1]
         self.chain.precompiles[ecmul] = "0x" + "00" * 64
