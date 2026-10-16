@@ -1280,21 +1280,13 @@ class SellerPolicyTests(unittest.IsolatedAsyncioTestCase):
             "amount": 1_000_000,
         }
         orig_budget = service.max_budget_usd
-        orig_duration = service.duration_hours
         try:
             service.max_budget_usd = None
             with self.assertRaises(ToolError) as ctx:
                 service._check_proposal_terms(proposal)
             self.assertIn("max_budget_usd is not configured in config/manifest.yaml", str(ctx.exception))
-
-            service.max_budget_usd = orig_budget
-            service.duration_hours = None
-            with self.assertRaises(ToolError) as ctx:
-                service._check_proposal_terms(proposal)
-            self.assertIn("duration_hours is not configured in config/manifest.yaml", str(ctx.exception))
         finally:
             service.max_budget_usd = orig_budget
-            service.duration_hours = orig_duration
 
     async def test_propose_fails_when_service_limits_unconfigured(self):
         service = self.service_of(self.mcp)

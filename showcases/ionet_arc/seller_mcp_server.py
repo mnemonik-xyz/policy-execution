@@ -685,8 +685,6 @@ class SellerWarrantService:
         """Refuse a stored proposal whose terms break configured limits."""
         if self.max_budget_usd is None:
             raise ToolError("max_budget_usd is not configured in config/manifest.yaml.")
-        if self.duration_hours is None:
-            raise ToolError("duration_hours is not configured in config/manifest.yaml.")
         amount = proposal.get("amount")
         max_amount = int(self.max_budget_usd * 1_000_000)
         prop_chain = proposal.get("chain_id")
