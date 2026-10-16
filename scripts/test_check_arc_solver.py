@@ -78,6 +78,26 @@ def artifact(immutables):
     return {"deployedBytecode": {"object": CHAIN_CODE, "immutableReferences": immutables}}
 
 
+class OutsideFactsTests(unittest.TestCase):
+    """Facts about the outside world, as literals. The fakes below read the module's own constants, so a typo in
+    one of them would otherwise pass every test (the 2G constant did)."""
+
+    def test_arc_usdc_address_and_mainnet_chain_id(self):
+        self.assertEqual(probe.ARC_USDC, "0x3600000000000000000000000000000000000000")
+        self.assertEqual(probe.MAINNET_ID, 5042)
+
+    def test_precompile_vectors_are_the_eip_196_and_197_ones(self):
+        g = "0x" + "00" * 31 + "01" + "00" * 31 + "02"
+        two_g = ("0x030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd3"
+                 "15ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4")
+        one = "0x" + "00" * 31 + "01"
+        self.assertEqual(probe.PRECOMPILES, (
+            ("ecadd", "0x" + "00" * 19 + "06", g + g[2:], two_g),
+            ("ecmul", "0x" + "00" * 19 + "07", g + "00" * 31 + "02", two_g),
+            ("ecpairing", "0x" + "00" * 19 + "08", "0x", one),
+        ))
+
+
 class ProbeCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
