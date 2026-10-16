@@ -664,6 +664,17 @@ class EnvTests(unittest.TestCase):
                 module.run("cargo", "build")
         self.assertNotIn("ETH_PASSWORD", run.call_args.kwargs["env"])
 
+    def test_eth_password_path_does_not_reach_unsigned_foundry_calls(self):
+        # forge 1.8 rejects ETH_PASSWORD without --account or --keystore, as in the deploy dry run.
+        with patch.dict(os.environ, {"ETH_PASSWORD": PASSWORD_FILE, canary.RPC_ENV: "https://rpc.example/KEY"}):
+            module = fresh_canary()
+            with patch.object(module.subprocess, "run", return_value=self.OK) as run:
+                module.run("forge", "script", "script/DeploySolver.s.sol:DeploySolver", "--sender", ESCROW)
+                module.run("cast", "chain-id")
+        for child in run.call_args_list:
+            self.assertNotIn("ETH_PASSWORD", child.kwargs["env"])
+            self.assertEqual(child.kwargs["env"]["ETH_RPC_URL"], "https://rpc.example/KEY")
+
     def test_eth_password_path_is_redacted_from_errors(self):
         rpc = "https://rpc.example/KEY123"
         failed = subprocess.CompletedProcess([], 1, stdout="", stderr=f"cannot read {PASSWORD_FILE} via {rpc}")
