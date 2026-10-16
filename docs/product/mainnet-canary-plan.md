@@ -9,7 +9,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 
 ## Already in place
 - Escrow, deploy script, solver guest/checker; CI settled a real Groth16 proof on private Anvil (`solver-bounty/ci-result.json`).
-- Worker image `ghcr.io/mnemonik-xyz/warrant-transcription:pilot`: public, linux/amd64, CUDA, about 1.9 GB compressed. The manual-dispatch workflow `.github/workflows/ionet-arc-image.yml` (PR #14) builds and pushes it. The tag is mutable. On 2026-10-09 it moved from `sha256:b150032a…` to `sha256:fe86f01e322fe4bee50ce171ac7e363f54f7447bb5017ee14e8e4d298bfbc4c0` (built 15:20 UTC, after the PR #14 merge). Read the digest at deploy time and deploy by digest. A CPU-only `:pilot-arm64` image exists for local runs on Apple Silicon. The image holds no Warrant logic.
+- Worker image `ghcr.io/mnemonik-xyz/transcription:pilot`: public, linux/amd64, CUDA, about 1.9 GB compressed. The separate `mnemonik-xyz/transcription` repository builds and pushes it. The tag is mutable, so read the digest at deploy time and deploy by digest. A CPU-only `:pilot-arm64` image exists for local runs on Apple Silicon. The image holds no Warrant logic.
 - Worker API after PR #14: `POST /job` returns a `job_id` (the audio SHA-256). Poll `GET /job/<job_id>`. `GET /jobs` lists all jobs. `GET /job` works only with zero or one job. Several uploads are accepted and run one at a time. `?language=` is supported. The worker writes JSON logs with GPU statistics and never logs the token, audio or transcript text.
 - io.net deploy/destroy driver (`scripts/ionet-showcase.py`) with offline tests.
 

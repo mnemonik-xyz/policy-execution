@@ -100,7 +100,7 @@ guardrail sidecar:
    - Supports `stdio` (for Claude Desktop / Cursor / Antigravity) and Streamable HTTP (port 8001).
 3. **Arc `TaskEscrow` Contract**: Holds buyer USDC in escrow until valid terms and deliverable
    settlement are executed.
-4. **Transcription Worker (`worker.py`)**: CUDA/FP16 `faster-whisper` container exposing HTTP
+4. **[Transcription Worker](https://github.com/mnemonik-xyz/transcription)**: CUDA/FP16 `faster-whisper` container exposing HTTP
    endpoints (`/health`, `/job`, `/jobs`) with structured operational logs and GPU telemetry.
 
 ---
@@ -529,6 +529,26 @@ Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their i
 `buyer_address`) directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
 `--manifest <path>`). You can still override `--rpc-url` via CLI arguments.
 
+### 0. Build the Seller MCP Image
+
+Build from the repository root; the seller image compiles the native Warrant binaries and packages
+the seller MCP server. BuildKit is required because
+[`Dockerfile.dockerignore`](Dockerfile.dockerignore) is a Dockerfile-specific, allowlist-based
+context filter. It must not become a root `.dockerignore`, which would also affect unrelated
+root-context image builds.
+
+```sh
+# Default: builds warrant-host and warrant-policy in the image.
+DOCKER_BUILDKIT=1 docker build \
+  -f showcases/ionet_arc/Dockerfile \
+  -t warrant-seller:dev .
+
+# Linux VM only: reuse prebuilt target/release binaries.
+DOCKER_BUILDKIT=1 docker build --build-arg BIN_SOURCE=host \
+  -f showcases/ionet_arc/Dockerfile \
+  -t warrant-seller:host .
+```
+
 ### 1. Run the Seller MCP Server
 
 Start the Seller MCP daemon:
@@ -623,7 +643,7 @@ run the scripted test agent:
 
 ## Worker HTTP API and Operational Logs
 
-The Whisper container HTTP service (`worker.py`) exposes the following endpoints:
+The [transcription worker](https://github.com/mnemonik-xyz/transcription) HTTP service exposes the following endpoints:
 
 | Request | Authentication | Result |
 | --- | --- | --- |
@@ -666,9 +686,6 @@ Run test suite:
 
 # TaskEscrow Web3 client unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_escrow -v
-
-# Whisper worker unit tests (queue, model caching, telemetry)
-.venv/bin/python -m unittest showcases.ionet_arc.test_worker -v
 
 # Core io.net CaaS pilot unit tests
 .venv/bin/python -m unittest showcases.ionet_arc.test_pilot -v
