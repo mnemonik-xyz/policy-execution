@@ -144,6 +144,18 @@ def spend_args(directory, **change):
     return argparse.Namespace(**values)
 
 
+class OutsideFactsTests(unittest.TestCase):
+    """Facts about the outside world, as literals, not read back from the module under test."""
+
+    def test_arc_usdc_address_chain_id_and_hard_cap(self):
+        self.assertEqual(canary.ARC_USDC, "0x3600000000000000000000000000000000000000")
+        self.assertEqual(canary.MAINNET_IDS, {5042})
+        self.assertEqual(canary.HARD_CAP, 10_000_000)  # 10 USDC, six decimals
+
+    def test_the_roles_are_the_four_canary_roles(self):
+        self.assertEqual(canary.ROLES, ("deployer", "buyer", "seller", "relayer"))
+
+
 class TempCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
