@@ -243,10 +243,12 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
 
         task_path = self.state_dir / "tasks" / f"{proposal['task_id']}.json"
-        data = json.loads(task_path.read_text())
+        base_data = json.loads(task_path.read_text())
+
+        # 1. Missing key
+        data = json.loads(json.dumps(base_data))
         del data["policy"]["valid_after"]
         task_path.write_text(json.dumps(data))
-
         with self.assertRaises(ToolError) as ctx:
             await self.call(
                 "warrant_sign_acceptance",
@@ -258,6 +260,54 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 2. None value for valid_after
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_after"] = None
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 3. None value for valid_until
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_until"] = None
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 4. Invalid non-integer value
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_after"] = "not_an_int"
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("invalid valid_after or valid_until", str(ctx.exception))
 
     async def test_warrant_evaluate_and_offer_insufficient_balance_no_automint(self):
         server = create_server(

@@ -517,9 +517,16 @@ class BuyerWarrantService:
             )
 
         logger.info("Constructing Acceptance statement for task_id=%s, deliverable_hash=%s", task_id, deliverable_hash)
-        if "valid_after" not in policy or "valid_until" not in policy:
+        if policy.get("valid_after") is None or policy.get("valid_until") is None:
             logger.error("Task '%s' policy is missing valid_after or valid_until", task_id)
             raise ToolError(f"Task '{task_id}' policy is missing valid_after or valid_until.")
+
+        try:
+            valid_after = int(policy["valid_after"])
+            valid_until = int(policy["valid_until"])
+        except (TypeError, ValueError) as e:
+            logger.error("Task '%s' policy has invalid valid_after or valid_until: %s", task_id, e)
+            raise ToolError(f"Task '{task_id}' policy has invalid valid_after or valid_until: {e}") from e
 
         scope = policy.get("scope") or {
             "chain_id": self._resolve_chain_id(),
@@ -534,8 +541,8 @@ class BuyerWarrantService:
             "recipient": list(address20(recipient)),
             "amount": atomic_amount,
             "accepted": True,
-            "valid_after": int(policy["valid_after"]),
-            "valid_until": int(policy["valid_until"]),
+            "valid_after": valid_after,
+            "valid_until": valid_until,
         }
 
         try:
