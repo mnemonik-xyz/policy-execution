@@ -113,8 +113,6 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             cls.mcp_port = s.getsockname()[1]
         cls.mcp_url = f"http://127.0.0.1:{cls.mcp_port}/mcp"
         cls.tmp_dir = tempfile.mkdtemp(prefix="warrant-state-")
-        cls.test_audio = Path(cls.tmp_dir) / "test_sample.mp3"
-        cls.test_audio.write_bytes(b"mock sample audio bytes for autonomous transcription pilot")
 
         import yaml
 
@@ -135,31 +133,43 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
         sig_bytes = sign_vendor_credential(cred_obj)
         cls.vendor_cred_path = Path(cls.tmp_dir) / "vendor_credential.yaml"
         cls.vendor_sig_path = Path(cls.tmp_dir) / "vendor_signature.yaml"
-        cls.vendor_cred_path.write_text(yaml.dump({
-            "scope": {
-                "chain_id": 31337,
-                "vault": cls.escrow_address,
-                "token": cls.token_address,
-            },
-            "recipient": cls.server_account,
-            "category": 42,
-            "valid_after": cred_obj["valid_after"],
-            "valid_until": cred_obj["valid_until"],
-        }))
+        cls.vendor_cred_path.write_text(
+            yaml.dump(
+                {
+                    "scope": {
+                        "chain_id": 31337,
+                        "vault": cls.escrow_address,
+                        "token": cls.token_address,
+                    },
+                    "recipient": cls.server_account,
+                    "category": 42,
+                    "valid_after": cred_obj["valid_after"],
+                    "valid_until": cred_obj["valid_until"],
+                }
+            )
+        )
         cls.vendor_sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
         cls.manifest_path = Path(cls.tmp_dir) / "manifest.yaml"
-        cls.manifest_path.write_text(yaml.dump({
-            "chain_id": 31337,
-            "rpc_url": cls.rpc_url,
-            "escrow_address": cls.escrow_address,
-            "token_address": cls.token_address,
-            "verifier_address": cls.verifier_address,
-            "seller_address": cls.server_account,
-            "buyer_address": cls.customer_account,
-            "public_files": {
-                "public_keys": "showcases/ionet_arc/config/public_keys.yaml",
-            },
-        }))
+        cls.manifest_path.write_text(
+            yaml.dump(
+                {
+                    "chain_id": 31337,
+                    "rpc_url": cls.rpc_url,
+                    "escrow_address": cls.escrow_address,
+                    "token_address": cls.token_address,
+                    "verifier_address": cls.verifier_address,
+                    "seller_address": cls.server_account,
+                    "buyer_address": cls.customer_account,
+                    "category": 42,
+                    "max_budget_usd": 2.00,
+                    "duration_hours": 1,
+                    "validity_seconds": 900,
+                    "public_files": {
+                        "public_keys": "showcases/ionet_arc/config/public_keys.yaml",
+                    },
+                }
+            )
+        )
 
         cmd = [
             str(PYTHON),
@@ -245,20 +255,17 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             self.rpc_url,
             "--manifest",
             str(self.manifest_path),
-            "--audio",
-            str(self.test_audio),
         ]
         res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env)
         print("CLIENT OUTPUT:\n", res.stdout)
         if res.returncode != 0:
             print("CLIENT STDERR:\n", res.stderr)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("WARRANT AUTONOMOUS TRANSCRIPTION AGENT", res.stdout)
+        self.assertIn("WARRANT AUTONOMOUS BUYER AGENT", res.stdout)
         self.assertIn("Policy evaluation: APPROVED", res.stdout)
         self.assertIn("TaskEscrow funded on-chain", res.stdout)
         self.assertIn("TaskEscrow settled on-chain: tx 0x", res.stdout)
-        self.assertIn("TRANSCRIPTION RESULT", res.stdout)
-        self.assertIn("Autonomous Warrant transcription showcase completed successfully!", res.stdout)
+        self.assertIn("Autonomous Warrant container deployment completed successfully!", res.stdout)
 
     def test_run_client_in_process_warrant_service(self):
         env = _clean_env()
@@ -271,15 +278,16 @@ class EndToEndWarrantTranscriptionTests(unittest.TestCase):
             self.rpc_url,
             "--manifest",
             str(self.manifest_path),
-            "--audio",
-            str(self.test_audio),
         ]
         res = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, env=env)
+        print("CLIENT OUTPUT:\n", res.stdout)
+        if res.returncode != 0:
+            print("CLIENT STDERR:\n", res.stderr)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("WARRANT AUTONOMOUS TRANSCRIPTION AGENT", res.stdout)
+        self.assertIn("WARRANT AUTONOMOUS BUYER AGENT", res.stdout)
         self.assertIn("Policy evaluation: APPROVED", res.stdout)
         self.assertIn("TaskEscrow funded on-chain", res.stdout)
-        self.assertIn("Autonomous Warrant transcription showcase completed successfully!", res.stdout)
+        self.assertIn("Autonomous Warrant container deployment completed successfully!", res.stdout)
 
 
 if __name__ == "__main__":
