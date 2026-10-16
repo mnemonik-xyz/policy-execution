@@ -1,0 +1,35 @@
+{
+  "phase": "after",
+  "read_only": true,
+  "chain_id": 5042,
+  "manifest": {
+    "escrow": "0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0",
+    "verifier": "0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99",
+    "image_id": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+    "token": "0x3600000000000000000000000000000000000000"
+  },
+  "code": {
+    "escrow": {
+      "address": "0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0",
+      "bytes": 5492,
+      "keccak": "0xefaf774fed9f0bdae63c8f3d97831fea60704c2bee06cd9c2eadbdd7737448ee",
+      "manifest_keccak": "0xefaf774fed9f0bdae63c8f3d97831fea60704c2bee06cd9c2eadbdd7737448ee",
+      "matches_build": true
+    },
+    "verifier": {
+      "address": "0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99",
+      "bytes": 4810,
+      "keccak": "0xb2df064231d4a19257ee10a778f3856632f5a3a45b46c02a99a7572c411edf55",
+      "manifest_keccak": "0xb2df064231d4a19257ee10a778f3856632f5a3a45b46c02a99a7572c411edf55",
+      "matches_build": true
+    }
+  },
+  "escrow": {
+    "token": "0x3600000000000000000000000000000000000000",
+    "verifier": "0xC4FB7340971E8ad6925F16C2A275cD13CB7bEc99",
+    "imageId": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+    "totalReserved": 0
+  },
+  "problems": [],
+  "verdict": "ok"
+}

@@ -58,8 +58,8 @@ Unverified on 2026-10-15: the contracts are not deployed yet.
 
 | Contract | Address |
 |---|---|
-| `SolverBountyEscrow` (proof escrow) | `<SOLVER_ESCROW_ADDRESS>` |
-| `RiscZeroGroth16Verifier` | `<GROTH16_VERIFIER_ADDRESS>` |
+| `SolverBountyEscrow` (proof escrow) | `0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0` |
+| `RiscZeroGroth16Verifier` | `0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99` |
 | USDC | `0x3600000000000000000000000000000000000000` |
 
 ## Next feature
