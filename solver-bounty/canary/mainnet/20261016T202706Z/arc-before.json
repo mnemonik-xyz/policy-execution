@@ -1,0 +1,37 @@
+{
+  "phase": "before",
+  "read_only": true,
+  "chain_id": 5042,
+  "precompiles": {
+    "ecadd": {
+      "address": "0x0000000000000000000000000000000000000006",
+      "ok": true,
+      "result": "0x030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd315ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4"
+    },
+    "ecmul": {
+      "address": "0x0000000000000000000000000000000000000007",
+      "ok": true,
+      "result": "0x030644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd315ed738c0e0a7c92e7845f96b2ae9c0a68a6a449e3538fc7ff3ebf7a5a18a2c4"
+    },
+    "ecpairing": {
+      "address": "0x0000000000000000000000000000000000000008",
+      "ok": true,
+      "result": "0x0000000000000000000000000000000000000000000000000000000000000001"
+    }
+  },
+  "usdc": {
+    "address": "0x3600000000000000000000000000000000000000",
+    "decimals": 6
+  },
+  "proof": {
+    "file": "/opt/warrant-canary/src/solver-bounty/canary/local/20261016T183720Z/evm.json",
+    "image_id": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+    "journal_digest": "0x4d225ba1d17891d5cd5ca070cc879ec99ca72fb0358d901781dbe961fb547bec"
+  },
+  "probe": {
+    "ok": true,
+    "result": "0x0000000000000000000000000000000000000000000000000000000000000001"
+  },
+  "problems": [],
+  "verdict": "ok"
+}

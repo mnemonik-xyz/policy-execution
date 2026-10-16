@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "created_at": "2026-10-16T20:27:54+00:00",
+  "chain_id": 5042,
+  "token": "0x3600000000000000000000000000000000000000",
+  "amount": 2000000,
+  "max_cost": 1764000000,
+  "accept_window": 1800,
+  "settle_window": 14400,
+  "roles": {
+    "deployer": "account:warrant-canary-deployer",
+    "buyer": "account:warrant-canary-buyer",
+    "seller": "account:warrant-canary-seller",
+    "relayer": "account:warrant-canary-relayer"
+  },
+  "addresses": {
+    "deployer": "0x588c6c6132193ed474367ac15fbd71d6f73455c8",
+    "buyer": "0xc0ef32fcb10bb9787800a4756fa3c3a8b220580b",
+    "seller": "0xb8202bebb6d8a0a822a56c0062632325c3923eeb",
+    "relayer": "0xf8822dc58160238398bf02116f2e7e84d510da3b"
+  },
+  "tx": {
+    "deploy": {
+      "intent_at": "2026-10-16T20:30:13+00:00",
+      "hash": "see deployment.json"
+    }
+  },
+  "escrow": "0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0",
+  "verifier": "0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99",
+  "image_id": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+  "code_hashes": {
+    "escrow": "0xefaf774fed9f0bdae63c8f3d97831fea60704c2bee06cd9c2eadbdd7737448ee",
+    "verifier": "0xb2df064231d4a19257ee10a778f3856632f5a3a45b46c02a99a7572c411edf55"
+  },
+  "image_builder": "risczero/risc0-guest-builder:r0.1.88.0"
+}
