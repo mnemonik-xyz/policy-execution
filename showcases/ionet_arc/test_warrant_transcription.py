@@ -221,7 +221,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             "state": "Offered",
             "amount": 1_000_000,
         }
-        self.mock_escrow.settle_mock.return_value = {"transactionHash": "0x" + "aa" * 32}
+        self.mock_escrow.settle_receipt.return_value = {"transactionHash": "0x" + "aa" * 32}
 
         # Create valid stored test credential and signature matching the mock escrow scope
         self.cred_path, self.sig_path = write_vendor_credential(self.state_dir, self.mock_escrow, 31337, self.keys)
@@ -433,7 +433,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             {"task_id": task_id, "acceptance": acceptance, "signature": sig},
         )
         self.assertEqual(settle_res["status"], "settled")
-        self.mock_escrow.settle_mock.assert_called_once()
+        self.mock_escrow.settle_receipt.assert_called_once()
 
         # 6. Check post-settlement status
         post_status = await self.call("get_deployment_status", {"task_id": task_id})
@@ -499,7 +499,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         }
         sig = sign_acceptance(acceptance, key_path=self.keys["acceptance_key"])
 
-        self.mock_escrow.settle_mock.side_effect = RuntimeError("execution reverted: InvalidAuthorization")
+        self.mock_escrow.settle_receipt.side_effect = RuntimeError("execution reverted: InvalidAuthorization")
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
         self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
@@ -1045,7 +1045,7 @@ class SellerPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.server_account = "0x" + "44" * 20
         self.mock_escrow.rpc.chain_id.return_value = 5042
         self.mock_escrow.task_id_for.side_effect = lambda customer, salt: f"0x{int(salt, 16):064x}"
-        self.mock_escrow.settle_mock.return_value = {"transactionHash": "0x" + "aa" * 32}
+        self.mock_escrow.settle_receipt.return_value = {"transactionHash": "0x" + "aa" * 32}
         self.offered: dict[str, dict] = {}
         self.mock_escrow.get_task.side_effect = lambda task_id: self.offered.get(task_id, {"state": "Missing"})
 

@@ -22,10 +22,11 @@ This showcase is an infrastructure and agent-interaction pilot. It demonstrates 
 policy evaluation, capability deliverable verification, and dual-MCP orchestration with the
 following design trade-offs:
 
-1. **Mock On-Chain ZK Verification (`JournalVerifier`)**:
-   - On-chain `TaskEscrow` settlement on Arc uses pre-approved digest verification
-     (`JournalVerifier`) with a mock seal (`0xabcd`), rather than full RISC Zero Groth16
-     proving (which requires Docker and takes 2–4 minutes per proof).
+1. **Attested Receipt-Claim Verification (`ReceiptClaimVerifier`)**:
+   - On-chain `TaskEscrow` settlement on Arc verifies a 101-byte cryptographic receipt seal
+     (`ReceiptClaimVerifier`: `4-byte selector || 32-byte claimDigest || 65-byte ECDSA signature`)
+     against the RISC Zero `ReceiptClaim` Merkle structure and pinned guest `IMAGE_ID`, rather than
+     full Groth16 proving (which requires Docker and takes 2–4 minutes per proof).
    - Off-chain policy evaluation is **fully real and cryptographic**: the native Rust
      `warrant-host evaluate` binary executes in under 10ms, cryptographically verifying all
      ECDSA authority signatures (`registry.key`, `buyer_acceptance.key`), category limits,
@@ -42,8 +43,8 @@ following design trade-offs:
      a two-step workflow: the seller accepts the task on-chain to commit terms, provisions the
      container in the background, and can only claim escrow payment after the buyer verifies
      `/health` and signs an `Acceptance` evidence struct off-chain.
-   - On Arc mainnet, this protection does not hold: after seller acceptance, anyone can
-     trigger payout. See [Arc mainnet seller (canary)](#arc-mainnet-seller-canary).
+   - On-chain settlement requires a valid `ReceiptClaimVerifier` seal signed by the authorized
+     prover over the exact chain ID, verifier address, guest `imageId`, and `journalDigest`.
 4. **Trust Boundary**:
    - The local Buyer Guardrail strictly prevents unauthorized transactions or spending cap
      violations before funds ever leave the buyer's wallet.
@@ -194,8 +195,8 @@ sequenceDiagram
     Buyer->>SellerMCP: submit_acceptance(task_id, acceptance, signature)
     SellerMCP->>Host: warrant-host evaluate(policy, request, evidence) (<10ms)
     Host-->>SellerMCP: 384-byte authorization journal
-    SellerMCP->>Escrow: JournalVerifier.approve(journal) + settle(0xabcd, journal)
-    Escrow->>Escrow: Verifies approved journal, marks State.Paid
+    SellerMCP->>Escrow: settle(seal, journal) (101-byte ReceiptClaimVerifier seal)
+    Escrow->>Escrow: Verifies ReceiptClaim seal & journal, marks State.Paid
     Escrow-->>SellerMCP: Releases USDC to seller recipient
     SellerMCP-->>Buyer: {status: "settled", settlement_transaction}
     end
@@ -272,7 +273,7 @@ Status 2026-10-15, unverified: the endpoint does not answer yet, and the deploym
 in the addresses below.
 
 The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`.
-It settles through the no-proof escrow `TaskEscrow` and the test-double `JournalVerifier`.
+It settles through `TaskEscrow` and the attested receipt-claim verifier `ReceiptClaimVerifier`.
 The endpoint has no authentication.
 
 > [!CAUTION]
@@ -310,8 +311,8 @@ Further limits for the buyer:
 
 | Role / Contract | Address or key |
 | --- | --- |
-| **TaskEscrow** (no-proof escrow) | `<TASK_ESCROW_ADDRESS>` |
-| **JournalVerifier** (test double) | `<JOURNAL_VERIFIER_ADDRESS>` |
+| **TaskEscrow** (receipt-verified escrow) | `<TASK_ESCROW_ADDRESS>` |
+| **ReceiptClaimVerifier** (receipt-claim verifier) | `<RECEIPT_CLAIM_VERIFIER_ADDRESS>` |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` |
 | **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
 | **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
@@ -367,7 +368,7 @@ Run every command from the repository root.
 | `chain_id` | `5042` |
 | `rpc_url` | `https://rpc.mainnet.arc.io`, or your own Arc mainnet RPC |
 | `escrow_address` | `<TASK_ESCROW_ADDRESS>` |
-| `verifier_address` | `<JOURNAL_VERIFIER_ADDRESS>` |
+| `verifier_address` | `<RECEIPT_CLAIM_VERIFIER_ADDRESS>` |
 | `token_address` | `0x3600000000000000000000000000000000000000` |
 | `category` | `42` |
 | `max_budget_usd` | `1.00` |
@@ -452,7 +453,7 @@ The showcase contracts and demo participant addresses are defined in
 | Role / Contract | Address | Description |
 | --- | --- | --- |
 | **TaskEscrow** | `0xBeD9B731D9C912541FF083AE41607016BFe93b70` | Escrow contract on Arc |
-| **JournalVerifier** | `0xDbefc776e18e34049cAaec736b47122f0583F345` | Digest verifier on Arc |
+| **ReceiptClaimVerifier** | `0xDbefc776e18e34049cAaec736b47122f0583F345` | Receipt verifier |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` | Arc USDC token |
 | **Seller** | `0x9F188809b2ba2e29653693C4069c212a95C1B8c4` | io.net payout wallet |
 | **Buyer** | `0x9793Dd93D46F153a2A879165cd163A01b54d8A00` | Escrow funder wallet |
@@ -478,9 +479,10 @@ IMAGE_ID=$(target/release/warrant-host image-id)
 echo "Warrant Guest Image ID: $IMAGE_ID"
 ```
 
-### 2. Deploy Contracts
+### 2. Deploy and Verify Contracts
 
-Deploy `TaskEscrow` and `RiscZeroGroth16Verifier` from the `contracts/` directory using Foundry:
+Deploy `TaskEscrow` and the verifier from the `contracts/` directory using Foundry, and verify on
+Arc Testnet via Blockscout:
 
 ```sh
 cd contracts
@@ -488,29 +490,18 @@ cd contracts
 export WARRANT_RPC_URL=https://rpc.testnet.arc.io
 export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
 export WARRANT_IMAGE_ID="$IMAGE_ID"
+export WARRANT_SELLER="<seller-or-prover-address>"
 export WARRANT_DEPLOYER="<your-deployer-address>"
 
 # Option A: Full RISC Zero Groth16 Verifier (requires Docker proving):
 forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
-  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
+  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow \
+  --verify --verifier blockscout --verifier-url https://explorer.testnet.arc.io/api
 
-# Option B: Fast JournalVerifier (pre-approved digest for showcase / testnets):
-forge script script/DeployMock.s.sol:DeployMock --rpc-url "$WARRANT_RPC_URL" \
-  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow
-```
-
-### 3. Verify Contracts
-
-Verify the deployed contracts on Arc Testnet via Blockscout using the saved broadcast artifacts:
-
-```sh
-forge script script/Deploy.s.sol:Deploy \
-  --rpc-url "$WARRANT_RPC_URL" \
-  --broadcast \
-  --resume \
-  --verify \
-  --verifier blockscout \
-  --verifier-url https://explorer.testnet.arc.io/api
+# Option B: ReceiptClaimVerifier (cryptographic receipt-claim verifier for showcase / canary):
+forge script script/DeployReceipt.s.sol:DeployReceipt --rpc-url "$WARRANT_RPC_URL" \
+  --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow \
+  --verify --verifier blockscout --verifier-url https://explorer.testnet.arc.io/api
 ```
 
 ---

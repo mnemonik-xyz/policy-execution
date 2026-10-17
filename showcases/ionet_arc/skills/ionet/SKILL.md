@@ -125,8 +125,8 @@ Inspects active container provisioning status, health, and remaining seconds in 
 
 #### 5. `submit_acceptance`
 Submits buyer-signed `Acceptance` evidence. Verifies policy rules and authority signatures
-off-chain via native `warrant-host evaluate`, approves the 384-byte authorization journal on
-`JournalVerifier`, and settles payment on `TaskEscrow` on-chain.
+off-chain via native `warrant-host evaluate`, signs the RISC Zero `ReceiptClaim` digest for
+`ReceiptClaimVerifier`, and settles payment on `TaskEscrow` on-chain in a single transaction.
 - Arguments:
   - `task_id` (string, required): Task identifier.
   - `acceptance` (object, required): `Acceptance` struct signed by buyer.
