@@ -3,8 +3,8 @@
 
 chain_id: 5042002  # Arc Testnet
 rpc_url: 'https://rpc.testnet.arc.io'  # Arc Testnet JSON-RPC
-escrow_address: '0xBeD9B731D9C912541FF083AE41607016BFe93b70'  # Deployed TaskEscrow contract
-verifier_address: '0xDbefc776e18e34049cAaec736b47122f0583F345'  # ReceiptClaimVerifier contract
+escrow_address: '0xeb2038CbaE9b25C7935782B21617025Affdd9890'  # Deployed TaskEscrow contract
+verifier_address: '0xA95eC8cB54233Cf7e033A2a3C5E6F2727901aE93'  # ReceiptClaimVerifier contract
 token_address: '0x3600000000000000000000000000000000000000'  # Arc USDC (6 decimals)
 seller_address: '0x9F188809b2ba2e29653693C4069c212a95C1B8c4'  # io.net seller payout wallet
 buyer_address: '0x9793Dd93D46F153a2A879165cd163A01b54d8A00'  # The client agent's wallet
