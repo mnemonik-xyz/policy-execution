@@ -273,9 +273,11 @@ Status 2026-10-17: live.
 
 The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`
 behind HTTP basic auth. It uses one shared credential, which the operator hands out; requests
-without it get 401. It settles through the no-proof `TaskEscrow` and the `JournalVerifier`
-test double (see "Mainnet addresses"). The signature-checking `ReceiptClaimVerifier` is
-deployed but the MCP will use it only in a later release.
+
+without it get 401. It settles through the no-proof escrow `TaskEscrow` and the test-double
+`JournalVerifier` (see "Mainnet addresses"). The verifier checks no signature and no proof, so
+a buyer trusts the seller. A signature-checking verifier is not used yet.
+
 
 > [!CAUTION]
 > Risks for everyone who holds the shared credential:
@@ -419,13 +421,23 @@ read on the VM. Ignore them or delete them.
     },
     "seller-transcription-service": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp"]
+      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp",
+               "--header", "Authorization:${SELLER_AUTH}"],
+      "env": { "SELLER_AUTH": "Basic <base64 of user:password>" }
     }
   }
 }
 ```
 
-The seller endpoint has no authentication, so `mcp-remote` needs no header or credential.
+The seller endpoint needs HTTP basic auth. Ask the operator for the user and password, then
+make the value in your own terminal, so the password does not land in a log or a chat:
+
+```sh
+printf '%s:%s' "<user>" "<password>" | base64
+```
+
+Put the output after `Basic ` in `SELLER_AUTH`. The header goes in an environment variable
+because some clients mishandle spaces inside an argument. Do not commit this file.
 
 ### Operator notes
 
