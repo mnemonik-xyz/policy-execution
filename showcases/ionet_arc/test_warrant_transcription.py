@@ -15,6 +15,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from showcases.ionet_arc import seller_mcp_server as seller_module
 from showcases.ionet_arc.adapter import PilotError
+from showcases.ionet_arc.arc import NETWORKS
 from showcases.ionet_arc.escrow import (
     DEFAULT_CATEGORY,
     DEFAULT_MANIFEST_PATH,
@@ -180,6 +181,9 @@ def credit_status_response(credits_balance, courtesy_balance=0.0) -> dict:
             "burn_rate": {"hourly_rate": None, "runway_hours_estimate": None, "cluster_count": 0},
         },
     }
+
+
+TESTNET_MANIFEST = Path(__file__).parent / "config-arc-testnet" / "manifest.yaml"
 
 
 class FakeCloud:
@@ -865,13 +869,23 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             app = create_app(config)
             self.assertIsNotNone(app)
 
-    def test_read_initial_parameters_from_manifest(self):
-        manifest = load_manifest()
-        config = ServerConfig(state_dir=self.state_dir)
+    def _assert_config_matches_manifest(self, manifest_path, network):
+        manifest = load_manifest(manifest_path)
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=manifest_path)
+        self.assertEqual(config.rpc_url, NETWORKS[network]["rpc"])
+        self.assertEqual(manifest["chain_id"], NETWORKS[network]["chain_id"])
         self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
         self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
+        self.assertEqual(config.token_address, manifest.get("token_address"))
         self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
-        self.assertEqual(config.rpc_url, manifest.get("rpc_url"))
+        self.assertEqual(config.max_budget_usd, Decimal(str(manifest["max_budget_usd"])))
+        self.assertEqual(config.duration_hours, int(manifest["duration_hours"]))
+
+    def test_read_initial_parameters_from_testnet_manifest(self):
+        self._assert_config_matches_manifest(TESTNET_MANIFEST, "testnet")
+
+    def test_read_initial_parameters_from_mainnet_manifest(self):
+        self._assert_config_matches_manifest(DEFAULT_MANIFEST_PATH, "mainnet")
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
