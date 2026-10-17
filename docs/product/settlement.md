@@ -77,14 +77,17 @@ Recorded 2026-10-14. Decision of the core team on 2026-10-09, in the
 - The exception applies to the canary only: one order, at most 10 USDC, on the solver path.
   It does not apply to a production launch. CHAIN-1 and CHAIN-5 remain open gates for P5.
 - Extension of 2026-10-15: the exception also covers the `TaskEscrow` seller service on
-  chain 5042. Its scope is the task set: `JournalVerifier` and `TaskEscrow` with image ID
-  `bytes32(1)`. There is no proof. `JournalVerifier` is a test-double verifier. Seller
+  chain 5042. Its scope is the task set: `ReceiptClaimVerifier` and `TaskEscrow` pinned to the
+  Warrant guest image ID. `ReceiptClaimVerifier` verifies a 101-byte cryptographic receipt seal
+  (`SELECTOR || claimDigest || signature`) signed by the authorized prover over the RISC Zero
+  `ReceiptClaim` digest, chain ID, and verifier address, without a Groth16 SNARK proof. Seller
   policy limits each deal to at most 1.00 USD and 1 hour, and allows one deal at a time.
   These limits are seller policy, not contract rules.
-- Trust facts of the seller service: `JournalVerifier.approve` is open to anyone, and
-  `TaskEscrow.settle` does not check the caller. After seller acceptance, anyone can
-  therefore trigger payout. The buyer trusts the seller fully. The extension does not
-  apply to a production launch either.
+- Trust facts of the seller service: `ReceiptClaimVerifier` requires the authorized prover's
+  secp256k1 signature over the exact `(chainId, verifier, imageId, journalDigest)` receipt claim,
+  so unauthorized third parties cannot forge a seal. Because the seller controls the prover key
+  for the canary, the buyer trusts the seller not to sign a receipt claim without buyer
+  acceptance. The extension does not apply to a production launch either.
 - CHAIN-6 for the task set: the deployment record `task-escrow.json` holds the Foundry
   broadcast and the `cast` checks, and the deployment PR publishes it. No settlement
   evidence exists before the first buyer deal, so CHAIN-6 stays open for the task set.
