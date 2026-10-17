@@ -11,8 +11,10 @@ It then prints the MCP client configuration for Claude Desktop, Claude Code and 
 The keys never leave this machine. A second run reuses the existing keys, so it never
 replaces a wallet that holds money.
 
-    python -m showcases.ionet_arc.buyer_init            # set up, or print the setup again
-    python -m showcases.ionet_arc.buyer_init --status   # show the wallet's USDC balance
+    uvx warrant-buyer init            # set up, or print the setup again
+    uvx warrant-buyer status          # show the wallet's USDC balance
+
+From a clone of the repository: python -m showcases.ionet_arc.buyer_init [--status].
 """
 
 import argparse
@@ -20,21 +22,26 @@ import json
 import os
 import pathlib
 import secrets
+import shutil
 import sys
 from decimal import Decimal, InvalidOperation
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+if __package__ != "warrant_buyer":  # a repository checkout, not the installed package
+    sys.path.insert(0, str(REPO_ROOT))
 
 import yaml  # noqa: E402
 from eth_account import Account  # noqa: E402
 from eth_keys import keys  # noqa: E402
 
-from showcases.ionet_arc.arc import NETWORKS, USDC  # noqa: E402
-from showcases.ionet_arc.escrow import EthRpc, find_warrant_binary  # noqa: E402
+from .arc import NETWORKS, USDC  # noqa: E402
+from .escrow import SHOWCASE_DIR, EthRpc, find_warrant_binary  # noqa: E402
+
+# Installed from PyPI as warrant-buyer, or run from a clone of the repository.
+PACKAGED = __package__ == "warrant_buyer"
 
 DEFAULT_HOME = pathlib.Path.home() / ".warrant-buyer"
-MAINNET_PUBLIC_KEYS = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "mainnet-public_keys.yaml"
+MAINNET_PUBLIC_KEYS = SHOWCASE_DIR / "config" / "mainnet-public_keys.yaml"
 SELLER_MCP_URL = "https://seller.mnemonik.xyz/mcp"
 EXPLORER = "https://explorer.arc.io"
 
@@ -131,19 +138,22 @@ def write_config(
     return manifest_path
 
 
+def package_version() -> str:
+    from importlib.metadata import version
+
+    return version("warrant-buyer")
+
+
 def guardrail_server(home: pathlib.Path, manifest: pathlib.Path) -> dict:
+    run_args = ["--transport", "stdio", "--manifest", str(manifest), "--state-dir", str(home / "state")]
+    if PACKAGED:
+        # Pin the version: a later release must not change the guardrail under a funded wallet unasked.
+        # Desktop clients start with a short PATH, so give uvx by its full path.
+        uvx = shutil.which("uvx") or "uvx"
+        return {"command": uvx, "args": [f"warrant-buyer=={package_version()}", "guardrail", *run_args]}
     return {
         "command": sys.executable,
-        "args": [
-            "-m",
-            "showcases.ionet_arc.buyer_mcp_server",
-            "--transport",
-            "stdio",
-            "--manifest",
-            str(manifest),
-            "--state-dir",
-            str(home / "state"),
-        ],
+        "args": ["-m", "showcases.ionet_arc.buyer_mcp_server", *run_args],
         "env": {"PYTHONPATH": str(REPO_ROOT)},
     }
 
@@ -169,12 +179,16 @@ def client_config(home: pathlib.Path, manifest: pathlib.Path) -> dict:
 def claude_code_commands(home: pathlib.Path, manifest: pathlib.Path) -> list[str]:
     guard = guardrail_server(home, manifest)
     args = " ".join(json.dumps(a) for a in guard["args"])
+    env = "".join(f" --env {k}={json.dumps(v)}" for k, v in guard.get("env", {}).items())
     return [
-        f"claude mcp add buyer-warrant-guardrail --env PYTHONPATH={json.dumps(str(REPO_ROOT))} "
-        f"-- {json.dumps(guard['command'])} {args}",
+        f"claude mcp add buyer-warrant-guardrail{env} -- {json.dumps(guard['command'])} {args}",
         f"claude mcp add --transport http seller-transcription-service {SELLER_MCP_URL} "
         '--header "Authorization: Basic <base64 of user:password>"',
     ]
+
+
+STATUS_COMMAND = "uvx warrant-buyer status" if PACKAGED else "python -m showcases.ionet_arc.buyer_init --status"
+INIT_COMMAND = "uvx warrant-buyer init" if PACKAGED else "python -m showcases.ionet_arc.buyer_init"
 
 
 def missing_binaries() -> list[str]:
@@ -205,7 +219,7 @@ def print_setup(home, address, created, manifest, max_budget_usd) -> None:
     print(f"   Send about 1.10 USDC to {address} on Arc mainnet (chain ID 5042).")
     print("   USDC also pays the gas on Arc. Send only what you are ready to spend.")
     print(f"   Explorer: {EXPLORER}/address/{address}")
-    print("   Check:    python -m showcases.ionet_arc.buyer_init --status")
+    print(f"   Check:    {STATUS_COMMAND}")
     print()
     print("2. Connect your MCP client")
     print("   Claude Desktop or Cursor: merge this into claude_desktop_config.json or mcp.json.")
@@ -226,8 +240,9 @@ def print_setup(home, address, created, manifest, max_budget_usd) -> None:
         print("   cargo build --release -p warrant-host")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     parser = argparse.ArgumentParser(
+        prog=prog,
         description="Set up the Warrant buyer guardrail for the Arc mainnet transcription seller."
     )
     parser.add_argument(
@@ -245,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         wallet = home / "buyer.key"
         if not wallet.exists():
-            print(f"No wallet in {home}. Run: python -m showcases.ionet_arc.buyer_init", file=sys.stderr)
+            print(f"No wallet in {home}. Run: {INIT_COMMAND}", file=sys.stderr)
             return 1
         address = Account.from_key(bytes.fromhex(read_hex_key(wallet))).address
         manifest = yaml.safe_load((home / "manifest.yaml").read_text()) if (home / "manifest.yaml").exists() else {}

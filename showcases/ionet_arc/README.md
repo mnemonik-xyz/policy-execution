@@ -408,7 +408,16 @@ money yet. The limits and risks above apply.
 
 Run every command from the repository root.
 
-**Short path.** After step 1 below, one command does steps 2 to 6. It makes a new burner
+**Install from PyPI (macOS and Linux).** No clone and no Rust build. The package carries the
+two helper binaries. It needs [uv](https://docs.astral.sh/uv/). This path exists after the first
+`buyer-v*` release of the package; see `.github/workflows/release-buyer.yml`.
+
+```bash
+uvx warrant-buyer init      # new wallet, keys, manifest and the MCP client configuration
+uvx warrant-buyer status    # USDC balance of the wallet
+```
+
+**Short path from a clone.** After step 1 below, one command does steps 2 to 6. It makes a new burner
 wallet and an acceptance key in `~/.warrant-buyer` (mode 0600), writes the manifest and the
 public keys file with the mainnet values, and prints the MCP configuration for Claude Desktop,
 Claude Code and Cursor. A second run reuses the keys, so it never replaces a funded wallet.

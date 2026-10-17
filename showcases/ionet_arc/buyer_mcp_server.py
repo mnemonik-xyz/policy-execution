@@ -24,7 +24,8 @@ from decimal import Decimal
 
 # Ensure repository root is on sys.path
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+if __package__ != "warrant_buyer":  # a repository checkout, not the installed package
+    sys.path.insert(0, str(REPO_ROOT))
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -38,10 +39,11 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 
-from showcases.ionet_arc.escrow import (  # noqa: E402
+from .escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
+    SHOWCASE_DIR,
     EscrowClient,
     address20,
     bytes32,
@@ -81,10 +83,10 @@ class BuyerWarrantService:
 
         self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
         self.template_path = template_path or (
-            REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
+            SHOWCASE_DIR / "config" / "buyer_policy_template.yaml"
         )
         self.buyer_acceptance_key_path = buyer_acceptance_key_path or (
-            REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
+            SHOWCASE_DIR / ".keys" / "buyer_acceptance.key"
         )
 
         self.max_duration_hours = int(max_duration_hours) if max_duration_hours is not None else None
@@ -663,7 +665,7 @@ class ServerConfig:
                 cand = pathlib.Path(raw_key_path)
                 self.buyer_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
             else:
-                default_buyer_key = REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer.key"
+                default_buyer_key = SHOWCASE_DIR / ".keys" / "buyer.key"
                 if default_buyer_key.exists():
                     self.buyer_key_path = default_buyer_key
 
@@ -810,7 +812,7 @@ def run_server(
         uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=logger.getEffectiveLevel())
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Run the Buyer Warrant guardrail MCP server (stdio or Streamable HTTP)."
     )
@@ -865,7 +867,7 @@ def main():
         default=None,
         help="Path to file containing buyer private key (default: from manifest or .keys/buyer.key)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config = ServerConfig(
         transport=args.transport,

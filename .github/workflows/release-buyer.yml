@@ -1,0 +1,138 @@
+name: Release warrant-buyer
+
+# Push a tag such as buyer-v0.1.0 to build the wheels, smoke-test them and publish to PyPI.
+# A manual run builds and tests the wheels only. It never publishes.
+on:
+  push:
+    tags: ['buyer-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for a test build, for example 0.0.0.dev1
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  platform: manylinux_2_17_x86_64,  musl: true }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, platform: manylinux_2_17_aarch64, musl: true }
+          - { name: macos-arm64,  runner: macos-14,         target: aarch64-apple-darwin,       platform: macosx_11_0_arm64 }
+          - { name: macos-x86_64, runner: macos-14,         target: x86_64-apple-darwin,        platform: macosx_10_12_x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#buyer-v}"; else v="${{ inputs.version }}"; fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build the helper binaries
+        # RISC0_SKIP_BUILD skips the guest programs. These two binaries do not use the prover.
+        run: >
+          cargo build --release --locked -p warrant-host
+          --bin warrant-policy --bin warrant-evidence --target ${{ matrix.target }}
+        env:
+          RISC0_SKIP_BUILD: '1'
+      - name: Build the wheel
+        run: |
+          pip install -q build wheel hatchling==1.27.0
+          scripts/build-buyer-wheel.sh "${{ steps.version.outputs.value }}" \
+            "target/${{ matrix.target }}/release" "${{ matrix.platform }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  smoke:
+    name: install and run (${{ matrix.name }})
+    needs: wheels
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04,     artifact: wheel-linux-x86_64 }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, artifact: wheel-linux-arm64 }
+          - { name: macos-arm64,  runner: macos-14,         artifact: wheel-macos-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Install the wheel in a clean environment, away from the repository
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q dist/*.whl
+          cd "$RUNNER_TEMP"
+          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/venv/bin/warrant-buyer" init > init.out
+          grep -q "Warrant buyer guardrail is ready" init.out
+          test "$(stat -c %a "$RUNNER_TEMP/home/.warrant-buyer/buyer.key" 2>/dev/null || stat -f %Lp "$RUNNER_TEMP/home/.warrant-buyer/buyer.key")" = 600
+      - name: The bundled binaries compute a policy hash and sign
+        run: |
+          cd "$RUNNER_TEMP"
+          HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/venv/bin/python" - <<'PY'
+          import os, pathlib
+          from warrant_buyer.escrow import compile_buyer_policy, find_warrant_binary, sign_acceptance
+          for name in ("warrant-policy", "warrant-evidence"):
+              assert "warrant_buyer" in str(find_warrant_binary(name)), name
+          base = pathlib.Path(os.environ["HOME"]) / ".warrant-buyer"
+          policy, policy_hash = compile_buyer_policy(manifest_path=base / "manifest.yaml")
+          assert policy_hash.startswith("0x") and len(policy_hash) == 66, policy_hash
+          signature = sign_acceptance(
+              {
+                  "scope": policy["scope"],
+                  "task_id": [1] * 32,
+                  "deliverable_hash": [2] * 32,
+                  "recipient": [3] * 20,
+                  "amount": 1,
+                  "accepted": True,
+                  "valid_after": policy["valid_after"],
+                  "valid_until": policy["valid_until"],
+              },
+              key_path=base / "buyer_acceptance.key",
+          )
+          assert len(signature) == 64, len(signature)
+          print("policy hash", policy_hash)
+          PY
+      - name: The guardrail answers over stdio
+        run: |
+          pip install -q mcp==2.3.0
+          python scripts/buyer-wheel-smoke.py "$RUNNER_TEMP/home" "$RUNNER_TEMP/venv/bin/warrant-buyer"
+
+  publish:
+    name: publish to PyPI
+    if: github.ref_type == 'tag'
+    needs: smoke
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI trusted publishing, so no password is stored in the repository
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
