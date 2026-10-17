@@ -269,28 +269,28 @@ the local Warrant tool for policy check and escrow funding, deploy, and transcri
 
 ## Arc mainnet seller (canary)
 
-Status 2026-10-15, unverified: the endpoint does not answer yet, and the deployment PR fills
-in the addresses below.
+Status 2026-10-17: live.
 
-The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`.
-It settles through `TaskEscrow` and the attested receipt-claim verifier `ReceiptClaimVerifier`.
-The endpoint has no authentication.
+The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`
+behind HTTP basic auth. It uses one shared credential, which the operator hands out; requests
+without it get 401. It settles through the no-proof `TaskEscrow` and the `JournalVerifier`
+test double (see "Mainnet addresses"). The signature-checking `ReceiptClaimVerifier` is
+deployed but the MCP will use it only in a later release.
 
 > [!CAUTION]
-> Risks of the unauthenticated seller endpoint:
+> Risks for everyone who holds the shared credential:
 >
-> - Anyone who can reach `/mcp` can call every tool. `get_deployment_status` returns the
->   worker token of the active deployment, so a stranger can use the paid GPU container
+> - Anyone with the credential can call every tool. `get_deployment_status` returns the
+>   worker token of the active deployment, so a credential holder can use the paid GPU container
 >   during the lease.
-> - Anyone can call `propose_deployment` and `list_suitable_hardware`. Each call reads the
+> - Any credential holder can call `propose_deployment` and `list_suitable_hardware`. Each call reads the
 >   io.net API and the seller RPC, and stores a proposal file. Nothing limits the rate, so
 >   this is a denial-of-service and disk-growth vector.
-> - A stranger who knows a funded `task_id` can trigger `deploy_with_escrow` and occupy the
+> - A credential holder who knows a funded `task_id` can trigger `deploy_with_escrow` and occupy the
 >   single deal slot, which blocks other buyers.
 > - The seller spends its own io.net credits on provisioning. The 1 USD cap per deal is the
 >   only spending limit.
-> - Put the endpoint behind a network control (firewall allowlist, VPN or reverse proxy
->   with auth) if you need any access limit.
+> - The credential is shared. Hand it out only to people you trust, and rotate it if it leaks.
 
 The seller path on mainnet (funding, acceptance, GPU provisioning, settlement) has not run
 with money. The first buyer is therefore the first test.
@@ -311,11 +311,30 @@ Further limits for the buyer:
 
 | Role / Contract | Address or key |
 | --- | --- |
-| **TaskEscrow** (receipt-verified escrow) | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
-| **ReceiptClaimVerifier** (receipt-claim verifier) | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
+| **TaskEscrow** (no-proof escrow, used by the MCP now) | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
+| **JournalVerifier** (test double, used by the MCP now) | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` |
-| **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
-| **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
+| **Seller** (payout wallet) | `0xb8202bebb6d8a0a822a56c0062632325c3923eeb` |
+| **Registry public key** | `0x02264b8d8cdb5b5a45736a4e3f679966966f39979b16794f08530c1ac6d77ee034` |
+
+#### Current deployment and the signature-checking verifier
+
+The seller MCP uses the `TaskEscrow` and the `JournalVerifier` test double in the table above
+(deployed 2026-10-17). The test double accepts any digest the seller approved and checks no
+signature.
+
+A signature-checking verifier set is also deployed on Arc mainnet. The MCP does **not** use
+it yet. The MCP will switch to it in a later release, together with a new seller deploy. Until
+then, buyers use the addresses in the table above.
+
+| Contract | Address |
+| --- | --- |
+| **TaskEscrow** (receipt-verified, not used by the MCP yet) | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
+| **ReceiptClaimVerifier** (checks the prover's ECDSA signature over the receipt claim, not used by the MCP yet) | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
+
+That set is pinned to the guest image ID
+`0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e`. Its prover address is
+`0x9F188809b2ba2e29653693C4069c212a95C1B8c4`, which is not the seller payout wallet above.
 
 The deployment PR also publishes `config/mainnet-public_keys.yaml` (repository path
 `showcases/ionet_arc/config/mainnet-public_keys.yaml`). It holds the registry public key only.
@@ -367,8 +386,8 @@ Run every command from the repository root.
 | --- | --- |
 | `chain_id` | `5042` |
 | `rpc_url` | `https://rpc.mainnet.arc.io`, or your own Arc mainnet RPC |
-| `escrow_address` | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
-| `verifier_address` | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
+| `escrow_address` | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
+| `verifier_address` | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
 | `token_address` | `0x3600000000000000000000000000000000000000` |
 | `category` | `42` |
 | `max_budget_usd` | `1.00` |
