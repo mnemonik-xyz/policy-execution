@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
+from showcases.ionet_arc.arc import NETWORKS
 from showcases.ionet_arc.buyer_mcp_server import (
     BuyerServerConfig,
     ServerConfig,
@@ -17,6 +18,8 @@ from showcases.ionet_arc.buyer_mcp_server import (
     create_server,
 )
 from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, load_manifest
+
+TESTNET_MANIFEST = Path(__file__).parent / "config-arc-testnet" / "manifest.yaml"
 
 
 class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
@@ -392,7 +395,14 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
         self.assertEqual(config.max_budget_usd, float(manifest["max_budget_usd"]))
         self.assertEqual(config.max_duration_hours, int(manifest["duration_hours"]))
-        self.assertEqual(config.rpc_url, manifest.get("rpc_url"))
+        self.assertEqual(config.rpc_url, NETWORKS["mainnet"]["rpc"])
+
+    def test_testnet_manifest_uses_testnet_rpc(self):
+        config = ServerConfig(
+            state_dir=self.state_dir,
+            manifest_path=TESTNET_MANIFEST,
+        )
+        self.assertEqual(config.rpc_url, NETWORKS["testnet"]["rpc"])
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
