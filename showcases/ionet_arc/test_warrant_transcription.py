@@ -878,8 +878,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
         self.assertEqual(config.token_address, manifest.get("token_address"))
         self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
-        self.assertEqual(config.max_budget_usd, float(manifest["max_budget_usd"]))
-        self.assertEqual(config.max_duration_hours, int(manifest["duration_hours"]))
+        self.assertEqual(config.max_budget_usd, Decimal(str(manifest["max_budget_usd"])))
+        self.assertEqual(config.duration_hours, int(manifest["duration_hours"]))
 
     def test_read_initial_parameters_from_testnet_manifest(self):
         self._assert_config_matches_manifest(TESTNET_MANIFEST, "testnet")
