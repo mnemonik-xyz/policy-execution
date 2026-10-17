@@ -667,6 +667,12 @@ class ServerConfig:
                 if default_buyer_key.exists():
                     self.buyer_key_path = default_buyer_key
 
+        if self.buyer_acceptance_key_path is None:
+            raw_acc_path = manifest.get("private_key_files", {}).get("buyer_acceptance_key")
+            if raw_acc_path:
+                cand = pathlib.Path(raw_acc_path)
+                self.buyer_acceptance_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
+
         if self.buyer_private_key is None:
             if self.buyer_key_path and self.buyer_key_path.exists() and self.buyer_key_path.is_file():
                 with contextlib.suppress(Exception):

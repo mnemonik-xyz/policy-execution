@@ -408,6 +408,19 @@ money yet. The limits and risks above apply.
 
 Run every command from the repository root.
 
+**Short path.** After step 1 below, one command does steps 2 to 6. It makes a new burner
+wallet and an acceptance key in `~/.warrant-buyer` (mode 0600), writes the manifest and the
+public keys file with the mainnet values, and prints the MCP configuration for Claude Desktop,
+Claude Code and Cursor. A second run reuses the keys, so it never replaces a funded wallet.
+
+```bash
+.venv/bin/python -m showcases.ionet_arc.buyer_init            # set up
+.venv/bin/python -m showcases.ionet_arc.buyer_init --status   # USDC balance of the wallet
+```
+
+Fund the printed wallet address with about 1.10 USDC on Arc mainnet. The steps below do the
+same work by hand, with your own wallet.
+
 1. Build the binaries with `cargo build --release -p warrant-host`. The buyer guardrail
    finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
    Without the build, it fails with "Could not find compiled binary".
