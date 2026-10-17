@@ -311,13 +311,47 @@ Further limits for the buyer:
 
 ### Mainnet addresses
 
-| Role / Contract | Address or key |
+All contracts below are published on Arc mainnet (chain ID `5042`). Each address links to the
+[Arc explorer](https://explorer.arc.io). The sources are in this repository.
+
+**Seller MCP (used by `https://seller.mnemonik.xyz/mcp` now)**
+
+| Role / Contract | Address or key | Source in this repository |
+| --- | --- | --- |
+| **TaskEscrow** (no-proof escrow) | [`0x5fae10ac58bf90c17f516292883a4f17c0768002`](https://explorer.arc.io/address/0x5fae10ac58bf90c17f516292883a4f17c0768002) | [`contracts/src/TaskEscrow.sol`](../../contracts/src/TaskEscrow.sol) |
+| **JournalVerifier** (test double) | [`0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c`](https://explorer.arc.io/address/0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c) | [`contracts/test/PolicyExecutionVault.t.sol`](../../contracts/test/PolicyExecutionVault.t.sol) (`JournalVerifier`) |
+| **USDC Token** | [`0x3600000000000000000000000000000000000000`](https://explorer.arc.io/address/0x3600000000000000000000000000000000000000) | Arc system token |
+| **Seller** (payout wallet) | [`0xb8202bebb6d8a0a822a56c0062632325c3923eeb`](https://explorer.arc.io/address/0xb8202bebb6d8a0a822a56c0062632325c3923eeb) | |
+| **Registry public key** | `0x02264b8d8cdb5b5a45736a4e3f679966966f39979b16794f08530c1ac6d77ee034` | |
+
+**Proven solver canary (real Groth16 proof, settled 2026-10-16)**
+
+| Role / Contract | Address | Source in this repository |
+| --- | --- | --- |
+| **SolverBountyEscrow** | [`0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0`](https://explorer.arc.io/address/0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0) | [`contracts/src/SolverBountyEscrow.sol`](../../contracts/src/SolverBountyEscrow.sol) |
+| **RiscZeroGroth16Verifier** | [`0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99`](https://explorer.arc.io/address/0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99) | RISC Zero `risc0-ethereum` v3.0.0 |
+
+The deployment was built from commit `fac8b909893cf168157d84e51ce103fdb0351299`. The deploy record is
+[`deployment.json`](../../solver-bounty/canary/mainnet/20261016T202706Z/deployment.json) in the
+evidence folder.
+
+**Warrant usage on Arc mainnet: transactions**
+
+The 2 USDC deal ran with a real RISC Zero Groth16 proof. The escrow released the funds only after
+the verifier accepted the proof.
+
+| Step | Transaction |
 | --- | --- |
-| **TaskEscrow** (no-proof escrow, used by the MCP now) | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
-| **JournalVerifier** (test double, used by the MCP now) | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
-| **USDC Token** | `0x3600000000000000000000000000000000000000` |
-| **Seller** (payout wallet) | `0xb8202bebb6d8a0a822a56c0062632325c3923eeb` |
-| **Registry public key** | `0x02264b8d8cdb5b5a45736a4e3f679966966f39979b16794f08530c1ac6d77ee034` |
+| Deploy RiscZeroGroth16Verifier | [`0xead1e9d7...ee189a`](https://explorer.arc.io/tx/0xead1e9d705b13fddfeb8c87c13307e61d9d13d4e5020fc0cfaf31fa12fee189a) |
+| Deploy SolverBountyEscrow | [`0x34902ab0...121aaa`](https://explorer.arc.io/tx/0x34902ab030ce99fa8427fdc8b908017bb8ec418b033b0f7dde22105013121aaa) |
+| Buyer approves 2 USDC | [`0x9c8104d5...db1ac9`](https://explorer.arc.io/tx/0x9c8104d5a49602ac45f9c6292981b82b1d5d88e6ff79df8acf9726f971db1ac9) |
+| Buyer funds the escrow (`offer`) | [`0x204eb61a...3d8279`](https://explorer.arc.io/tx/0x204eb61a89776a6ce764a61770d7c48f2d63df40d8e32657287937738b3d8279) |
+| Buyer accepts the proven terms (`accept`) | [`0x346fcfc1...8dac9c`](https://explorer.arc.io/tx/0x346fcfc14d1ece27a022090629a7ace6519f131829472cbe220d88b9648dac9c) |
+| Settlement with the Groth16 proof, 2 USDC to the seller | [`0xd0fb5b02...975026`](https://explorer.arc.io/tx/0xd0fb5b024c28ca80e38466917702fdb1b856761cd6cd8bccd58a814699975026) |
+| Deploy JournalVerifier (test double) | [`0x457e62dc...685ade`](https://explorer.arc.io/tx/0x457e62dc0a375d87a9a7b27582a0e02e6fd60d27c840aa9a8e0ab6a16b685ade) |
+| Deploy TaskEscrow (seller MCP) | [`0x6adc9771...b14735`](https://explorer.arc.io/tx/0x6adc9771ca30d1726e0e08fc9fd553ff205ae4d4a72cf0b18e9cf3f54eb14735) |
+
+The full records are in the evidence folder above.
 
 #### Current deployment and the signature-checking verifier
 
@@ -340,6 +374,35 @@ That set is pinned to the guest image ID
 
 The deployment PR also publishes `config/mainnet-public_keys.yaml` (repository path
 `showcases/ionet_arc/config/mainnet-public_keys.yaml`). It holds the registry public key only.
+
+### Try the seller MCP
+
+Anyone can ask the live seller for a quote. A quote moves no money.
+
+1. Ask the operator for the basic-auth user and password. They are not published here.
+2. Make the header value in your own terminal. Do not paste the password into a chat:
+
+   ```sh
+   printf 'Basic %s' "$(printf '%s:%s' "<user>" "<password>" | base64 | tr -d '\n')"
+   ```
+
+3. Add the seller to Claude Desktop, Cursor or another MCP client as shown in "Desktop
+   configuration for mainnet" below. Put the output of step 2 into `SELLER_AUTH`. The
+   `--header` argument must read exactly `"Authorization:${SELLER_AUTH}"`. Restart the
+   client and open a new chat.
+4. Ask the agent: "Use the seller-transcription-service tools to request a quote for a
+   transcription task with a maximum of 1.00 USD. My customer address is `<your wallet
+   address>`. Do not fund or accept anything."
+5. The seller answers with a proposal: a one-hour GPU deployment, the price (about 0.30 USD),
+   the `TaskEscrow` address and a `task_id`. Nothing is funded until you do it.
+
+To buy, follow "Buyer setup" below. You need an Arc mainnet wallet with a little USDC
+(native and ERC-20 USDC share one balance on Arc). The seller gives you a GPU
+container for one hour. You send audio to it. For a video, extract the audio first, for example
+`ffmpeg -i video.mp4 -vn audio.mp3`.
+
+The mainnet seller path (funding, acceptance, GPU provisioning, settlement) has not run with
+money yet. The limits and risks above apply.
 
 ### Buyer setup
 
