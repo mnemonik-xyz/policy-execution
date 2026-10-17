@@ -8,6 +8,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -34,6 +35,7 @@ __all__ = [
     "REPO_ROOT",
     "REQUEST_ACTIONS",
     "REQUEST_MAX_AGE_SECONDS",
+    "REQUEST_MAX_FUTURE_SECONDS",
     "SHOWCASE_DIR",
     "EscrowClient",
     "EthRpc",
@@ -42,6 +44,7 @@ __all__ = [
     "buyer_request_message",
     "bytes32",
     "canonical",
+    "check_request_timestamp",
     "compile_buyer_policy",
     "compute_claim_digest",
     "compute_receipt_digest",
@@ -64,6 +67,8 @@ __all__ = [
     "sign_vendor_credential",
     "to_addr_str",
 ]
+
+TASK_ID_CACHE_MAX = 4096
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # This directory: showcases/ionet_arc in the repository, warrant_buyer when installed as a package.
@@ -201,6 +206,8 @@ def encode_journal(
     return encode(types, vals)
 
 
+logger = logging.getLogger(__name__)
+
 _CHAIN_ID_CACHE: dict[str, int] = {}
 
 
@@ -231,12 +238,12 @@ class EthRpc:
             body = ""
             with contextlib.suppress(Exception):
                 body = err.read().decode("utf-8", errors="replace").strip()
-            msg = f"RPC HTTP {err.code} ({err.reason}) calling {method} on {self.rpc_url}"
-            if body:
-                msg += f": {body}"
-            raise RuntimeError(msg) from err
+            # The URL can carry an API key and the body is provider text: keep both out of the message.
+            logger.debug("RPC HTTP %s (%s) calling %s on %s: %s", err.code, err.reason, method, self.rpc_url, body)
+            raise RuntimeError(f"RPC HTTP {err.code} calling {method}") from err
         if "error" in data:
-            raise RuntimeError(f"RPC error {method}: {data['error']}")
+            logger.debug("RPC error %s on %s: %s", method, self.rpc_url, data["error"])
+            raise RuntimeError(f"RPC error {method}: {str(data['error']).replace(self.rpc_url, '<rpc-url>')}")
         if "result" not in data:
             raise RuntimeError(f"RPC response missing result for {method}")
         return data["result"]
@@ -648,13 +655,20 @@ class EscrowClient:
                     pass
         return None
 
-    def _resolve_prover_key(self, sender: str | None = None) -> str | bytes:
+    def _resolve_prover_key(self, sender: str | None = None, allow_derived_key: bool = False) -> str | bytes:
+        """The key that signs receipt seals.
+
+        The derived key is public (it is computed from the address alone), so only the local anvil
+        flow may ask for it. Anywhere else a missing key is an error, not a silent fallback.
+        """
         target = sender or self.server_account
         if target:
             pk = self._resolve_private_key(target)
             if pk:
                 return pk
-            return keccak(b"warrant/prover/v1" + address20(target))
+            if allow_derived_key:
+                return keccak(b"warrant/prover/v1" + address20(target))
+            raise ValueError(f"No private key registered for prover {target}; refusing to derive one")
         if self.private_keys:
             return next(iter(self.private_keys.values()))
         raise ValueError("Sender or registered key required to sign receipt claim")
@@ -723,7 +737,7 @@ class EscrowClient:
                 err_str = str(e)
                 if "-32601" in err_str or "not supported" in err_str or "unsupported" in err_str:
                     raise RuntimeError(
-                        f"Failed to send transaction from {from_addr} on {self.rpc_url}: "
+                        f"Failed to send transaction from {from_addr}: "
                         f"RPC node does not support eth_sendTransaction (-32601) and no private key "
                         f"was configured to sign the transaction locally. Configure a private key via "
                         f"manifest.yaml private_key_files, environment variable (WARRANT_PRIVATE_KEY, "
@@ -789,6 +803,8 @@ class EscrowClient:
                 tid = compute_task_id(chain_id, self.escrow, customer, salt)
             else:
                 raise
+        if len(self._task_id_cache) >= TASK_ID_CACHE_MAX:
+            self._task_id_cache.pop(next(iter(self._task_id_cache)))
         self._task_id_cache[cache_key] = tid
         return tid
 
@@ -937,7 +953,7 @@ class EscrowClient:
                 raise RuntimeError(f"Deploy {name} failed: {res.stderr.strip() or res.stdout.strip()}")
             return json.loads(res.stdout)["deployedTo"]
 
-        prover = Account.from_key(self._resolve_prover_key(agent)).address
+        prover = Account.from_key(self._resolve_prover_key(agent, allow_derived_key=True)).address
         token = deploy_contract("test/PolicyExecutionVault.t.sol:TestToken")
         verifier = deploy_contract(
             "src/ReceiptClaimVerifier.sol:ReceiptClaimVerifier",
@@ -1062,8 +1078,17 @@ def ensure_policy_hash(
 
 # A buyer proves who it is to the seller with the wallet that funded the order. No shared password.
 REQUEST_ACTIONS = ("status", "deploy")
-REQUEST_MAX_AGE_SECONDS = 300
-REQUEST_MAX_FUTURE_SECONDS = 60
+REQUEST_MAX_AGE_SECONDS = 60
+REQUEST_MAX_FUTURE_SECONDS = 15  # a small forward skew between the buyer and seller clocks
+
+
+def check_request_timestamp(timestamp: int, now: int | None = None) -> None:
+    """Raise ValueError unless a signed request timestamp is fresh. Tells clock skew from an old signature."""
+    now = int(time.time()) if now is None else int(now)
+    if timestamp > now + REQUEST_MAX_FUTURE_SECONDS:
+        raise ValueError("The request signature is dated in the future (clock skew). Check the buyer clock.")
+    if timestamp < now - REQUEST_MAX_AGE_SECONDS:
+        raise ValueError("The request signature is too old. Sign a new one.")
 
 
 def buyer_request_message(chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int) -> str:

@@ -6,6 +6,7 @@ import atexit
 import collections
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ if not logging.getLogger().handlers:
 
 import httpx2  # noqa: E402
 import uvicorn  # noqa: E402
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 
@@ -49,10 +50,10 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_MANIFEST_PATH,
     REQUEST_ACTIONS,
     REQUEST_MAX_AGE_SECONDS,
-    REQUEST_MAX_FUTURE_SECONDS,
     EscrowClient,
     address20,
     bytes32,
+    check_request_timestamp,
     evaluate_authorization,
     get_manifest_parameter,
     hash_policy,
@@ -67,10 +68,35 @@ TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
 
 # Limits that protect an open seller. The buyer needs no password, so a stranger can call the open tools.
 HARDWARE_CACHE_SECONDS = 20  # one io.net lookup serves every caller in this window
-PROPOSALS_PER_HOUR = 120  # all callers together
-PROPOSALS_PER_CUSTOMER_PER_HOUR = 10
+HARDWARE_FAILURE_CACHE_SECONDS = 5  # a failed lookup is not repeated for every caller
+# The client IP comes from the X-Real-IP header: Caddy sets it (header_up X-Real-IP {remote_host}) and the
+# container is reachable only through Caddy. The customer address is chosen by the caller, so it is only a guard.
+PROPOSALS_PER_CLIENT_PER_HOUR = 10
+PROPOSALS_PER_HOUR = 120  # all callers together; rejected requests do not count
+# Additional guard only. It is above the per-client limit, so that one client cannot lock out a customer.
+PROPOSALS_PER_CUSTOMER_PER_HOUR = 30
+SUBMISSIONS_PER_CLIENT_PER_HOUR = 20
+SUBMISSIONS_PER_HOUR = 120
+UNKNOWN_CLIENT = "unknown"
+# A proposal without a session is useless after an hour. The cap is far above rate x retention
+# (PROPOSALS_PER_HOUR x 1 h), and proposals with a session do not count against it.
+PROPOSAL_RETENTION_SECONDS = 3600
 MAX_STORED_PROPOSALS = 2000
-PROPOSAL_RETENTION_SECONDS = 24 * 3600
+SESSION_RETENTION_SECONDS = 7 * 24 * 3600  # settled, failed and expired sessions are deleted after this age
+TASK_ID_CACHE_MAX = 4096
+SETTLE_MARGIN_SECONDS = 15 * 60  # settleBy must leave this much after the lease for provisioning and acceptance
+
+MAINNET_CHAIN_ID = 5042
+MAINNET_LABEL = "after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD"
+MAINNET_LIMITS = (
+    "Settlement uses a test-double verifier that accepts any digest the seller approves.",
+    "The 1 USD cap and the one-hour lease are seller policy, not contract rules.",
+    "One deal at a time.",
+    "The mainnet seller path has not been exercised with money before this listing.",
+    "Only the customer wallet of a task can read its worker token.",
+)
+MAINNET_INSTRUCTIONS = MAINNET_LABEL + ".\n" + " ".join(MAINNET_LIMITS)
+DEFAULT_ALLOWED_HOSTS = ("seller.mnemonik.xyz", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*")
 
 
 class StartRefusedError(RuntimeError):
@@ -98,7 +124,46 @@ def safe_tool_error(exc: Exception) -> ToolError:
     pilot = unwrap_error(exc)
     if pilot:
         return ToolError(str(pilot))
-    return ToolError(f"Operation failed: {exc!s}")
+    reference = uuid.uuid4().hex[:12]
+    logger.error("Operation failed (ref %s): %s", reference, exc)
+    return ToolError(f"Operation failed. Reference: {reference}.")
+
+
+def opaque_error(what: str, exc: Exception) -> ToolError:
+    """A tool error without provider text or URLs: a generic message and a reference. Detail stays in the log."""
+    reference = uuid.uuid4().hex[:12]
+    logger.error("%s failed (ref %s): %s", what, reference, exc)
+    return ToolError(f"{what} failed. Reference: {reference}.")
+
+
+class RateWindow:
+    """Timestamps of the last hour, per key."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self._times: dict[str, collections.deque[float]] = {}
+
+    def _trim(self, now: float) -> None:
+        for key in list(self._times):  # callers choose some keys, so drop idle entries
+            times = self._times[key]
+            while times and now - times[0] > 3600:
+                times.popleft()
+            if not times:
+                del self._times[key]
+
+    def full(self, key: str, now: float) -> bool:
+        self._trim(now)
+        return len(self._times.get(key, ())) >= self.limit
+
+    def add(self, key: str, now: float) -> None:
+        self._times.setdefault(key, collections.deque()).append(now)
+
+    def discard(self, key: str, now: float) -> None:
+        times = self._times.get(key)
+        if times and now in times:
+            times.remove(now)
+            if not times:
+                del self._times[key]
 
 
 def _is_single_gpu(hw_id: str | int | None, max_gpus: int | None) -> bool:
@@ -244,8 +309,17 @@ class SellerWarrantService:
 
         self.require_request_signature = require_request_signature
         self._hardware_cache: tuple[float, list[dict]] | None = None
-        self._proposal_times: collections.deque[float] = collections.deque()
-        self._customer_proposal_times: dict[str, collections.deque[float]] = {}
+        self._hardware_failed_at: float | None = None
+        self._hardware_lock = asyncio.Lock()  # one io.net lookup at a time
+        self._client_windows = {
+            "propose": RateWindow(PROPOSALS_PER_CLIENT_PER_HOUR),
+            "submit": RateWindow(SUBMISSIONS_PER_CLIENT_PER_HOUR),
+        }
+        self._global_windows = {"propose": RateWindow(PROPOSALS_PER_HOUR), "submit": RateWindow(SUBMISSIONS_PER_HOUR)}
+        self._customer_window = RateWindow(PROPOSALS_PER_CUSTOMER_PER_HOUR)
+        self._deal_lock = asyncio.Lock()  # one deal at a time, on every chain
+        self._task_locks: dict[str, list] = {}  # task id -> [lock, users]
+        self._used_signatures: dict[str, float] = {}  # replay cache: signed request -> expiry
 
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
@@ -265,30 +339,48 @@ class SellerWarrantService:
     async def list_suitable_hardware(self) -> list[dict]:
         logger.info("Tool called: list_suitable_hardware")
         try:
-            cached = self._hardware_cache
-            if cached and time.monotonic() - cached[0] < HARDWARE_CACHE_SECONDS:
-                return [dict(hw) for hw in cached[1]]
-            logger.info("Calling io.net CaaS API to list available hardware")
+            cached = self._fresh_hardware()
+            if cached is not None:
+                return cached
+            async with self._hardware_lock:  # single flight: callers that wait reuse the result
+                cached = self._fresh_hardware()
+                if cached is not None:
+                    return cached
+                failed_at = self._hardware_failed_at
+                if failed_at is not None and time.monotonic() - failed_at < HARDWARE_FAILURE_CACHE_SECONDS:
+                    raise ToolError("The hardware list is temporarily unavailable. Try again later.")
+                logger.info("Calling io.net CaaS API to list available hardware")
 
-            async def op(cloud):
-                res = await cloud.call("caas_get_hardware_ids", {})
-                data = res.get("data", {})
-                return data.get("data", []) if isinstance(data, dict) else []
+                async def op(cloud):
+                    res = await cloud.call("caas_get_hardware_ids", {})
+                    data = res.get("data", {})
+                    return data.get("data", []) if isinstance(data, dict) else []
 
-            raw_items = await connected(op)
+                try:
+                    raw_items = await connected(op)
+                except Exception:
+                    self._hardware_failed_at = time.monotonic()
+                    raise
 
-            logger.info("Filtering %d raw hardware options", len(raw_items))
-            filtered = filter_suitable_gpus(raw_items)
-            candidate_summary = [
-                {"id": hw["hardware_id"], "name": hw["hardware_name"], "price_hr": hw["price_per_hour_usd"]}
-                for hw in filtered
-            ]
-            logger.info("list_suitable_hardware returning %d suitable GPUs: %s", len(filtered), candidate_summary)
-            self._hardware_cache = (time.monotonic(), filtered)
-            return [dict(hw) for hw in filtered]
+                logger.info("Filtering %d raw hardware options", len(raw_items))
+                filtered = filter_suitable_gpus(raw_items)
+                candidate_summary = [
+                    {"id": hw["hardware_id"], "name": hw["hardware_name"], "price_hr": hw["price_per_hour_usd"]}
+                    for hw in filtered
+                ]
+                logger.info("list_suitable_hardware returning %d suitable GPUs: %s", len(filtered), candidate_summary)
+                self._hardware_cache = (time.monotonic(), filtered)
+                self._hardware_failed_at = None
+                return [dict(hw) for hw in filtered]
         except Exception as exc:
             logger.error("list_suitable_hardware failed: %s", exc)
             raise safe_tool_error(exc) from None
+
+    def _fresh_hardware(self) -> list[dict] | None:
+        cached = self._hardware_cache
+        if cached and time.monotonic() - cached[0] < HARDWARE_CACHE_SECONDS:
+            return [dict(hw) for hw in cached[1]]
+        return None
 
     def _select_hardware(self, candidates: list[dict], hardware_id: str | int | None) -> dict:
         if hardware_id is None:
@@ -351,19 +443,18 @@ class SellerWarrantService:
             raise ToolError(f"Invalid budget_cap_usd: {budget_cap_usd}")
         return min(cap, self.max_budget_usd)
 
-    async def _require_credits(self, required_usd: Decimal):
-        """Refuse a proposal when io.net credits are below the required cost or cannot be read (fail closed)."""
+    async def _require_credits(self, required_usd: Decimal, outcome: str = "no deal is proposed"):
+        """Refuse when io.net credits are below the required cost or cannot be read (fail closed)."""
         try:
             status = await connected(lambda cloud: cloud.call("get_credit_status", {}))
             balance = parse_credit_balance(status)
             if not isinstance(balance, Decimal) or not balance.is_finite() or balance < 0:
                 raise ValueError("the credit balance is not a finite amount of 0 or more")
         except Exception:
-            raise ToolError("The io.net credit balance cannot be read, so no deal is proposed.") from None
+            raise ToolError(f"The io.net credit balance cannot be read, so {outcome}.") from None
         if balance < required_usd:
             raise ToolError(
-                f"The seller's io.net credits are below {required_usd:.2f} USD, so no deal is proposed. "
-                "Try again later."
+                f"The seller's io.net credits are below {required_usd:.2f} USD, so {outcome}. Try again later."
             )
 
     def _resolve_duration_and_cap(
@@ -381,41 +472,91 @@ class SellerWarrantService:
         cap = self._effective_budget_cap(budget_cap_usd)
         return duration_hours, cap
 
-    def _check_proposal_rate(self, customer_address: str) -> None:
-        """Throttle proposals and cap what they store. Quotes are open, so this is the seller's own defence."""
+    @staticmethod
+    def _client_key(ctx: Context | None) -> str:
+        """The client IP from X-Real-IP, which Caddy sets. Without a valid header all callers share one bucket."""
+        try:
+            headers = ctx.headers if ctx is not None else None
+            raw = headers.get("x-real-ip") if headers is not None else None
+            return str(ipaddress.ip_address(str(raw).strip())) if raw else UNKNOWN_CLIENT
+        except Exception:  # no HTTP request (tests, stdio) or a malformed header
+            return UNKNOWN_CLIENT
+
+    @contextlib.contextmanager
+    def _throttled(self, kind: str, client: str, customer: str | None = None, busy: str = "Too many requests."):
+        """Throttle a tool. Every attempt counts for its client; the global and customer budgets keep only
+        requests that did not fail, so that rejected requests cannot use up the budget of other callers."""
         now = time.monotonic()
-        key = customer_address.lower()
-        while self._proposal_times and now - self._proposal_times[0] > 3600:
-            self._proposal_times.popleft()
-        for address in list(self._customer_proposal_times):  # callers choose the address, so drop idle entries
-            times = self._customer_proposal_times[address]
-            while times and now - times[0] > 3600:
-                times.popleft()
-            if not times:
-                del self._customer_proposal_times[address]
-        per_customer = self._customer_proposal_times.get(key, collections.deque())
-        if len(self._proposal_times) >= PROPOSALS_PER_HOUR or len(per_customer) >= PROPOSALS_PER_CUSTOMER_PER_HOUR:
-            raise ToolError("Too many proposals. Try again later.")
-        self._prune_proposals()
-        self._proposal_times.append(now)
-        per_customer.append(now)
-        self._customer_proposal_times[key] = per_customer
+        clients, total = self._client_windows[kind], self._global_windows[kind]
+        if clients.full(client, now):
+            raise ToolError(f"{busy} Try again later.")
+        clients.add(client, now)
+        if total.full("all", now) or (customer and self._customer_window.full(customer, now)):
+            raise ToolError(f"{busy} Try again later.")
+        total.add("all", now)
+        if customer:
+            self._customer_window.add(customer, now)
+        try:
+            yield
+        except BaseException:
+            total.discard("all", now)
+            if customer:
+                self._customer_window.discard(customer, now)
+            raise
 
     def _prune_proposals(self) -> None:
         """Delete old proposals that never became a deal. Refuse new ones when the store is full."""
         now = time.time()
-        files = []
-        for path in self.proposals_dir.glob("*.json"):
+        self._prune_sessions(now)
+        self._bound_task_id_cache()
+        unfunded = 0
+        for path in list(self.proposals_dir.glob("*.json")):
             try:
-                files.append((path.stat().st_mtime, path))
+                mtime = path.stat().st_mtime
             except OSError:
                 continue
-        for mtime, path in files:
-            if now - mtime > PROPOSAL_RETENTION_SECONDS and not (self.sessions_dir / path.name).exists():
+            if (self.sessions_dir / path.name).exists():
+                continue  # a deal: it does not count against the cap
+            if now - mtime > PROPOSAL_RETENTION_SECONDS:
                 with contextlib.suppress(OSError):
                     path.unlink()
-        if len(list(self.proposals_dir.glob("*.json"))) >= MAX_STORED_PROPOSALS:
+                continue
+            unfunded += 1
+        if unfunded >= MAX_STORED_PROPOSALS:
             raise ToolError("The seller is busy. Try again later.")
+
+    def _prune_sessions(self, now: float) -> None:
+        """Delete sessions (and their proposals) that ended more than SESSION_RETENTION_SECONDS ago."""
+        for path in list(self.sessions_dir.glob("*.json")):
+            try:
+                session = read_json(path)
+                mtime = path.stat().st_mtime
+            except Exception:
+                continue  # an unreadable session stays: it blocks new deals (fail closed)
+            if not isinstance(session, dict) or session.get("status") == "provisioning":
+                continue
+            expires_at = session.get("expires_at")
+            ended = expires_at if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) else mtime
+            if now - ended > SESSION_RETENTION_SECONDS:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                with contextlib.suppress(OSError):
+                    (self.proposals_dir / path.name).unlink()
+
+    def _bound_task_id_cache(self) -> None:
+        cache = getattr(self.escrow_client, "_task_id_cache", None)
+        if isinstance(cache, dict) and len(cache) > TASK_ID_CACHE_MAX:
+            cache.clear()
+
+    def _claim_signature(self, task_id: str, action: str, timestamp: int) -> None:
+        """Accept a signed request once inside its validity window (replay cache)."""
+        now = time.time()
+        for key in [k for k, expiry in self._used_signatures.items() if expiry <= now]:
+            del self._used_signatures[key]
+        key = hashlib.sha256(f"{task_id}|{action}|{timestamp}".encode()).hexdigest()
+        if key in self._used_signatures:
+            raise ToolError("This request signature was already used. Sign a new one.")
+        self._used_signatures[key] = timestamp + REQUEST_MAX_AGE_SECONDS + 1
 
     def _authenticate_buyer(
         self,
@@ -440,9 +581,10 @@ class SellerWarrantService:
             timestamp = int(request_timestamp)
         except (TypeError, ValueError):
             raise ToolError("request_timestamp must be a Unix time in seconds.") from None
-        now = int(time.time())
-        if timestamp < now - REQUEST_MAX_AGE_SECONDS or timestamp > now + REQUEST_MAX_FUTURE_SECONDS:
-            raise ToolError("The request signature is too old. Sign a new one.")
+        try:
+            check_request_timestamp(timestamp)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
 
         proposal_path = self.proposals_dir / f"{task_id}.json"
         customer = str(read_json(proposal_path).get("customer", "")).lower() if proposal_path.exists() else ""
@@ -457,6 +599,8 @@ class SellerWarrantService:
             raise denied from None
         if signer.lower() != customer:
             raise denied
+        if action == "deploy":  # a status poll may legitimately repeat a signature inside one second
+            self._claim_signature(task_id, action, timestamp)
 
     async def propose_deployment(
         self,
@@ -465,6 +609,7 @@ class SellerWarrantService:
         location_id: str = "US",
         duration_hours: int | None = None,
         budget_cap_usd: str | float | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         logger.info(
             "Tool called: propose_deployment with hardware_id=%.80r, customer_address=%.80r, location_id=%.80r, "
@@ -477,109 +622,128 @@ class SellerWarrantService:
         )
         try:
             customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
+            try:
+                address20(customer_address)
+            except (ValueError, TypeError):
+                raise ToolError("customer_address must be a 20-byte hex address.") from None
             self._ensure_escrow_contracts(chain_id)
-            self._check_proposal_rate(customer_address)
-
-            duration_hours, effective_cap = self._resolve_duration_and_cap(duration_hours, budget_cap_usd)
-
-            logger.info("Querying suitable hardware candidates for proposal...")
-            candidates = await self.list_suitable_hardware()
-            if not candidates:
-                raise ToolError("No available suitable GPUs found.")
-
-            selected_hw = self._select_hardware(candidates, hardware_id)
-            logger.info(
-                "Selected hardware '%s' (id=%s, price=$%s/hr, location=%s)",
-                selected_hw["hardware_name"],
-                selected_hw["hardware_id"],
-                selected_hw["price_per_hour_usd"],
-                selected_hw.get("location"),
-            )
-            # Dynamic pricing based on real hardware cost and duration
-            price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
-            if not price_per_hour.is_finite() or price_per_hour <= 0:
-                raise ToolError(f"Selected hardware '{selected_hw['hardware_name']}' has no valid price.")
-            duration = Decimal(str(duration_hours))
-            cost_usd = price_per_hour * duration
-
-            if cost_usd > effective_cap:
-                raise ToolError(
-                    f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
-                    f"exceeds budget cap of ${effective_cap:.2f}."
+            with self._throttled(
+                "propose", self._client_key(ctx), customer_address.lower(), busy="Too many proposals."
+            ):
+                self._prune_proposals()
+                return await self._build_proposal(
+                    customer_address, chain_id, hardware_id, location_id, duration_hours, budget_cap_usd
                 )
-
-            if not self.local_server:
-                await self._require_credits(cost_usd)
-
-            salt = "0x" + secrets.token_hex(32)
-            task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
-            logger.info("Derived taskIdFor(%s, salt=%s): %s", customer_address, salt, task_id)
-
-            token_amount = int(cost_usd.quantize(Decimal("0.000001")) * Decimal(1_000_000))
-            amount_usd = (
-                f"{cost_usd:.2f}"
-                if cost_usd == cost_usd.quantize(Decimal("0.01"))
-                else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
-            )
-
-            proposal = {
-                "status": "proposed",
-                "task_id": task_id,
-                "salt": salt,
-                "customer": customer_address,
-                "recipient": self.escrow_client.server_account,
-                "escrow_address": self.escrow_client.escrow,
-                "token_address": self.escrow_client.token,
-                "verifier_address": self.escrow_client.verifier,
-                "chain_id": chain_id,
-                "policy_version": 1,
-                "category": DEFAULT_CATEGORY,
-                "amount": token_amount,
-                "amount_usd": amount_usd,
-                "hardware_id": selected_hw["hardware_id"],
-                "hardware_name": selected_hw["hardware_name"],
-                "price_per_hour_usd": selected_hw["price_per_hour_usd"],
-                "location_ids": selected_hw.get("location") or location_id,
-                "duration_hours": duration_hours,
-                "billing_model": "duration",
-                "image_url": PILOT_IMAGE,
-                "traffic_port": 8080,
-                "proposed_at": int(time.time()),
-                "instructions": (
-                    "Verify this proposal against your Warrant policy (max budget, category, duration).\n"
-                    "Call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
-                    "acceptBy, settleBy) on-chain.\n"
-                    "Call warrant_sign_request(task_id, 'deploy'), then "
-                    "deploy_with_escrow(task_id, policy, request_signature, request_timestamp) to commit agreement "
-                    "and begin provisioning.\n"
-                    "Poll get_deployment_status with a fresh warrant_sign_request(task_id, 'status') signature until "
-                    "ready, verify container /health, and sign Acceptance evidence.\n"
-                    "Submit acceptance via submit_acceptance to settle escrow on-chain, then operate the container "
-                    "at <public_url> with Bearer <worker_token>."
-                ),
-            }
-
-            prop_path = self.proposals_dir / f"{task_id}.json"
-            save(prop_path, proposal)
-            logger.info("Saved proposal record to %s", prop_path)
-            logger.info(
-                "propose_deployment returning: task_id=%s, amount=%d ($%s), recipient=%s, escrow=%s",
-                task_id,
-                token_amount,
-                amount_usd,
-                proposal["recipient"],
-                proposal["escrow_address"],
-            )
-            return proposal
         except Exception as exc:
             logger.error("propose_deployment failed: %s", exc)
             raise safe_tool_error(exc) from None
+
+    async def _build_proposal(
+        self,
+        customer_address: str,
+        chain_id: int,
+        hardware_id: str | int | None,
+        location_id: str,
+        duration_hours: int | None,
+        budget_cap_usd: str | float | None,
+    ) -> dict:
+        duration_hours, effective_cap = self._resolve_duration_and_cap(duration_hours, budget_cap_usd)
+
+        logger.info("Querying suitable hardware candidates for proposal...")
+        candidates = await self.list_suitable_hardware()
+        if not candidates:
+            raise ToolError("No available suitable GPUs found.")
+
+        selected_hw = self._select_hardware(candidates, hardware_id)
+        logger.info(
+            "Selected hardware '%s' (id=%s, price=$%s/hr, location=%s)",
+            selected_hw["hardware_name"],
+            selected_hw["hardware_id"],
+            selected_hw["price_per_hour_usd"],
+            selected_hw.get("location"),
+        )
+        # Dynamic pricing based on real hardware cost and duration
+        price_per_hour = Decimal(str(selected_hw["price_per_hour_usd"]))
+        if not price_per_hour.is_finite() or price_per_hour <= 0:
+            raise ToolError(f"Selected hardware '{selected_hw['hardware_name']}' has no valid price.")
+        duration = Decimal(str(duration_hours))
+        cost_usd = price_per_hour * duration
+
+        if cost_usd > effective_cap:
+            raise ToolError(
+                f"Selected hardware '{selected_hw['hardware_name']}' cost ${cost_usd:.2f} "
+                f"exceeds budget cap of ${effective_cap:.2f}."
+            )
+
+        if not self.local_server:
+            await self._require_credits(cost_usd)
+
+        salt = "0x" + secrets.token_hex(32)
+        task_id = await asyncio.to_thread(self.escrow_client.task_id_for, customer_address, salt)
+        logger.info("Derived taskIdFor(%s, salt=%s): %s", customer_address, salt, task_id)
+
+        token_amount = int(cost_usd.quantize(Decimal("0.000001")) * Decimal(1_000_000))
+        amount_usd = (
+            f"{cost_usd:.2f}"
+            if cost_usd == cost_usd.quantize(Decimal("0.01"))
+            else f"{cost_usd:.4f}".rstrip("0").rstrip(".")
+        )
+
+        proposal = {
+            "status": "proposed",
+            "task_id": task_id,
+            "salt": salt,
+            "customer": customer_address,
+            "recipient": self.escrow_client.server_account,
+            "escrow_address": self.escrow_client.escrow,
+            "token_address": self.escrow_client.token,
+            "verifier_address": self.escrow_client.verifier,
+            "chain_id": chain_id,
+            "policy_version": 1,
+            "category": DEFAULT_CATEGORY,
+            "amount": token_amount,
+            "amount_usd": amount_usd,
+            "hardware_id": selected_hw["hardware_id"],
+            "hardware_name": selected_hw["hardware_name"],
+            "price_per_hour_usd": selected_hw["price_per_hour_usd"],
+            "location_ids": selected_hw.get("location") or location_id,
+            "duration_hours": duration_hours,
+            "billing_model": "duration",
+            "image_url": PILOT_IMAGE,
+            "traffic_port": 8080,
+            "proposed_at": int(time.time()),
+            "instructions": (
+                "Verify this proposal against your Warrant policy (max budget, category, duration).\n"
+                "Call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
+                "acceptBy, settleBy) on-chain.\n"
+                "Call warrant_sign_request(task_id, 'deploy'), then "
+                "deploy_with_escrow(task_id, policy, request_signature, request_timestamp) to commit agreement "
+                "and begin provisioning.\n"
+                "Poll get_deployment_status with a fresh warrant_sign_request(task_id, 'status') signature until "
+                "ready, verify container /health, and sign Acceptance evidence.\n"
+                "Submit acceptance via submit_acceptance to settle escrow on-chain, then operate the container "
+                "at <public_url> with Bearer <worker_token>."
+            ),
+        }
+
+        prop_path = self.proposals_dir / f"{task_id}.json"
+        save(prop_path, proposal)
+        logger.info("Saved proposal record to %s", prop_path)
+        logger.info(
+            "propose_deployment returning: task_id=%s, amount=%d ($%s), recipient=%s, escrow=%s",
+            task_id,
+            token_amount,
+            amount_usd,
+            proposal["recipient"],
+            proposal["escrow_address"],
+        )
+        return proposal
 
     async def _verify_task_offered(self, task_id: str, proposal: dict) -> dict:
         try:
             task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
         except Exception as e:
-            raise ToolError(f"Failed to query TaskEscrow for task '{task_id}': {e}") from e
+            raise opaque_error("The TaskEscrow query", e) from None
 
         task_state = task_data.get("state")
         if task_state == "Missing":
@@ -590,29 +754,40 @@ class SellerWarrantService:
         if task_state in ("Paid", "Refunded"):
             raise ToolError(f"Task '{task_id}' is already in terminal state: {task_state}.")
 
-        # Enforce on-chain terms match proposal
-        if task_data.get("amount") is not None and task_data.get("amount") != proposal.get("amount"):
+        # Enforce on-chain terms match proposal. A missing field is a mismatch (fail closed).
+        if task_data.get("amount") != proposal.get("amount"):
             raise ToolError(
                 f"On-chain amount ({task_data.get('amount')}) does not match proposal ({proposal.get('amount')})."
             )
-        for key, label in (("recipient", "recipient"), ("customer", "customer")):
-            if task_data.get(key) and proposal.get(key) and str(task_data[key]).lower() != str(proposal[key]).lower():
-                raise ToolError(
-                    f"On-chain {label} ({task_data.get(key)}) does not match proposal ({proposal.get(key)})."
-                )
-        now = int(time.time())
-        min_settle_by = now + 60
-        if task_data.get("settle_by") and task_data["settle_by"] < min_settle_by:
+        for key in ("recipient", "customer"):
+            onchain, expected = task_data.get(key), proposal.get(key)
+            if not onchain or not expected or str(onchain).lower() != str(expected).lower():
+                raise ToolError(f"On-chain {key} ({onchain}) does not match proposal ({expected}).")
+        if task_data.get("policy_version") != proposal.get("policy_version"):
             raise ToolError(
-                f"On-chain settleBy ({task_data.get('settle_by')}) does not provide sufficient time "
-                f"(minimum {min_settle_by})."
+                f"On-chain policy version ({task_data.get('policy_version')}) does not match "
+                f"proposal ({proposal.get('policy_version')})."
             )
+        now = int(time.time())
+        settle_by = task_data.get("settle_by")
+        min_settle_by = now + int(proposal.get("duration_hours", 1)) * 3600 + SETTLE_MARGIN_SECONDS
+        if type(settle_by) is not int or settle_by < min_settle_by:
+            raise ToolError(
+                f"On-chain settleBy ({settle_by}) does not provide sufficient time "
+                f"(minimum {min_settle_by}: the lease plus {SETTLE_MARGIN_SECONDS // 60} minutes)."
+            )
+        accept_by = task_data.get("accept_by")
+        if task_state == "Offered" and (type(accept_by) is not int or accept_by <= now):
+            raise ToolError(f"On-chain acceptBy ({accept_by}) is not in the future; the offer cannot be accepted.")
 
         return task_data
 
     async def _accept_task(self, task_id: str, proposal: dict, task_state: str | None = None):
         if task_state is None:
-            task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
+            try:
+                task_data = await asyncio.to_thread(self.escrow_client.get_task, task_id)
+            except Exception as e:
+                raise opaque_error("The TaskEscrow query", e) from None
             task_state = task_data.get("state")
 
         if task_state == "Offered":
@@ -620,7 +795,22 @@ class SellerWarrantService:
             try:
                 await asyncio.to_thread(self.escrow_client.accept, task_id, sender=sender)
             except Exception as e:
-                raise ToolError(f"Failed to accept TaskEscrow task '{task_id}' on-chain: {e}") from e
+                raise opaque_error("Accepting the task on TaskEscrow", e) from None
+
+    @staticmethod
+    def _onchain_address(client: EscrowClient, getter: str) -> str:
+        return str(client.call_contract(client.escrow, f"{getter}()", [], [], ["address"])[0]).lower()
+
+    def verify_escrow_wiring(self) -> None:
+        """Refuse to start unless the escrow's immutable token and verifier are the configured ones."""
+        client = self.escrow_client
+        for name, configured in (("token", client.token), ("verifier", client.verifier)):
+            try:
+                onchain = self._onchain_address(client, name)
+            except Exception as exc:
+                raise StartRefusedError(f"cannot read escrow.{name}() ({type(exc).__name__})") from None
+            if not configured or onchain != str(configured).lower():
+                raise StartRefusedError(f"escrow.{name}() does not equal the configured {name} address")
 
     def _ionet_state_path(self, deployment_id: str) -> pathlib.Path:
         """The io.net deploy state file; adapter.deploy writes it before the remote deploy call."""
@@ -778,6 +968,47 @@ class SellerWarrantService:
             save(self.state_dir / "active_session.json", session)
             save(self.state_dir / "sessions" / f"{task_id}.json", session)
 
+    def _blocking_session(self) -> str | None:
+        """Describe a session that blocks a new deal, or return None.
+
+        Scans every file in sessions/: active_session.json holds the latest session only, and
+        _lookup_session treats a session without expires_at as expired. Fails closed on any doubt.
+        """
+        now = time.time()
+        for path in sorted(self.sessions_dir.glob("*.json")):
+            try:
+                session = read_json(path)
+            except Exception:
+                return f"session file {path.name} is unreadable"
+            if not isinstance(session, dict):
+                return f"session file {path.name} is unreadable"
+            status = session.get("status")
+            task = session.get("task_id") or path.stem
+            expires_at = session.get("expires_at")
+            expired = isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= now
+            if status == "failed":
+                if not session.get("deployment_may_exist") or expired:
+                    continue
+                return f"task {task} failed, but its io.net deployment can still run until its lease ends"
+            if status in ("ready", "settled") and expired:
+                continue
+            # provisioning (with or without expires_at), a running lease, or an unknown state
+            return f"task {task} is {status or 'in an unknown state'}"
+        return None
+
+    @contextlib.asynccontextmanager
+    async def _task_lock(self, task_id: str):
+        """One caller at a time per task. The entry is removed when nobody uses it."""
+        entry = self._task_locks.setdefault(task_id, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._task_locks.pop(task_id, None)
+
     def _check_proposal_terms(self, proposal: dict):
         """Refuse a stored proposal whose terms break configured limits."""
         if self.max_budget_usd is None:
@@ -828,6 +1059,11 @@ class SellerWarrantService:
         proposal["policy_hash"] = computed_policy_hash
         save(prop_path, proposal)
 
+        # The credits can have fallen since the proposal. The check comes before the on-chain accept,
+        # so that the buyer can still refund an unaccepted offer.
+        if not self.local_server:
+            await self._require_credits(Decimal(proposal["amount"]) / Decimal(1_000_000), "the offer is not accepted")
+
         now = int(time.time())
 
         # 3. Accept task on-chain first to commit agreement before spinning up hardware
@@ -866,9 +1102,34 @@ class SellerWarrantService:
             "settlement_tx": None,
             "error": None,
         }
+        try:
+            save(self.sessions_dir / f"{task_id}.json", session, exclusive=True)  # the first session wins
+        except FileExistsError:
+            raise ToolError(f"Task '{task_id}' already has a deployment session.") from None
         save(self.state_dir / "active_session.json", session)
-        save(self.state_dir / "sessions" / f"{task_id}.json", session)
         return proposal, session
+
+    @staticmethod
+    def _deploy_result(session: dict, current: dict | None = None, existing: bool = False) -> dict:
+        curr = current or session
+        curr_status = curr.get("status", "provisioning")
+        if existing:
+            message = "This task already has a deployment. Poll get_deployment_status(task_id) for its state."
+        elif curr_status == "provisioning":
+            message = (
+                "Deployment initiated. Container provisioning in background.\n"
+                "Poll get_deployment_status(task_id) until status is 'ready'."
+            )
+        else:
+            message = "Container is ready. Verify /health and submit signed acceptance."
+        return {
+            "status": curr_status,
+            "task_id": session["task_id"],
+            "deployment_id": session["deployment_id"],
+            "public_url": curr.get("public_url"),
+            "deliverable_hash": session["deliverable_hash"],
+            "message": message,
+        }
 
     async def deploy_with_escrow(
         self,
@@ -881,10 +1142,33 @@ class SellerWarrantService:
         try:
             task_id = self._require_task_id(task_id, required=True)
             self._authenticate_buyer(task_id, "deploy", request_signature, request_timestamp)
-            proposal, session = await self._commit_deal(task_id, policy)
+            existing = self._lookup_session(task_id)
+            if existing:  # idempotent: no new container, no new worker token
+                return self._deploy_result(existing, existing, existing=True)
+
+            # One deal at a time on every chain. The lock makes the check and the save of the provisioning
+            # session atomic for concurrent calls; a failure before the save releases the slot. The check comes
+            # before the on-chain accept, so that the buyer can still refund an unaccepted offer.
+            if self._deal_lock.locked():
+                # Another deal is between its check and its session save (the on-chain accept can take
+                # about 30 s); refuse at once instead of making the caller wait for that.
+                raise ToolError(
+                    "One deal at a time: another deal is being accepted. "
+                    "The offer is not accepted; try again after the active deal ends."
+                )
+            async with self._deal_lock:
+                existing = self._lookup_session(task_id)
+                if existing:
+                    return self._deploy_result(existing, existing, existing=True)
+                blocking = self._blocking_session()
+                if blocking:
+                    raise ToolError(
+                        f"One deal at a time: {blocking}. "
+                        "The offer is not accepted; try again after the active deal ends."
+                    )
+                proposal, session = await self._commit_deal(task_id, policy)
             deployment_id = session["deployment_id"]
             worker_token = session["worker_token"]
-            deliverable_hash = session["deliverable_hash"]
 
             # 5. Spawn background provisioning
             logger.info("Spawning background container provisioning for deployment_id=%s", deployment_id)
@@ -894,22 +1178,7 @@ class SellerWarrantService:
 
             await asyncio.sleep(0.02)
 
-            curr = self._lookup_session(task_id) or session
-            curr_status = curr.get("status", "provisioning")
-
-            result = {
-                "status": curr_status,
-                "task_id": task_id,
-                "deployment_id": deployment_id,
-                "public_url": curr.get("public_url"),
-                "deliverable_hash": deliverable_hash,
-                "message": (
-                    "Deployment initiated. Container provisioning in background.\n"
-                    "Poll get_deployment_status(task_id) until status is 'ready'."
-                    if curr_status == "provisioning"
-                    else "Container is ready. Verify /health and submit signed acceptance."
-                ),
-            }
+            result = self._deploy_result(session, self._lookup_session(task_id))
             logger.info(
                 "deploy_with_escrow returning: status=%s, task_id=%s, deployment_id=%s, public_url=%s",
                 result["status"],
@@ -959,7 +1228,7 @@ class SellerWarrantService:
     ) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
         try:
-            task_id = self._require_task_id(task_id, required=self.require_request_signature)
+            task_id = self._require_task_id(task_id, required=True)  # never the latest session: it holds a token
             self._authenticate_buyer(task_id, "status", request_signature, request_timestamp)
         except Exception as exc:
             raise safe_tool_error(exc) from None
@@ -1106,119 +1375,131 @@ class SellerWarrantService:
         task_id: str,
         acceptance: dict,
         signature: list[int] | str,
+        ctx: Context | None = None,
     ) -> dict:
         """Verify buyer acceptance evidence off-chain, approve journal, and settle TaskEscrow on-chain."""
         sig_len = len(signature) if isinstance(signature, (list, bytes)) else len(str(signature))
         logger.info("Tool called: submit_acceptance with task_id=%.80r, signature_length=%d", task_id, sig_len)
         try:
             task_id = self._require_task_id(task_id, required=True)
-            session = self._lookup_session(task_id)
-            if not session:
-                raise ToolError(f"No deployment session found for task '{task_id}'.")
-
-            if session.get("status") == "settled" and session.get("settlement_tx"):
-                res = {
-                    "status": "settled",
-                    "task_id": task_id,
-                    "settlement_transaction": session.get("settlement_tx"),
-                    "message": "Task is already settled.",
-                }
-                logger.info("submit_acceptance returning: task already settled (tx=%s)", session.get("settlement_tx"))
-                return res
-
-            expected_deliv = session.get("deliverable_hash")
-            acc_deliv = acceptance.get("deliverable_hash")
-            acc_deliv_hex = "0x" + bytes(acc_deliv).hex() if isinstance(acc_deliv, list) else str(acc_deliv).lower()
-
-            logger.info("Verifying deliverable hash match: expected=%s, acceptance=%s", expected_deliv, acc_deliv_hex)
-            if expected_deliv and acc_deliv_hex != expected_deliv.lower():
-                raise ToolError(
-                    f"Deliverable hash mismatch: acceptance provided {acc_deliv_hex} "
-                    f"but worker generated {expected_deliv}"
-                )
-
-            # Resolve policy
-            policy = session.get("policy")
-            if not policy:
-                raise ToolError(f"No policy associated with deployment session for task '{task_id}'.")
-
-            # Build Request struct
-            request = {
-                "scope": {
-                    "chain_id": int(session["chain_id"]),
-                    "vault": list(address20(session["escrow_address"])),
-                    "token": list(address20(session["token_address"])),
-                },
-                "task_id": list(bytes32(task_id)),
-                "deliverable_hash": list(bytes32(session["deliverable_hash"])),
-                "recipient": list(address20(session["recipient"])),
-                "amount": int(session["amount"]),
-            }
-
-            # Convert signature if passed as hex string
-            if isinstance(signature, str):
-                raw_sig = signature.replace("0x", "")
-                acc_sig_bytes = list(bytes.fromhex(raw_sig))
-            else:
-                acc_sig_bytes = list(signature)
-
-            # Resolve VendorCredential and sign
-            logger.info("Resolving vendor credential and signature for task_id=%s", task_id)
-            v_cred, v_sig = self._resolve_vendor_credential(session)
-
-            evidence = {
-                "vendor": v_cred,
-                "vendor_signature": v_sig,
-                "acceptance": acceptance,
-                "acceptance_signature": acc_sig_bytes,
-            }
-
-            # Execute real native off-chain policy evaluation (<10ms)
-            logger.info("Evaluating off-chain Warrant authorization policy for task_id=%s", task_id)
-            try:
-                _auth, journal_bytes = await asyncio.to_thread(evaluate_authorization, policy, request, evidence)
-                logger.info("Off-chain authorization verified successfully (journal=%d bytes)", len(journal_bytes))
-            except Exception as e:
-                logger.error("Off-chain Warrant authorization evaluation failed: %s", e)
-                raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
-
-            # Settle on-chain via TaskEscrow and ReceiptClaimVerifier
-            settlement_tx = None
-            try:
-                logger.info("Settling TaskEscrow on-chain with verified receipt claim")
-                settle_res = await asyncio.to_thread(
-                    self.escrow_client.settle_receipt,
-                    journal_bytes,
-                    sender=session.get("recipient") or self.escrow_client.server_account,
-                )
-                settlement_tx = settle_res.get("transactionHash")
-                logger.info("TaskEscrow settled on-chain in tx %s", settlement_tx)
-            except Exception as err:
-                logger.error("Escrow settlement failed on-chain: %s", err)
-                raise ToolError(f"Escrow settlement failed on-chain: {err}") from err
-
-            session["status"] = "settled"
-            session["settlement_tx"] = settlement_tx
-            session["journal_hex"] = "0x" + journal_bytes.hex()
-            save(self.state_dir / "active_session.json", session)
-            save(self.state_dir / "sessions" / f"{task_id}.json", session)
-
-            res = {
-                "status": "settled",
-                "task_id": task_id,
-                "settlement_transaction": settlement_tx,
-                "message": "Authorization successfully verified off-chain and TaskEscrow settled on-chain.",
-            }
-            logger.info(
-                "submit_acceptance returning: status=%s, task_id=%s, tx=%s",
-                res["status"],
-                res["task_id"],
-                settlement_tx,
-            )
-            return res
+            with self._throttled("submit", self._client_key(ctx), busy="Too many requests."):
+                async with self._task_lock(task_id):  # the check and the settlement of one task do not overlap
+                    return await self._settle_task(task_id, acceptance, signature)
         except Exception as exc:
             logger.error("submit_acceptance failed: %s", exc)
             raise safe_tool_error(exc) from None
+
+    async def _settle_task(self, task_id: str, acceptance: dict, signature: list[int] | str) -> dict:
+        session = self._lookup_session(task_id)  # read inside the lock
+        if not session:
+            raise ToolError(f"No deployment session found for task '{task_id}'.")
+
+        if session.get("status") == "settled" and session.get("settlement_tx"):
+            res = {
+                "status": "settled",
+                "task_id": task_id,
+                "settlement_transaction": session.get("settlement_tx"),
+                "message": "Task is already settled.",
+            }
+            logger.info("submit_acceptance returning: task already settled (tx=%s)", session.get("settlement_tx"))
+            return res
+
+        expected_deliv = session.get("deliverable_hash")
+        acc_deliv = acceptance.get("deliverable_hash")
+        acc_deliv_hex = "0x" + bytes(acc_deliv).hex() if isinstance(acc_deliv, list) else str(acc_deliv).lower()
+
+        logger.info("Verifying deliverable hash match: expected=%s, acceptance=%s", expected_deliv, acc_deliv_hex)
+        if expected_deliv and acc_deliv_hex != expected_deliv.lower():
+            raise ToolError(
+                f"Deliverable hash mismatch: acceptance provided {acc_deliv_hex} but worker generated {expected_deliv}"
+            )
+
+        # Resolve policy
+        policy = session.get("policy")
+        if not policy:
+            raise ToolError(f"No policy associated with deployment session for task '{task_id}'.")
+
+        # Build Request struct
+        request = {
+            "scope": {
+                "chain_id": int(session["chain_id"]),
+                "vault": list(address20(session["escrow_address"])),
+                "token": list(address20(session["token_address"])),
+            },
+            "task_id": list(bytes32(task_id)),
+            "deliverable_hash": list(bytes32(session["deliverable_hash"])),
+            "recipient": list(address20(session["recipient"])),
+            "amount": int(session["amount"]),
+        }
+
+        # Convert signature if passed as hex string
+        if isinstance(signature, str):
+            raw_sig = signature.replace("0x", "")
+            acc_sig_bytes = list(bytes.fromhex(raw_sig))
+        else:
+            acc_sig_bytes = list(signature)
+
+        # Resolve VendorCredential and sign
+        logger.info("Resolving vendor credential and signature for task_id=%s", task_id)
+        v_cred, v_sig = self._resolve_vendor_credential(session)
+
+        evidence = {
+            "vendor": v_cred,
+            "vendor_signature": v_sig,
+            "acceptance": acceptance,
+            "acceptance_signature": acc_sig_bytes,
+        }
+
+        # Execute real native off-chain policy evaluation (<10ms)
+        logger.info("Evaluating off-chain Warrant authorization policy for task_id=%s", task_id)
+        try:
+            _auth, journal_bytes = await asyncio.to_thread(evaluate_authorization, policy, request, evidence)
+            logger.info("Off-chain authorization verified successfully (journal=%d bytes)", len(journal_bytes))
+        except Exception as e:
+            logger.error("Off-chain Warrant authorization evaluation failed: %s", e)
+            raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
+
+        # Settle on-chain via TaskEscrow and ReceiptClaimVerifier
+        settlement_tx = None
+        try:
+            logger.info("Settling TaskEscrow on-chain with verified receipt claim")
+            settle_res = await asyncio.to_thread(
+                self.escrow_client.settle_receipt,
+                journal_bytes,
+                sender=session.get("recipient") or self.escrow_client.server_account,
+            )
+            settlement_tx = settle_res.get("transactionHash")
+            logger.info("TaskEscrow settled on-chain in tx %s", settlement_tx)
+        except Exception as err:
+            logger.error("Escrow settlement failed on-chain: %s", err)
+            raise opaque_error("Escrow settlement", err) from None
+
+        session["status"] = "settled"
+        session["settlement_tx"] = settlement_tx
+        session["journal_hex"] = "0x" + journal_bytes.hex()
+        save(self.state_dir / "active_session.json", session)
+        save(self.state_dir / "sessions" / f"{task_id}.json", session)
+
+        res = {
+            "status": "settled",
+            "task_id": task_id,
+            "settlement_transaction": settlement_tx,
+            "message": "Authorization successfully verified off-chain and TaskEscrow settled on-chain.",
+        }
+        logger.info(
+            "submit_acceptance returning: status=%s, task_id=%s, tx=%s",
+            res["status"],
+            res["task_id"],
+            settlement_tx,
+        )
+        return res
+
+
+def allowed_hosts_from_env() -> list[str]:
+    """Host header values that the server accepts: WARRANT_ALLOWED_HOSTS (comma separated) or the defaults."""
+    raw = os.environ.get("WARRANT_ALLOWED_HOSTS", "")
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    return hosts or list(DEFAULT_ALLOWED_HOSTS)
 
 
 @dataclass
@@ -1247,6 +1528,7 @@ class ServerConfig:
     require_request_signature: bool = field(
         default_factory=lambda: os.environ.get("WARRANT_REQUIRE_REQUEST_SIGNATURE", "1") != "0"
     )
+    allowed_hosts: list[str] = field(default_factory=lambda: allowed_hosts_from_env())
 
     def _resolve_paths(self):
         if isinstance(self.state_dir, str):
@@ -1351,7 +1633,17 @@ def create_server(
         server_account=cfg.server_account,
     )
     chain_id = detect_rpc_chain(escrow_client)
-    server = MCPServer("seller-mcp-server")
+    mainnet = chain_id == MAINNET_CHAIN_ID
+    if not cfg.require_request_signature:
+        if mainnet:
+            raise StartRefusedError(
+                f"WARRANT_REQUIRE_REQUEST_SIGNATURE is off, which is not allowed on chain {MAINNET_CHAIN_ID}"
+            )
+        logger.warning(
+            "seller-mcp-server: WARNING: request signatures are OFF. Anyone can start deals and read worker "
+            "tokens. Use this for a local test only."
+        )
+    server = MCPServer("seller-mcp-server", instructions=MAINNET_INSTRUCTIONS if mainnet else None)
     if cfg.seller_private_key:
         if cfg.server_account:
             escrow_client.register_key(cfg.server_account, cfg.seller_private_key)
@@ -1376,6 +1668,11 @@ def create_server(
         duration_hours=cfg.duration_hours,
         require_request_signature=cfg.require_request_signature,
     )
+    service.verify_escrow_wiring()
+
+    def describe(text: str, deal_tool: bool = False) -> str:
+        # On chain 5042 the deal tools start with the honest label; other chains keep their text.
+        return f"{MAINNET_LABEL}.\n{text}" if mainnet and deal_tool else text
 
     server.tool(
         name="list_suitable_hardware",
@@ -1387,21 +1684,23 @@ def create_server(
 
     server.tool(
         name="propose_deployment",
-        description=(
+        description=describe(
             "Generate an escrow proposal to deploy a container for 1 hour duration.\n"
             "Selects the cheapest suitable available GPU (or a specific hardware_id), calculates pricing, "
-            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient)."
+            "and returns concrete TaskEscrow payment terms (taskId, salt, amount, recipient).",
+            deal_tool=True,
         ),
     )(service.propose_deployment)
 
     server.tool(
         name="deploy_with_escrow",
-        description=(
+        description=describe(
             "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision "
             "the io.net container in the background for 1 hour duration.\n"
             "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain.\n"
             "Pass request_signature and request_timestamp from the buyer guardrail tool warrant_sign_request "
-            "with action 'deploy'."
+            "with action 'deploy'.",
+            deal_tool=True,
         ),
     )(service.deploy_with_escrow)
 
@@ -1416,10 +1715,11 @@ def create_server(
 
     server.tool(
         name="submit_acceptance",
-        description=(
+        description=describe(
             "Submit buyer-signed Acceptance evidence for a verified deliverable.\n"
             "Evaluates policy and signatures off-chain via Warrant, approves the 384-byte journal, "
-            "and settles payment on TaskEscrow on-chain."
+            "and settles payment on TaskEscrow on-chain.",
+            deal_tool=True,
         ),
     )(service.submit_acceptance)
 
@@ -1433,7 +1733,7 @@ def create_app(
     """Build ASGI app with streamable HTTP transport."""
     cfg = _normalize_config(config, **kwargs)
     server = create_server(cfg)
-    sec = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    sec = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=list(cfg.allowed_hosts))
     return server.streamable_http_app(transport_security=sec)
 
 
