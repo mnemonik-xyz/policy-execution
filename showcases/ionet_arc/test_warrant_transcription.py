@@ -8,6 +8,7 @@ import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -79,6 +80,8 @@ def make_offered_task(proposal: dict, keys: dict) -> tuple[dict, dict]:
         "recipient": proposal["recipient"],
         "policy_hash": policy_hash,
         "customer": proposal["customer"],
+        "policy_version": proposal["policy_version"],
+        "accept_by": int(time.time()) + 3600,
         "settle_by": int(time.time()) + 86400,
     }
     return buyer_policy, task_data
@@ -117,6 +120,24 @@ def write_vendor_credential(directory: Path, escrow, chain_id: int, keys: dict) 
     sig_path.write_text(yaml.dump({"signature": "0x" + bytes(sig_bytes).hex()}))
     return cred_path, sig_path
 
+
+def wire_escrow_views(escrow) -> None:
+    """Make the mock escrow answer token() and verifier() with the configured addresses."""
+    views = {"token()": lambda: escrow.token, "verifier()": lambda: escrow.verifier}
+    escrow.call_contract.side_effect = lambda to, signature, types, args, outputs: (views[signature](),)
+
+
+def service_of(server):
+    return server._tool_manager._tools["deploy_with_escrow"].fn.__self__
+
+
+def ctx_for(ip: str | None):
+    """A tool context as the HTTP transport builds it behind Caddy: X-Real-IP carries the client address."""
+    return SimpleNamespace(headers={"x-real-ip": ip} if ip else {})
+
+
+LABEL = seller_module.MAINNET_LABEL
+LABELLED_TOOLS = {"propose_deployment", "deploy_with_escrow", "submit_acceptance"}
 
 SELLER_TOOLS = {
     "list_suitable_hardware",
@@ -219,6 +240,9 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         no_cache = patch.object(seller_module, "HARDWARE_CACHE_SECONDS", 0)
         no_cache.start()
         self.addCleanup(no_cache.stop)
+        no_failure_cache = patch.object(seller_module, "HARDWARE_FAILURE_CACHE_SECONDS", 0)
+        no_failure_cache.start()
+        self.addCleanup(no_failure_cache.stop)
 
         # Mock EscrowClient
         self.mock_escrow = MagicMock()
@@ -227,6 +251,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.verifier = "0x" + "33" * 20
         self.mock_escrow.server_account = "0x" + "44" * 20
         self.mock_escrow.rpc.chain_id.return_value = 31337
+        wire_escrow_views(self.mock_escrow)
         self.mock_escrow.rpc.accounts.return_value = ["0x" + "55" * 20, "0x" + "44" * 20]
         self.mock_escrow.task_id_for.return_value = "0x" + "99" * 32
         self.mock_escrow.get_task.return_value = {
@@ -515,7 +540,8 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.settle_receipt.side_effect = RuntimeError("execution reverted: InvalidAuthorization")
         with self.assertRaises(ToolError) as ctx:
             await self.call("submit_acceptance", {"task_id": task_id, "acceptance": acceptance, "signature": sig})
-        self.assertIn("Escrow settlement failed on-chain", str(ctx.exception))
+        self.assertIn("Escrow settlement failed. Reference:", str(ctx.exception))
+        self.assertNotIn("InvalidAuthorization", str(ctx.exception))  # provider text stays in the log
 
     async def test_submit_acceptance_fails_when_vendor_credential_missing(self):
         proposal = await self.call("propose_deployment")
@@ -824,17 +850,25 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.mock_escrow.get_task.side_effect = mock_get_task
 
-        # Deploy both tasks
+        # Deploy the first task; the single deal slot refuses the second while the first runs
         res1 = await self.call("deploy_with_escrow", {"task_id": t1, "policy": policy1})
         self.assertIn(res1["status"], ("provisioning", "ready"))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("deploy_with_escrow", {"task_id": t2, "policy": policy2})
+        self.assertIn("One deal at a time", str(ctx.exception))
+        # Simulate the end of the first lease, then the second deal starts
+        first = self.state_dir / "sessions" / f"{t1}.json"
+        ended = json.loads(first.read_text())
+        ended["expires_at"] = int(time.time()) - 1
+        first.write_text(json.dumps(ended))
         res2 = await self.call("deploy_with_escrow", {"task_id": t2, "policy": policy2})
         self.assertIn(res2["status"], ("provisioning", "ready"))
 
         # Check status individually by task_id
         st1 = await self.call("get_deployment_status", {"task_id": t1})
         self.assertEqual(st1["task_id"], t1)
-        self.assertTrue(st1["active"])
-        self.assertEqual(st1["status"], "ready")
+        self.assertFalse(st1["active"])
+        self.assertTrue(st1["is_expired"])
 
         st2 = await self.call("get_deployment_status", {"task_id": t2})
         self.assertEqual(st2["task_id"], t2)
@@ -842,10 +876,10 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st2["status"], "ready")
         self.assertNotEqual(st1["worker_token"], st2["worker_token"])
 
-        # Default get_deployment_status without task_id routes to latest active session
-        st_default = await self.call("get_deployment_status")
-        self.assertEqual(st_default["task_id"], t2)
-        self.assertEqual(st_default["status"], "ready")
+        # Without a task_id there is no latest-session lookup: it would hand out a worker token
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("get_deployment_status")
+        self.assertIn("task_id is required", str(ctx.exception))
 
         # Nonexistent task_id returns missing status
         nonexistent_id = "0x" + "00" * 32
@@ -856,7 +890,6 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         # Upper-case hex names the same task
         st_upper = await self.call("get_deployment_status", {"task_id": "0x" + t1[2:].upper()})
         self.assertEqual(st_upper["task_id"], t1)
-        self.assertEqual(st_upper["status"], "ready")
 
         # Invalid task_id raises ToolError
         with self.assertRaises(ToolError) as ctx:
@@ -944,6 +977,9 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         mock_client = MagicMock()
         mock_client.server_account = None
         mock_client.rpc.chain_id.return_value = 31337
+        mock_client.token = "0x" + "22" * 20
+        mock_client.verifier = "0x" + "33" * 20
+        wire_escrow_views(mock_client)
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=mock_client):
             local_mcp = create_server(
                 self.state_dir,
@@ -988,17 +1024,16 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             await self.call("get_deployment_status", {"task_id": ""})
         self.assertIn("task_id is required", str(ctx.exception))
 
-        missing = await self.call("get_deployment_status")
-        self.assertEqual(missing["status"], "missing")
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("get_deployment_status")
+        self.assertIn("task_id is required", str(ctx.exception))
 
         proposal = await self.call("propose_deployment")
         buyer_policy, task_data = self._create_mock_offered_task(proposal)
         self.mock_escrow.get_task.return_value = task_data
         await self.call("deploy_with_escrow", {"task_id": proposal["task_id"], "policy": buyer_policy})
 
-        # Without task_id the status falls back to the latest session.
-        latest = await self.call("get_deployment_status")
-        self.assertEqual(latest["task_id"], proposal["task_id"])
+        latest = await self.call("get_deployment_status", {"task_id": proposal["task_id"]})
         self.assertEqual(latest["status"], "ready")
 
     async def test_live_mode_enforces_manifest_policy(self):
@@ -1056,6 +1091,9 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
 class SellerFixture(unittest.IsolatedAsyncioTestCase):
     """A seller with a mocked escrow and a fake io.net cloud. Subclasses add the tests."""
 
+    # Unsigned requests are refused on chain 5042, so the unsigned tests run on the Arc testnet chain id.
+    CHAIN_ID = 5042002
+
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -1067,18 +1105,21 @@ class SellerFixture(unittest.IsolatedAsyncioTestCase):
         self.mock_escrow.token = "0x3600000000000000000000000000000000000000"
         self.mock_escrow.verifier = "0x" + "33" * 20
         self.mock_escrow.server_account = "0x" + "44" * 20
-        self.mock_escrow.rpc.chain_id.return_value = 5042
+        self.mock_escrow.rpc.chain_id.return_value = self.CHAIN_ID
+        wire_escrow_views(self.mock_escrow)
         self.mock_escrow.task_id_for.side_effect = lambda customer, salt: f"0x{int(salt, 16):064x}"
         self.mock_escrow.settle_receipt.return_value = {"transactionHash": "0x" + "aa" * 32}
         self.offered: dict[str, dict] = {}
         self.mock_escrow.get_task.side_effect = lambda task_id: self.offered.get(task_id, {"state": "Missing"})
 
         manifest = yaml.safe_load(DEFAULT_MANIFEST_PATH.read_text())
-        manifest["chain_id"] = 5042
+        manifest["chain_id"] = self.CHAIN_ID
         manifest["max_budget_usd"] = 1.00
         self.manifest_path = Path(self.tmp.name) / "manifest.yaml"
         self.manifest_path.write_text(yaml.dump(manifest))
-        self.cred_path, self.sig_path = write_vendor_credential(Path(self.tmp.name), self.mock_escrow, 5042, self.keys)
+        self.cred_path, self.sig_path = write_vendor_credential(
+            Path(self.tmp.name), self.mock_escrow, self.CHAIN_ID, self.keys
+        )
 
         env = patch.dict(os.environ, {"IO_NET_API_KEY": "test-dummy-key", "WARRANT_REQUIRE_REQUEST_SIGNATURE": "0"})
         env.start()
@@ -1086,6 +1127,9 @@ class SellerFixture(unittest.IsolatedAsyncioTestCase):
         no_cache = patch.object(seller_module, "HARDWARE_CACHE_SECONDS", 0)
         no_cache.start()
         self.addCleanup(no_cache.stop)
+        no_failure_cache = patch.object(seller_module, "HARDWARE_FAILURE_CACHE_SECONDS", 0)
+        no_failure_cache.start()
+        self.addCleanup(no_failure_cache.stop)
 
         self.cloud = FakeCloud()
 
@@ -1106,6 +1150,8 @@ class SellerFixture(unittest.IsolatedAsyncioTestCase):
             "manifest_path": self.manifest_path,
             "buyer_account": SAMPLE_BUYER,
         }
+        if self.CHAIN_ID == 5042:
+            kwargs["require_request_signature"] = True  # the seller refuses to start without it on chain 5042
         kwargs.update(overrides)
         with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
             return create_server(self.state_dir, **kwargs)
@@ -1293,7 +1339,7 @@ class SellerPolicyTests(SellerFixture):
         tampered = (
             {"amount": 2_000_000},
             {"duration_hours": 0},
-            {"chain_id": 5042002},
+            {"chain_id": 5042},
             {"amount": "490000"},
         )
         for change in tampered:
@@ -1348,12 +1394,10 @@ class SellerPolicyTests(SellerFixture):
             self.assertIn("32-byte hex", str(ctx.exception))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class SignedSellerFixture(SellerFixture):
+    """Chain 5042 with signed requests: a call about a task works only with the signature of its customer."""
 
-
-class SellerRequestAuthTests(SellerFixture):
-    """The seller needs no password. A call about a task works only with the signature of its customer."""
+    CHAIN_ID = 5042
 
     BUYER_KEY = "0x" + "01" * 32
     OTHER_KEY = "0x" + "02" * 32
@@ -1385,6 +1429,8 @@ class SellerRequestAuthTests(SellerFixture):
         self.offered[task_id] = task_data
         return task_id, policy
 
+
+class SellerRequestAuthTests(SignedSellerFixture):
     async def test_quotes_are_open(self):
         hardware = await self.signed_call("list_suitable_hardware")
         self.assertTrue(hardware)
@@ -1410,7 +1456,9 @@ class SellerRequestAuthTests(SellerFixture):
     async def test_customer_deploys_and_reads_the_worker_token(self):
         task_id, policy = await self.deployed_task()
         args = {"task_id": task_id, "policy": policy, **self.sign(task_id, "deploy")}
-        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"):
+        with patch.object(
+            seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"
+        ):
             deployed = await self.signed_call("deploy_with_escrow", args)
             await asyncio.sleep(0.05)
         self.assertEqual(deployed["task_id"], task_id)
@@ -1422,7 +1470,9 @@ class SellerRequestAuthTests(SellerFixture):
 
     async def test_status_does_not_give_the_worker_token_to_a_stranger(self):
         task_id, policy = await self.deployed_task()
-        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"):
+        with patch.object(
+            seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"
+        ):
             await self.signed_call(
                 "deploy_with_escrow", {"task_id": task_id, "policy": policy, **self.sign(task_id, "deploy")}
             )
@@ -1468,15 +1518,6 @@ class SellerRequestAuthTests(SellerFixture):
                 {"task_id": task_id, "policy": policy, "request_signature": signature, "request_timestamp": ts},
             )
 
-    async def test_proposals_are_rate_limited_per_customer(self):
-        for _ in range(seller_module.PROPOSALS_PER_CUSTOMER_PER_HOUR):
-            await self.signed_call("propose_deployment", {"customer_address": self.buyer})
-        with self.assertRaises(ToolError) as ctx:
-            await self.signed_call("propose_deployment", {"customer_address": self.buyer})
-        self.assertIn("Too many proposals", str(ctx.exception))
-        other = await self.signed_call("propose_deployment", {"customer_address": self.stranger})
-        self.assertTrue(other["task_id"])
-
     async def test_a_full_proposal_store_refuses_new_proposals(self):
         with patch.object(seller_module, "MAX_STORED_PROPOSALS", 2):
             await self.signed_call("propose_deployment", {"customer_address": self.buyer})
@@ -1500,3 +1541,479 @@ class SellerRequestAuthTests(SellerFixture):
             for _ in range(3):
                 await server.call_tool("list_suitable_hardware", {})
         self.assertEqual(self.cloud.calls.count("caas_get_hardware_ids") - before, 1)
+
+
+class SellerAuditTests(SignedSellerFixture):
+    """Regression tests for the security audit of PR 52 (findings F1 to F11)."""
+
+    def service(self):
+        return service_of(self.signed)
+
+    async def offered_task(self, ip: str | None = None, customer: str | None = None) -> tuple[str, dict]:
+        proposal = await self.service().propose_deployment(customer_address=customer or self.buyer, ctx=ctx_for(ip))
+        policy, task_data = make_offered_task(proposal, self.keys)
+        self.offered[proposal["task_id"]] = task_data
+        return proposal["task_id"], policy
+
+    async def deploy(self, task_id: str, policy: dict, offset: int = 0):
+        args = {
+            "task_id": task_id,
+            "policy": policy,
+            **self.sign(task_id, "deploy", timestamp=int(time.time()) - offset),
+        }
+        return await self.signed.call_tool("deploy_with_escrow", args)
+
+    # F1: one deal at a time
+
+    async def test_concurrent_deploys_for_different_tasks_start_one_provisioning(self):
+        task_a, policy_a = await self.offered_task("10.0.0.1")
+        task_b, policy_b = await self.offered_task("10.0.0.2")
+        with patch.object(
+            seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"
+        ) as provision:
+            results = await asyncio.gather(
+                self.deploy(task_a, policy_a), self.deploy(task_b, policy_b), return_exceptions=True
+            )
+            await asyncio.sleep(0.05)
+        failures = [r for r in results if isinstance(r, Exception)]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("One deal at a time", str(failures[0]))
+        self.assertEqual(provision.call_count, 1)
+        self.mock_escrow.accept.assert_called_once()
+        self.assertEqual(len(list((self.state_dir / "sessions").glob("*.json"))), 1)
+
+    async def test_a_running_deal_blocks_the_next_one_before_the_accept(self):
+        task_a, policy_a = await self.offered_task("10.0.0.1")
+        task_b, policy_b = await self.offered_task("10.0.0.2")
+        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://x.invalid"):
+            await self.deploy(task_a, policy_a)
+            await asyncio.sleep(0.05)
+            with self.assertRaises(ToolError) as ctx:
+                await self.deploy(task_b, policy_b)
+        self.assertIn("One deal at a time", str(ctx.exception))
+        self.mock_escrow.accept.assert_called_once()
+
+    async def test_credits_are_checked_again_before_the_accept(self):
+        task_id, policy = await self.offered_task()
+        self.cloud.credit_result = credit_status_response(0.10)
+        with self.assertRaises(ToolError) as ctx:
+            await self.deploy(task_id, policy)
+        self.assertIn("credits are below", str(ctx.exception))
+        self.mock_escrow.accept.assert_not_called()
+        self.assertFalse((self.state_dir / "sessions" / f"{task_id}.json").exists())
+
+    # F2: idempotent deploy
+
+    async def test_deploy_again_returns_the_existing_session(self):
+        task_id, policy = await self.offered_task()
+        with patch.object(
+            seller_module.SellerWarrantService, "_provision_container", return_value="http://127.0.0.1:8080"
+        ) as provision:
+            first = json.loads((await self.deploy(task_id, policy)).content[0].text)
+            await asyncio.sleep(0.05)
+            token = json.loads((self.state_dir / "sessions" / f"{task_id}.json").read_text())["worker_token"]
+            second = json.loads((await self.deploy(task_id, policy, offset=2)).content[0].text)
+        self.assertEqual(second["deployment_id"], first["deployment_id"])
+        self.assertEqual(second["deliverable_hash"], first["deliverable_hash"])
+        self.assertNotIn("worker_token", second)
+        self.assertEqual(provision.call_count, 1)
+        self.mock_escrow.accept.assert_called_once()
+        stored = json.loads((self.state_dir / "sessions" / f"{task_id}.json").read_text())
+        self.assertEqual(stored["worker_token"], token)
+
+    async def test_the_first_session_is_written_exclusively(self):
+        task_id, policy = await self.offered_task()
+        (self.state_dir / "sessions" / f"{task_id}.json").write_text(json.dumps({"status": "ready"}))
+        with self.assertRaises(ToolError) as ctx:
+            await self.service()._commit_deal(task_id, policy)
+        self.assertIn("already has a deployment session", str(ctx.exception))
+        self.assertEqual(json.loads((self.state_dir / "sessions" / f"{task_id}.json").read_text()), {"status": "ready"})
+
+    # F3: limits keyed on the client address
+
+    def test_client_key_comes_from_x_real_ip(self):
+        key = seller_module.SellerWarrantService._client_key
+        self.assertEqual(key(ctx_for("203.0.113.7")), "203.0.113.7")
+        self.assertEqual(key(ctx_for("2001:db8::1")), "2001:db8::1")
+        for bad in (None, "not-an-ip", "1.2.3.4, 5.6.7.8"):
+            self.assertEqual(key(ctx_for(bad)), seller_module.UNKNOWN_CLIENT)
+        self.assertEqual(key(None), seller_module.UNKNOWN_CLIENT)
+        self.assertEqual(key(SimpleNamespace(headers=None)), seller_module.UNKNOWN_CLIENT)
+
+    async def test_changing_the_customer_address_does_not_escape_the_client_limit(self):
+        service = self.service()
+        for i in range(seller_module.PROPOSALS_PER_CLIENT_PER_HOUR):
+            await service.propose_deployment(customer_address="0x" + f"{i + 1:040x}", ctx=ctx_for("198.51.100.1"))
+        with self.assertRaises(ToolError) as ctx:
+            await service.propose_deployment(customer_address="0x" + "ee" * 20, ctx=ctx_for("198.51.100.1"))
+        self.assertIn("Too many proposals", str(ctx.exception))
+        other = await service.propose_deployment(customer_address="0x" + "ee" * 20, ctx=ctx_for("198.51.100.2"))
+        self.assertTrue(other["task_id"])
+
+    async def test_one_client_cannot_lock_out_a_customer_with_that_address(self):
+        service = self.service()
+        for _ in range(seller_module.PROPOSALS_PER_CLIENT_PER_HOUR):
+            await service.propose_deployment(customer_address=self.buyer, ctx=ctx_for("198.51.100.1"))
+        victim = await service.propose_deployment(customer_address=self.buyer, ctx=ctx_for("198.51.100.9"))
+        self.assertEqual(victim["customer"].lower(), self.buyer.lower())
+
+    async def test_the_customer_limit_still_guards_many_clients(self):
+        service = self.service()
+        for i in range(seller_module.PROPOSALS_PER_CUSTOMER_PER_HOUR):
+            await service.propose_deployment(customer_address=self.buyer, ctx=ctx_for(f"10.1.0.{i}"))
+        with self.assertRaises(ToolError) as ctx:
+            await service.propose_deployment(customer_address=self.buyer, ctx=ctx_for("10.1.1.1"))
+        self.assertIn("Too many proposals", str(ctx.exception))
+        other = await service.propose_deployment(customer_address=self.stranger, ctx=ctx_for("10.1.1.1"))
+        self.assertTrue(other["task_id"])
+
+    async def test_rejected_proposals_do_not_use_the_global_budget(self):
+        with patch.object(seller_module, "PROPOSALS_PER_HOUR", 3):
+            service = service_of(self.build(require_request_signature=True))
+            self.cloud.hardware = []
+            for i in range(6):
+                with self.assertRaises(ToolError) as ctx:
+                    await service.propose_deployment(ctx=ctx_for(f"10.2.0.{i}"))
+                self.assertIn("No available suitable GPUs", str(ctx.exception))
+            self.cloud.hardware = list(SAMPLE_HARDWARE)
+            for i in range(3):
+                await service.propose_deployment(ctx=ctx_for(f"10.3.0.{i}"))
+            with self.assertRaises(ToolError) as ctx:
+                await service.propose_deployment(ctx=ctx_for("10.3.0.9"))
+        self.assertIn("Too many proposals", str(ctx.exception))
+
+    async def test_customer_address_must_be_a_20_byte_address(self):
+        for bad in ("victim", "0x1234", "0x" + "zz" * 20):
+            with self.subTest(address=bad), self.assertRaises(ToolError) as ctx:
+                await self.service().propose_deployment(customer_address=bad)
+            self.assertIn("20-byte hex address", str(ctx.exception))
+
+    async def test_submit_acceptance_has_the_same_throttle(self):
+        with patch.object(seller_module, "SUBMISSIONS_PER_CLIENT_PER_HOUR", 2):
+            service = service_of(self.build(require_request_signature=True))
+            for _ in range(2):
+                with self.assertRaises(ToolError) as ctx:
+                    await service.submit_acceptance("0x" + "ab" * 32, {}, "0x00", ctx=ctx_for("192.0.2.1"))
+                self.assertIn("No deployment session", str(ctx.exception))
+            with self.assertRaises(ToolError) as ctx:
+                await service.submit_acceptance("0x" + "ab" * 32, {}, "0x00", ctx=ctx_for("192.0.2.1"))
+            self.assertIn("Too many requests", str(ctx.exception))
+            with self.assertRaises(ToolError) as ctx:
+                await service.submit_acceptance("0x" + "ab" * 32, {}, "0x00", ctx=ctx_for("192.0.2.2"))
+            self.assertIn("No deployment session", str(ctx.exception))
+
+    # F4: retention, cap, caches
+
+    def test_the_cap_is_above_rate_times_retention(self):
+        hours = seller_module.PROPOSAL_RETENTION_SECONDS / 3600
+        self.assertEqual(seller_module.PROPOSAL_RETENTION_SECONDS, 3600)
+        self.assertGreater(seller_module.MAX_STORED_PROPOSALS, seller_module.PROPOSALS_PER_HOUR * hours)
+
+    async def test_proposals_with_a_session_do_not_count_against_the_cap(self):
+        with patch.object(seller_module, "MAX_STORED_PROPOSALS", 2):
+            first = await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+            await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+            with self.assertRaises(ToolError):
+                await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+            (self.state_dir / "sessions" / f"{first['task_id']}.json").write_text(
+                json.dumps({"status": "ready", "expires_at": int(time.time()) + 3600})
+            )
+            third = await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+        self.assertTrue(third["task_id"])
+
+    async def test_old_sessions_and_their_proposals_are_deleted(self):
+        proposal = await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+        task_id = proposal["task_id"]
+        long_ago = int(time.time()) - seller_module.SESSION_RETENTION_SECONDS - 100
+        session_path = self.state_dir / "sessions" / f"{task_id}.json"
+        session_path.write_text(json.dumps({"status": "settled", "task_id": task_id, "expires_at": long_ago}))
+        recent = await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+        recent_path = self.state_dir / "sessions" / f"{recent['task_id']}.json"
+        recent_path.write_text(json.dumps({"status": "settled", "expires_at": int(time.time()) - 3600}))
+        await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+        self.assertFalse(session_path.exists())
+        self.assertFalse((self.state_dir / "proposals" / f"{task_id}.json").exists())
+        self.assertTrue(recent_path.exists())
+
+    async def test_the_task_id_cache_is_bounded(self):
+        self.mock_escrow._task_id_cache = dict.fromkeys(range(seller_module.TASK_ID_CACHE_MAX + 1), "x")
+        await self.signed_call("propose_deployment", {"customer_address": self.buyer})
+        self.assertEqual(self.mock_escrow._task_id_cache, {})
+
+    # F5: signatures cannot be switched off on chain 5042
+
+    def test_start_is_refused_on_chain_5042_without_request_signatures(self):
+        with self.assertRaises(seller_module.StartRefusedError) as ctx:
+            self.build(require_request_signature=False)
+        self.assertIn("5042", str(ctx.exception))
+        with (
+            patch.dict(os.environ, {"WARRANT_REQUIRE_REQUEST_SIGNATURE": "0"}),
+            self.assertRaises(seller_module.StartRefusedError),
+        ):
+            self.build(require_request_signature=ServerConfig().require_request_signature)
+
+    async def test_status_needs_a_task_id_even_when_signatures_are_off(self):
+        self.mock_escrow.rpc.chain_id.return_value = 5042002
+        server = self.build(require_request_signature=False)
+        with self.assertRaises(ToolError) as ctx:
+            await server.call_tool("get_deployment_status", {})
+        self.assertIn("task_id is required", str(ctx.exception))
+
+    def test_signatures_off_on_another_chain_logs_a_warning(self):
+        self.mock_escrow.rpc.chain_id.return_value = 5042002
+        with self.assertLogs(seller_module.logger, level="WARNING") as logs:
+            self.build(require_request_signature=False)
+        self.assertTrue(any("signatures are OFF" in line for line in logs.output))
+
+    # F6: no provider text in tool errors
+
+    async def test_rpc_errors_reach_the_caller_as_a_reference_only(self):
+        task_id, policy = await self.offered_task()
+        secret = "https://rpc.example.invalid/v1/KEY123"
+        good = self.mock_escrow.get_task.side_effect
+        self.mock_escrow.get_task.side_effect = RuntimeError(f"RPC HTTP 429 calling eth_call on {secret}: slow down")
+        with self.assertRaises(ToolError) as ctx:
+            await self.deploy(task_id, policy)
+        self.assertNotIn("KEY123", str(ctx.exception))
+        self.assertNotIn("slow down", str(ctx.exception))
+        self.assertIn("Reference:", str(ctx.exception))
+
+        self.mock_escrow.get_task.side_effect = good
+        self.mock_escrow.accept.side_effect = RuntimeError(f"failed on {secret}")
+        with self.assertRaises(ToolError) as ctx:
+            await self.deploy(task_id, policy, offset=2)
+        self.assertNotIn("KEY123", str(ctx.exception))
+        self.assertIn("Reference:", str(ctx.exception))
+
+    async def test_unexpected_errors_are_generic(self):
+        self.mock_escrow.task_id_for.side_effect = RuntimeError("connect to https://rpc.example.invalid/KEY123 failed")
+        with self.assertRaises(ToolError) as ctx:
+            await self.service().propose_deployment(customer_address=self.buyer)
+        self.assertNotIn("KEY123", str(ctx.exception))
+        self.assertIn("Reference:", str(ctx.exception))
+
+    async def test_settlement_errors_are_generic(self):
+        task_id, policy = await self.offered_task()
+        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://x.invalid"):
+            await self.deploy(task_id, policy)
+            await asyncio.sleep(0.05)
+        session = json.loads((self.state_dir / "sessions" / f"{task_id}.json").read_text())
+        self.mock_escrow.settle_receipt.side_effect = RuntimeError("revert at https://rpc.example.invalid/KEY123")
+        acceptance = {"deliverable_hash": session["deliverable_hash"]}
+        with (
+            patch.object(seller_module, "evaluate_authorization", return_value=(None, b"journal")),
+            self.assertRaises(ToolError) as ctx,
+        ):
+            await self.service().submit_acceptance(task_id, acceptance, "0x" + "00" * 64)
+        self.assertNotIn("KEY123", str(ctx.exception))
+        self.assertIn("Reference:", str(ctx.exception))
+
+    # F7: funded-order checks
+
+    async def refused_with(self, change: dict, message: str):
+        task_id, policy = await self.offered_task()
+        self.offered[task_id] = {**self.offered[task_id], **change}
+        with self.assertRaises(ToolError) as ctx:
+            await self.deploy(task_id, policy)
+        self.assertIn(message, str(ctx.exception))
+        self.mock_escrow.accept.assert_not_called()
+
+    async def test_settle_by_must_cover_the_lease_and_a_margin(self):
+        now = int(time.time())
+        await self.refused_with({"settle_by": now + 3600 + 600}, "settleBy")
+        await self.refused_with({"settle_by": now + 120}, "settleBy")
+        await self.refused_with({"settle_by": None}, "settleBy")
+        task_id, policy = await self.offered_task()
+        self.offered[task_id]["settle_by"] = now + 3600 + seller_module.SETTLE_MARGIN_SECONDS + 60
+        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://x.invalid"):
+            await self.deploy(task_id, policy)
+
+    async def test_accept_by_must_be_in_the_future(self):
+        now = int(time.time())
+        await self.refused_with({"accept_by": now - 1}, "acceptBy")
+        await self.refused_with({"accept_by": None}, "acceptBy")
+
+    async def test_missing_on_chain_fields_fail_closed(self):
+        for field_name in ("amount", "recipient", "customer", "policy_version"):
+            with self.subTest(field=field_name):
+                task_id, policy = await self.offered_task()
+                task = dict(self.offered[task_id])
+                del task[field_name]
+                self.offered[task_id] = task
+                with self.assertRaises(ToolError) as ctx:
+                    await self.deploy(task_id, policy)
+                self.assertIn("does not match", str(ctx.exception))
+                self.mock_escrow.accept.assert_not_called()
+
+    async def test_policy_version_must_match_the_proposal(self):
+        await self.refused_with({"policy_version": 2}, "policy version")
+
+    def test_start_is_refused_when_token_or_verifier_differ(self):
+        for name in ("token()", "verifier()"):
+            with self.subTest(view=name):
+                other = "0x" + "99" * 20
+                self.mock_escrow.call_contract.side_effect = lambda to, sig, t, a, o, n=name, other=other: (
+                    (other,)
+                    if sig == n
+                    else ((self.mock_escrow.token,) if sig == "token()" else (self.mock_escrow.verifier,))
+                )
+                with self.assertRaises(seller_module.StartRefusedError) as ctx:
+                    self.build()
+                self.assertIn(name[:-2], str(ctx.exception))
+
+    def test_start_is_refused_when_the_escrow_cannot_be_read(self):
+        self.mock_escrow.call_contract.side_effect = RuntimeError("boom https://rpc.example.invalid/KEY123")
+        with self.assertRaises(seller_module.StartRefusedError) as ctx:
+            self.build()
+        self.assertNotIn("KEY123", str(ctx.exception))
+
+    # F9: replay cache and clock messages
+
+    async def test_a_deploy_signature_works_once(self):
+        task_id, _ = await self.offered_task()
+        service = self.service()
+        args = self.sign(task_id, "deploy")
+        service._authenticate_buyer(task_id, "deploy", args["request_signature"], args["request_timestamp"])
+        with self.assertRaises(ToolError) as ctx:
+            service._authenticate_buyer(task_id, "deploy", args["request_signature"], args["request_timestamp"])
+        self.assertIn("already used", str(ctx.exception))
+        status = self.sign(task_id, "status")  # a status poll may repeat a signature
+        for _ in range(2):
+            service._authenticate_buyer(task_id, "status", status["request_signature"], status["request_timestamp"])
+
+    async def test_replay_entries_expire_with_the_window(self):
+        task_id, _ = await self.offered_task()
+        service = self.service()
+        args = self.sign(task_id, "deploy")
+        service._authenticate_buyer(task_id, "deploy", args["request_signature"], args["request_timestamp"])
+        self.assertEqual(len(service._used_signatures), 1)
+        expiry = args["request_timestamp"] + seller_module.REQUEST_MAX_AGE_SECONDS + 1
+        with patch.object(seller_module.time, "time", return_value=expiry + 1):
+            service._claim_signature(task_id, "deploy", args["request_timestamp"] + 1000)
+        self.assertEqual(len(service._used_signatures), 1)
+
+    async def test_clock_skew_and_old_signatures_have_different_errors(self):
+        task_id, _ = await self.offered_task()
+        service = self.service()
+        for offset, message in ((3600, "too old"), (-3600, "clock skew")):
+            ts = int(time.time()) - offset
+            args = self.sign(task_id, "deploy", timestamp=ts)
+            with self.subTest(message=message), self.assertRaises(ToolError) as ctx:
+                service._authenticate_buyer(task_id, "deploy", args["request_signature"], ts)
+            self.assertIn(message, str(ctx.exception))
+
+    # F10: one settlement at a time
+
+    async def test_concurrent_acceptances_settle_once(self):
+        task_id, policy = await self.offered_task()
+        with patch.object(seller_module.SellerWarrantService, "_provision_container", return_value="http://x.invalid"):
+            await self.deploy(task_id, policy)
+            await asyncio.sleep(0.05)
+        session = json.loads((self.state_dir / "sessions" / f"{task_id}.json").read_text())
+        acceptance = {"deliverable_hash": session["deliverable_hash"]}
+
+        def slow_settle(*args, **kwargs):
+            time.sleep(0.2)
+            return {"transactionHash": "0x" + "aa" * 32}
+
+        self.mock_escrow.settle_receipt.side_effect = slow_settle
+        service = self.service()
+        with patch.object(seller_module, "evaluate_authorization", return_value=(None, b"journal")):
+            results = await asyncio.gather(
+                service.submit_acceptance(task_id, acceptance, "0x" + "00" * 64, ctx=ctx_for("192.0.2.1")),
+                service.submit_acceptance(task_id, acceptance, "0x" + "00" * 64, ctx=ctx_for("192.0.2.2")),
+            )
+        self.assertEqual(self.mock_escrow.settle_receipt.call_count, 1)
+        self.assertEqual({r["status"] for r in results}, {"settled"})
+        self.assertEqual(service._task_locks, {})
+
+    # F11: io.net lookups, hosts
+
+    async def test_concurrent_hardware_lookups_share_one_io_net_call(self):
+        gate = asyncio.Event()
+        original = self.cloud.call
+
+        async def slow_call(name, arguments):
+            if name == "caas_get_hardware_ids":
+                await gate.wait()
+            return await original(name, arguments)
+
+        self.cloud.call = slow_call
+        service = self.service()
+        with patch.object(seller_module, "HARDWARE_CACHE_SECONDS", 20):
+            calls = [asyncio.create_task(service.list_suitable_hardware()) for _ in range(5)]
+            await asyncio.sleep(0.05)
+            gate.set()
+            results = await asyncio.gather(*calls)
+        self.assertEqual(self.cloud.calls.count("caas_get_hardware_ids"), 1)
+        self.assertTrue(all(r == results[0] for r in results))
+
+    async def test_a_failed_hardware_lookup_is_cached_briefly(self):
+        self.cloud.call = MagicMock(side_effect=PilotError("io.net down"))
+        service = self.service()
+        with patch.object(seller_module, "HARDWARE_FAILURE_CACHE_SECONDS", 5):
+            for _ in range(3):
+                with self.assertRaises(ToolError):
+                    await service.list_suitable_hardware()
+        self.assertEqual(self.cloud.call.call_count, 1)
+
+    def test_allowed_hosts_come_from_the_environment(self):
+        with patch.dict(os.environ, {"WARRANT_ALLOWED_HOSTS": " a.example , b.example "}):
+            self.assertEqual(seller_module.allowed_hosts_from_env(), ["a.example", "b.example"])
+        with patch.dict(os.environ, {"WARRANT_ALLOWED_HOSTS": ""}):
+            self.assertIn("seller.mnemonik.xyz", seller_module.allowed_hosts_from_env())
+
+    async def test_unknown_host_headers_are_refused(self):
+        import httpx2
+
+        with patch("showcases.ionet_arc.seller_mcp_server.EscrowClient", return_value=self.mock_escrow):
+            app = create_app(
+                self.state_dir,
+                manifest_path=self.manifest_path,
+                require_request_signature=True,
+                allowed_hosts=["seller.mnemonik.xyz"],
+            )
+        body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        headers = {"accept": "application/json, text/event-stream", "content-type": "application/json"}
+        transport = httpx2.ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            httpx2.AsyncClient(transport=transport) as client,
+        ):
+            bad = await client.post("http://evil.example/mcp", json=body, headers=headers)
+            good = await client.post("http://seller.mnemonik.xyz/mcp", json=body, headers=headers)
+        self.assertEqual(bad.status_code, 421)
+        self.assertNotEqual(good.status_code, 421)
+
+    # Label and limits on chain 5042
+
+    async def test_initialize_instructions_carry_label_and_limits(self):
+        async with Client(self.mcp) as client:
+            instructions = client.instructions
+        self.assertIn(LABEL, instructions)
+        for sentence in seller_module.MAINNET_LIMITS:
+            self.assertIn(sentence, instructions)
+        self.assertIn("One deal at a time.", instructions)
+
+    async def test_deal_tool_descriptions_start_with_the_label(self):
+        async with Client(self.mcp) as client:
+            tools = {t.name: t.description for t in (await client.list_tools()).tools}
+        self.assertEqual(set(tools), SELLER_TOOLS)
+        for name in LABELLED_TOOLS:
+            self.assertTrue(tools[name].startswith(LABEL), name)
+        for name in SELLER_TOOLS - LABELLED_TOOLS:
+            self.assertNotIn(LABEL, tools[name], name)
+
+
+class SellerNoLabelTests(SellerFixture):
+    async def test_other_chains_carry_no_mainnet_label(self):
+        async with Client(self.mcp) as client:
+            tools = {t.name: t.description for t in (await client.list_tools()).tools}
+            instructions = client.instructions
+        self.assertNotIn(LABEL, instructions or "")
+        for description in tools.values():
+            self.assertNotIn(LABEL, description)
+
+
+if __name__ == "__main__":
+    unittest.main()

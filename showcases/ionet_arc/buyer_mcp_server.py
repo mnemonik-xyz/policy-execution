@@ -45,6 +45,7 @@ from .escrow import (  # noqa: E402
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
     REQUEST_ACTIONS,
+    REQUEST_MAX_AGE_SECONDS,
     SHOWCASE_DIR,
     EscrowClient,
     address20,
@@ -608,7 +609,10 @@ class BuyerWarrantService:
             "action": action,
             "request_signature": signature,
             "request_timestamp": timestamp,
-            "message": "Pass request_signature and request_timestamp to the seller tool. Valid for 5 minutes.",
+            "message": (
+                "Pass request_signature and request_timestamp to the seller tool. "
+                f"Valid for {REQUEST_MAX_AGE_SECONDS} seconds."
+            ),
         }
 
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
@@ -824,7 +828,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
             "deploy_with_escrow (action 'deploy') and get_deployment_status (action 'status'). "
             "Pass the returned request_signature and request_timestamp to that seller tool. "
             "The seller serves only the customer of the task, so no password is needed. "
-            "A signature is valid for 5 minutes. Sign a new one for each call."
+            f"A signature is valid for {REQUEST_MAX_AGE_SECONDS} seconds. Sign a new one for each call."
         ),
     )(service.warrant_sign_request)
 

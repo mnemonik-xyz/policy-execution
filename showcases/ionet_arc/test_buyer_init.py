@@ -27,7 +27,7 @@ class BuyerInitTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name) / "buyer"
+        self.home = Path(self.tmp.name).resolve() / "buyer"  # macOS: /var is a link to /private/var
 
     def test_writes_private_keys_and_mainnet_manifest(self):
         out = run_init("--home", str(self.home))
@@ -93,6 +93,57 @@ class BuyerInitTests(unittest.TestCase):
         self.assertEqual(cfg.buyer_account, Account.from_key(wallet).address)
         self.assertEqual(cfg.buyer_acceptance_key_path, self.home / "buyer_acceptance.key")
         self.assertEqual(cfg.escrow_address, buyer_init.MAINNET_BUYER["escrow_address"])
+
+    def test_seller_bridge_is_pinned(self):
+        run_init("--home", str(self.home))
+        seller = json.loads((self.home / "mcp.json").read_text())["mcpServers"]["seller-transcription-service"]
+        self.assertEqual(seller["args"][:2], ["-y", f"mcp-remote@{buyer_init.MCP_REMOTE_VERSION}"])
+        self.assertRegex(buyer_init.MCP_REMOTE_VERSION, r"^\d+\.\d+\.\d+$")
+        out = run_init("--home", str(self.home))
+        self.assertIn(f"mcp-remote@{buyer_init.MCP_REMOTE_VERSION}", out)
+        self.assertNotIn('"mcp-remote"', out)
+
+    def test_home_and_written_files_are_private(self):
+        run_init("--home", str(self.home))
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o700)
+        for name in ("manifest.yaml", "mcp.json", "public_keys.yaml"):
+            self.assertEqual(stat.S_IMODE((self.home / name).stat().st_mode), 0o600, name)
+
+    def test_existing_loose_home_and_keys_are_tightened(self):
+        run_init("--home", str(self.home))
+        self.home.chmod(0o755)
+        for name in ("buyer.key", "buyer_acceptance.key", "manifest.yaml"):
+            (self.home / name).chmod(0o644)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            run_init("--home", str(self.home))
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o700)
+        for name in ("buyer.key", "buyer_acceptance.key", "manifest.yaml"):
+            self.assertEqual(stat.S_IMODE((self.home / name).stat().st_mode), 0o600, name)
+        self.assertIn("buyer.key was readable by others", err.getvalue())
+
+    def test_rpc_url_credentials_are_detected_and_warned_about(self):
+        for url in (
+            "https://user:pass@rpc.example/arc",
+            "https://rpc.example/arc?apikey=abc",
+            "https://rpc.example/arc?api_key=abc",
+            "https://rpc.example/arc?token=abc",
+        ):
+            self.assertTrue(buyer_init.rpc_url_has_credentials(url), url)
+        self.assertFalse(buyer_init.rpc_url_has_credentials("https://rpc.mainnet.arc.io"))
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            run_init("--home", str(self.home), "--rpc-url", "https://rpc.example/arc?apikey=SECRETVALUE")
+        self.assertIn("holds credentials", err.getvalue())
+        self.assertNotIn("SECRETVALUE", err.getvalue())
+        self.assertEqual(stat.S_IMODE((self.home / "manifest.yaml").stat().st_mode), 0o600)
+
+        quiet = io.StringIO()
+        other = Path(self.tmp.name).resolve() / "other"
+        with contextlib.redirect_stderr(quiet):
+            run_init("--home", str(other), "--rpc-url", "https://rpc.mainnet.arc.io")
+        self.assertNotIn("credentials", quiet.getvalue())
 
     def test_status_reads_usdc_balance(self):
         run_init("--home", str(self.home))
