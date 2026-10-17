@@ -17,7 +17,7 @@ from showcases.ionet_arc.buyer_mcp_server import (
     create_app,
     create_server,
 )
-from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, load_manifest
+from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, DEFAULT_MANIFEST_PATH, load_manifest
 
 TESTNET_MANIFEST = Path(__file__).parent / "config-arc-testnet" / "manifest.yaml"
 
@@ -388,21 +388,37 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(app)
 
     def test_read_initial_parameters_from_manifest(self):
-        manifest = load_manifest()
-        config = ServerConfig(state_dir=self.state_dir)
-        self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
-        self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
-        self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
-        self.assertEqual(config.max_budget_usd, float(manifest["max_budget_usd"]))
-        self.assertEqual(config.max_duration_hours, int(manifest["duration_hours"]))
-        self.assertEqual(config.rpc_url, NETWORKS["mainnet"]["rpc"])
-
-    def test_testnet_manifest_uses_testnet_rpc(self):
-        config = ServerConfig(
-            state_dir=self.state_dir,
-            manifest_path=TESTNET_MANIFEST,
+        manifest_path = Path(self.state_dir) / "fixture_manifest.yaml"
+        manifest_path.write_text(
+            yaml.dump(
+                {
+                    "rpc_url": "https://fixture.rpc.test",
+                    "escrow_address": "0x" + "a1" * 20,
+                    "verifier_address": "0x" + "b2" * 20,
+                    "token_address": "0x" + "c3" * 20,
+                    "buyer_address": "0x" + "d4" * 20,
+                    "max_budget_usd": 3.25,
+                    "duration_hours": 4,
+                }
+            )
         )
-        self.assertEqual(config.rpc_url, NETWORKS["testnet"]["rpc"])
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=manifest_path)
+        self.assertEqual(config.rpc_url, "https://fixture.rpc.test")
+        self.assertEqual(config.escrow_address, "0x" + "a1" * 20)
+        self.assertEqual(config.verifier_address, "0x" + "b2" * 20)
+        self.assertEqual(config.token_address, "0x" + "c3" * 20)
+        self.assertEqual(config.buyer_account, "0x" + "d4" * 20)
+        self.assertEqual(config.max_budget_usd, 3.25)
+        self.assertEqual(config.max_duration_hours, 4)
+
+    def test_shipped_manifests_name_their_network(self):
+        shipped = {"mainnet": DEFAULT_MANIFEST_PATH, "testnet": TESTNET_MANIFEST}
+        for network, path in shipped.items():
+            with self.subTest(network=network):
+                manifest = load_manifest(path)
+                config = ServerConfig(state_dir=self.state_dir, manifest_path=path)
+                self.assertEqual(config.rpc_url, NETWORKS[network]["rpc"])
+                self.assertEqual(manifest["chain_id"], NETWORKS[network]["chain_id"])
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
