@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -200,6 +201,85 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         res = await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
         self.assertEqual(res["status"], "APPROVED")
         self.mock_escrow.mint_token.assert_called_once()
+
+    BUYER_KEY = "0x" + "01" * 32
+
+    def _proposal(self) -> dict:
+        return {
+            "task_id": "0x" + "55" * 32,
+            "amount": 1_000_000,
+            "amount_usd": "1.00",
+            "duration_hours": 1,
+            "salt": "0x" + "66" * 32,
+            "recipient": "0x" + "44" * 20,
+            "category": DEFAULT_CATEGORY,
+            "escrow_address": self.mock_escrow.escrow,
+            "token_address": self.mock_escrow.token,
+        }
+
+    def _server_with_wallet_key(self):
+        return create_server(
+            state_dir=self.state_dir,
+            escrow_address=self.mock_escrow.escrow,
+            token_address=self.mock_escrow.token,
+            buyer_account="0x" + "aa" * 20,
+            max_budget_usd=2.00,
+            max_duration_hours=1,
+            allowed_categories=[DEFAULT_CATEGORY],
+            escrow_client=self.mock_escrow,
+            buyer_private_key=self.BUYER_KEY,
+        )
+
+    async def test_warrant_sign_request_signs_for_an_offered_task(self):
+        from eth_account import Account
+
+        from showcases.ionet_arc.escrow import recover_request_signer
+
+        proposal = self._proposal()
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+        mcp = self._server_with_wallet_key()
+        for action in ("status", "deploy"):
+            res = json.loads(
+                (await mcp.call_tool("warrant_sign_request", {"task_id": proposal["task_id"], "action": action}))
+                .content[0]
+                .text
+            )
+            signer = recover_request_signer(
+                res["request_signature"],
+                31337,
+                self.mock_escrow.escrow,
+                proposal["task_id"],
+                action,
+                res["request_timestamp"],
+            )
+            self.assertEqual(signer, Account.from_key(self.BUYER_KEY).address)
+            self.assertAlmostEqual(res["request_timestamp"], time.time(), delta=5)
+
+    async def test_warrant_sign_request_refuses_a_task_it_did_not_offer(self):
+        mcp = self._server_with_wallet_key()
+        with self.assertRaises(ToolError) as ctx:
+            await mcp.call_tool("warrant_sign_request", {"task_id": "0x" + "ab" * 32, "action": "status"})
+        self.assertIn("not offered by this guardrail", str(ctx.exception))
+
+    async def test_warrant_sign_request_refuses_bad_input(self):
+        proposal = self._proposal()
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+        mcp = self._server_with_wallet_key()
+        for args in (
+            {"task_id": proposal["task_id"], "action": "withdraw"},
+            {"task_id": proposal["task_id"], "action": ""},
+            {"task_id": "0x1234", "action": "status"},
+            {"task_id": "../" + proposal["task_id"], "action": "status"},
+        ):
+            with self.subTest(args=args), self.assertRaises(ToolError):
+                await mcp.call_tool("warrant_sign_request", args)
+
+    async def test_warrant_sign_request_needs_the_wallet_key(self):
+        proposal = self._proposal()
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+        with self.assertRaises(ToolError) as ctx:
+            await self.call("warrant_sign_request", {"task_id": proposal["task_id"], "action": "status"})
+        self.assertIn("wallet key is not configured", str(ctx.exception))
 
     async def test_warrant_sign_acceptance(self):
         proposal = {

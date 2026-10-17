@@ -32,10 +32,14 @@ __all__ = [
     "DEFAULT_IMAGE_ID",
     "DEFAULT_MANIFEST_PATH",
     "REPO_ROOT",
+    "REQUEST_ACTIONS",
+    "REQUEST_MAX_AGE_SECONDS",
+    "SHOWCASE_DIR",
     "EscrowClient",
     "EthRpc",
     "address20",
     "build_receipt_seal",
+    "buyer_request_message",
     "bytes32",
     "canonical",
     "compile_buyer_policy",
@@ -53,17 +57,21 @@ __all__ = [
     "hash_policy",
     "load_manifest",
     "parse_public_key",
+    "recover_request_signer",
     "should_trust_env",
     "sign_acceptance",
+    "sign_buyer_request",
     "sign_vendor_credential",
     "to_addr_str",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# This directory: showcases/ionet_arc in the repository, warrant_buyer when installed as a package.
+SHOWCASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 42
 DEFAULT_IMAGE_ID = "0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e"
-DEFAULT_MANIFEST_PATH = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+DEFAULT_MANIFEST_PATH = SHOWCASE_DIR / "config" / "manifest.yaml"
 
 OUTPUT_TAG = hashlib.sha256(b"risc0.Output").digest()
 CLAIM_TAG = hashlib.sha256(b"risc0.ReceiptClaim").digest()
@@ -280,7 +288,12 @@ def find_binary(name: str) -> str:
 
 
 def find_warrant_binary(name: str) -> Path:
+    bundled = SHOWCASE_DIR / "bin" / name  # shipped inside the warrant-buyer wheel
+    if bundled.is_file() and not os.access(bundled, os.X_OK):
+        with contextlib.suppress(OSError):
+            bundled.chmod(bundled.stat().st_mode | 0o111)
     for cand in [
+        bundled,
         REPO_ROOT / "target" / "release" / name,
         REPO_ROOT / "target" / "debug" / name,
         Path(shutil.which(name) or ""),
@@ -332,7 +345,7 @@ def _resolve_authority_public_key(
     elif manifest_path:
         candidates.append(manifest_path.parent / "public_keys.yaml")
     else:
-        candidates.append(REPO_ROOT / "showcases" / "ionet_arc" / "config" / "public_keys.yaml")
+        candidates.append(SHOWCASE_DIR / "config" / "public_keys.yaml")
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
@@ -370,7 +383,7 @@ def compile_buyer_policy(
 ) -> tuple[dict, str]:
     """Compile buyer policy template into concrete Policy and compute its cryptographic policy_hash."""
     manifest_path = manifest_path or DEFAULT_MANIFEST_PATH
-    template_path = template_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml")
+    template_path = template_path or (SHOWCASE_DIR / "config" / "buyer_policy_template.yaml")
 
     manifest = load_manifest(manifest_path)
     template = yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
@@ -440,7 +453,7 @@ def hash_policy(policy: dict) -> str:
 
 def sign_acceptance(acceptance: dict, key_path: Path | None = None) -> list[int]:
     """Sign Acceptance struct with buyer_acceptance.key using warrant-evidence."""
-    key_path = key_path or (REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key")
+    key_path = key_path or (SHOWCASE_DIR / ".keys" / "buyer_acceptance.key")
     if not key_path.exists():
         raise FileNotFoundError(f"Buyer acceptance key not found at {key_path}")
 
@@ -463,7 +476,7 @@ def sign_acceptance(acceptance: dict, key_path: Path | None = None) -> list[int]
 
 def sign_vendor_credential(credential: dict, key_path: Path | None = None) -> list[int]:
     """Sign VendorCredential struct with registry.key using warrant-evidence."""
-    key_path = key_path or (REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "registry.key")
+    key_path = key_path or (SHOWCASE_DIR / ".keys" / "registry.key")
     if not key_path.exists():
         raise FileNotFoundError(f"Registry authority key not found at {key_path}")
 
@@ -1028,8 +1041,8 @@ def ensure_policy_hash(
     template_path: Path | None = None,
 ) -> str:
     """Instantiate and hash policy for this scope, failing loudly if configs or keys are missing."""
-    manifest_path = manifest_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml")
-    template_path = template_path or (REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml")
+    manifest_path = manifest_path or (SHOWCASE_DIR / "config" / "manifest.yaml")
+    template_path = template_path or (SHOWCASE_DIR / "config" / "buyer_policy_template.yaml")
 
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
@@ -1045,3 +1058,46 @@ def ensure_policy_hash(
         max_amount=max_amount,
     )
     return pol_hash
+
+
+# A buyer proves who it is to the seller with the wallet that funded the order. No shared password.
+REQUEST_ACTIONS = ("status", "deploy")
+REQUEST_MAX_AGE_SECONDS = 300
+REQUEST_MAX_FUTURE_SECONDS = 60
+
+
+def buyer_request_message(chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int) -> str:
+    """The text that the buyer wallet signs. It binds the chain, the escrow, the task and the action."""
+    if action not in REQUEST_ACTIONS:
+        raise ValueError(f"unknown request action {action!r}")
+    return (
+        "warrant-seller-request/v1\n"
+        f"chain: {int(chain_id)}\n"
+        f"escrow: {to_addr_str(escrow_address).lower()}\n"
+        f"task: {str(task_id).lower()}\n"
+        f"action: {action}\n"
+        f"timestamp: {int(timestamp)}"
+    )
+
+
+def sign_buyer_request(
+    private_key: str, chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int
+) -> str:
+    """Sign a seller request with the buyer wallet key (EIP-191). Returns the signature as 0x hex."""
+    from eth_account.messages import encode_defunct
+
+    message = encode_defunct(text=buyer_request_message(chain_id, escrow_address, task_id, action, timestamp))
+    return "0x" + Account.sign_message(message, private_key=private_key).signature.hex().removeprefix("0x")
+
+
+def recover_request_signer(
+    signature: str, chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int
+) -> str:
+    """The address that signed a seller request. Raises ValueError when the signature is malformed."""
+    from eth_account.messages import encode_defunct
+
+    message = encode_defunct(text=buyer_request_message(chain_id, escrow_address, task_id, action, timestamp))
+    try:
+        return Account.recover_message(message, signature=signature)
+    except Exception as exc:
+        raise ValueError("request signature is malformed") from exc

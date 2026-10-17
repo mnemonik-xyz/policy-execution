@@ -271,43 +271,40 @@ the local Warrant tool for policy check and escrow funding, deploy, and transcri
 
 Status 2026-10-17: live.
 
-The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`
-behind HTTP basic auth. It uses one shared credential, which the operator hands out; requests
+The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`.
+It needs no password. A buyer proves itself with the wallet that funded the order. It settles
+through the no-proof escrow `TaskEscrow` and the test-double `JournalVerifier` (see "Mainnet
+addresses"). The verifier checks no signature and no proof, so a buyer trusts the seller. A
+signature-checking verifier is not used yet.
 
-without it get 401. It settles through the no-proof escrow `TaskEscrow` and the test-double
-`JournalVerifier` (see "Mainnet addresses"). The verifier checks no signature and no proof, so
-a buyer trusts the seller. A signature-checking verifier is not used yet.
+How the open seller protects itself:
 
+- **Quotes are open.** `list_suitable_hardware` and `propose_deployment` move no money. The seller
+  answers `list_suitable_hardware` from a 20 second cache, limits proposals (120 an hour in all,
+  10 an hour for each customer address) and refuses new proposals when 2,000 are stored. It deletes
+  proposals older than 24 hours that never became a deal.
+- **A call about a task needs the customer's signature.** `deploy_with_escrow` and
+  `get_deployment_status` need `request_signature` and `request_timestamp` from the buyer guardrail
+  tool `warrant_sign_request`. The signature (EIP-191) binds the chain, the escrow, the task and the
+  action. The seller accepts it only from the customer address of that task, and only for 5
+  minutes. A stranger cannot read the worker token or deploy a task that is not theirs. The seller
+  has no "latest session" fallback: `get_deployment_status` needs a `task_id`.
+- **The guardrail signs only for orders it funded.** `warrant_sign_request` refuses a `task_id`
+  that this guardrail did not offer, so a prompt injection cannot make it sign for another task.
+- **Money stays safe.** The seller starts a container only after the buyer's USDC is in escrow with
+  a matching policy hash, so the seller's io.net spend is backed by the buyer.
 
 > [!CAUTION]
-> Risks for everyone who holds the shared credential:
+> Limits that remain:
 >
-> - Anyone with the credential can call every tool. `get_deployment_status` returns the
->   worker token of the active deployment, so a credential holder can use the paid GPU container
->   during the lease.
-> - Any credential holder can call `propose_deployment` and `list_suitable_hardware`. Each call reads the
->   io.net API and the seller RPC, and stores a proposal file. Nothing limits the rate, so
->   this is a denial-of-service and disk-growth vector.
-> - A credential holder who knows a funded `task_id` can trigger `deploy_with_escrow` and occupy the
->   single deal slot, which blocks other buyers.
-> - The seller spends its own io.net credits on provisioning. The 1 USD cap per deal is the
->   only spending limit.
-> - The credential is shared. Hand it out only to people you trust, and rotate it if it leaks.
-
-The seller path on mainnet (funding, acceptance, GPU provisioning, settlement) has not run
-with money. The first buyer is therefore the first test.
-
-Further limits for the buyer:
-
-- The compiled buyer policy is valid for 900 seconds (`validity_seconds: 900`). Sign the
-  acceptance within 15 minutes of the policy compilation.
-- The buyer guardrail refuses a proposal above `max_budget_usd` of the manifest (1.00).
-  The policy rule comes from
-  [`config/buyer_policy_template.yaml`](config/buyer_policy_template.yaml) and allows up to
-  2.00 USDC. Do not edit the template: the 1.00 limit comes from the manifest.
-- On chain 5042, `deploy_with_escrow`, `get_deployment_status` and `submit_acceptance` need
-  the `task_id`. It is the `TaskEscrow` task ID that `propose_deployment` returns: `0x`
-  and 64 hex digits.
+> - The single deal slot. A buyer who funds an order and never settles blocks other buyers until
+>   the order expires.
+> - The proxy in front of the seller must limit requests for each IP address. The in-process limits
+>   above are global, so one client can use them up.
+> - The seller spends its own io.net credits on provisioning. The 1 USD cap per deal is the only
+>   spending limit.
+> - To run a seller for local tests without signatures, set `WARRANT_REQUIRE_REQUEST_SIGNATURE=0`.
+>   Never set it on a public seller.
 
 ### Mainnet addresses
 
@@ -377,23 +374,14 @@ The deployment PR also publishes `config/mainnet-public_keys.yaml` (repository p
 
 ### Try the seller MCP
 
-Anyone can ask the live seller for a quote. A quote moves no money.
+Anyone can ask the live seller for a quote. A quote moves no money, and no password is needed.
 
-1. Ask the operator for the basic-auth user and password. They are not published here.
-2. Make the header value in your own terminal. Do not paste the password into a chat:
-
-   ```sh
-   printf 'Basic %s' "$(printf '%s:%s' "<user>" "<password>" | base64 | tr -d '\n')"
-   ```
-
-3. Add the seller to Claude Desktop, Cursor or another MCP client as shown in "Desktop
-   configuration for mainnet" below. Put the output of step 2 into `SELLER_AUTH`. The
-   `--header` argument must read exactly `"Authorization:${SELLER_AUTH}"`. Restart the
-   client and open a new chat.
-4. Ask the agent: "Use the seller-transcription-service tools to request a quote for a
+1. Add the seller to Claude Desktop, Cursor or another MCP client as shown in "Desktop
+   configuration for mainnet" below. Restart the client and open a new chat.
+2. Ask the agent: "Use the seller-transcription-service tools to request a quote for a
    transcription task with a maximum of 1.00 USD. My customer address is `<your wallet
    address>`. Do not fund or accept anything."
-5. The seller answers with a proposal: a one-hour GPU deployment, the price (about 0.30 USD),
+3. The seller answers with a proposal: a one-hour GPU deployment, the price (about 0.30 USD),
    the `TaskEscrow` address and a `task_id`. Nothing is funded until you do it.
 
 To buy, follow "Buyer setup" below. You need an Arc mainnet wallet with a little USDC
@@ -407,6 +395,28 @@ money yet. The limits and risks above apply.
 ### Buyer setup
 
 Run every command from the repository root.
+
+**Install from PyPI (macOS and Linux).** No clone and no Rust build. The package carries the
+two helper binaries. It needs [uv](https://docs.astral.sh/uv/). This path exists after the first
+`buyer-v*` release of the package; see `.github/workflows/release-buyer.yml`.
+
+```bash
+uvx warrant-buyer init      # new wallet, keys, manifest and the MCP client configuration
+uvx warrant-buyer status    # USDC balance of the wallet
+```
+
+**Short path from a clone.** After step 1 below, one command does steps 2 to 6. It makes a new burner
+wallet and an acceptance key in `~/.warrant-buyer` (mode 0600), writes the manifest and the
+public keys file with the mainnet values, and prints the MCP configuration for Claude Desktop,
+Claude Code and Cursor. A second run reuses the keys, so it never replaces a funded wallet.
+
+```bash
+.venv/bin/python -m showcases.ionet_arc.buyer_init            # set up
+.venv/bin/python -m showcases.ionet_arc.buyer_init --status   # USDC balance of the wallet
+```
+
+Fund the printed wallet address with about 1.10 USDC on Arc mainnet. The steps below do the
+same work by hand, with your own wallet.
 
 1. Build the binaries with `cargo build --release -p warrant-host`. The buyer guardrail
    finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
@@ -484,23 +494,14 @@ read on the VM. Ignore them or delete them.
     },
     "seller-transcription-service": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp",
-               "--header", "Authorization:${SELLER_AUTH}"],
-      "env": { "SELLER_AUTH": "Basic <base64 of user:password>" }
+      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp"]
     }
   }
 }
 ```
 
-The seller endpoint needs HTTP basic auth. Ask the operator for the user and password, then
-make the value in your own terminal, so the password does not land in a log or a chat:
-
-```sh
-printf '%s:%s' "<user>" "<password>" | base64
-```
-
-Put the output after `Basic ` in `SELLER_AUTH`. The header goes in an environment variable
-because some clients mishandle spaces inside an argument. Do not commit this file.
+The seller needs no password. The guardrail signs each request about your task with your wallet.
+Do not commit this file: it names your key files.
 
 ### Operator notes
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -24,7 +25,8 @@ from decimal import Decimal
 
 # Ensure repository root is on sys.path
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+if __package__ != "warrant_buyer":  # a repository checkout, not the installed package
+    sys.path.insert(0, str(REPO_ROOT))
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -38,10 +40,12 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
 
-from showcases.ionet_arc.escrow import (  # noqa: E402
+from .escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
+    REQUEST_ACTIONS,
+    SHOWCASE_DIR,
     EscrowClient,
     address20,
     bytes32,
@@ -49,6 +53,7 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     get_manifest_parameter,
     load_manifest,
     sign_acceptance,
+    sign_buyer_request,
 )
 
 
@@ -70,7 +75,9 @@ class BuyerWarrantService:
         manifest_path: pathlib.Path | None = None,
         template_path: pathlib.Path | None = None,
         buyer_acceptance_key_path: pathlib.Path | None = None,
+        buyer_private_key: str | None = None,
     ):
+        self._buyer_private_key = buyer_private_key
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.tasks_dir = self.state_dir / "tasks"
@@ -81,10 +88,10 @@ class BuyerWarrantService:
 
         self.manifest_path = pathlib.Path(manifest_path) if manifest_path else DEFAULT_MANIFEST_PATH
         self.template_path = template_path or (
-            REPO_ROOT / "showcases" / "ionet_arc" / "config" / "buyer_policy_template.yaml"
+            SHOWCASE_DIR / "config" / "buyer_policy_template.yaml"
         )
         self.buyer_acceptance_key_path = buyer_acceptance_key_path or (
-            REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
+            SHOWCASE_DIR / ".keys" / "buyer_acceptance.key"
         )
 
         self.max_duration_hours = int(max_duration_hours) if max_duration_hours is not None else None
@@ -572,6 +579,38 @@ class BuyerWarrantService:
         )
         return result
 
+    async def warrant_sign_request(self, task_id: str, action: str) -> dict:
+        """Sign a request to the seller with the buyer wallet, so the seller serves only the customer of the task."""
+        logger.info("Tool called: warrant_sign_request task_id=%.80r action=%.20r", task_id, action)
+        if action not in REQUEST_ACTIONS:
+            raise ToolError(f"action must be one of: {', '.join(REQUEST_ACTIONS)}.")
+        if not isinstance(task_id, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", task_id):
+            raise ToolError("task_id must be a 0x-prefixed 32-byte hex string.")
+        task_id = task_id.lower()
+        if not (self.tasks_dir / f"{task_id}.json").exists():
+            # This guardrail signs only for orders that it funded itself.
+            raise ToolError(
+                f"Task '{task_id}' was not offered by this guardrail. Call warrant_evaluate_and_offer first."
+            )
+        if not self._buyer_private_key:
+            raise ToolError("The buyer wallet key is not configured, so the request cannot be signed.")
+        escrow = self.pinned_escrow or self.escrow_client.escrow
+        timestamp = int(time.time())
+        try:
+            signature = sign_buyer_request(
+                self._buyer_private_key, self._resolve_chain_id(), escrow, task_id, action, timestamp
+            )
+        except Exception as exc:
+            logger.error("warrant_sign_request failed: %s", type(exc).__name__)
+            raise ToolError("Could not sign the request.") from None
+        return {
+            "task_id": task_id,
+            "action": action,
+            "request_signature": signature,
+            "request_timestamp": timestamp,
+            "message": "Pass request_signature and request_timestamp to the seller tool. Valid for 5 minutes.",
+        }
+
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
         """Query TaskEscrow state on-chain for a task ID."""
         logger.info("Tool called: warrant_check_escrow_status with task_id=%s", task_id)
@@ -663,9 +702,15 @@ class ServerConfig:
                 cand = pathlib.Path(raw_key_path)
                 self.buyer_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
             else:
-                default_buyer_key = REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer.key"
+                default_buyer_key = SHOWCASE_DIR / ".keys" / "buyer.key"
                 if default_buyer_key.exists():
                     self.buyer_key_path = default_buyer_key
+
+        if self.buyer_acceptance_key_path is None:
+            raw_acc_path = manifest.get("private_key_files", {}).get("buyer_acceptance_key")
+            if raw_acc_path:
+                cand = pathlib.Path(raw_acc_path)
+                self.buyer_acceptance_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
 
         if self.buyer_private_key is None:
             if self.buyer_key_path and self.buyer_key_path.exists() and self.buyer_key_path.is_file():
@@ -735,6 +780,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
         manifest_path=cfg.manifest_path,
         template_path=cfg.template_path,
         buyer_acceptance_key_path=cfg.buyer_acceptance_key_path,
+        buyer_private_key=cfg.buyer_private_key,
     )
 
     server = MCPServer(
@@ -772,6 +818,17 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
     )(service.warrant_sign_acceptance)
 
     server.tool(
+        name="warrant_sign_request",
+        description=(
+            "Sign a request to the seller with the buyer wallet. Call it before the seller tools "
+            "deploy_with_escrow (action 'deploy') and get_deployment_status (action 'status'). "
+            "Pass the returned request_signature and request_timestamp to that seller tool. "
+            "The seller serves only the customer of the task, so no password is needed. "
+            "A signature is valid for 5 minutes. Sign a new one for each call."
+        ),
+    )(service.warrant_sign_request)
+
+    server.tool(
         name="warrant_check_escrow_status",
         description="Check on-chain TaskEscrow state and details for a given task ID.",
     )(service.warrant_check_escrow_status)
@@ -804,7 +861,7 @@ def run_server(
         uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=logger.getEffectiveLevel())
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Run the Buyer Warrant guardrail MCP server (stdio or Streamable HTTP)."
     )
@@ -859,7 +916,7 @@ def main():
         default=None,
         help="Path to file containing buyer private key (default: from manifest or .keys/buyer.key)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config = ServerConfig(
         transport=args.transport,

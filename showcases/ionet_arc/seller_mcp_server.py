@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import atexit
+import collections
 import contextlib
 import hashlib
 import json
@@ -15,7 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 # Ensure repository root is on sys.path
@@ -46,6 +47,9 @@ from showcases.ionet_arc.adapter import (  # noqa: E402
 from showcases.ionet_arc.escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_MANIFEST_PATH,
+    REQUEST_ACTIONS,
+    REQUEST_MAX_AGE_SECONDS,
+    REQUEST_MAX_FUTURE_SECONDS,
     EscrowClient,
     address20,
     bytes32,
@@ -53,12 +57,20 @@ from showcases.ionet_arc.escrow import (  # noqa: E402
     get_manifest_parameter,
     hash_policy,
     load_manifest,
+    recover_request_signer,
     should_trust_env,
 )
 
 PILOT_IMAGE = "ghcr.io/mnemonik-xyz/transcription:pilot"
 
 TASK_ID_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}")
+
+# Limits that protect an open seller. The buyer needs no password, so a stranger can call the open tools.
+HARDWARE_CACHE_SECONDS = 20  # one io.net lookup serves every caller in this window
+PROPOSALS_PER_HOUR = 120  # all callers together
+PROPOSALS_PER_CUSTOMER_PER_HOUR = 10
+MAX_STORED_PROPOSALS = 2000
+PROPOSAL_RETENTION_SECONDS = 24 * 3600
 
 
 class StartRefusedError(RuntimeError):
@@ -181,6 +193,7 @@ class SellerWarrantService:
         chain_id: int | None = None,
         max_budget_usd: Decimal | float | str | None = None,
         duration_hours: int | None = None,
+        require_request_signature: bool = True,
     ):
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -229,6 +242,11 @@ class SellerWarrantService:
             if not self.escrow_client.server_account:
                 self.escrow_client.server_account = get_manifest_parameter(manifest, "seller_address")
 
+        self.require_request_signature = require_request_signature
+        self._hardware_cache: tuple[float, list[dict]] | None = None
+        self._proposal_times: collections.deque[float] = collections.deque()
+        self._customer_proposal_times: dict[str, collections.deque[float]] = {}
+
         self._bg_tasks: set[asyncio.Task] = set()
         self._ssh_container_started = False
         if self.local_server:
@@ -247,6 +265,9 @@ class SellerWarrantService:
     async def list_suitable_hardware(self) -> list[dict]:
         logger.info("Tool called: list_suitable_hardware")
         try:
+            cached = self._hardware_cache
+            if cached and time.monotonic() - cached[0] < HARDWARE_CACHE_SECONDS:
+                return [dict(hw) for hw in cached[1]]
             logger.info("Calling io.net CaaS API to list available hardware")
 
             async def op(cloud):
@@ -263,7 +284,8 @@ class SellerWarrantService:
                 for hw in filtered
             ]
             logger.info("list_suitable_hardware returning %d suitable GPUs: %s", len(filtered), candidate_summary)
-            return filtered
+            self._hardware_cache = (time.monotonic(), filtered)
+            return [dict(hw) for hw in filtered]
         except Exception as exc:
             logger.error("list_suitable_hardware failed: %s", exc)
             raise safe_tool_error(exc) from None
@@ -359,6 +381,83 @@ class SellerWarrantService:
         cap = self._effective_budget_cap(budget_cap_usd)
         return duration_hours, cap
 
+    def _check_proposal_rate(self, customer_address: str) -> None:
+        """Throttle proposals and cap what they store. Quotes are open, so this is the seller's own defence."""
+        now = time.monotonic()
+        key = customer_address.lower()
+        while self._proposal_times and now - self._proposal_times[0] > 3600:
+            self._proposal_times.popleft()
+        for address in list(self._customer_proposal_times):  # callers choose the address, so drop idle entries
+            times = self._customer_proposal_times[address]
+            while times and now - times[0] > 3600:
+                times.popleft()
+            if not times:
+                del self._customer_proposal_times[address]
+        per_customer = self._customer_proposal_times.get(key, collections.deque())
+        if len(self._proposal_times) >= PROPOSALS_PER_HOUR or len(per_customer) >= PROPOSALS_PER_CUSTOMER_PER_HOUR:
+            raise ToolError("Too many proposals. Try again later.")
+        self._prune_proposals()
+        self._proposal_times.append(now)
+        per_customer.append(now)
+        self._customer_proposal_times[key] = per_customer
+
+    def _prune_proposals(self) -> None:
+        """Delete old proposals that never became a deal. Refuse new ones when the store is full."""
+        now = time.time()
+        files = []
+        for path in self.proposals_dir.glob("*.json"):
+            try:
+                files.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        for mtime, path in files:
+            if now - mtime > PROPOSAL_RETENTION_SECONDS and not (self.sessions_dir / path.name).exists():
+                with contextlib.suppress(OSError):
+                    path.unlink()
+        if len(list(self.proposals_dir.glob("*.json"))) >= MAX_STORED_PROPOSALS:
+            raise ToolError("The seller is busy. Try again later.")
+
+    def _authenticate_buyer(
+        self,
+        task_id: str | None,
+        action: str,
+        request_signature: str | None,
+        request_timestamp: int | None,
+    ) -> None:
+        """Accept a call about a task only from the wallet that is the customer of that task."""
+        if not self.require_request_signature:
+            return
+        if action not in REQUEST_ACTIONS:
+            raise ToolError("Unknown request action.")
+        if not task_id:
+            raise ToolError("task_id is required.")
+        if not request_signature or request_timestamp is None:
+            raise ToolError(
+                "request_signature and request_timestamp are required. "
+                "Get them from the buyer guardrail tool warrant_sign_request."
+            )
+        try:
+            timestamp = int(request_timestamp)
+        except (TypeError, ValueError):
+            raise ToolError("request_timestamp must be a Unix time in seconds.") from None
+        now = int(time.time())
+        if timestamp < now - REQUEST_MAX_AGE_SECONDS or timestamp > now + REQUEST_MAX_FUTURE_SECONDS:
+            raise ToolError("The request signature is too old. Sign a new one.")
+
+        proposal_path = self.proposals_dir / f"{task_id}.json"
+        customer = str(read_json(proposal_path).get("customer", "")).lower() if proposal_path.exists() else ""
+        denied = ToolError("The request signature does not match the customer of this task.")
+        if not customer:
+            raise denied  # an unknown task looks the same as a wrong signer
+        try:
+            signer = recover_request_signer(
+                str(request_signature), self.chain_id, self.escrow_client.escrow, task_id, action, timestamp
+            )
+        except ValueError:
+            raise denied from None
+        if signer.lower() != customer:
+            raise denied
+
     async def propose_deployment(
         self,
         hardware_id: str | int | None = None,
@@ -379,6 +478,7 @@ class SellerWarrantService:
         try:
             customer_address, chain_id = await self._resolve_addresses_and_chain(customer_address)
             self._ensure_escrow_contracts(chain_id)
+            self._check_proposal_rate(customer_address)
 
             duration_hours, effective_cap = self._resolve_duration_and_cap(duration_hours, budget_cap_usd)
 
@@ -449,8 +549,11 @@ class SellerWarrantService:
                     "Verify this proposal against your Warrant policy (max budget, category, duration).\n"
                     "Call TaskEscrow.offer(salt, recipient, policyHash, policyVersion, amount, "
                     "acceptBy, settleBy) on-chain.\n"
-                    "Call deploy_with_escrow(task_id, policy) to commit agreement and begin provisioning.\n"
-                    "Poll get_deployment_status until ready, verify container /health, and sign Acceptance evidence.\n"
+                    "Call warrant_sign_request(task_id, 'deploy'), then "
+                    "deploy_with_escrow(task_id, policy, request_signature, request_timestamp) to commit agreement "
+                    "and begin provisioning.\n"
+                    "Poll get_deployment_status with a fresh warrant_sign_request(task_id, 'status') signature until "
+                    "ready, verify container /health, and sign Acceptance evidence.\n"
                     "Submit acceptance via submit_acceptance to settle escrow on-chain, then operate the container "
                     "at <public_url> with Bearer <worker_token>."
                 ),
@@ -767,10 +870,17 @@ class SellerWarrantService:
         save(self.state_dir / "sessions" / f"{task_id}.json", session)
         return proposal, session
 
-    async def deploy_with_escrow(self, task_id: str, policy: dict | None = None) -> dict:
+    async def deploy_with_escrow(
+        self,
+        task_id: str,
+        policy: dict | None = None,
+        request_signature: str | None = None,
+        request_timestamp: int | None = None,
+    ) -> dict:
         logger.info("Tool called: deploy_with_escrow with task_id=%.80r", task_id)
         try:
             task_id = self._require_task_id(task_id, required=True)
+            self._authenticate_buyer(task_id, "deploy", request_signature, request_timestamp)
             proposal, session = await self._commit_deal(task_id, policy)
             deployment_id = session["deployment_id"]
             worker_token = session["worker_token"]
@@ -841,9 +951,18 @@ class SellerWarrantService:
                 return candidate
         return self._find_latest_unexpired_session()
 
-    async def get_deployment_status(self, task_id: str | None = None) -> dict:
+    async def get_deployment_status(
+        self,
+        task_id: str | None = None,
+        request_signature: str | None = None,
+        request_timestamp: int | None = None,
+    ) -> dict:
         logger.info("Tool called: get_deployment_status with task_id=%.80r", task_id)
-        task_id = self._require_task_id(task_id, required=False)
+        try:
+            task_id = self._require_task_id(task_id, required=self.require_request_signature)
+            self._authenticate_buyer(task_id, "status", request_signature, request_timestamp)
+        except Exception as exc:
+            raise safe_tool_error(exc) from None
         session = self._lookup_session(task_id)
         if not session:
             msg = f"No deployment session found for task '{task_id}'." if task_id else "No deployment session active."
@@ -1124,6 +1243,10 @@ class ServerConfig:
     escrow_client: EscrowClient | None = None
     max_budget_usd: Decimal | float | str | None = None
     duration_hours: int | None = None
+    # A buyer proves itself with a wallet signature. Set WARRANT_REQUIRE_REQUEST_SIGNATURE=0 only for a local test.
+    require_request_signature: bool = field(
+        default_factory=lambda: os.environ.get("WARRANT_REQUIRE_REQUEST_SIGNATURE", "1") != "0"
+    )
 
     def _resolve_paths(self):
         if isinstance(self.state_dir, str):
@@ -1251,6 +1374,7 @@ def create_server(
         chain_id=chain_id,
         max_budget_usd=cfg.max_budget_usd,
         duration_hours=cfg.duration_hours,
+        require_request_signature=cfg.require_request_signature,
     )
 
     server.tool(
@@ -1275,15 +1399,18 @@ def create_server(
         description=(
             "Verify on-chain escrow funding for the proposed task, accept it on-chain, and provision "
             "the io.net container in the background for 1 hour duration.\n"
-            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain."
+            "Prerequisite: propose_deployment must have been called and TaskEscrow.offer executed on-chain.\n"
+            "Pass request_signature and request_timestamp from the buyer guardrail tool warrant_sign_request "
+            "with action 'deploy'."
         ),
     )(service.deploy_with_escrow)
 
     server.tool(
         name="get_deployment_status",
         description=(
-            "Check status of active 1-hour container deployment and remaining duration.\n"
-            "Optionally provide task_id to inspect a specific deployment session."
+            "Check status of the 1-hour container deployment of a task and its remaining duration.\n"
+            "Pass task_id, and request_signature and request_timestamp from the buyer guardrail tool "
+            "warrant_sign_request with action 'status'. Only the customer of the task can read the worker token."
         ),
     )(service.get_deployment_status)
 
