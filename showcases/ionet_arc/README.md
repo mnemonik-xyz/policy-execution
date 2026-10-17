@@ -311,8 +311,8 @@ Further limits for the buyer:
 
 | Role / Contract | Address or key |
 | --- | --- |
-| **TaskEscrow** (receipt-verified escrow) | `<TASK_ESCROW_ADDRESS>` |
-| **ReceiptClaimVerifier** (receipt-claim verifier) | `<RECEIPT_CLAIM_VERIFIER_ADDRESS>` |
+| **TaskEscrow** (receipt-verified escrow) | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
+| **ReceiptClaimVerifier** (receipt-claim verifier) | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` |
 | **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
 | **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
@@ -367,8 +367,8 @@ Run every command from the repository root.
 | --- | --- |
 | `chain_id` | `5042` |
 | `rpc_url` | `https://rpc.mainnet.arc.io`, or your own Arc mainnet RPC |
-| `escrow_address` | `<TASK_ESCROW_ADDRESS>` |
-| `verifier_address` | `<RECEIPT_CLAIM_VERIFIER_ADDRESS>` |
+| `escrow_address` | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
+| `verifier_address` | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
 | `token_address` | `0x3600000000000000000000000000000000000000` |
 | `category` | `42` |
 | `max_budget_usd` | `1.00` |
@@ -467,7 +467,7 @@ The showcase contracts and demo participant addresses are defined in
 
 ---
 
-## Deploying Contracts to Arc Testnet
+## Deploying Contracts to Arc (Testnet or Mainnet)
 
 ### 1. Build Host and Obtain Guest Image ID
 
@@ -482,27 +482,40 @@ echo "Warrant Guest Image ID: $IMAGE_ID"
 ### 2. Deploy and Verify Contracts
 
 Deploy `TaskEscrow` and the verifier from the `contracts/` directory using Foundry, and verify on
-Arc Testnet via Blockscout:
+Arc via Blockscout:
 
 ```sh
 cd contracts
 
+# Target network RPC and Blockscout explorer API:
+# For Arc Testnet (chain ID 5042002):
 export WARRANT_RPC_URL=https://rpc.testnet.arc.io
+VERIFIER_URL=https://explorer.testnet.arc.io/api
+
+# For Arc Mainnet (chain ID 5042):
+# export WARRANT_RPC_URL=https://rpc.mainnet.arc.io
+# VERIFIER_URL=https://explorer.arc.io/api
+
 export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
 export WARRANT_IMAGE_ID="$IMAGE_ID"
 export WARRANT_SELLER="<seller-or-prover-address>"
 export WARRANT_DEPLOYER="<your-deployer-address>"
 
-# Option A: Full RISC Zero Groth16 Verifier (requires Docker proving):
+# Option A: Full RISC Zero Groth16 Verifier (requires Docker proving; linux/amd64 on ARM):
 forge script script/Deploy.s.sol:Deploy --rpc-url "$WARRANT_RPC_URL" \
   --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow \
-  --verify --verifier blockscout --verifier-url https://explorer.testnet.arc.io/api
+  --verify --verifier blockscout --verifier-url "$VERIFIER_URL"
 
 # Option B: ReceiptClaimVerifier (cryptographic receipt-claim verifier for showcase / canary):
 forge script script/DeployReceipt.s.sol:DeployReceipt --rpc-url "$WARRANT_RPC_URL" \
   --account warrant-deployer --sender "$WARRANT_DEPLOYER" --broadcast --slow \
-  --verify --verifier blockscout --verifier-url https://explorer.testnet.arc.io/api
+  --verify --verifier blockscout --verifier-url "$VERIFIER_URL"
 ```
+
+> [!NOTE]
+> Automated verification (`--verify`) on `explorer.arc.io/api` may be challenged or blocked
+> by Cloudflare. The contracts are successfully deployed and functional on-chain regardless;
+> verification can be omitted or performed manually via the Blockscout web UI.
 
 ---
 
@@ -512,6 +525,11 @@ Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their i
 (`rpc_url`, `escrow_address`, `verifier_address`, `token_address`, `seller_address`, and
 `buyer_address`) directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
 `--manifest <path>`). You can still override `--rpc-url` via CLI arguments.
+
+To run the demo on **Arc Mainnet** (chain ID `5042`) instead of testnet, update `manifest.yaml` (or
+pass `--manifest <path>`) with `chain_id: 5042`, `rpc_url: 'https://rpc.mainnet.arc.io'`, your
+deployed `escrow_address` and `verifier_address`, and funded `buyer_address`/`seller_address`
+wallets.
 
 ### 1. Run the Seller MCP Server
 
