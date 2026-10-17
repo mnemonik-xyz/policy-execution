@@ -1,0 +1,13 @@
+{
+    "category": 42,
+    "chain_id": 5042,
+    "duration_hours": 1,
+    "endpoint": "https://seller.mnemonik.xyz/mcp",
+    "escrow_address": "0x5fae10ac58bf90c17f516292883a4f17c0768002",
+    "max_budget_usd": 1.0,
+    "rpc_url": "https://rpc.mainnet.arc.io",
+    "seller_address": "0xb8202bebb6d8a0a822a56c0062632325c3923eeb",
+    "token_address": "0x3600000000000000000000000000000000000000",
+    "validity_seconds": 900,
+    "verifier_address": "0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c"
+}
