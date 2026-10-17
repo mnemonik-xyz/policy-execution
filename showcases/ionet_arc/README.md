@@ -329,8 +329,8 @@ then, buyers use the addresses in the table above.
 
 | Contract | Address |
 | --- | --- |
-| **TaskEscrow** (receipt-verified, not used by the MCP yet) | `0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51` |
-| **ReceiptClaimVerifier** (checks the prover's ECDSA signature over the receipt claim, not used by the MCP yet) | `0x0932F120DEe4cA83676B8224769eE52b7d6D00c6` |
+| **TaskEscrow** (receipt-verified) | Defined in `manifest.yaml` (`escrow_address`) |
+| **ReceiptClaimVerifier** | Defined in `manifest.yaml` (`verifier_address`) |
 
 That set is pinned to the guest image ID
 `0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e`. Its prover address is
@@ -471,11 +471,11 @@ The showcase contracts and demo participant addresses are defined in
 
 | Role / Contract | Address | Description |
 | --- | --- | --- |
-| **TaskEscrow** | `0xeb2038CbaE9b25C7935782B21617025Affdd9890` | Escrow contract on Arc |
-| **ReceiptClaimVerifier** | `0xA95eC8cB54233Cf7e033A2a3C5E6F2727901aE93` | Receipt verifier |
+| **TaskEscrow** | Defined in `manifest.yaml` (`escrow_address`) | Escrow contract on Arc |
+| **ReceiptClaimVerifier** | Defined in `manifest.yaml` (`verifier_address`) | Receipt verifier |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` | Arc USDC token |
-| **Seller** | `0x9F188809b2ba2e29653693C4069c212a95C1B8c4` | io.net payout wallet |
-| **Buyer** | `0x9793Dd93D46F153a2A879165cd163A01b54d8A00` | Escrow funder wallet |
+| **Seller** | Defined in `manifest.yaml` (`seller_address`) | io.net payout wallet |
+| **Buyer** | Defined in `manifest.yaml` (`buyer_address`) | Escrow funder wallet |
 
 - **Buyer Address (`buyer_address` / `buyer_account`)**: The buyer agent's funded wallet. It
   approves USDC allowance and calls `TaskEscrow.offer()` to fund deposits. This address is
