@@ -96,10 +96,44 @@ async def sign_acceptance_via_buyer_mcp(
                 return extract_result(res)
 
 
-async def poll_deployment_ready(session: ClientSession, task_id: str, max_polls: int = 60) -> dict:
-    """Poll get_deployment_status until container status is ready or fails."""
+async def sign_request_via_buyer_mcp(buyer_mcp_url: str, task_id: str, action: str) -> dict:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(buyer_mcp_url)) as http_client:
+        async with streamable_http_client(buyer_mcp_url, http_client=http_client) as (r, w):
+            async with ClientSession(r, w, read_timeout_seconds=60) as session:
+                await session.initialize()
+                res = await session.call_tool("warrant_sign_request", {"task_id": task_id, "action": action})
+                return extract_result(res)
+
+
+async def request_auth(
+    buyer_mcp_url: str | None, service: BuyerWarrantService | None, task_id: str, action: str
+) -> dict:
+    """The seller serves only the customer of a task. Sign the request with the buyer wallet.
+
+    A local demo seller that runs with WARRANT_REQUIRE_REQUEST_SIGNATURE=0 needs no signature, and a local
+    guardrail without a wallet key cannot make one. Both cases return no signature.
+    """
+    if buyer_mcp_url:
+        signed = await sign_request_via_buyer_mcp(buyer_mcp_url, task_id, action)
+    elif service is not None and service._buyer_private_key:
+        signed = await service.warrant_sign_request(task_id, action)
+    else:
+        return {}
+    if signed.get("status") == "ERROR":
+        sys.exit(f"Could not sign the {action} request: {signed.get('error')}")
+    return {k: signed[k] for k in ("request_signature", "request_timestamp")}
+
+
+async def poll_deployment_ready(
+    session: ClientSession,
+    task_id: str,
+    max_polls: int = 60,
+    sign=None,
+) -> dict:
+    """Poll get_deployment_status until container status is ready or fails. `sign` makes a fresh signature."""
     for poll_i in range(max_polls):
-        res_stat = await session.call_tool("get_deployment_status", {"task_id": task_id})
+        auth = await sign("status") if sign else {}
+        res_stat = await session.call_tool("get_deployment_status", {"task_id": task_id, **auth})
         stat = extract_result(res_stat)
         st = stat.get("status")
         if st == "ready":
@@ -273,9 +307,16 @@ async def run_client(
 
                 # Step 4: deploy_with_escrow
                 print("\n[Step 4] Calling deploy_with_escrow on MCP server...")
+                async def sign(action: str) -> dict:
+                    return await request_auth(buyer_mcp_url, service, proposal["task_id"], action)
+
                 res_dep = await session.call_tool(
                     "deploy_with_escrow",
-                    {"task_id": proposal["task_id"], "policy": offer_res.get("policy")},
+                    {
+                        "task_id": proposal["task_id"],
+                        "policy": offer_res.get("policy"),
+                        **await sign("deploy"),
+                    },
                 )
                 dep_info = extract_result(res_dep)
                 if dep_info.get("status") == "ERROR":
@@ -284,7 +325,7 @@ async def run_client(
 
                 # Step 5: Poll get_deployment_status until container is ready
                 print("\n[Step 5] Polling deployment status until worker container is ready...")
-                ready_stat = await poll_deployment_ready(session, proposal["task_id"])
+                ready_stat = await poll_deployment_ready(session, proposal["task_id"], sign=sign)
 
                 public_url = ready_stat["public_url"].rstrip("/")
                 worker_token = ready_stat.get("worker_token")
@@ -328,7 +369,9 @@ async def run_client(
 
                 # Step 8: Final inspection of live deployment session status
                 print("\n[Step 8] Inspecting final deployment session status...")
-                res_stat = await session.call_tool("get_deployment_status", {"task_id": proposal["task_id"]})
+                res_stat = await session.call_tool(
+                    "get_deployment_status", {"task_id": proposal["task_id"], **await sign("status")}
+                )
                 stat = extract_result(res_stat)
                 print(f"Active session:    {stat.get('active')}")
                 print(f"Status:            {stat.get('status')}")

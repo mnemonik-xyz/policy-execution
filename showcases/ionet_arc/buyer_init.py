@@ -159,11 +159,8 @@ def guardrail_server(home: pathlib.Path, manifest: pathlib.Path) -> dict:
 
 
 def seller_server() -> dict:
-    return {
-        "command": "npx",
-        "args": ["-y", "mcp-remote", SELLER_MCP_URL, "--header", "Authorization:${SELLER_AUTH}"],
-        "env": {"SELLER_AUTH": "Basic <base64 of user:password>"},
-    }
+    """The seller needs no password. It serves a buyer that proves itself with its wallet signature."""
+    return {"command": "npx", "args": ["-y", "mcp-remote", SELLER_MCP_URL]}
 
 
 def client_config(home: pathlib.Path, manifest: pathlib.Path) -> dict:
@@ -182,8 +179,7 @@ def claude_code_commands(home: pathlib.Path, manifest: pathlib.Path) -> list[str
     env = "".join(f" --env {k}={json.dumps(v)}" for k, v in guard.get("env", {}).items())
     return [
         f"claude mcp add buyer-warrant-guardrail{env} -- {json.dumps(guard['command'])} {args}",
-        f"claude mcp add --transport http seller-transcription-service {SELLER_MCP_URL} "
-        '--header "Authorization: Basic <base64 of user:password>"',
+        f"claude mcp add --transport http seller-transcription-service {SELLER_MCP_URL}",
     ]
 
 
@@ -224,7 +220,7 @@ def print_setup(home, address, created, manifest, max_budget_usd) -> None:
     print("2. Connect your MCP client")
     print("   Claude Desktop or Cursor: merge this into claude_desktop_config.json or mcp.json.")
     print(f"   The same block is in {config_file}.")
-    print("   Put your seller credential into SELLER_AUTH. Ask the operator for it.")
+    print("   The seller needs no password. The guardrail signs your requests with this wallet.")
     print()
     print(json.dumps(client_config(home, manifest), indent=2))
     print()

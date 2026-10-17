@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from .escrow import (  # noqa: E402
     DEFAULT_CATEGORY,
     DEFAULT_CHAIN_ID,
     DEFAULT_MANIFEST_PATH,
+    REQUEST_ACTIONS,
     SHOWCASE_DIR,
     EscrowClient,
     address20,
@@ -51,6 +53,7 @@ from .escrow import (  # noqa: E402
     get_manifest_parameter,
     load_manifest,
     sign_acceptance,
+    sign_buyer_request,
 )
 
 
@@ -72,7 +75,9 @@ class BuyerWarrantService:
         manifest_path: pathlib.Path | None = None,
         template_path: pathlib.Path | None = None,
         buyer_acceptance_key_path: pathlib.Path | None = None,
+        buyer_private_key: str | None = None,
     ):
+        self._buyer_private_key = buyer_private_key
         self.state_dir = pathlib.Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.tasks_dir = self.state_dir / "tasks"
@@ -574,6 +579,38 @@ class BuyerWarrantService:
         )
         return result
 
+    async def warrant_sign_request(self, task_id: str, action: str) -> dict:
+        """Sign a request to the seller with the buyer wallet, so the seller serves only the customer of the task."""
+        logger.info("Tool called: warrant_sign_request task_id=%.80r action=%.20r", task_id, action)
+        if action not in REQUEST_ACTIONS:
+            raise ToolError(f"action must be one of: {', '.join(REQUEST_ACTIONS)}.")
+        if not isinstance(task_id, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", task_id):
+            raise ToolError("task_id must be a 0x-prefixed 32-byte hex string.")
+        task_id = task_id.lower()
+        if not (self.tasks_dir / f"{task_id}.json").exists():
+            # This guardrail signs only for orders that it funded itself.
+            raise ToolError(
+                f"Task '{task_id}' was not offered by this guardrail. Call warrant_evaluate_and_offer first."
+            )
+        if not self._buyer_private_key:
+            raise ToolError("The buyer wallet key is not configured, so the request cannot be signed.")
+        escrow = self.pinned_escrow or self.escrow_client.escrow
+        timestamp = int(time.time())
+        try:
+            signature = sign_buyer_request(
+                self._buyer_private_key, self._resolve_chain_id(), escrow, task_id, action, timestamp
+            )
+        except Exception as exc:
+            logger.error("warrant_sign_request failed: %s", type(exc).__name__)
+            raise ToolError("Could not sign the request.") from None
+        return {
+            "task_id": task_id,
+            "action": action,
+            "request_signature": signature,
+            "request_timestamp": timestamp,
+            "message": "Pass request_signature and request_timestamp to the seller tool. Valid for 5 minutes.",
+        }
+
     async def warrant_check_escrow_status(self, task_id: str) -> dict:
         """Query TaskEscrow state on-chain for a task ID."""
         logger.info("Tool called: warrant_check_escrow_status with task_id=%s", task_id)
@@ -743,6 +780,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
         manifest_path=cfg.manifest_path,
         template_path=cfg.template_path,
         buyer_acceptance_key_path=cfg.buyer_acceptance_key_path,
+        buyer_private_key=cfg.buyer_private_key,
     )
 
     server = MCPServer(
@@ -778,6 +816,17 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
             "buyer's private acceptance key. Required by compute seller before on-chain escrow settlement."
         ),
     )(service.warrant_sign_acceptance)
+
+    server.tool(
+        name="warrant_sign_request",
+        description=(
+            "Sign a request to the seller with the buyer wallet. Call it before the seller tools "
+            "deploy_with_escrow (action 'deploy') and get_deployment_status (action 'status'). "
+            "Pass the returned request_signature and request_timestamp to that seller tool. "
+            "The seller serves only the customer of the task, so no password is needed. "
+            "A signature is valid for 5 minutes. Sign a new one for each call."
+        ),
+    )(service.warrant_sign_request)
 
     server.tool(
         name="warrant_check_escrow_status",

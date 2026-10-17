@@ -13,7 +13,13 @@ import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-TOOLS = {"warrant_get_policy", "warrant_evaluate_and_offer", "warrant_sign_acceptance", "warrant_check_escrow_status"}
+TOOLS = {
+    "warrant_get_policy",
+    "warrant_evaluate_and_offer",
+    "warrant_sign_acceptance",
+    "warrant_sign_request",
+    "warrant_check_escrow_status",
+}
 
 
 async def main(home: str, exe: str) -> None:

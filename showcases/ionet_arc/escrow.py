@@ -32,11 +32,14 @@ __all__ = [
     "DEFAULT_IMAGE_ID",
     "DEFAULT_MANIFEST_PATH",
     "REPO_ROOT",
+    "REQUEST_ACTIONS",
+    "REQUEST_MAX_AGE_SECONDS",
     "SHOWCASE_DIR",
     "EscrowClient",
     "EthRpc",
     "address20",
     "build_receipt_seal",
+    "buyer_request_message",
     "bytes32",
     "canonical",
     "compile_buyer_policy",
@@ -54,8 +57,10 @@ __all__ = [
     "hash_policy",
     "load_manifest",
     "parse_public_key",
+    "recover_request_signer",
     "should_trust_env",
     "sign_acceptance",
+    "sign_buyer_request",
     "sign_vendor_credential",
     "to_addr_str",
 ]
@@ -1053,3 +1058,46 @@ def ensure_policy_hash(
         max_amount=max_amount,
     )
     return pol_hash
+
+
+# A buyer proves who it is to the seller with the wallet that funded the order. No shared password.
+REQUEST_ACTIONS = ("status", "deploy")
+REQUEST_MAX_AGE_SECONDS = 300
+REQUEST_MAX_FUTURE_SECONDS = 60
+
+
+def buyer_request_message(chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int) -> str:
+    """The text that the buyer wallet signs. It binds the chain, the escrow, the task and the action."""
+    if action not in REQUEST_ACTIONS:
+        raise ValueError(f"unknown request action {action!r}")
+    return (
+        "warrant-seller-request/v1\n"
+        f"chain: {int(chain_id)}\n"
+        f"escrow: {to_addr_str(escrow_address).lower()}\n"
+        f"task: {str(task_id).lower()}\n"
+        f"action: {action}\n"
+        f"timestamp: {int(timestamp)}"
+    )
+
+
+def sign_buyer_request(
+    private_key: str, chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int
+) -> str:
+    """Sign a seller request with the buyer wallet key (EIP-191). Returns the signature as 0x hex."""
+    from eth_account.messages import encode_defunct
+
+    message = encode_defunct(text=buyer_request_message(chain_id, escrow_address, task_id, action, timestamp))
+    return "0x" + Account.sign_message(message, private_key=private_key).signature.hex().removeprefix("0x")
+
+
+def recover_request_signer(
+    signature: str, chain_id: int, escrow_address: str, task_id: str, action: str, timestamp: int
+) -> str:
+    """The address that signed a seller request. Raises ValueError when the signature is malformed."""
+    from eth_account.messages import encode_defunct
+
+    message = encode_defunct(text=buyer_request_message(chain_id, escrow_address, task_id, action, timestamp))
+    try:
+        return Account.recover_message(message, signature=signature)
+    except Exception as exc:
+        raise ValueError("request signature is malformed") from exc

@@ -80,6 +80,10 @@ class BuyerInitTests(unittest.TestCase):
         self.assertIn(str(self.home / "manifest.yaml"), guard["args"])
         self.assertEqual(guard["env"]["PYTHONPATH"], str(buyer_init.REPO_ROOT))
         self.assertIn(buyer_init.SELLER_MCP_URL, config["mcpServers"]["seller-transcription-service"]["args"])
+        seller = config["mcpServers"]["seller-transcription-service"]
+        self.assertNotIn("env", seller)  # no shared password
+        self.assertNotIn("--header", seller["args"])
+        self.assertNotIn("SELLER_AUTH", (self.home / "mcp.json").read_text())
 
     def test_guardrail_loads_the_written_setup(self):
         run_init("--home", str(self.home))

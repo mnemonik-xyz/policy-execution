@@ -21,17 +21,25 @@ workflow across both servers:
   claims escrow payment only after the buyer verifies `/health` and signs an `Acceptance` receipt.
 - **Direct Worker Inference**: Once provisioned, the buyer operates the container directly over
   HTTP (`curl`) using `public_url` and `worker_token` for the duration of the 1-hour lease.
-- **Strict 8-Step Lifecycle**:
+- **No Password, a Wallet Signature Instead**: The seller needs no password. For `deploy_with_escrow`
+  and `get_deployment_status` the seller serves only the customer of the task. Before each of those
+  calls, call `warrant_sign_request` (Buyer) and pass its `request_signature` and `request_timestamp`
+  to the seller tool. A signature is valid for 5 minutes and for one action. Sign a new one for every
+  call, including every poll. Never reuse a signature and never skip the call.
+- **Strict 9-Step Lifecycle**:
   1. `list_suitable_hardware` (Seller): Find single-GPU options for Whisper.
   2. `propose_deployment` (Seller): Obtain formal escrow payment terms.
   3. `warrant_evaluate_and_offer` (Buyer): Validate policy, verify hash, and fund escrow on-chain.
-  4. `deploy_with_escrow` (Seller): Commit agreement on-chain and start background provisioning.
-  5. `get_deployment_status` (Seller): Poll until status is `"ready"`, getting URL and token.
+  4. `warrant_sign_request` (Buyer, action `"deploy"`), then `deploy_with_escrow` (Seller): Commit
+     agreement on-chain and start background provisioning.
+  5. `warrant_sign_request` (Buyer, action `"status"`), then `get_deployment_status` (Seller): Poll
+     until status is `"ready"`, getting URL and token. Sign again before each poll.
   6. Health Check (`curl`): Verify `GET <public_url>/health` on the worker endpoint.
   7. Deliverable Settlement: Call `warrant_sign_acceptance` (Buyer) and `submit_acceptance`
      (Seller) to sign evidence and settle on-chain.
   8. Direct Transcription (`curl`): Upload audio to `POST <public_url>/job` and poll
      `GET <public_url>/job/<job_id>` with `Authorization: Bearer <worker_token>`.
+  9. Report the result. Never print the `worker_token`, a wallet key or a signature to the user.
 
 ---
 
@@ -71,7 +79,16 @@ acceptance key (`buyer_acceptance.key`). Required by compute seller before on-ch
   - `status`: `"signed"`.
   - `task_id`, `acceptance` (object), `signature` (array of bytes).
 
-#### 4. `warrant_check_escrow_status`
+#### 4. `warrant_sign_request`
+Signs a request to the seller with the buyer wallet, so that the seller serves only the customer
+of the task. The guardrail signs only for tasks that it funded itself.
+- Arguments:
+  - `task_id` (string, required): Task ID from `warrant_evaluate_and_offer`.
+  - `action` (string, required): `"deploy"` for `deploy_with_escrow`, `"status"` for
+    `get_deployment_status`.
+- Returns: `task_id`, `action`, `request_signature`, `request_timestamp`, `message`.
+
+#### 5. `warrant_check_escrow_status`
 Queries on-chain `TaskEscrow` state to verify task lifecycle.
 - Arguments: `task_id` (string, required).
 - Returns: `task_id`, `state` (`"Offered"`, `"Accepted"`, `"Paid"`, `"Refunded"`), `state_idx`,
@@ -109,12 +126,18 @@ deliverable hash, launches background container provisioning, and returns initia
 - Arguments:
   - `task_id` (string, required): Task ID from `propose_deployment`.
   - `policy` (object, required): Concrete buyer policy stamped by buyer guardrail.
+  - `request_signature` (string, required) and `request_timestamp` (integer, required): From
+    `warrant_sign_request` with action `"deploy"`.
 - Returns: `status` (`"provisioning"` or `"ready"`), `task_id`, `deployment_id`, `public_url`,
   `deliverable_hash`, `message`.
 
 #### 4. `get_deployment_status`
 Inspects active container provisioning status, health, and remaining seconds in the 1-hour window.
-- Arguments: `task_id` (optional string).
+- Arguments:
+  - `task_id` (string, required): Task ID from `propose_deployment`.
+  - `request_signature` (string, required) and `request_timestamp` (integer, required): From
+    `warrant_sign_request` with action `"status"`. Only the customer of the task can read the
+    `worker_token`.
 - Returns:
   - When provisioning: `active` (`false`), `status` (`"provisioning"`), `task_id`, `deployment_id`,
     `deliverable_hash`, `elapsed_seconds`, `message`.
