@@ -313,8 +313,8 @@ Further limits for the buyer:
 | **TaskEscrow** (no-proof escrow) | `0x5fae10ac58bf90c17f516292883a4f17c0768002` |
 | **JournalVerifier** (test double) | `0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c` |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` |
-| **Seller** (payout wallet) | `<SELLER_ADDRESS>` |
-| **Registry public key** | `<REGISTRY_PUBLIC_KEY>` |
+| **Seller** (payout wallet) | `0xb8202bebb6d8a0a822a56c0062632325c3923eeb` |
+| **Registry public key** | `0x02264b8d8cdb5b5a45736a4e3f679966966f39979b16794f08530c1ac6d77ee034` |
 
 The deployment PR also publishes `config/mainnet-public_keys.yaml` (repository path
 `showcases/ionet_arc/config/mainnet-public_keys.yaml`). It holds the registry public key only.
