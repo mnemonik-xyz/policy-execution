@@ -7,23 +7,36 @@ an entry in the [policy catalog](policy-catalog.md). The compute marketplace in
 [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13) is its first consumer,
 not its owner.
 
+Revision 2026-10-14, evening: settlement is by proof for every batch. No signer key
+exists in the design. The family deploys on the proof-only escrow and factory of
+[policy-execution#19](https://github.com/mnemonik-xyz/policy-execution/pull/19),
+which is therefore a dependency of this family. It is not a dependency of the canary.
+
 Abbreviations: GPU — Graphics Processing Unit; VPS — Virtual Private Server;
 HTTP — Hypertext Transfer Protocol; API — Application Programming Interface.
 
 ## 1. Goal
 
-Pay for any service that is sold in pieces, through `InvoiceEscrow`, without a
-contract change and without a design per service. The buyer funds one order with a
-ceiling. The buyer then pays per piece with a signed note. The seller settles notes in
-batches, by signature in the normal case and by proof as the fallback.
+Pay for any service that is sold in pieces, through the proof-only invoice escrow,
+without a contract change and without a design per service. The buyer funds one order
+with a ceiling. The buyer then pays per piece with a signed note. The seller settles
+notes in batches, each batch with a proof. No key can move the money. Only a receipt
+for the pinned meter image over the buyer's own notes can.
 
 The checker does not know what a piece is. A GPU job, an hour of a VPS, a gigabyte,
 an API call: the service decides, by the moment it demands a note. The guest, the
 escrow and the guardrail are the same for all of them.
 
-Catalog entry: **Metered payment**. Adapters: `meter-proof-v1` on `InvoiceEscrow.settle`
-and `meter-signature-v1` on `InvoiceEscrow.settleSigned`, both with the fifteen-word
-journal and a deployment pinned to the meter image ID.
+Catalog entry: **Metered payment**. Adapter: `meter-proof-v1` on
+`ProofInvoiceEscrow.settle`, with the fifteen-word journal, created by
+`ProofInvoiceFactory` for the meter image ID. The factory holds the replay history of
+every escrow it created, so a later meter image inherits it. Section 11 describes an
+optional weaker tier on the plain escrow with a signer. It is not the design.
+
+Why proof for every batch is affordable: the proof is never on the service path. The
+service answers against a note in milliseconds. The settlement worker proves a batch
+in the background, once per hour or once per day. The cost is prover time per batch,
+measured by ME-8, and it sets the batch size.
 
 ## 2. The note
 
@@ -89,19 +102,20 @@ established. The quote path keeps the `exact` scheme, so the listing is not at r
 Serving never waits for settlement. A worker inside the seller server settles later:
 
 1. Notes accumulate in a queue as the buyer uses the service.
-2. On a timer, the worker takes the unsettled notes that fill a batch, builds the batch input and the journal, and asks the buyer's signing endpoint to countersign. That endpoint runs the new `warrant-host meter-sign`, under the buyer's guardrail. It reads the live order from the chain, runs `authorize_meter` natively on the batch, checks that the journal matches, and signs the journal with the existing `sign_journal`. The note signatures are not settlement signatures. `settleSigned` recovers a 65-byte signature over `signerDigest(journal)`, and `invoice-sign` accepts only invoice requests.
-3. The worker calls `settleSigned`.
-4. If the signing endpoint refuses or does not answer, the worker keeps the batch and retries on the next tick.
-5. At `settleBy` minus a margin, the worker stops retrying and proves every unsettled batch itself: `warrant-host meter-prove`, the Groth16 wrap, then `settle`. One proof covers a whole batch.
-6. A partial last batch is settled the same way before `settleBy`.
+2. On a timer, the worker takes the unsettled notes that fill a batch and builds the batch input.
+3. The worker proves the batch: `warrant-host meter-prove`, then the Groth16 wrap. One proof covers the whole batch.
+4. The worker calls `settle` with the seal and the journal. The escrow verifies the receipt against the pinned meter image, then checks the order, the ceiling, the deadline and the replay registry.
+5. If the prover fails, the worker keeps the batch and retries on the next tick. It never discards a batch.
+6. A partial last batch is proved and settled the same way before `settleBy`. The worker stops accepting new notes for a lease when the time left is below its proving and settlement margin.
 
-The worker needs a queue, a timer, the signer call, and the prove-and-settle fallback.
-The prover is the seller's own x86 Docker host from the canary plan, or a rented
-proving service. The seller runs it because the seller wants to be paid.
+The worker needs a queue, a timer, a prover and one settlement call. The prover is the
+seller's own x86 Docker host from the canary plan, or a rented proving service. The
+receipt is checked on chain, so the prover needs no trust. The seller runs it because
+the seller wants to be paid. The seller depends on nobody else for settlement: not on
+the buyer, not on a signer, not on a third party.
 
-Nothing is disputed in this flow. The proof replaces the buyer's countersignature
-with a receipt that the same checker ran on the same bytes. The contract pays or
-refuses by the same rules either way. No arbiter, no third party, no new trust.
+Nothing is disputed in this flow. A batch either verifies or it does not. The contract
+pays or refuses by the same rules for every batch. No arbiter, no approval, no key.
 
 ## 4a. Process flow
 
@@ -110,7 +124,7 @@ sequenceDiagram
     autonumber
     actor Agent as Buyer agent
     participant Guard as Buyer guardrail
-    participant Escrow as InvoiceEscrow (Arc)
+    participant Escrow as ProofInvoiceEscrow (Arc)
     participant Svc as Seller service
     participant Worker as Seller settlement worker
     participant Prover as Prover (seller's)
@@ -119,7 +133,7 @@ sequenceDiagram
     Note over Agent,Escrow: Order: commitment before delivery
     Agent->>Guard: fund lease (quote)
     Guard->>Guard: check quote, credential rule, policy hash
-    Guard->>Escrow: offer(policyHash, vendor, ceiling, signer, acceptBy, settleBy)
+    Guard->>Escrow: offer(policyHash, vendor, ceiling, signer = 0, acceptBy, settleBy)
     Svc->>Escrow: read order, inspect policy (SS-5)
     Svc->>Escrow: accept(orderId)
     end
@@ -137,26 +151,20 @@ sequenceDiagram
     end
 
     rect rgb(255, 250, 240)
-    Note over Guard,Prover: Settlement: by signature, proof as fallback
-    loop every tick, while a batch is full
-        Worker->>Worker: build batch input and journal
-        Worker->>Guard: meter-sign(batch)
-        alt signer answers
-            Guard->>Escrow: read live order
-            Guard->>Guard: authorize_meter natively, sign journal
-            Guard-->>Worker: 65-byte signature
-            Worker->>Escrow: settleSigned(journal, signature)
-        else signer refuses or silent
+    Note over Svc,Prover: Settlement: a proof for every batch, in the background
+    loop every tick, while a batch is full, and once for the partial last batch
+        Worker->>Worker: build batch input
+        Worker->>Prover: meter-prove(batch), Groth16 wrap
+        alt prover succeeds
+            Prover-->>Worker: receipt
+            Worker->>Escrow: settle(seal, journal)
+            Escrow->>Escrow: verify receipt against the meter image ID
+            Escrow->>Escrow: order accepted, vendor, ceiling, window, registry.consume(customer, batch)
+            Escrow-->>Svc: pay batch to vendor
+        else prover fails
             Worker->>Worker: keep batch, retry next tick
         end
     end
-    opt settleBy minus margin reached
-        Worker->>Prover: meter-prove(batch), Groth16 wrap
-        Prover-->>Worker: receipt
-        Worker->>Escrow: settle(seal, journal)
-    end
-    Escrow->>Escrow: order accepted, vendor, ceiling, obligation unconsumed, window
-    Escrow-->>Svc: pay batch to vendor
     end
 
     rect rgb(245, 245, 245)
@@ -165,9 +173,9 @@ sequenceDiagram
     end
 ```
 
-The diagram shows one lease. Steps 7 to 14 repeat once per piece of service. Steps
-15 to 23 run in the background and never block step 14. Step 24 runs at most once per
-lease, and only when the signer stayed silent until the margin.
+The diagram shows one lease. The metered-use steps repeat once per piece of service.
+The settlement steps run in the background and never block a request. The buyer takes
+no part in settlement.
 
 ## 4b. Components, deployment and ownership
 
@@ -175,15 +183,15 @@ lease, and only when the signer stayed silent until the margin.
 flowchart TB
     subgraph BUYER["Buyer's environment (owned and run by the buyer)"]
         AG["Buyer agent<br/>LLM client, desktop or server<br/>holds no key"]
-        GD["Buyer guardrail<br/>MCP sidecar, daemon on the buyer's host<br/>holds: wallet key, registry key, note key, signer key<br/>runs: warrant-host meter-sign"]
+        GD["Buyer guardrail<br/>MCP sidecar on the buyer's host<br/>holds: wallet key, registry key, note key<br/>no part in settlement"]
         AG -->|answer 402, fund lease| GD
     end
 
     subgraph SELLER["Seller's environment (owned and run by the seller)"]
         SV["Seller service<br/>HTTP + MCP, public HTTPS host<br/>402 middleware, native note check<br/>holds: payout key"]
         NQ[("Note store<br/>signed notes, batches, settlement state")]
-        WK["Settlement worker<br/>background process beside the service<br/>timer, signer call, settleSigned, prove fallback"]
-        PR["Prover<br/>x86 Docker host, seller's or rented<br/>runs: warrant-host meter-prove, wrap"]
+        WK["Settlement worker<br/>background process beside the service<br/>timer, prove, settle, retry"]
+        PR["Prover<br/>x86 Docker host, seller's or rented<br/>runs: warrant-host meter-prove, wrap<br/>required, one proof per batch"]
         SV --> NQ --> WK --> PR
     end
 
@@ -192,9 +200,12 @@ flowchart TB
     end
 
     subgraph ARC["Arc (public chain, owned by nobody)"]
-        ES["InvoiceEscrow<br/>no owner, no upgrade, pinned meter image ID"]
+        FY["ProofInvoiceFactory<br/>no admin; shared replay registry<br/>for every escrow it created"]
+        ES["ProofInvoiceEscrow<br/>no owner, no upgrade, no signer, no approval<br/>pinned meter image ID"]
         VF["RISC Zero verifier"]
         US["USDC"]
+        FY -->|createEscrow| ES
+        ES -->|consume| FY
         ES --> VF
         ES --> US
     end
@@ -215,8 +226,7 @@ flowchart TB
     SV -->|jobs| WR
     GD -->|offer, close| ES
     SV -->|accept| ES
-    WK -->|meter-sign| GD
-    WK -->|settleSigned / settle| ES
+    WK -->|settle(seal, journal)| ES
     IMG -.->|image ID| ES
     HOST -.-> GD
     HOST -.-> WK
@@ -226,23 +236,24 @@ flowchart TB
 | Component | Runs where | Owner | Holds | Trusted for |
 |---|---|---|---|---|
 | Buyer agent | The buyer's desktop or server | Buyer | No key | Nothing. It proposes. |
-| Buyer guardrail | A daemon on the buyer's host | Buyer | Wallet key, registry key, note key, signer key | Funding, note signing under BG-1, countersigning batches |
+| Buyer guardrail | The buyer's host | Buyer | Wallet key, registry key, note key | Funding, note signing under BG-1, closing orders |
 | Seller service | A public HTTPS host of the seller | Seller | Payout key | Serving against notes, SS-1 to SS-8 |
 | Note store | The seller's host | Seller | Signed notes, settlement state | Liveness of settlement only |
-| Settlement worker | A background process on the seller's host | Seller | Access to the note store and the payout key | Settling in time |
-| Prover | The seller's x86 Docker host, or a rented proving service | Seller, or a vendor | Batch inputs | Nothing. The receipt is checked on chain. |
+| Settlement worker | A background process on the seller's host | Seller | Access to the note store and the payout key | Settling every batch in time |
+| Prover | The seller's x86 Docker host, or a rented proving service | Seller, or a vendor | Batch inputs | Nothing. The receipt is checked on chain. Required for every batch. |
 | Worker container | The cloud provider | Provider, rented by the seller | No Warrant key | Nothing. Service quality is outside the protocol. |
-| `InvoiceEscrow` | Arc | Nobody. No owner, no upgrade. | Reserved USDC per order | Recipient, ceiling, deadline, one payment per batch |
+| `ProofInvoiceEscrow` | Arc | Nobody. No owner, no upgrade, no signer, no approval. | Reserved USDC per order | Recipient, ceiling, deadline, proof only, one payment per batch |
+| `ProofInvoiceFactory` | Arc | Nobody. No admin. | The replay history of every escrow it created | One payment per batch across image migrations |
 | RISC Zero verifier | Arc | Nobody | Verifying key | Proof validity |
 | Discovery API | Circle | Circle | Listings | Liveness of discovery only |
 | Facilitator Service | Circle | Circle | Quote fee settlement | The quote fee only. Never a note or a lease. |
 | Meter guest image | Built in `policy-execution`, pinned in the escrow | Warrant team | The checker program | Everything the proof claims |
 | `warrant-host` | Buyer's guardrail, seller's worker, seller's prover | Warrant team | The same native checker | Native results equal the guest's |
 
-Three facts follow from the table. No component outside the buyer's environment holds
-a key that can spend the buyer's funds. No component outside Arc decides who gets
-paid. The seller depends on nobody for settlement except its own worker and, in the
-fallback, its own prover.
+Three facts follow from the table. No key anywhere can spend the buyer's funds: the
+note key authorizes pieces of service, and only a receipt moves money. No component
+outside Arc decides who gets paid. The seller depends on nobody for settlement except
+its own worker and its own prover.
 
 ## 4c. Hardware and other requirements per component
 
@@ -263,11 +274,11 @@ batch size or threshold is chosen.
 
 | Requirement | Value |
 |---|---|
-| Hardware | One always-on host. A small VPS or the buyer's server. Two CPUs and 2 GiB of memory are enough for native checking, which is measured at 0.04 s per decision. |
-| Software | Python 3 with `mcp==2.3.0`, `httpx2`, `eth-account`, `pyyaml`. The `warrant-host` binary built with Rust 1.88.0 from `rzup` and `r0vm 3.0.5` for `meter-sign` and `meter-evaluate`. |
-| Process | A daemon with a restart policy, not a child of the desktop app. It answers 402 challenges and `meter-sign` calls while the agent is offline. |
-| Network | Arc JSON-RPC for order reads and `offer`, `close`. Inbound HTTPS from the seller's worker for `meter-sign`, or an outbound long-poll if the buyer has no inbound address. |
-| Keys | Wallet key for `offer` and `close`; registry key; note key; signer key named in the order. Each in a keystore, never in a config file. The note key and the signer key are low-value keys bounded by one order's ceiling. |
+| Hardware | Any host the buyer's agent runs on. Native note checking is measured at 0.04 s per decision. No always-on requirement: the guardrail is needed only while the agent uses the service. |
+| Software | Python 3 with `mcp==2.3.0`, `httpx2`, `eth-account`, `pyyaml`. The `warrant-host` binary built with Rust 1.88.0 from `rzup` and `r0vm 3.0.5` for `meter-evaluate`. |
+| Process | The MCP sidecar of the showcase. It answers 402 challenges for the agent. It takes no part in settlement. |
+| Network | Outbound only: Arc JSON-RPC for order reads, `offer` and `close`. No inbound endpoint. |
+| Keys | Wallet key for `offer` and `close`; registry key; note key. Each in a keystore, never in a config file. The note key is a low-value key bounded by one order's ceiling, and it cannot move money. |
 | Clock | NTP. Note windows and `settleBy` are compared with block time. |
 | State | The next note index per lease, persisted before a note is signed. A lost index means a reused index and a refused request. |
 
@@ -278,7 +289,7 @@ batch size or threshold is chosen.
 | Hardware | One public host. Two CPUs and 2 GiB of memory for the service and the worker together. Disk for the note store, below 1 KiB per note. |
 | Software | Python 3 with the showcase dependencies, `uvicorn`, Starlette with the MCP transport, the 402 middleware of section 3, and the `warrant-host` binary for native note checks. |
 | Network | A public HTTPS host with a valid TLS certificate and a stable DNS name. Circle health-checks it continuously and drops the listing while it is unreachable. Port 443 inbound. Outbound to Arc JSON-RPC, to the cloud provider's API, and to Circle's Facilitator Service for the quote fee. |
-| Keys | The payout key, used for `accept`, for the quote signature, for the seller proof toward Circle, and by the worker for `settleSigned` and `settle`. In a keystore. |
+| Keys | The payout key, used for `accept`, for the quote signature, for the seller proof toward Circle, and by the worker for `settle`. In a keystore. |
 | Accounts | A cloud provider account with an API key and prefunded credits, bounded per the canary plan. A Circle API key for the Facilitator Service in production; the Arc testnet trial is keyless. |
 | Operations | Rate limiting on the public paths, request logs without note bodies (SS-7), a backup of the note store, alerts for approaching `settleBy`, low gas and a proof backlog, per the delivery plan. |
 
@@ -288,7 +299,7 @@ batch size or threshold is chosen.
 |---|---|
 | Hardware | Shares the seller host. |
 | Software | The `warrant-host` binary for batch inputs and `meter-evaluate`; Arc JSON-RPC access; a local path or a remote call to the prover. |
-| Funds | Native USDC on Arc for gas on `settleSigned` and `settle`. Arc pays gas in USDC. One settlement per batch; the batch size sets the transaction count. |
+| Funds | Native USDC on Arc for gas on `settle`. Arc pays gas in USDC. One settlement per batch; the batch size sets the transaction count and the proof count. |
 | Clock | NTP. The margin before `settleBy` is measured in block time. |
 | State | Per batch: built, signed, submitted, confirmed, or proving. Persisted so that a restart neither double-submits nor loses a batch. |
 
@@ -317,7 +328,7 @@ batch size or threshold is chosen.
 | Requirement | Value |
 |---|---|
 | Networks | Testnet chain 5042002 at `https://rpc.testnet.arc.io`; mainnet chain 5042 at `https://rpc.mainnet.arc.io`. USDC at `0x3600000000000000000000000000000000000000`, six decimals. Native and ERC-20 USDC share one balance. |
-| Contracts | `InvoiceEscrow` and the RISC Zero verifier deployed together by `DeployInvoice.s.sol`, Solidity 0.8.28 Cancun, OpenZeppelin 5.6.1, pinned to the meter image ID from a `RISC0_USE_DOCKER=1` build. The BN254 precompiles at `0x07` and `0x08` answered correctly on testnet. |
+| Contracts | `ProofInvoiceFactory`, `ProofInvoiceEscrow` and the RISC Zero verifier deployed by `DeployInvoice.s.sol` with `proofOnly`, Solidity 0.8.28 Cancun, OpenZeppelin 5.6.1, pinned to the meter image ID from a `RISC0_USE_DOCKER=1` build. Available after policy-execution#19 merges. The BN254 precompiles at `0x07` and `0x08` answered correctly on testnet. |
 | Funds | Deployer gas; buyer ceiling plus gas; seller gas for `accept` and settlements. Canary amounts first. |
 | Keys | Deployer in a Foundry keystore or a hardware wallet. Separate low-value buyer, seller and relayer keys. Mainnet keys never in the team's secrets file, per the canary plan. |
 | Probe | Before any order: chain ID, precompiles, USDC decimals, and the code hashes of the deployed verifier and escrow against the build. |
@@ -404,20 +415,20 @@ pub fn authorize_meter(input: &MeterInput) -> Result<MeterAuthorization, MeterEr
 
 Batches are disjoint by construction, because a note index belongs to exactly one
 batch. Each batch is one obligation, so each note pays once with no contract change.
-Batch size one is allowed. The module does not know the spent ceiling or whether an
-earlier batch was paid. The contract checks both. It does not know whether the service
-ran. Nobody can check that.
+The factory's registry keeps that true across escrows of later meter images. Batch
+size one is allowed. The module does not know the spent ceiling or whether an earlier
+batch was paid. The contract checks both. It does not know whether the service ran.
+Nobody can check that.
 
 The rest of the delta:
 
 | Piece | Work |
 |---|---|
 | `methods/meter-guest` | Read `MeterInput`, call `authorize_meter`, commit the journal. Add the name to `build.rs`. |
-| Host | `meter-image-id`, `meter-evaluate`, `meter-execute`, `meter-prove`, copied from the solver ones. `meter-sign signer-key policy rpc-url batch.json output.json`, modelled on `invoice-sign`: read the order, run the checker natively, sign the journal. |
-| Signer path | `signer_digest` and `sign_journal` from `evidence.rs` apply unchanged. |
+| Host | `meter-image-id`, `meter-evaluate`, `meter-execute`, `meter-prove`, copied from the solver ones. |
 | Fixtures | One meter journal for the Solidity test that mutates all fifteen words. |
 | Template | `templates/meter-v1.json` with ceiling, per-note cap and batch size as parameters. |
-| Deployment | `DeployInvoice.s.sol` with the meter image ID. |
+| Deployment | `DeployInvoice.s.sol` with `proofOnly` and the meter image ID: one factory, one escrow from it. A later meter image gets a new escrow from the same factory. |
 | Tests | The positive path, every gate, removed-check mutations. |
 
 ## 6. Seller service requirements
@@ -425,7 +436,7 @@ The rest of the delta:
 - SS-1: A metered path answers an unpaid request with the 402 challenge of section 3, and serves only against a note that verifies natively.
 - SS-2: The service refuses a note whose identifier it has seen, and refuses service for it.
 - SS-3: The service verifies the note's signature, scope, recipient, lease and amount against the policy it accepted, before it serves.
-- SS-4: The settlement worker of section 4 settles every note before the note's `valid_until` and before the order's `settleBy`. The service stops challenging when the time left is below its settlement margin.
+- SS-4: The settlement worker of section 4 proves and settles every batch before the notes' `valid_until` and before the order's `settleBy`. The service stops challenging when the time left is below its proving and settlement margin.
 - SS-5: Before `accept`, the seller reads the policy: keys, ceiling, per-note cap, batch size, deadlines, and that the rule passes for a sample note. It refuses a policy it cannot settle against.
 - SS-6: The OpenAPI document records the 402 response, the scheme and the price on every metered path.
 - SS-7: Notes are payment authorizations. The service stores them for settlement and does not log them elsewhere.
@@ -435,16 +446,17 @@ The rest of the delta:
 
 - BG-1: The guardrail answers a 402 challenge only when the lease is one it funded, the recipient equals the order's vendor, the escrow and network match the order, the amount is at most the per-note cap, and a per-lease rate limit allows it. Everything else is refused.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
-- BG-3: The guardrail runs the signing endpoint of section 4 for its own leases, with `meter-sign` and the signer key named in the order.
-- BG-4: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
+- BG-3: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
+- BG-4: The guardrail funds an order only with `signer == address(0)`, no allowance and no threshold, on an escrow created by the factory for an image the buyer approved.
 
 ## 8. Trust assumptions
 
 | Assumption | If it fails |
 |---|---|
-| The note key is held by the buyer, through the guardrail | An attacker spends the ceiling on service to the fixed recipient. Loss is bounded by the ceiling and the deadline. The key cannot be rotated inside an order. Keep orders small. |
+| The note key is held by the buyer, through the guardrail | An attacker obtains service that the buyer's ceiling pays for, to the fixed recipient. Loss is bounded by the ceiling and the deadline. The key cannot move money by itself. Keep orders small. |
 | The seller's recipient is the address the buyer meant | A wrong credential pays the wrong seller for service received. The credential rule of the marketplace proposal decides who may be a seller. |
-| The meter image ID pinned in the escrow is the reviewed guest | Everything else holds for a wrong program. Reproducible build and the code-hash probe of the canary plan. |
+| The meter image ID pinned in the escrow is the reviewed guest | Everything else holds for a wrong program. Reproducible build and the code-hash probe of the canary plan. The buyer checks the image ID of an escrow before funding it, because factory creation is permissionless. |
+| `ProofInvoiceFactory` and `ProofInvoiceEscrow` are the reviewed code | The factory accepts `consume` only from escrows it created with its own code. A different factory is a different family. |
 | RISC Zero soundness, the verifier, the BN254 precompiles on Arc | Existing assumptions, unchanged. |
 | Block time for windows and `settleBy` | Existing assumption. The worker keeps a margin. |
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
@@ -458,17 +470,19 @@ The rest of the delta:
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
 | Buyer | Stop near `settleBy` so the seller cannot settle | SS-4: the service stops first, by its margin. |
-| Buyer | Refuse to countersign a batch | The worker proves the batch. Delay only. |
-| Buyer | Revoke the signer | `revokeSigner` only tightens. The worker proves. |
+| Buyer | Withhold any cooperation after funding | None is needed. Settlement is a proof over notes the buyer already signed. |
 | Buyer | Cancel after `accept` | Impossible before `settleBy`. |
 | Buyer | Never answer the first challenge | The seller loses provisioning cost. The no-show residue. |
 | Seller | Forge a note | Impossible. |
-| Seller | Settle a batch twice, or count a note in two batches | One obligation per batch, indices in exactly one batch, consumed on chain. |
+| Seller | Settle a batch twice, or count a note in two batches | One obligation per batch, indices in exactly one batch, consumed on chain and in the factory registry. |
+| Seller | Settle the same batch again on an escrow for a newer meter image | The factory registry refuses: same customer, same obligation. |
+| Anyone | Create a rogue-image escrow on the factory and consume a victim's obligations | Impossible. `consume` takes the customer from the order being paid, and only the funder of an order is its customer. A rogue escrow can consume under the attacker's own address only. |
 | Seller | Settle notes of another lease, chain or customer | Lease, scope and customer are in the signed note and the journal. |
 | Seller | Overcharge | The amount is the sum of notes the buyer signed, each at most the cap. |
 | Seller | Take a note and not serve | The buyer loses one piece and stops. SS-8 states who carries that piece. |
 | Seller | Settle before any service | No note exists before the buyer asks. |
 | Anyone | Replay a settlement, relay to another recipient | Consumed obligation, recipient fixed, any relayer pays only the recipient. |
+| Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. |
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
 
 What this does not secure: quality of service, the hardware model, response time. The
@@ -478,18 +492,30 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 
 - ME-1: `authorize_meter` rejects every gate of section 5 in a dedicated test, and a removed-check experiment fails for each.
 - ME-2: The meter journal is byte for byte the `InvoiceAuthorization` layout, and the Solidity fixture test that mutates all fifteen words passes with a meter journal.
-- ME-3: `settleSigned` with a `meter-sign` signature and `settle` with a receipt both pay one batch on `InvoiceEscrow` on local Anvil, and a second settlement of the same batch, or a batch that reuses an index, is rejected.
+- ME-3: `settle` with a receipt pays one batch on a `ProofInvoiceEscrow` created by the factory on local Anvil. `settleSigned` and `settleApproved` revert. A second settlement of the same batch, a batch that reuses an index, and the same batch on a second escrow of the same factory are all rejected.
 - ME-4: A note with `valid_after` in the future is rejected by the contract until that time.
 - ME-5: `meter-image-id` is recorded from a `RISC0_USE_DOCKER=1` build before any deployment.
 - ME-6: A metered path returns the 402 challenge of section 3 unpaid, serves against a valid note, and refuses a reused index.
-- ME-7: The settlement worker settles a batch by signature, retries on refusal, and settles by proof before `settleBy` when the signer stays silent, in a test with a mocked signer and a mocked verifier.
-- ME-8: Proving time and cost for one full batch are measured on the x86 prover before any threshold or batch size is chosen.
+- ME-7: The settlement worker proves and settles a full batch and a partial last batch, retries after a prover failure without losing a batch, and stops accepting notes at its margin before `settleBy`, in a test with a mocked prover and a mocked verifier.
+- ME-8: Proving time, CPU seconds, peak memory and cost for one full batch are measured on the x86 prover before the batch size is chosen. The batch size is set so that proving cost per batch stays well below the batch value.
 
 ## 11. Effort
 
-About one engineer-week for the family: the module and its tests, the guest, five
-host subcommands including the signer, one fixture, one template, one deployment script run. About three
+About one engineer-week for the family, after policy-execution#19 merges: the module
+and its tests, the guest, four host subcommands, one fixture, one template, one deployment script run. About three
 days for the seller side: the 402 middleware on the showcase service and the settlement
-worker. About two days for the guardrail: the challenge handler and the signing
-endpoint. The Verus proof covers the evaluator only. The meter checker is tested, not
+worker. About one day for the guardrail: the challenge handler. The Verus proof covers the evaluator only. The meter checker is tested, not
 proved, like the other two checkers.
+
+## 12. Optional weaker tier: signature settlement
+
+Buyers who want payout in seconds instead of a proof per batch can fund an order on
+the plain `InvoiceEscrow` with a signer, an allowance and a threshold. The seller then
+asks the buyer's signing endpoint, `warrant-host meter-sign` modelled on `invoice-sign`,
+to countersign the batch journal, and settles by `settleSigned`. The proof path remains
+the fallback.
+
+This tier adds a key that can authorize payment, bounded by the allowance per order,
+and a dependency of the seller on the buyer's endpoint until the fallback margin. It
+is listed in the catalog as `meter-signature-v1` and marked as the weaker tier. It is
+not the design of this family, and the showcase does not use it.
