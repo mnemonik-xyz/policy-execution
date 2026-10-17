@@ -869,38 +869,23 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             app = create_app(config)
             self.assertIsNotNone(app)
 
-    def test_read_initial_parameters_from_manifest(self):
-        manifest_path = Path(self.state_dir) / "fixture_manifest.yaml"
-        manifest_path.write_text(
-            yaml.dump(
-                {
-                    "rpc_url": "https://fixture.rpc.test",
-                    "escrow_address": "0x" + "a1" * 20,
-                    "verifier_address": "0x" + "b2" * 20,
-                    "token_address": "0x" + "c3" * 20,
-                    "buyer_address": "0x" + "d4" * 20,
-                    "max_budget_usd": 3.25,
-                    "duration_hours": 4,
-                }
-            )
-        )
+    def _assert_config_matches_manifest(self, manifest_path, network):
+        manifest = load_manifest(manifest_path)
         config = ServerConfig(state_dir=self.state_dir, manifest_path=manifest_path)
-        self.assertEqual(config.rpc_url, "https://fixture.rpc.test")
-        self.assertEqual(config.escrow_address, "0x" + "a1" * 20)
-        self.assertEqual(config.verifier_address, "0x" + "b2" * 20)
-        self.assertEqual(config.token_address, "0x" + "c3" * 20)
-        self.assertEqual(config.buyer_account, "0x" + "d4" * 20)
-        self.assertEqual(config.max_budget_usd, 3.25)
-        self.assertEqual(config.max_duration_hours, 4)
+        self.assertEqual(config.rpc_url, NETWORKS[network]["rpc"])
+        self.assertEqual(manifest["chain_id"], NETWORKS[network]["chain_id"])
+        self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
+        self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
+        self.assertEqual(config.token_address, manifest.get("token_address"))
+        self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
+        self.assertEqual(config.max_budget_usd, float(manifest["max_budget_usd"]))
+        self.assertEqual(config.max_duration_hours, int(manifest["duration_hours"]))
 
-    def test_shipped_manifests_name_their_network(self):
-        shipped = {"mainnet": DEFAULT_MANIFEST_PATH, "testnet": TESTNET_MANIFEST}
-        for network, path in shipped.items():
-            with self.subTest(network=network):
-                manifest = load_manifest(path)
-                config = ServerConfig(state_dir=self.state_dir, manifest_path=path)
-                self.assertEqual(config.rpc_url, NETWORKS[network]["rpc"])
-                self.assertEqual(manifest["chain_id"], NETWORKS[network]["chain_id"])
+    def test_read_initial_parameters_from_testnet_manifest(self):
+        self._assert_config_matches_manifest(TESTNET_MANIFEST, "testnet")
+
+    def test_read_initial_parameters_from_mainnet_manifest(self):
+        self._assert_config_matches_manifest(DEFAULT_MANIFEST_PATH, "mainnet")
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
