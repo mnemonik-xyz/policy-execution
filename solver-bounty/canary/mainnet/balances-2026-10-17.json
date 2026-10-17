@@ -1,0 +1,29 @@
+{
+  "chain_id": 5042,
+  "block": 26420391,
+  "token": "0x3600000000000000000000000000000000000000",
+  "unit": "USDC, 6 decimals (balanceOf)",
+  "balances": [
+    {
+      "role": "deployer",
+      "address": "0x588c6C6132193Ed474367aC15FbD71D6f73455C8",
+      "balance": 416868
+    },
+    {
+      "role": "buyer",
+      "address": "0xc0ef32fcb10bb9787800a4756fa3c3a8b220580b",
+      "balance": 494532
+    },
+    {
+      "role": "seller",
+      "address": "0xB8202bebb6d8A0A822a56c0062632325C3923EEB",
+      "balance": 2199246
+    },
+    {
+      "role": "relayer",
+      "address": "0xf8822dc58160238398bf02116f2e7e84d510da3b",
+      "balance": 193466
+    }
+  ],
+  "note": "Read after deploy-seller, at one block. Deal delta: seller +2000000 (settle tx 0xd0fb5b024c28ca80e38466917702fdb1b856761cd6cd8bccd58a814699975026)."
+}
