@@ -1,0 +1,39 @@
+{
+  "source_commit": "fac8b909893cf168157d84e51ce103fdb0351299",
+  "source_dirty": false,
+  "compiler": {
+    "solc": "0.8.28",
+    "evm_version": "cancun",
+    "optimizer_runs": 200
+  },
+  "dependencies": {
+    "openzeppelin_contracts": "5.6.1",
+    "risc0_ethereum_contracts": "v3.0.0",
+    "risc0_zkvm": "3.0.5"
+  },
+  "chain_id": 5042,
+  "token": "0x3600000000000000000000000000000000000000",
+  "escrow": "0xbe6b87c0d2a1a7c28207cdecd4f6c68ffe4122e0",
+  "verifier": "0xc4fb7340971e8ad6925f16c2a275cd13cb7bec99",
+  "image_id": "0x56d9ff10f85f9f023a32c632dcd11ae95a9cd7024d34e4f489c1b392a299bff2",
+  "image_builder": "risczero/risc0-guest-builder:r0.1.88.0",
+  "code_hashes": {
+    "escrow": "0xefaf774fed9f0bdae63c8f3d97831fea60704c2bee06cd9c2eadbdd7737448ee",
+    "verifier": "0xb2df064231d4a19257ee10a778f3856632f5a3a45b46c02a99a7572c411edf55"
+  },
+  "transactions": {
+    "deploy": "0x34902ab030ce99fa8427fdc8b908017bb8ec418b033b0f7dde22105013121aaa",
+    "deploy_verifier": "0xead1e9d705b13fddfeb8c87c13307e61d9d13d4e5020fc0cfaf31fa12fee189a",
+    "approve": "0x9c8104d5a49602ac45f9c6292981b82b1d5d88e6ff79df8acf9726f971db1ac9",
+    "offer": "0x204eb61a89776a6ce764a61770d7c48f2d63df40d8e32657287937738b3d8279",
+    "accept": "0x346fcfc14d1ece27a022090629a7ace6519f131829472cbe220d88b9648dac9c",
+    "settle": "0xd0fb5b024c28ca80e38466917702fdb1b856761cd6cd8bccd58a814699975026"
+  },
+  "addresses": {
+    "deployer": "0x588c6c6132193ed474367ac15fbd71d6f73455c8",
+    "buyer": "0xc0ef32fcb10bb9787800a4756fa3c3a8b220580b",
+    "seller": "0xb8202bebb6d8a0a822a56c0062632325c3923eeb",
+    "relayer": "0xf8822dc58160238398bf02116f2e7e84d510da3b"
+  },
+  "created_at": "2026-10-16T21:26:30+00:00"
+}
