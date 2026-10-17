@@ -452,8 +452,8 @@ The showcase contracts and demo participant addresses are defined in
 
 | Role / Contract | Address | Description |
 | --- | --- | --- |
-| **TaskEscrow** | `0xBeD9B731D9C912541FF083AE41607016BFe93b70` | Escrow contract on Arc |
-| **ReceiptClaimVerifier** | `0xDbefc776e18e34049cAaec736b47122f0583F345` | Receipt verifier |
+| **TaskEscrow** | `0xeb2038CbaE9b25C7935782B21617025Affdd9890` | Escrow contract on Arc |
+| **ReceiptClaimVerifier** | `0xA95eC8cB54233Cf7e033A2a3C5E6F2727901aE93` | Receipt verifier |
 | **USDC Token** | `0x3600000000000000000000000000000000000000` | Arc USDC token |
 | **Seller** | `0x9F188809b2ba2e29653693C4069c212a95C1B8c4` | io.net payout wallet |
 | **Buyer** | `0x9793Dd93D46F153a2A879165cd163A01b54d8A00` | Escrow funder wallet |

@@ -20,6 +20,7 @@ from showcases.ionet_arc.escrow import (
     DEFAULT_MANIFEST_PATH,
     compile_buyer_policy,
     find_warrant_binary,
+    load_manifest,
 )
 from showcases.ionet_arc.init import ensure_key_file, get_public_key_hex
 from showcases.ionet_arc.seller_mcp_server import (
@@ -865,10 +866,11 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(app)
 
     def test_read_initial_parameters_from_manifest(self):
+        manifest = load_manifest()
         config = ServerConfig(state_dir=self.state_dir)
-        self.assertEqual(config.escrow_address, "0xBeD9B731D9C912541FF083AE41607016BFe93b70")
-        self.assertEqual(config.verifier_address, "0xDbefc776e18e34049cAaec736b47122f0583F345")
-        self.assertEqual(config.buyer_account, "0x9793Dd93D46F153a2A879165cd163A01b54d8A00")
+        self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
+        self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
+        self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
         self.assertEqual(config.rpc_url, "https://rpc.testnet.arc.io")
 
     def test_explicit_parameters_override_manifest(self):
