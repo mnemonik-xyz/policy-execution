@@ -76,7 +76,7 @@ From Circle's
 
 - `POST /x402/quote` on the existing Starlette application, mounted beside the MCP transport.
 - `GET /openapi.json` serves the OpenAPI document. It is free.
-- Both routes sit outside `BasicAuthMiddleware`. The MCP route keeps its Basic Auth.
+- Both routes, like the MCP route, have no authentication.
 - The endpoint provisions nothing. It only prices and signs.
 
 ### 4.2 Request
@@ -156,10 +156,9 @@ The body is the existing `propose_deployment` result, with four additions:
 
 - `quote_id`: the payment identifier.
 - `valid_until`: `proposed_at` plus 900 seconds.
-- `fulfillment`: the MCP URL and a bearer credential, see section 4.7.
+- `fulfillment`: the MCP URL, see section 4.6.
 - `signature`: a 65-byte secp256k1 signature by the `server_account` key over the SHA-256 of the canonical JSON of all other fields except `fulfillment`. `canonical` and `digest` in `adapter.py` define the encoding.
 
-The credential stays outside the signed fields, so the quote can be shown to a third party without it.
 
 One invariant holds across the whole path:
 
@@ -173,24 +172,26 @@ The buyer guardrail checks the first three. The escrow enforces the fourth.
 
 A discovery client that paid for a quote must be able to complete the deal. The deal
 completes through the existing MCP tools `deploy_with_escrow`, `get_deployment_status`,
-`submit_acceptance` and `transcribe_audio`. The MCP route sits behind Basic Auth, which
-a discovery client does not hold. The paid quote therefore carries a credential:
+`submit_acceptance` and `transcribe_audio`. The MCP route has no authentication, so the
+paid quote carries no credential, only the endpoint:
 
 ```json
 {
   "fulfillment": {
     "mcp_url": "https://<host>/mcp",
-    "authorization": "Bearer <token>",
     "expires_at": 1791900000
   }
 }
 ```
 
-- The token is an HMAC of `quote_id` under a server secret. The server stores nothing extra.
-- The token is valid until the task `settleBy` of the quote. It is accepted for that `task_id` only.
-- `BasicAuthMiddleware` accepts either the Basic credentials or a valid bearer token on the MCP route.
-- The tools stay safe without a stronger credential. `deploy_with_escrow` reads the funded task from the chain. `submit_acceptance` requires the buyer acceptance signature. A stranger with the token can at most trigger provisioning for a task the buyer already funded.
+- The `/x402/quote` and `/openapi.json` routes and the MCP route are all open.
+- The tools stay safe without a credential on the chain side. `deploy_with_escrow` reads the funded task from the chain. `submit_acceptance` requires the buyer acceptance signature.
 - The OpenAPI document describes the `fulfillment` object and names the MCP tools and their argument schemas, so an agent can read the whole flow from the listing.
+
+> [!CAUTION]
+> The open MCP route has the risks listed in the
+> [mainnet seller section](../../showcases/ionet_arc/README.md#arc-mainnet-seller-canary).
+> A paid quote also proves nothing about who uses the endpoint.
 
 ### 4.7 Implementation choice
 
@@ -247,7 +248,6 @@ only what the quote endpoint requires of it:
 - The route must not provision, accept or settle. It prices and signs only.
 - Never log the `PAYMENT-SIGNATURE` header or the seller proof.
 - The seller proof key is the payout key. The seller server already holds it, because it calls `accept` and `settle`. No new key appears.
-- The fulfilment token is a bearer credential. Transmit it over TLS only, and never log it.
 - A quote fee paid to a copied `payTo` is lost to the buyer. The guardrail must take `payTo` from Circle's listing, not from the 402 header alone.
 
 ## 9. Acceptance criteria
@@ -261,7 +261,6 @@ only what the quote endpoint requires of it:
 - AC-7: The invariant of section 4.5 has a test.
 - AC-8: One keyless trial settlement on Arc testnet is recorded with its transaction hash.
 - AC-9: A 402 challenge without `info.id` in the payload, or with an identifier outside the pattern, is rejected.
-- AC-10: The fulfilment token of one quote opens the MCP route for that `task_id`, and is rejected for another `task_id` and after `settleBy`.
 
 ## 10. Effort
 

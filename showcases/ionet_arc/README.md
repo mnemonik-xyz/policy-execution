@@ -258,7 +258,7 @@ Because the Buyer Guardrail manages local keys and spending limits, it runs loca
 > [!NOTE]
 > If your client does not support direct HTTP MCP URLs, bridge the remote endpoint via
 > `mcp-remote`: `"command": "npx", "args": ["-y", "mcp-remote", "http://<seller-host>:8000/mcp"]`.
-> For the Arc mainnet seller with basic auth, see
+> For the Arc mainnet seller, see
 > [Desktop configuration for mainnet](#desktop-configuration-for-mainnet).
 
 The agent prompts can then naturally discover GPU hardware, request a quote, submit it to
@@ -273,17 +273,23 @@ in the addresses below.
 
 The seller MCP for Arc mainnet (chain ID `5042`) runs at `https://seller.mnemonik.xyz/mcp`.
 It settles through the no-proof escrow `TaskEscrow` and the test-double `JournalVerifier`.
-Access needs basic auth. The operator hands out the credential personally. This README never
-holds the credential.
+The endpoint has no authentication.
 
-The seller puts this label in its `initialize` instructions and at the start of the
-descriptions of `propose_deployment`, `deploy_with_escrow` and `submit_acceptance`:
-
-> after seller acceptance anyone can trigger payout; no proof; amounts up to 1 USD
-
-The `initialize` instructions also state these limits:
-
-> Settlement uses a test-double verifier that accepts any digest the seller approves. The 1 USD cap and the one-hour lease are seller policy, not contract rules. One deal at a time. The mainnet seller path has not been exercised with money before this listing. Any holder of the basic-auth credential can read the current deployment status, including its worker token.
+> [!CAUTION]
+> Risks of the unauthenticated seller endpoint:
+>
+> - Anyone who can reach `/mcp` can call every tool. `get_deployment_status` returns the
+>   worker token of the active deployment, so a stranger can use the paid GPU container
+>   during the lease.
+> - Anyone can call `propose_deployment` and `list_suitable_hardware`. Each call reads the
+>   io.net API and the seller RPC, and stores a proposal file. Nothing limits the rate, so
+>   this is a denial-of-service and disk-growth vector.
+> - A stranger who knows a funded `task_id` can trigger `deploy_with_escrow` and occupy the
+>   single deal slot, which blocks other buyers.
+> - The seller spends its own io.net credits on provisioning. The 1 USD cap per deal is the
+>   only spending limit.
+> - Put the endpoint behind a network control (firewall allowlist, VPN or reverse proxy
+>   with auth) if you need any access limit.
 
 The seller path on mainnet (funding, acceptance, GPU provisioning, settlement) has not run
 with money. The first buyer is therefore the first test.
@@ -293,16 +299,12 @@ Further limits for the buyer:
 - The compiled buyer policy is valid for 900 seconds (`validity_seconds: 900`). Sign the
   acceptance within 15 minutes of the policy compilation.
 - The buyer guardrail refuses a proposal above `max_budget_usd` of the manifest (1.00).
-  The policy rule comes from [`config/buyer_policy_template.yaml`](config/buyer_policy_template.yaml)
-  and allows up to 2.00 USDC. Do not edit the template: the 1.00 limit comes from the manifest.
+  The policy rule comes from
+  [`config/buyer_policy_template.yaml`](config/buyer_policy_template.yaml) and allows up to
+  2.00 USDC. Do not edit the template: the 1.00 limit comes from the manifest.
 - On chain 5042, `deploy_with_escrow`, `get_deployment_status` and `submit_acceptance` need
   the `task_id`. It is the `TaskEscrow` task ID that `propose_deployment` returns: `0x`
   and 64 hex digits.
-- Any basic-auth holder who knows a public `task_id` can read the worker token through
-  `get_deployment_status`.
-- While the seller accepts one deal (up to about 30 seconds), it refuses a second
-  `deploy_with_escrow` with "another deal is being accepted". Try again after the active
-  deal ends. The buyer can still refund an offer that the seller did not accept.
 
 ### Mainnet addresses
 
@@ -324,8 +326,8 @@ Run every command from the repository root.
 1. Build the binaries with `cargo build --release -p warrant-host`. The buyer guardrail
    finds `warrant-policy` and `warrant-evidence` in `target/release/` or `target/debug/`.
    Without the build, it fails with "Could not find compiled binary".
-2. Copy [`config/mainnet-manifest.example.yaml`](config/mainnet-manifest.example.yaml) to
-   your own file outside git. Set the fields of the manifest table after step 7.
+2. Copy [`config/manifest.yaml`](config/manifest.yaml) to your own file outside git. Set the
+   fields of the manifest table after step 7.
 3. Give the guardrail your own funded Arc wallet key. Use one of these inputs:
    - the flag `--key-file <path>`;
    - the manifest field `private_key_files.buyer_key`;
@@ -391,28 +393,19 @@ read on the VM. Ignore them or delete them.
       "args": [
         "-m", "showcases.ionet_arc.buyer_mcp_server",
         "--transport", "stdio",
-        "--manifest", "/path/to/your/mainnet-manifest.yaml",
+        "--manifest", "/path/to/your/manifest.yaml",
         "--key-file", "/path/to/your/buyer.key"
       ]
     },
     "seller-transcription-service": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp", "--header", "Authorization:${AUTH_HEADER}"],
-      "env": {
-        "AUTH_HEADER": "Basic <base64 of user:password>"
-      }
+      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp"]
     }
   }
 }
 ```
 
-`mcp-remote` puts the value of the environment variable `AUTH_HEADER` in place of
-`${AUTH_HEADER}`. The header argument has no space after the colon, because some clients
-split arguments on spaces. Set `AUTH_HEADER` to `Basic` and the base64 form of
-`user:password` from the operator. The configuration file then holds the credential:
-keep it at mode 0600 and out of git. If your client passes the shell environment to
-`mcp-remote`, export `AUTH_HEADER` in that shell and remove the `env` block. Unverified on 2026-10-15: this form follows the
-`mcp-remote` documentation, and it has not run against this endpoint.
+The seller endpoint has no authentication, so `mcp-remote` needs no header or credential.
 
 ### Operator notes
 
@@ -529,26 +522,6 @@ Both `seller_mcp_server.py` and `buyer_mcp_server.py` automatically read their i
 `buyer_address`) directly from [`config/manifest.yaml`](config/manifest.yaml) by default (or via
 `--manifest <path>`). You can still override `--rpc-url` via CLI arguments.
 
-### 0. Build the Seller MCP Image
-
-Build from the repository root; the seller image compiles the native Warrant binaries and packages
-the seller MCP server. BuildKit is required because
-[`Dockerfile.dockerignore`](Dockerfile.dockerignore) is a Dockerfile-specific, allowlist-based
-context filter. It must not become a root `.dockerignore`, which would also affect unrelated
-root-context image builds.
-
-```sh
-# Default: builds warrant-host and warrant-policy in the image.
-DOCKER_BUILDKIT=1 docker build \
-  -f showcases/ionet_arc/Dockerfile \
-  -t warrant-seller:dev .
-
-# Linux VM only: reuse prebuilt target/release binaries.
-DOCKER_BUILDKIT=1 docker build --build-arg BIN_SOURCE=host \
-  -f showcases/ionet_arc/Dockerfile \
-  -t warrant-seller:host .
-```
-
 ### 1. Run the Seller MCP Server
 
 Start the Seller MCP daemon:
@@ -575,7 +548,7 @@ On live networks like Arc Testnet, the seller agent signs `TaskEscrow.accept()` 
 `TaskEscrow.settle()` on-chain. Configure the seller private key via any of:
 - File: save to `showcases/ionet_arc/.keys/seller.key` (or reference in `manifest.yaml`
   under `private_key_files.seller_key`)
-- Environment variable: `export WARRANT_SELLER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- Environment variable: `export WARRANT_SELLER_KEY="0x..."`
 - CLI flag: `--private-key 0x...` or `--key-file <path>`
 
 Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--server-account <address>`,
@@ -599,7 +572,7 @@ On live networks such as Arc Testnet, the buyer agent signs on-chain transaction
 and `TaskEscrow.offer`) locally. Configure the buyer private key via any of:
 - File: save the key to `showcases/ionet_arc/.keys/buyer.key` (or reference in `manifest.yaml`
   under `private_key_files.buyer_key`)
-- Environment variable: `export WARRANT_BUYER_KEY="0x..."` (or `WARRANT_PRIVATE_KEY`)
+- Environment variable: `export WARRANT_BUYER_KEY="0x..."`
 - CLI flag: `--private-key 0x...` or `--key-file <path>`
 
 Optional CLI flags: `--manifest <path>`, `--rpc-url <url>`, `--auto-mint`, `--private-key <hex>`,

@@ -87,32 +87,37 @@ class BuyerWarrantService:
             REPO_ROOT / "showcases" / "ionet_arc" / ".keys" / "buyer_acceptance.key"
         )
 
-        manifest = load_manifest(self.manifest_path)
-        if max_duration_hours is not None:
-            self.max_duration_hours = int(max_duration_hours)
-        else:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
-            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+        self.max_duration_hours = int(max_duration_hours) if max_duration_hours is not None else None
+        self.max_budget_usd = float(max_budget_usd) if max_budget_usd is not None else None
+        self.pinned_escrow = pinned_escrow
+        self.pinned_token = pinned_token
+        self.buyer_account = buyer_account
+        self.verifier_address = verifier_address
 
-        if max_budget_usd is not None:
-            self.max_budget_usd = float(max_budget_usd)
-        else:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
-            if raw_budget is not None:
-                self.max_budget_usd = float(raw_budget)
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
-        self.pinned_escrow = pinned_escrow or get_manifest_parameter(manifest, "escrow_address", "escrow-address")
-        self.pinned_token = pinned_token or get_manifest_parameter(manifest, "token_address", "token-address")
-        self.buyer_account = buyer_account or get_manifest_parameter(
-            manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
+        needs_manifest = (
+            self.max_duration_hours is None
+            or self.max_budget_usd is None
+            or not self.pinned_escrow
+            or not self.pinned_token
+            or not self.buyer_account
+            or not self.verifier_address
         )
-        self.verifier_address = verifier_address or get_manifest_parameter(
-            manifest, "verifier_address", "verifier-address"
-        )
+        if needs_manifest:
+            manifest = load_manifest(self.manifest_path)
+            if self.max_duration_hours is None:
+                raw_duration = get_manifest_parameter(manifest, "duration_hours")
+                self.max_duration_hours = int(raw_duration) if raw_duration is not None else None
+            if self.max_budget_usd is None:
+                raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
+                self.max_budget_usd = float(raw_budget) if raw_budget is not None else None
+            if not self.pinned_escrow:
+                self.pinned_escrow = get_manifest_parameter(manifest, "escrow_address")
+            if not self.pinned_token:
+                self.pinned_token = get_manifest_parameter(manifest, "token_address")
+            if not self.buyer_account:
+                self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
+            if not self.verifier_address:
+                self.verifier_address = get_manifest_parameter(manifest, "verifier_address")
 
         if not self.escrow_client.escrow and self.pinned_escrow:
             self.escrow_client.escrow = self.pinned_escrow
@@ -163,81 +168,45 @@ class BuyerWarrantService:
         token_addr: str,
         chain_id: int,
     ):
+        if self.max_budget_usd is None:
+            raise ToolError("Policy rejection: max_budget_usd is not configured in config/manifest.yaml")
+
         if cost_usd > self.max_budget_usd:
-            logger.warning(
-                "Policy rejection: proposed cost $%.4f exceeds max budget cap $%.4f",
-                cost_usd,
-                self.max_budget_usd,
-            )
             raise ToolError(
                 f"Policy rejection: proposed cost ${cost_usd:.4f} exceeds max budget cap ${self.max_budget_usd:.4f}"
             )
         max_atomic = round(self.max_budget_usd * 1_000_000)
         if atomic_amount > max_atomic:
-            logger.warning(
-                "Policy rejection: proposed amount %d exceeds budget limit %d",
-                atomic_amount,
-                max_atomic,
-            )
             raise ToolError(
                 f"Policy rejection: proposed amount {atomic_amount} atomic units exceeds budget limit {max_atomic}"
             )
         expected_atomic = round(cost_usd * 1_000_000)
         if abs(atomic_amount - expected_atomic) > 1:
-            logger.warning(
-                "Policy rejection: atomic amount %d does not match amount_usd $%.4f",
-                atomic_amount,
-                cost_usd,
-            )
             raise ToolError(
                 f"Policy rejection: atomic amount {atomic_amount} does not match amount_usd ${cost_usd:.4f}"
             )
         if duration_hours is None or duration_hours <= 0:
-            logger.warning("Policy rejection: duration_hours is required and must be at least 1")
             raise ToolError("Policy rejection: duration_hours is required and must be at least 1")
+        if self.max_duration_hours is None:
+            raise ToolError("Policy rejection: duration_hours is not configured in config/manifest.yaml")
         if duration_hours > self.max_duration_hours:
-            logger.warning(
-                "Policy rejection: proposed duration %dh exceeds max duration %dh",
-                duration_hours,
-                self.max_duration_hours,
-            )
             raise ToolError(
                 f"Policy rejection: proposed duration {duration_hours}h exceeds max duration {self.max_duration_hours}h"
             )
         if category not in self.allowed_categories:
-            logger.warning(
-                "Policy rejection: category %s not in allowed %s",
-                category,
-                self.allowed_categories,
-            )
             raise ToolError(
                 f"Policy rejection: category {category} is not in allowed categories {self.allowed_categories}"
             )
         if self.pinned_escrow and escrow_addr.lower() != self.pinned_escrow.lower():
-            logger.warning(
-                "Policy rejection: escrow address %s != pinned %s",
-                escrow_addr,
-                self.pinned_escrow,
-            )
             raise ToolError(
                 f"Policy rejection: escrow address {escrow_addr} does not match pinned escrow {self.pinned_escrow}"
             )
         if self.pinned_token and token_addr.lower() != self.pinned_token.lower():
-            logger.warning(
-                "Policy rejection: token address %s != pinned %s",
-                token_addr,
-                self.pinned_token,
-            )
             raise ToolError(
                 f"Policy rejection: token address {token_addr} does not match pinned token {self.pinned_token}"
             )
         active_chain = self._resolve_chain_id()
         if chain_id != active_chain:
-            logger.warning(
-                "Policy rejection: proposed chain_id %s != active chain_id %s",
-                chain_id,
-                active_chain,
-            )
             raise ToolError(
                 f"Policy rejection: proposed chain_id {chain_id} does not match RPC chain_id {active_chain}"
             )
@@ -284,7 +253,6 @@ class BuyerWarrantService:
                         f"Insufficient balance ({balance} < {atomic_amount}) and auto-mint failed: {e}"
                     ) from e
             else:
-                logger.warning("Insufficient balance: %d < %d for buyer %s", balance, atomic_amount, buyer_account)
                 raise ToolError(f"Insufficient token balance ({balance} < {atomic_amount}) for buyer {buyer_account}.")
 
         try:
@@ -341,7 +309,7 @@ class BuyerWarrantService:
         escrow_address: str | None = None,
         token_address: str | None = None,
         category: int = DEFAULT_CATEGORY,
-        duration_hours: int | None = 1,
+        duration_hours: int | None = None,
         policy_version: int = 1,
         chain_id: int | None = None,
     ) -> dict:
@@ -353,7 +321,7 @@ class BuyerWarrantService:
         effective_salt = salt or prop.get("salt")
         effective_recipient = recipient or prop.get("recipient")
         effective_category = prop.get("category", category) if category == DEFAULT_CATEGORY else category
-        effective_duration = prop.get("duration_hours", duration_hours) if duration_hours == 1 else duration_hours
+        effective_duration = prop.get("duration_hours") if "duration_hours" in prop else duration_hours
 
         logger.info(
             "Tool called: warrant_evaluate_and_offer with task_id=%s, amount=%s, amount_usd=%s, "
@@ -400,7 +368,6 @@ class BuyerWarrantService:
         if not token_addr:
             missing.append("token_address")
         if missing:
-            logger.warning("Missing required proposal fields: %s", ", ".join(missing))
             raise ToolError(f"Missing required proposal fields: {', '.join(missing)}")
 
         cost_usd = float(Decimal(str(amount_usd)))
@@ -435,7 +402,6 @@ class BuyerWarrantService:
             raise ToolError(f"Failed to derive taskIdFor({buyer_account}, {salt}): {e}") from e
 
         if str(task_id).lower() != str(expected_task_id).lower():
-            logger.warning("Proposed task_id '%s' != derived taskIdFor '%s'", task_id, expected_task_id)
             raise ToolError(
                 f"Policy rejection: proposed task_id '{task_id}' does not match "
                 f"derived taskIdFor('{buyer_account}', '{salt}'): '{expected_task_id}'"
@@ -535,7 +501,6 @@ class BuyerWarrantService:
         )
         task_path = self.tasks_dir / f"{task_id}.json"
         if not task_path.exists():
-            logger.warning("Task '%s' not found in buyer state at %s", task_id, task_path)
             raise ToolError(f"Task '{task_id}' not found in buyer state. Offer must be created first.")
 
         task_data = json.loads(task_path.read_text())
@@ -543,21 +508,26 @@ class BuyerWarrantService:
 
         atomic_amount = int(amount)
         if atomic_amount != int(task_data.get("amount", 0)):
-            logger.warning("Acceptance amount %d != offered task amount %s", atomic_amount, task_data.get("amount"))
             raise ToolError(
                 f"Acceptance amount {atomic_amount} does not match offered task amount {task_data.get('amount')}"
             )
         if recipient.lower() != str(task_data.get("recipient", "")).lower():
-            logger.warning(
-                "Acceptance recipient %s != offered task recipient %s",
-                recipient,
-                task_data.get("recipient"),
-            )
             raise ToolError(
                 f"Acceptance recipient {recipient} does not match offered task recipient {task_data.get('recipient')}"
             )
 
         logger.info("Constructing Acceptance statement for task_id=%s, deliverable_hash=%s", task_id, deliverable_hash)
+        if policy.get("valid_after") is None or policy.get("valid_until") is None:
+            logger.error("Task '%s' policy is missing valid_after or valid_until", task_id)
+            raise ToolError(f"Task '{task_id}' policy is missing valid_after or valid_until.")
+
+        try:
+            valid_after = int(policy["valid_after"])
+            valid_until = int(policy["valid_until"])
+        except (TypeError, ValueError) as e:
+            logger.error("Task '%s' policy has invalid valid_after or valid_until: %s", task_id, e)
+            raise ToolError(f"Task '{task_id}' policy has invalid valid_after or valid_until: {e}") from e
+
         scope = policy.get("scope") or {
             "chain_id": self._resolve_chain_id(),
             "vault": list(address20(self.pinned_escrow or self.escrow_client.escrow)),
@@ -571,8 +541,8 @@ class BuyerWarrantService:
             "recipient": list(address20(recipient)),
             "amount": atomic_amount,
             "accepted": True,
-            "valid_after": int(policy.get("valid_after", int(time.time()) - 300)),
-            "valid_until": int(policy.get("valid_until", int(time.time()) + 900)),
+            "valid_after": valid_after,
+            "valid_until": valid_until,
         }
 
         try:
@@ -668,35 +638,27 @@ class ServerConfig:
 
     def _resolve_parameters(self, manifest: dict):
         if self.rpc_url is None:
-            self.rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+            self.rpc_url = get_manifest_parameter(manifest, "rpc_url") or "http://127.0.0.1:8545"
         if self.escrow_address is None:
-            self.escrow_address = get_manifest_parameter(manifest, "escrow_address", "escrow-address")
+            self.escrow_address = get_manifest_parameter(manifest, "escrow_address")
         if self.buyer_account is None:
-            self.buyer_account = get_manifest_parameter(
-                manifest, "buyer_account", "buyer-account", "buyer_address", "buyer-address"
-            )
+            self.buyer_account = get_manifest_parameter(manifest, "buyer_address")
         if self.verifier_address is None:
-            self.verifier_address = get_manifest_parameter(manifest, "verifier_address", "verifier-address")
+            self.verifier_address = get_manifest_parameter(manifest, "verifier_address")
         if self.token_address is None:
-            self.token_address = get_manifest_parameter(manifest, "token_address", "token-address")
+            self.token_address = get_manifest_parameter(manifest, "token_address")
         if self.max_budget_usd is None:
-            raw_budget = get_manifest_parameter(manifest, "max_budget_usd", "max-budget-usd")
+            raw_budget = get_manifest_parameter(manifest, "max_budget_usd")
             if raw_budget is not None:
                 self.max_budget_usd = float(raw_budget)
-            else:
-                raw_amount = get_manifest_parameter(manifest, "max_amount", "max-amount")
-                self.max_budget_usd = float(raw_amount) / 1_000_000 if raw_amount is not None else 2.00
         if self.max_duration_hours is None:
-            raw_duration = get_manifest_parameter(
-                manifest, "duration_hours", "duration-hours", "max_duration_hours", "max-duration-hours"
-            )
-            self.max_duration_hours = int(raw_duration) if raw_duration is not None else 1
+            raw_duration = get_manifest_parameter(manifest, "duration_hours")
+            if raw_duration is not None:
+                self.max_duration_hours = int(raw_duration)
 
     def _resolve_key(self, manifest: dict):
         if self.buyer_key_path is None:
-            raw_key_path = manifest.get("private_key_files", {}).get(
-                "buyer_key", manifest.get("private_key_files", {}).get("buyer_account_key")
-            )
+            raw_key_path = manifest.get("private_key_files", {}).get("buyer_key")
             if raw_key_path:
                 cand = pathlib.Path(raw_key_path)
                 self.buyer_key_path = cand if cand.is_absolute() else (REPO_ROOT / cand)
@@ -710,10 +672,9 @@ class ServerConfig:
                 with contextlib.suppress(Exception):
                     self.buyer_private_key = self.buyer_key_path.read_text().strip()
             if not self.buyer_private_key:
-                for env_var in ("WARRANT_BUYER_KEY", "BUYER_PRIVATE_KEY", "WARRANT_PRIVATE_KEY"):
-                    if os.environ.get(env_var):
-                        self.buyer_private_key = os.environ.get(env_var).strip()
-                        break
+                val = os.environ.get("WARRANT_BUYER_KEY")
+                if val:
+                    self.buyer_private_key = val.strip()
 
     def __post_init__(self):
         self._resolve_paths()
@@ -756,6 +717,7 @@ def create_server(config: ServerConfig | pathlib.Path | str | None = None, **kwa
             escrow_client.register_key(cfg.buyer_account, cfg.buyer_private_key)
         with contextlib.suppress(Exception):
             from eth_account import Account
+
             derived_addr = Account.from_key(cfg.buyer_private_key).address
             escrow_client.register_key(derived_addr, cfg.buyer_private_key)
 
@@ -888,7 +850,7 @@ def main():
     parser.add_argument(
         "--private-key",
         default=None,
-        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY / WARRANT_PRIVATE_KEY)",
+        help="Private key for buyer account to sign transactions (or set WARRANT_BUYER_KEY)",
     )
     parser.add_argument(
         "--key-file",

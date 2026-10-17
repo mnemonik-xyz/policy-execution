@@ -228,6 +228,87 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["acceptance"]["accepted"])
         self.assertEqual(len(res["signature"]), 64)
 
+    async def test_warrant_sign_acceptance_missing_policy_validity(self):
+        proposal = {
+            "task_id": "0x" + "55" * 32,
+            "amount": 1_000_000,
+            "amount_usd": "1.00",
+            "duration_hours": 1,
+            "salt": "0x" + "66" * 32,
+            "recipient": "0x" + "44" * 20,
+            "category": DEFAULT_CATEGORY,
+            "escrow_address": self.mock_escrow.escrow,
+            "token_address": self.mock_escrow.token,
+        }
+        await self.call("warrant_evaluate_and_offer", {"proposal": proposal})
+
+        task_path = self.state_dir / "tasks" / f"{proposal['task_id']}.json"
+        base_data = json.loads(task_path.read_text())
+
+        # 1. Missing key
+        data = json.loads(json.dumps(base_data))
+        del data["policy"]["valid_after"]
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 2. None value for valid_after
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_after"] = None
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 3. None value for valid_until
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_until"] = None
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("missing valid_after or valid_until", str(ctx.exception))
+
+        # 4. Invalid non-integer value
+        data = json.loads(json.dumps(base_data))
+        data["policy"]["valid_after"] = "not_an_int"
+        task_path.write_text(json.dumps(data))
+        with self.assertRaises(ToolError) as ctx:
+            await self.call(
+                "warrant_sign_acceptance",
+                {
+                    "task_id": proposal["task_id"],
+                    "deliverable_hash": "0x" + "77" * 32,
+                    "recipient": proposal["recipient"],
+                    "amount": proposal["amount"],
+                },
+            )
+        self.assertIn("invalid valid_after or valid_until", str(ctx.exception))
+
     async def test_warrant_evaluate_and_offer_insufficient_balance_no_automint(self):
         server = create_server(
             state_dir=self.state_dir,
@@ -312,32 +393,6 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.max_duration_hours, 1)
         self.assertEqual(config.rpc_url, "https://rpc.testnet.arc.io")
 
-    def test_read_initial_parameters_from_custom_manifest_kebab_case(self):
-        custom_manifest = Path(self.state_dir) / "custom_manifest.yaml"
-        custom_manifest.write_text(yaml.dump({
-            "rpc-url": "https://custom.rpc.io",
-            "escrow-address": "0x" + "12" * 20,
-            "verifier-address": "0x" + "34" * 20,
-            "buyer-account": "0x" + "56" * 20,
-            "max-budget-usd": 4.50,
-            "duration-hours": 3,
-        }))
-        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
-        self.assertEqual(config.rpc_url, "https://custom.rpc.io")
-        self.assertEqual(config.escrow_address, "0x" + "12" * 20)
-        self.assertEqual(config.verifier_address, "0x" + "34" * 20)
-        self.assertEqual(config.buyer_account, "0x" + "56" * 20)
-        self.assertEqual(config.max_budget_usd, 4.50)
-        self.assertEqual(config.max_duration_hours, 3)
-
-    def test_read_max_budget_derived_from_max_amount(self):
-        custom_manifest = Path(self.state_dir) / "custom_manifest_amount.yaml"
-        custom_manifest.write_text(yaml.dump({
-            "max_amount": 3_500_000,
-        }))
-        config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
-        self.assertEqual(config.max_budget_usd, 3.50)
-
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
             state_dir=self.state_dir,
@@ -368,15 +423,70 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             service._resolve_buyer_account()
         self.assertIn("Buyer account is not configured in config/manifest.yaml", str(ctx.exception))
 
+    def test_validate_proposal_terms_fails_when_max_budget_usd_unconfigured(self):
+        empty_manifest = Path(self.state_dir) / "empty_manifest.yaml"
+        empty_manifest.write_text(yaml.dump({}))
+        from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService
+
+        service = BuyerWarrantService(
+            state_dir=self.state_dir,
+            escrow_client=self.mock_escrow,
+            manifest_path=empty_manifest,
+        )
+        with self.assertRaises(ToolError) as ctx:
+            service._validate_proposal_terms(
+                cost_usd=1.0,
+                atomic_amount=1_000_000,
+                duration_hours=1,
+                category=DEFAULT_CATEGORY,
+                escrow_addr="0x" + "11" * 20,
+                token_addr="0x" + "22" * 20,
+                chain_id=31337,
+            )
+        self.assertIn("max_budget_usd is not configured in config/manifest.yaml", str(ctx.exception))
+
+    def test_validate_proposal_terms_fails_when_duration_hours_unconfigured(self):
+        manifest_file = Path(self.state_dir) / "manifest_budget_only.yaml"
+        manifest_file.write_text(yaml.dump({"max_budget_usd": 2.0}))
+        from showcases.ionet_arc.buyer_mcp_server import BuyerWarrantService
+
+        service = BuyerWarrantService(
+            state_dir=self.state_dir,
+            escrow_client=self.mock_escrow,
+            manifest_path=manifest_file,
+        )
+        with self.assertRaises(ToolError) as ctx:
+            service._validate_proposal_terms(
+                cost_usd=1.0,
+                atomic_amount=1_000_000,
+                duration_hours=1,
+                category=DEFAULT_CATEGORY,
+                escrow_addr="0x" + "11" * 20,
+                token_addr="0x" + "22" * 20,
+                chain_id=31337,
+            )
+        self.assertIn("duration_hours is not configured in config/manifest.yaml", str(ctx.exception))
+
+    def test_empty_manifest_results_in_none_limits_in_server_config(self):
+        empty_manifest = Path(self.state_dir) / "empty_manifest.yaml"
+        empty_manifest.write_text(yaml.dump({}))
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=empty_manifest)
+        self.assertIsNone(config.max_budget_usd)
+        self.assertIsNone(config.max_duration_hours)
+
     def test_buyer_private_key_resolved_from_key_file(self):
         key_file = Path(self.state_dir) / "custom_buyer.key"
         key_file.write_text("0x" + "11" * 32 + "\n")
         custom_manifest = Path(self.state_dir) / "manifest_with_key.yaml"
-        custom_manifest.write_text(yaml.dump({
-            "private_key_files": {
-                "buyer_key": str(key_file),
-            }
-        }))
+        custom_manifest.write_text(
+            yaml.dump(
+                {
+                    "private_key_files": {
+                        "buyer_key": str(key_file),
+                    }
+                }
+            )
+        )
         config = ServerConfig(state_dir=self.state_dir, manifest_path=custom_manifest)
         self.assertEqual(config.buyer_private_key, "0x" + "11" * 32)
 

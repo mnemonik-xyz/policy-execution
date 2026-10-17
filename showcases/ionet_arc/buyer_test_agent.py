@@ -14,7 +14,6 @@ Demonstrates the capability-based two-step escrow lifecycle:
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -117,8 +116,8 @@ def _resolve_agent_wallets(rpc_url: str, manifest_path: Path | None = None) -> t
         Path(os.environ["WARRANT_MANIFEST"]) if "WARRANT_MANIFEST" in os.environ else DEFAULT_MANIFEST_PATH
     )
     manifest = load_manifest(m_path)
-    customer = get_manifest_parameter(manifest, "buyer_address", "buyer-address", "buyer_account", "buyer-account")
-    agent = get_manifest_parameter(manifest, "seller_address", "seller-address", "server_account", "server-account")
+    customer = get_manifest_parameter(manifest, "buyer_address")
+    agent = get_manifest_parameter(manifest, "seller_address")
 
     if not customer or not agent:
         try:
@@ -198,12 +197,17 @@ async def _sign_acceptance(
 async def run_client(
     mcp_url: str,
     rpc_url: str,
-    auth_user: str | None = None,
-    auth_pass: str | None = None,
-    max_budget_usdc: float = 1.00,
+    max_budget_usdc: float | None = None,
     buyer_mcp_url: str | None = None,
     manifest_path: Path | None = None,
 ):
+    if max_budget_usdc is None:
+        m = load_manifest(manifest_path or DEFAULT_MANIFEST_PATH)
+        raw_budget = get_manifest_parameter(m, "max_budget_usd")
+        if raw_budget is None:
+            sys.exit(f"max_budget_usd is not configured in {manifest_path or DEFAULT_MANIFEST_PATH}")
+        max_budget_usdc = float(raw_budget)
+
     print("=" * 70)
     print("  WARRANT AUTONOMOUS BUYER AGENT")
     print("=" * 70)
@@ -213,12 +217,7 @@ async def run_client(
     print(f"Customer wallet: {customer}")
     print(f"Agent wallet:    {agent}")
 
-    headers = {}
-    if auth_user and auth_pass:
-        creds = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode("ascii")
-        headers["Authorization"] = f"Basic {creds}"
-
-    async with httpx2.AsyncClient(headers=headers, timeout=60, trust_env=should_trust_env(mcp_url)) as http_client:
+    async with httpx2.AsyncClient(timeout=60, trust_env=should_trust_env(mcp_url)) as http_client:
         async with streamable_http_client(mcp_url, http_client=http_client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, read_timeout_seconds=60) as session:
                 await session.initialize()
@@ -347,9 +346,12 @@ def main():
         default=os.environ.get("WARRANT_RPC_URL", os.environ.get("ARC_RPC_URL")),
         help="Ethereum / Arc JSON-RPC URL (default: read from manifest.yaml or http://127.0.0.1:8545)",
     )
-    parser.add_argument("--auth-user", default=os.environ.get("MCP_AUTH_USER"), help="HTTP Basic Auth user")
-    parser.add_argument("--auth-pass", default=os.environ.get("MCP_AUTH_PASS"), help="HTTP Basic Auth pass")
-    parser.add_argument("--max-budget", type=float, default=1.00, help="Max budget ceiling in USDC (default: 1.00)")
+    parser.add_argument(
+        "--max-budget",
+        type=float,
+        default=None,
+        help="Max budget ceiling in USDC (default: from manifest.yaml)",
+    )
     parser.add_argument(
         "--buyer-mcp-url",
         default=os.environ.get("BUYER_MCP_URL"),
@@ -367,14 +369,12 @@ def main():
     rpc_url = args.rpc_url
     if not rpc_url:
         manifest = load_manifest(args.manifest_path or DEFAULT_MANIFEST_PATH)
-        rpc_url = get_manifest_parameter(manifest, "rpc_url", "rpc-url") or "http://127.0.0.1:8545"
+        rpc_url = get_manifest_parameter(manifest, "rpc_url") or "http://127.0.0.1:8545"
 
     asyncio.run(
         run_client(
             mcp_url=args.mcp_url,
             rpc_url=rpc_url,
-            auth_user=args.auth_user,
-            auth_pass=args.auth_pass,
             max_budget_usdc=args.max_budget,
             buyer_mcp_url=args.buyer_mcp_url,
             manifest_path=args.manifest_path,
