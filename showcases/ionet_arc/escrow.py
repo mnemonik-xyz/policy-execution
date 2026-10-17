@@ -6,6 +6,7 @@ Uses eth-abi and eth-account for fast, lightweight in-process EVM interaction wi
 import asyncio
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import shutil
@@ -28,17 +29,20 @@ from .adapter import canonical, digest
 __all__ = [
     "DEFAULT_CATEGORY",
     "DEFAULT_CHAIN_ID",
+    "DEFAULT_IMAGE_ID",
     "DEFAULT_MANIFEST_PATH",
-    "MOCK_IMAGE_ID",
-    "MOCK_SEAL",
     "REPO_ROOT",
     "EscrowClient",
     "EthRpc",
     "address20",
+    "build_receipt_seal",
     "bytes32",
     "canonical",
     "compile_buyer_policy",
+    "compute_claim_digest",
+    "compute_receipt_digest",
     "compute_task_id",
+    "compute_verifier_selector",
     "digest",
     "encode_journal",
     "ensure_policy_hash",
@@ -58,9 +62,16 @@ __all__ = [
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHAIN_ID = 31337
 DEFAULT_CATEGORY = 42
-MOCK_SEAL = "0xabcd"
-MOCK_IMAGE_ID = "0x" + "00" * 31 + "01"
+DEFAULT_IMAGE_ID = "0xafd4ad2d38c10243e72193f92a5d1ab23f3d2135f32282a9c1e43bf734dc105e"
 DEFAULT_MANIFEST_PATH = REPO_ROOT / "showcases" / "ionet_arc" / "config" / "manifest.yaml"
+
+OUTPUT_TAG = hashlib.sha256(b"risc0.Output").digest()
+CLAIM_TAG = hashlib.sha256(b"risc0.ReceiptClaim").digest()
+SEAL_TAG = hashlib.sha256(b"warrant/receipt-claim/v1").digest()
+SYSTEM_STATE_ZERO_DIGEST = hashlib.sha256(
+    hashlib.sha256(b"risc0.SystemState").digest() + b"\x00" * 36 + b"\x01\x00"
+).digest()
+RECEIPT_VERSION = b"3.0.0"
 
 
 def load_manifest(manifest_path: Path | str | None = None) -> dict:
@@ -524,6 +535,54 @@ def compute_task_id(chain_id: int, escrow_address: str, customer_address: str, s
     return "0x" + keccak(encoded).hex()
 
 
+def compute_claim_digest(
+    image_id: str | bytes,
+    journal_digest: str | bytes,
+    system_state_zero_digest: str | bytes = SYSTEM_STATE_ZERO_DIGEST,
+) -> bytes:
+    """Compute the RISC Zero ReceiptClaim digest for a successful (Halted, 0) guest execution."""
+    output_digest = hashlib.sha256(OUTPUT_TAG + bytes32(journal_digest) + b"\x00" * 32 + b"\x02\x00").digest()
+    return hashlib.sha256(
+        CLAIM_TAG
+        + b"\x00" * 32
+        + bytes32(image_id)
+        + bytes32(system_state_zero_digest)
+        + output_digest
+        + b"\x00" * 8
+        + b"\x04\x00"
+    ).digest()
+
+
+def compute_verifier_selector(prover: str | bytes) -> bytes:
+    """Compute the 4-byte verifier selector matching ReceiptClaimVerifier.SELECTOR."""
+    return hashlib.sha256(SEAL_TAG + RECEIPT_VERSION + address20(prover)).digest()[:4]
+
+
+def compute_receipt_digest(chain_id: int, verifier: str | bytes, selector: bytes, claim_digest: str | bytes) -> bytes:
+    """Compute the domain-separated receipt digest matching ReceiptClaimVerifier.receiptDigest."""
+    return hashlib.sha256(
+        SEAL_TAG + int(chain_id).to_bytes(32, "big") + address20(verifier) + bytes(selector[:4]) + bytes32(claim_digest)
+    ).digest()
+
+
+def build_receipt_seal(
+    prover_key: str | bytes,
+    chain_id: int,
+    verifier: str | bytes,
+    image_id: str | bytes,
+    journal_bytes: bytes,
+    system_state_zero_digest: str | bytes = SYSTEM_STATE_ZERO_DIGEST,
+) -> bytes:
+    """Construct a 101-byte selector-prefixed ReceiptClaimVerifier seal signed by prover_key."""
+    acc = Account.from_key(prover_key)
+    selector = compute_verifier_selector(acc.address)
+    journal_digest = hashlib.sha256(journal_bytes).digest()
+    claim_digest = compute_claim_digest(image_id, journal_digest, system_state_zero_digest)
+    receipt_digest = compute_receipt_digest(chain_id, verifier, selector, claim_digest)
+    signed = acc.unsafe_sign_hash(receipt_digest)
+    return selector + claim_digest + bytes(signed.signature)
+
+
 class EscrowClient:
     """Interface to query and settle TaskEscrow on-chain using eth-abi and eth-account."""
 
@@ -546,12 +605,46 @@ class EscrowClient:
         self.server_account = server_account
         self.private_keys = {k.lower(): v for k, v in (private_keys or {}).items()}
         self._task_id_cache: dict[tuple[str, str, bytes], str] = {}
+        self._image_id_cache: dict[str, str] = {}
         # One seller key serves all tools: hold this lock from the pending nonce read to the send,
         # so that concurrent transactions never reuse a nonce. The receipt wait stays outside.
         self._tx_lock = threading.Lock()
 
     def register_key(self, address: str, private_key: str):
         self.private_keys[address.lower()] = private_key
+
+    def _resolve_private_key(self, from_account: str) -> str | None:
+        from_addr = to_checksum_address(from_account)
+        pk = self.private_keys.get(from_addr.lower())
+        if pk:
+            return pk
+        for env_var in (
+            "WARRANT_PRIVATE_KEY",
+            "WARRANT_BUYER_KEY",
+            "WARRANT_SELLER_KEY",
+            "BUYER_PRIVATE_KEY",
+            "SELLER_PRIVATE_KEY",
+        ):
+            candidate_pk = os.environ.get(env_var)
+            if candidate_pk:
+                try:
+                    acc = Account.from_key(candidate_pk)
+                    if acc.address.lower() == from_addr.lower():
+                        return candidate_pk
+                except Exception:
+                    pass
+        return None
+
+    def _resolve_prover_key(self, sender: str | None = None) -> str | bytes:
+        target = sender or self.server_account
+        if target:
+            pk = self._resolve_private_key(target)
+            if pk:
+                return pk
+            return keccak(b"warrant/prover/v1" + address20(target))
+        if self.private_keys:
+            return next(iter(self.private_keys.values()))
+        raise ValueError("Sender or registered key required to sign receipt claim")
 
     def call_contract(
         self,
@@ -572,24 +665,7 @@ class EscrowClient:
     def send_transaction(self, from_account: str, to_address: str, calldata: bytes) -> dict:
         to_addr = to_checksum_address(to_address)
         from_addr = to_checksum_address(from_account)
-        pk = self.private_keys.get(from_addr.lower())
-        if not pk:
-            for env_var in (
-                "WARRANT_PRIVATE_KEY",
-                "WARRANT_BUYER_KEY",
-                "WARRANT_SELLER_KEY",
-                "BUYER_PRIVATE_KEY",
-                "SELLER_PRIVATE_KEY",
-            ):
-                candidate_pk = os.environ.get(env_var)
-                if candidate_pk:
-                    try:
-                        acc = Account.from_key(candidate_pk)
-                        if acc.address.lower() == from_addr.lower():
-                            pk = candidate_pk
-                            break
-                    except Exception:
-                        pass
+        pk = self._resolve_private_key(from_addr)
 
         if pk:
             acc = Account.from_key(pk)
@@ -657,6 +733,21 @@ class EscrowClient:
             time.sleep(0.05)
         raise TimeoutError(f"Transaction receipt timeout for {tx_hash}")
 
+    def image_id(self) -> str:
+        """Read TaskEscrow.imageId() with result caching and fallback to DEFAULT_IMAGE_ID."""
+        key = to_checksum_address(self.escrow) if self.escrow else ""
+        if key in self._image_id_cache:
+            return self._image_id_cache[key]
+        if self.escrow:
+            try:
+                res = self.call_contract(self.escrow, "imageId()", [], [], ["bytes32"])
+                iid = "0x" + res[0].hex()
+                self._image_id_cache[key] = iid
+                return iid
+            except Exception:
+                pass
+        return DEFAULT_IMAGE_ID
+
     def task_id_for(self, customer: str, salt: str) -> str:
         """Call TaskEscrow.taskIdFor(customer, salt) with result caching and offline fallback."""
         cache_key = (
@@ -721,17 +812,6 @@ class EscrowClient:
         calldata = selector + encode(["bytes32"], [bytes32(task_id)])
         return self.send_transaction(sender, self.escrow, calldata)
 
-    def approve_journal(self, journal_bytes: bytes, sender: str | None = None) -> dict:
-        """Call JournalVerifier.approve(journal)."""
-        sender = sender or self.server_account
-        if not sender:
-            raise ValueError("Sender required to approve journal")
-        if not self.verifier:
-            raise ValueError("Verifier address required to approve journal")
-        selector = function_signature_to_4byte_selector("approve(bytes)")
-        calldata = selector + encode(["bytes"], [journal_bytes])
-        return self.send_transaction(sender, self.verifier, calldata)
-
     def settle(self, seal: bytes | str, journal_bytes: bytes, sender: str | None = None) -> dict:
         """Call TaskEscrow.settle(seal, journal)."""
         sender = sender or self.server_account
@@ -746,18 +826,28 @@ class EscrowClient:
         calldata = selector + encode(["bytes", "bytes"], [seal_bytes, journal_bytes])
         return self.send_transaction(sender, self.escrow, calldata)
 
-    def settle_mock(
-        self,
-        journal_bytes: bytes,
-        sender: str | None = None,
-        seal_hex: str = MOCK_SEAL,
-    ) -> dict:
-        """Approve journal on JournalVerifier (if configured) and settle TaskEscrow with mock seal."""
+    def seal_receipt(self, journal_bytes: bytes, sender: str | None = None) -> bytes:
+        """Build a 101-byte ReceiptClaimVerifier seal for journal_bytes."""
+        if not self.verifier:
+            raise ValueError("Verifier address required to seal receipt claim")
+        try:
+            chain_id = int(self.rpc.chain_id())
+        except Exception:
+            chain_id = DEFAULT_CHAIN_ID
+        prover_key = self._resolve_prover_key(sender)
+        return build_receipt_seal(
+            prover_key=prover_key,
+            chain_id=chain_id,
+            verifier=self.verifier,
+            image_id=self.image_id(),
+            journal_bytes=journal_bytes,
+        )
+
+    def settle_receipt(self, journal_bytes: bytes, sender: str | None = None) -> dict:
+        """Sign a ReceiptClaimVerifier seal and settle TaskEscrow in a single transaction."""
         sender = sender or self.server_account
-        if self.verifier:
-            with contextlib.suppress(Exception):
-                self.approve_journal(journal_bytes, sender=sender)
-        return self.settle(seal_hex, journal_bytes, sender=sender)
+        seal = self.seal_receipt(journal_bytes, sender=sender)
+        return self.settle(seal, journal_bytes, sender=sender)
 
     def token_balance(self, account: str) -> int:
         """Read ERC-20 token balance for account."""
@@ -811,7 +901,7 @@ class EscrowClient:
         return self.send_transaction(sender, self.escrow, calldata)
 
     def deploy_local_anvil(self, customer: str, agent: str) -> dict:
-        """Deploy TestToken, JournalVerifier, and TaskEscrow to local anvil node."""
+        """Deploy TestToken, ReceiptClaimVerifier, and TaskEscrow to local anvil node."""
         contracts_dir = REPO_ROOT / "contracts"
 
         def deploy_contract(name, *args):
@@ -834,14 +924,20 @@ class EscrowClient:
                 raise RuntimeError(f"Deploy {name} failed: {res.stderr.strip() or res.stdout.strip()}")
             return json.loads(res.stdout)["deployedTo"]
 
+        prover = Account.from_key(self._resolve_prover_key(agent)).address
         token = deploy_contract("test/PolicyExecutionVault.t.sol:TestToken")
-        verifier = deploy_contract("test/PolicyExecutionVault.t.sol:JournalVerifier")
-        escrow = deploy_contract("src/TaskEscrow.sol:TaskEscrow", token, verifier, MOCK_IMAGE_ID)
+        verifier = deploy_contract(
+            "src/ReceiptClaimVerifier.sol:ReceiptClaimVerifier",
+            prover,
+            "0x" + SYSTEM_STATE_ZERO_DIGEST.hex(),
+        )
+        escrow = deploy_contract("src/TaskEscrow.sol:TaskEscrow", token, verifier, DEFAULT_IMAGE_ID)
 
         self.token = token
         self.verifier = verifier
         self.escrow = escrow
         self.server_account = agent
+        self._image_id_cache[to_checksum_address(escrow)] = DEFAULT_IMAGE_ID
 
         # Mint and approve test tokens for customer
         self.mint_token(customer, 100_000_000, sender=customer)
@@ -865,13 +961,8 @@ class EscrowClient:
     async def async_accept(self, task_id: str, sender: str | None = None) -> dict:
         return await asyncio.to_thread(self.accept, task_id, sender)
 
-    async def async_settle_mock(
-        self,
-        journal_bytes: bytes,
-        sender: str | None = None,
-        seal_hex: str = MOCK_SEAL,
-    ) -> dict:
-        return await asyncio.to_thread(self.settle_mock, journal_bytes, sender, seal_hex)
+    async def async_settle_receipt(self, journal_bytes: bytes, sender: str | None = None) -> dict:
+        return await asyncio.to_thread(self.settle_receipt, journal_bytes, sender)
 
     async def async_settle(
         self,

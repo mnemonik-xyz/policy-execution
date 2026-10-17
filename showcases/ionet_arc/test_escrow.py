@@ -12,10 +12,14 @@ from eth_account import Account
 from eth_utils import function_signature_to_4byte_selector, to_checksum_address
 
 from showcases.ionet_arc.escrow import (
+    DEFAULT_IMAGE_ID,
     EscrowClient,
     EthRpc,
+    build_receipt_seal,
     compile_buyer_policy,
+    compute_claim_digest,
     compute_task_id,
+    compute_verifier_selector,
     encode_journal,
     ensure_policy_hash,
     parse_public_key,
@@ -271,6 +275,39 @@ class EscrowClientTests(unittest.TestCase):
             self.assertEqual(args[1], self.escrow_addr)
             expected_selector = function_signature_to_4byte_selector("accept(bytes32)")
             self.assertEqual(args[2][:4], expected_selector)
+
+    def test_seal_receipt_and_settle_receipt_single_tx(self):
+        journal = b"\x55" * 384
+        acc = Account.create()
+        self.client.register_key(self.server_account, acc.key.hex())
+
+        seal = self.client.seal_receipt(journal, sender=self.server_account)
+        self.assertEqual(len(seal), 101)
+        expected_selector = compute_verifier_selector(acc.address)
+        self.assertEqual(seal[:4], expected_selector)
+
+        import hashlib
+
+        expected_claim = compute_claim_digest(DEFAULT_IMAGE_ID, hashlib.sha256(journal).digest())
+        self.assertEqual(seal[4:36], expected_claim)
+
+        direct_seal = build_receipt_seal(
+            prover_key=acc.key.hex(),
+            chain_id=31337,
+            verifier=self.verifier_addr,
+            image_id=DEFAULT_IMAGE_ID,
+            journal_bytes=journal,
+        )
+        self.assertEqual(seal, direct_seal)
+
+        with patch.object(self.client, "send_transaction", return_value={"status": "0x1"}) as mock_send:
+            self.client.settle_receipt(journal, sender=self.server_account)
+            mock_send.assert_called_once()
+            args = mock_send.call_args[0]
+            self.assertEqual(args[0], self.server_account)
+            self.assertEqual(args[1], self.escrow_addr)
+            expected_fn = function_signature_to_4byte_selector("settle(bytes,bytes)")
+            self.assertEqual(args[2][:4], expected_fn)
 
     def test_should_trust_env(self):
         self.assertFalse(should_trust_env("http://127.0.0.1:8545"))

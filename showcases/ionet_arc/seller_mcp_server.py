@@ -1063,12 +1063,12 @@ class SellerWarrantService:
                 logger.error("Off-chain Warrant authorization evaluation failed: %s", e)
                 raise ToolError(f"Off-chain Warrant authorization evaluation failed: {e}") from e
 
-            # Settle on-chain via TaskEscrow (Option B: JournalVerifier approves digest, settles with mock seal)
+            # Settle on-chain via TaskEscrow and ReceiptClaimVerifier
             settlement_tx = None
             try:
-                logger.info("Settling TaskEscrow on-chain via settle_mock with journal digest")
+                logger.info("Settling TaskEscrow on-chain with verified receipt claim")
                 settle_res = await asyncio.to_thread(
-                    self.escrow_client.settle_mock,
+                    self.escrow_client.settle_receipt,
                     journal_bytes,
                     sender=session.get("recipient") or self.escrow_client.server_account,
                 )

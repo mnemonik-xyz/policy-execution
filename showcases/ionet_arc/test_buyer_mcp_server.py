@@ -10,13 +10,16 @@ from unittest.mock import MagicMock, patch
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
+from showcases.ionet_arc.arc import NETWORKS
 from showcases.ionet_arc.buyer_mcp_server import (
     BuyerServerConfig,
     ServerConfig,
     create_app,
     create_server,
 )
-from showcases.ionet_arc.escrow import DEFAULT_CATEGORY
+from showcases.ionet_arc.escrow import DEFAULT_CATEGORY, DEFAULT_MANIFEST_PATH, load_manifest
+
+TESTNET_MANIFEST = Path(__file__).parent / "config-arc-testnet" / "manifest.yaml"
 
 
 class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
@@ -384,14 +387,23 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
         app = create_app(config)
         self.assertIsNotNone(app)
 
-    def test_read_initial_parameters_from_manifest(self):
-        config = ServerConfig(state_dir=self.state_dir)
-        self.assertEqual(config.escrow_address, "0xBeD9B731D9C912541FF083AE41607016BFe93b70")
-        self.assertEqual(config.verifier_address, "0xDbefc776e18e34049cAaec736b47122f0583F345")
-        self.assertEqual(config.buyer_account, "0x9793Dd93D46F153a2A879165cd163A01b54d8A00")
-        self.assertEqual(config.max_budget_usd, 2.00)
-        self.assertEqual(config.max_duration_hours, 1)
-        self.assertEqual(config.rpc_url, "https://rpc.testnet.arc.io")
+    def _assert_config_matches_manifest(self, manifest_path, network):
+        manifest = load_manifest(manifest_path)
+        config = ServerConfig(state_dir=self.state_dir, manifest_path=manifest_path)
+        self.assertEqual(config.rpc_url, NETWORKS[network]["rpc"])
+        self.assertEqual(manifest["chain_id"], NETWORKS[network]["chain_id"])
+        self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
+        self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
+        self.assertEqual(config.token_address, manifest.get("token_address"))
+        self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
+        self.assertEqual(config.max_budget_usd, float(manifest["max_budget_usd"]))
+        self.assertEqual(config.max_duration_hours, int(manifest["duration_hours"]))
+
+    def test_read_initial_parameters_from_testnet_manifest(self):
+        self._assert_config_matches_manifest(TESTNET_MANIFEST, "testnet")
+
+    def test_read_initial_parameters_from_mainnet_manifest(self):
+        self._assert_config_matches_manifest(DEFAULT_MANIFEST_PATH, "mainnet")
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
