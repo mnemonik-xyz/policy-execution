@@ -1,0 +1,54 @@
+{
+  "protocol": "warrant.solver.v1",
+  "type": "rfq",
+  "instance": {
+    "machines": [
+      {
+        "capacity": 1,
+        "price_per_unit_tick": 490000
+      }
+    ],
+    "jobs": [
+      {
+        "units": 1,
+        "durations": [
+          30
+        ],
+        "release": 0,
+        "deadline": 3600,
+        "dependencies": []
+      },
+      {
+        "units": 1,
+        "durations": [
+          30
+        ],
+        "release": 0,
+        "deadline": 3600,
+        "dependencies": []
+      },
+      {
+        "units": 1,
+        "durations": [
+          30
+        ],
+        "release": 0,
+        "deadline": 3600,
+        "dependencies": []
+      },
+      {
+        "units": 1,
+        "durations": [
+          31
+        ],
+        "release": 0,
+        "deadline": 3600,
+        "dependencies": []
+      }
+    ]
+  },
+  "instanceHash": "0x48ed79b023d0ca12bcfea54afb9146e4262cb43c18df89fc77579f740118a6e0",
+  "maxCost": 1764000000,
+  "amount": 2000000,
+  "seller": "0xb8202bebb6d8a0a822a56c0062632325c3923eeb"
+}

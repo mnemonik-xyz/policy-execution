@@ -1,0 +1,22 @@
+[
+  {
+    "job": 0,
+    "machine": 0,
+    "start": 0
+  },
+  {
+    "job": 1,
+    "machine": 0,
+    "start": 30
+  },
+  {
+    "job": 2,
+    "machine": 0,
+    "start": 60
+  },
+  {
+    "job": 3,
+    "machine": 0,
+    "start": 90
+  }
+]
