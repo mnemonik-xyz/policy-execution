@@ -871,7 +871,7 @@ class WarrantTranscriptionServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.escrow_address, manifest.get("escrow_address"))
         self.assertEqual(config.verifier_address, manifest.get("verifier_address"))
         self.assertEqual(config.buyer_account, manifest.get("buyer_address"))
-        self.assertEqual(config.rpc_url, "https://rpc.testnet.arc.io")
+        self.assertEqual(config.rpc_url, manifest.get("rpc_url"))
 
     def test_explicit_parameters_override_manifest(self):
         config = ServerConfig(
