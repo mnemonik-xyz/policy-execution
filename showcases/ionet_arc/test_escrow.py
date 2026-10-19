@@ -276,6 +276,18 @@ class EscrowClientTests(unittest.TestCase):
             expected_selector = function_signature_to_4byte_selector("accept(bytes32)")
             self.assertEqual(args[2][:4], expected_selector)
 
+    def test_resolve_prover_key_refuses_to_derive_from_a_public_address(self):
+        # No key registered for the seller account: sealing must fail loudly
+        # instead of falling back to a key anyone can compute from the address.
+        with self.assertRaises(ValueError) as ctx:
+            self.client._resolve_prover_key(self.server_account)
+        self.assertIn("No private key is registered", str(ctx.exception))
+        # Registering someone else's key does not make it the prover either.
+        other = Account.create()
+        self.client.register_key(other.address, other.key.hex())
+        with self.assertRaises(ValueError):
+            self.client._resolve_prover_key(self.server_account)
+
     def test_seal_receipt_and_settle_receipt_single_tx(self):
         journal = b"\x55" * 384
         acc = Account.create()

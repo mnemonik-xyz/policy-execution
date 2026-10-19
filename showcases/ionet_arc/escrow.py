@@ -617,6 +617,9 @@ class EscrowClient:
         self.verifier = verifier_address
         self.server_account = server_account
         self.private_keys = {k.lower(): v for k, v in (private_keys or {}).items()}
+        # Set only by deploy_local_anvil: a fresh prover key for a local chain
+        # whose verifier was deployed with it. Never set on a public network.
+        self._local_prover_key: str | None = None
         self._task_id_cache: dict[tuple[str, str, bytes], str] = {}
         self._image_id_cache: dict[str, str] = {}
         # One seller key serves all tools: hold this lock from the pending nonce read to the send,
@@ -649,15 +652,28 @@ class EscrowClient:
         return None
 
     def _resolve_prover_key(self, sender: str | None = None) -> str | bytes:
+        """Return the private key that signs ReceiptClaimVerifier seals.
+
+        The seal is the only thing TaskEscrow.settle checks, so the prover key
+        must be a real secret: the key registered for the seller account, or
+        the throwaway key that deploy_local_anvil created for a local chain.
+        There is no derived fallback. An earlier version returned
+        keccak("warrant/prover/v1" + address) when no key was registered;
+        anyone can compute that from a public address and settle any Accepted
+        task on a verifier whose prover was set that way.
+        """
         target = sender or self.server_account
         if target:
             pk = self._resolve_private_key(target)
             if pk:
                 return pk
-            return keccak(b"warrant/prover/v1" + address20(target))
-        if self.private_keys:
-            return next(iter(self.private_keys.values()))
-        raise ValueError("Sender or registered key required to sign receipt claim")
+        if self._local_prover_key:
+            return self._local_prover_key
+        raise ValueError(
+            "No private key is registered for the prover account"
+            f"{f' {target}' if target else ''}. Register the seller key "
+            "(register_key / WARRANT_SELLER_KEY) before sealing a receipt claim."
+        )
 
     def call_contract(
         self,
@@ -937,6 +953,12 @@ class EscrowClient:
                 raise RuntimeError(f"Deploy {name} failed: {res.stderr.strip() or res.stdout.strip()}")
             return json.loads(res.stdout)["deployedTo"]
 
+        # The local verifier gets its own random prover key. The seller
+        # account signs transactions; the prover key signs receipt seals.
+        # A random key, not one derived from the address, so a local setup
+        # never teaches a pattern that is unsafe on a public chain.
+        if not self._resolve_private_key(agent):
+            self._local_prover_key = Account.create().key.hex()
         prover = Account.from_key(self._resolve_prover_key(agent)).address
         token = deploy_contract("test/PolicyExecutionVault.t.sol:TestToken")
         verifier = deploy_contract(

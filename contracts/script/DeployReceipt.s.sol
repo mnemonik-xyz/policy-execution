@@ -6,7 +6,6 @@ import {ReceiptClaimVerifier} from "../src/ReceiptClaimVerifier.sol";
 
 interface DeployReceiptVm {
     function envAddress(string calldata) external returns (address);
-    function envOr(string calldata, address) external returns (address);
     function envOr(string calldata, bytes32) external returns (bytes32);
     function startBroadcast() external;
     function stopBroadcast() external;
@@ -21,7 +20,11 @@ contract DeployReceipt {
 
     function run() external returns (ReceiptClaimVerifier verifier, TaskEscrow escrow) {
         address token = vm.envAddress("WARRANT_TOKEN");
-        address prover = vm.envOr("WARRANT_SELLER", msg.sender);
+        // The prover is the only key that can settle TaskEscrow through this
+        // verifier, and the verifier has no rotation path. It must be named
+        // on purpose: no fallback to the deployer key.
+        address prover = vm.envAddress("WARRANT_SELLER");
+        require(prover != address(0), "WARRANT_SELLER must not be the zero address");
         bytes32 imageId = vm.envOr("WARRANT_IMAGE_ID", DEFAULT_IMAGE_ID);
         bytes32 defaultSystemStateDigest =
             sha256(abi.encodePacked(sha256("risc0.SystemState"), bytes32(0), uint32(0), uint16(1) << 8));

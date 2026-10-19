@@ -593,7 +593,7 @@ VERIFIER_URL=https://explorer.testnet.arc.io/api
 
 export WARRANT_TOKEN=0x3600000000000000000000000000000000000000
 export WARRANT_IMAGE_ID="$IMAGE_ID"
-export WARRANT_SELLER="<seller-or-prover-address>"
+export WARRANT_SELLER="<prover-address>"   # required: the only key that can settle through the verifier
 export WARRANT_DEPLOYER="<your-deployer-address>"
 
 # Option A: Full RISC Zero Groth16 Verifier (requires Docker proving; linux/amd64 on ARM):
