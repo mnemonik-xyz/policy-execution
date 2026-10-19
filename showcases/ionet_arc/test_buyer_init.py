@@ -102,5 +102,44 @@ class BuyerInitTests(unittest.TestCase):
         self.assertEqual(bal.call_args.args[0], buyer_init.MAINNET_BUYER["rpc_url"])
 
 
+class MainnetAddressConsistencyTests(unittest.TestCase):
+    """The repo names the live Arc mainnet deployment in three places. They must agree.
+
+    PR #45 left config/manifest.yaml on an escrow and verifier that no deployment
+    record names, while buyer_init.py and the seller's published manifest moved
+    on. A seller started from the repo manifest then checked offers against the
+    wrong escrow and every deal failed. The ServerConfig tests load the manifest
+    they compare against, so only a cross-file check catches this drift.
+    """
+
+    REPO_MANIFEST = buyer_init.SHOWCASE_DIR / "config" / "manifest.yaml"
+    SELLER_PUBLIC_MANIFEST = (
+        buyer_init.SHOWCASE_DIR.parent.parent
+        / "solver-bounty"
+        / "canary"
+        / "mainnet"
+        / "seller-public-manifest.json"
+    )
+
+    def test_repo_manifest_matches_buyer_init(self):
+        manifest = yaml.safe_load(self.REPO_MANIFEST.read_text())
+        for key in ("chain_id", "escrow_address", "verifier_address", "token_address", "category"):
+            self.assertEqual(
+                str(manifest[key]).lower(),
+                str(buyer_init.MAINNET_BUYER[key]).lower(),
+                f"config/manifest.yaml {key} differs from buyer_init.MAINNET_BUYER",
+            )
+
+    def test_repo_manifest_matches_seller_public_manifest(self):
+        manifest = yaml.safe_load(self.REPO_MANIFEST.read_text())
+        published = json.loads(self.SELLER_PUBLIC_MANIFEST.read_text())
+        for key in ("chain_id", "escrow_address", "verifier_address", "token_address", "seller_address"):
+            self.assertEqual(
+                str(manifest[key]).lower(),
+                str(published[key]).lower(),
+                f"config/manifest.yaml {key} differs from the seller's published manifest",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

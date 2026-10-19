@@ -3,10 +3,10 @@
 
 chain_id: 5042  # Arc Mainnet
 rpc_url: 'https://rpc.mainnet.arc.io'  # Arc Mainnet JSON-RPC
-escrow_address: '0x9449C1fDd068cDe33D900b1ab15f9861dc39bC51'  # Deployed TaskEscrow contract
-verifier_address: '0x0932F120DEe4cA83676B8224769eE52b7d6D00c6'  # ReceiptClaimVerifier contract
+escrow_address: '0x5fae10ac58bf90c17f516292883a4f17c0768002'  # TaskEscrow used by seller.mnemonik.xyz (README, canary/mainnet/task-escrow.json)
+verifier_address: '0xdfe2fdb1d9942af02f99facfaa5b22d0031ad76c'  # JournalVerifier test double behind that escrow (checks no proof)
 token_address: '0x3600000000000000000000000000000000000000'  # Arc USDC (6 decimals)
-seller_address: '0x9F188809b2ba2e29653693C4069c212a95C1B8c4'  # io.net seller payout wallet
+seller_address: '0xb8202bebb6d8a0a822a56c0062632325c3923eeb'  # io.net seller payout wallet; 0x9F18... is the prover, not the payout
 buyer_address: '0x9793Dd93D46F153a2A879165cd163A01b54d8A00'  # The client agent's wallet
 category: 42  # Accredited GPU Whisper transcription service
 max_budget_usd: 2.00  # $2.00 maximum budget per proposal
