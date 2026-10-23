@@ -78,7 +78,7 @@ identifier. The service stores the note for settlement.
 
 The metering rule is therefore not prose. The unit of metering is whichever paths
 challenge, and for how much. The OpenAPI document records the 402 response on each
-metered path, as the [listing specification](circle-listing.md) already does for the
+metered path, as the [listing specification](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/docs/circle-listing.md) already does for the
 quote path.
 
 Whether Circle's review accepts a resource whose metered paths use this scheme is not
