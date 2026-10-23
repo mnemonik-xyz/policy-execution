@@ -197,13 +197,11 @@ class EscrowClientTests(unittest.TestCase):
         self.assertEqual(tx_data["to"], to_checksum_address(to_address))
         self.assertEqual(tx_data["data"], "0x12345678")
 
-    def test_prover_key_is_not_derived_unless_asked(self):
+    def test_seal_receipt_needs_a_registered_prover_key(self):
         with self.assertRaises(ValueError):
             self.client._resolve_prover_key(self.server_account)
         with self.assertRaises(ValueError):
             self.client.seal_receipt(b"\x55" * 384, sender=self.server_account)
-        derived = self.client._resolve_prover_key(self.server_account, allow_derived_key=True)
-        self.assertEqual(len(derived), 32)
         acc = Account.create()
         self.client.register_key(self.server_account, acc.key.hex())
         self.assertEqual(self.client._resolve_prover_key(self.server_account), acc.key.hex())
@@ -286,6 +284,18 @@ class EscrowClientTests(unittest.TestCase):
             self.assertEqual(args[1], self.escrow_addr)
             expected_selector = function_signature_to_4byte_selector("accept(bytes32)")
             self.assertEqual(args[2][:4], expected_selector)
+
+    def test_resolve_prover_key_refuses_to_derive_from_a_public_address(self):
+        # No key registered for the seller account: sealing must fail loudly
+        # instead of falling back to a key anyone can compute from the address.
+        with self.assertRaises(ValueError) as ctx:
+            self.client._resolve_prover_key(self.server_account)
+        self.assertIn("No private key is registered", str(ctx.exception))
+        # Registering someone else's key does not make it the prover either.
+        other = Account.create()
+        self.client.register_key(other.address, other.key.hex())
+        with self.assertRaises(ValueError):
+            self.client._resolve_prover_key(self.server_account)
 
     def test_seal_receipt_and_settle_receipt_single_tx(self):
         journal = b"\x55" * 384
