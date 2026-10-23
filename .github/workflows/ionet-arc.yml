@@ -28,7 +28,7 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: showcases/ionet_arc/Dockerfile
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: pip install -r showcases/ionet_arc/requirements-dev.txt
