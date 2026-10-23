@@ -55,8 +55,13 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             "settle_by": 1700086400,
         }
 
+        # A throwaway acceptance key keeps the test independent of a .keys directory on the machine.
+        acceptance_key = self.state_dir / "acceptance.key"
+        acceptance_key.write_text("11" * 32 + "\n")
+
         self.mcp = create_server(
             state_dir=self.state_dir,
+            buyer_acceptance_key_path=acceptance_key,
             escrow_address=self.mock_escrow.escrow,
             token_address=self.mock_escrow.token,
             buyer_account="0x" + "aa" * 20,
@@ -254,6 +259,7 @@ class BuyerWarrantServerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(signer, Account.from_key(self.BUYER_KEY).address)
             self.assertAlmostEqual(res["request_timestamp"], time.time(), delta=5)
+            self.assertIn("Valid for 60 seconds", res["message"])
 
     async def test_warrant_sign_request_refuses_a_task_it_did_not_offer(self):
         mcp = self._server_with_wallet_key()

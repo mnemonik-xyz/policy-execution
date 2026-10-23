@@ -197,6 +197,15 @@ class EscrowClientTests(unittest.TestCase):
         self.assertEqual(tx_data["to"], to_checksum_address(to_address))
         self.assertEqual(tx_data["data"], "0x12345678")
 
+    def test_seal_receipt_needs_a_registered_prover_key(self):
+        with self.assertRaises(ValueError):
+            self.client._resolve_prover_key(self.server_account)
+        with self.assertRaises(ValueError):
+            self.client.seal_receipt(b"\x55" * 384, sender=self.server_account)
+        acc = Account.create()
+        self.client.register_key(self.server_account, acc.key.hex())
+        self.assertEqual(self.client._resolve_prover_key(self.server_account), acc.key.hex())
+
     def test_send_transaction_unlocked_mode_unsupported_error(self):
         from_account = "0x" + "aa" * 20
         to_address = "0x" + "bb" * 20
@@ -726,3 +735,64 @@ class SendTransactionNonceLockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EthRpcErrorTests(unittest.TestCase):
+    URL = "https://rpc.example/v1/SECRETKEY"
+
+    def _http_error(self, code=429, body=b"rate limited for https://rpc.example/v1/SECRETKEY"):
+        import io
+        import urllib.error
+
+        return urllib.error.HTTPError(self.URL, code, "Too Many Requests", {}, io.BytesIO(body))
+
+    def test_http_error_hides_url_and_body_but_keeps_method_and_status(self):
+        rpc = EthRpc(self.URL)
+        with patch.object(rpc._opener, "open", side_effect=self._http_error()):
+            with self.assertRaises(RuntimeError) as ctx:
+                rpc.rpc("eth_call")
+        msg = str(ctx.exception)
+        self.assertIn("429", msg)
+        self.assertIn("eth_call", msg)
+        self.assertNotIn("SECRETKEY", msg)
+        self.assertNotIn("rate limited", msg)
+
+    def test_http_error_detail_goes_to_the_debug_log(self):
+        rpc = EthRpc(self.URL)
+        with patch.object(rpc._opener, "open", side_effect=self._http_error()):
+            with self.assertLogs("showcases.ionet_arc.escrow", level="DEBUG") as logs:
+                with self.assertRaises(RuntimeError):
+                    rpc.rpc("eth_call")
+        self.assertIn("rate limited", "\n".join(logs.output))
+
+    def test_json_rpc_error_redacts_the_url(self):
+        import io
+
+        rpc = EthRpc(self.URL)
+        body = io.BytesIO(b'{"error": {"code": -32000, "message": "bad call to https://rpc.example/v1/SECRETKEY"}}')
+        with patch.object(rpc._opener, "open") as opened:
+            opened.return_value.__enter__.return_value = body
+            with self.assertRaises(RuntimeError) as ctx:
+                rpc.rpc("eth_call")
+        self.assertNotIn("SECRETKEY", str(ctx.exception))
+        self.assertIn("-32000", str(ctx.exception))
+
+
+class RequestTimestampTests(unittest.TestCase):
+    def test_window_is_one_minute_with_small_forward_skew(self):
+        from showcases.ionet_arc.escrow import (
+            REQUEST_MAX_AGE_SECONDS,
+            REQUEST_MAX_FUTURE_SECONDS,
+            check_request_timestamp,
+        )
+
+        self.assertEqual(REQUEST_MAX_AGE_SECONDS, 60)
+        self.assertLessEqual(REQUEST_MAX_FUTURE_SECONDS, 30)
+        now = 1_000_000
+        check_request_timestamp(now, now)
+        check_request_timestamp(now - REQUEST_MAX_AGE_SECONDS, now)
+        check_request_timestamp(now + REQUEST_MAX_FUTURE_SECONDS, now)
+        with self.assertRaisesRegex(ValueError, "too old"):
+            check_request_timestamp(now - REQUEST_MAX_AGE_SECONDS - 1, now)
+        with self.assertRaisesRegex(ValueError, "clock skew"):
+            check_request_timestamp(now + REQUEST_MAX_FUTURE_SECONDS + 1, now)

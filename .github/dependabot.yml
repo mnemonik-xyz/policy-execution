@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+    reviewers:
+      - mnemonik-dev
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: 'ci(deps):'
+      include: scope

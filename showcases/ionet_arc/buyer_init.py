@@ -21,9 +21,12 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import secrets
 import shutil
+import stat
 import sys
+import urllib.parse
 from decimal import Decimal, InvalidOperation
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -43,6 +46,10 @@ PACKAGED = __package__ == "warrant_buyer"
 DEFAULT_HOME = pathlib.Path.home() / ".warrant-buyer"
 MAINNET_PUBLIC_KEYS = SHOWCASE_DIR / "config" / "mainnet-public_keys.yaml"
 SELLER_MCP_URL = "https://seller.mnemonik.xyz/mcp"
+# The bridge for clients without HTTP MCP support. It runs next to the wallet keys, so pin it.
+# 0.1.16 is the minimum (earlier releases had an OS command injection, CVE-2025-6514); 0.15.1 is the
+# newest release that was checked with `npm view mcp-remote version`. Raise it only after a review.
+MCP_REMOTE_VERSION = "0.15.1"
 EXPLORER = "https://explorer.arc.io"
 
 # The values that the seller MCP on Arc mainnet uses now. See README.md, "Buyer setup".
@@ -65,6 +72,40 @@ def write_secret(path: pathlib.Path, text: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
+
+
+def write_private(path: pathlib.Path, text: str) -> None:
+    """Write a file that only the owner can read, replacing an older copy. For files that a rerun rewrites."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)  # the mode argument above applies only to a new file
+        f.write(text)
+
+
+def secure_home(home: pathlib.Path) -> list[str]:
+    """Make the directory 0700 and any existing key file 0600. Returns a note for each repair."""
+    os.chmod(home, 0o700)
+    notes = []
+    for name in ("buyer.key", "buyer_acceptance.key"):
+        path = home / name
+        if path.is_file() and stat.S_IMODE(path.stat().st_mode) & 0o077:
+            os.chmod(path, 0o600)
+            notes.append(
+                f"{path} was readable by others. Its mode is now 0600. "
+                "Treat the key as exposed on a shared machine."
+            )
+    return notes
+
+
+CREDENTIAL_QUERY = re.compile(r"(api[-_]?key|key|token|secret|auth|password|passwd|sig)", re.IGNORECASE)
+
+
+def rpc_url_has_credentials(rpc_url: str) -> bool:
+    """True when the URL holds user:pass@ or a query parameter that looks like an API key."""
+    parts = urllib.parse.urlsplit(rpc_url)
+    if parts.username or parts.password:
+        return True
+    return any(CREDENTIAL_QUERY.search(name) for name, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
 
 
 def read_hex_key(path: pathlib.Path) -> str:
@@ -116,8 +157,9 @@ def write_config(
     """Write the public keys file and the manifest. Both hold no secret, so a rerun rewrites them."""
     registry_key = yaml.safe_load(MAINNET_PUBLIC_KEYS.read_text())["registry_key"]
     public_keys = home / "public_keys.yaml"
-    public_keys.write_text(
-        yaml.safe_dump({"registry_key": registry_key, "buyer_acceptance_key": acceptance_pub}, sort_keys=False)
+    write_private(
+        public_keys,
+        yaml.safe_dump({"registry_key": registry_key, "buyer_acceptance_key": acceptance_pub}, sort_keys=False),
     )
 
     manifest = dict(MAINNET_BUYER)
@@ -131,9 +173,11 @@ def write_config(
         "buyer_acceptance_key": str(acceptance_key),
     }
     manifest_path = home / "manifest.yaml"
-    manifest_path.write_text(
+    # Owner only: --rpc-url can carry an API key.
+    write_private(
+        manifest_path,
         "# Buyer guardrail manifest for Arc mainnet, written by buyer_init.py.\n"
-        + yaml.safe_dump(manifest, sort_keys=False)
+        + yaml.safe_dump(manifest, sort_keys=False),
     )
     return manifest_path
 
@@ -160,7 +204,7 @@ def guardrail_server(home: pathlib.Path, manifest: pathlib.Path) -> dict:
 
 def seller_server() -> dict:
     """The seller needs no password. It serves a buyer that proves itself with its wallet signature."""
-    return {"command": "npx", "args": ["-y", "mcp-remote", SELLER_MCP_URL]}
+    return {"command": "npx", "args": ["-y", f"mcp-remote@{MCP_REMOTE_VERSION}", SELLER_MCP_URL]}
 
 
 def client_config(home: pathlib.Path, manifest: pathlib.Path) -> dict:
@@ -266,11 +310,19 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         return 0
 
     max_budget_usd = parse_budget(args.max_budget)
+    if args.rpc_url and rpc_url_has_credentials(args.rpc_url):
+        print(
+            "Warning: --rpc-url holds credentials (user:pass@ or an API key). It is stored in "
+            f"{home / 'manifest.yaml'} with mode 0600. Do not share that file.",
+            file=sys.stderr,
+        )
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for note in secure_home(home):
+        print(f"Warning: {note}", file=sys.stderr)
     wallet_key, address, created = ensure_wallet_key(home)
     acceptance_key, acceptance_pub = ensure_acceptance_key(home)
     manifest = write_config(home, address, wallet_key, acceptance_key, acceptance_pub, max_budget_usd, args.rpc_url)
-    (home / "mcp.json").write_text(json.dumps(client_config(home, manifest), indent=2) + "\n")
+    write_private(home / "mcp.json", json.dumps(client_config(home, manifest), indent=2) + "\n")
     print_setup(home, address, created, manifest, max_budget_usd)
     return 0
 

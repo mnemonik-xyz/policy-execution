@@ -258,7 +258,7 @@ Because the Buyer Guardrail manages local keys and spending limits, it runs loca
 
 > [!NOTE]
 > If your client does not support direct HTTP MCP URLs, bridge the remote endpoint via
-> `mcp-remote`: `"command": "npx", "args": ["-y", "mcp-remote", "http://<seller-host>:8000/mcp"]`.
+> `mcp-remote`: `"command": "npx", "args": ["-y", "mcp-remote@0.15.1", "http://<seller-host>:8000/mcp"]`.
 > For the Arc mainnet seller, see
 > [Desktop configuration for mainnet](#desktop-configuration-for-mainnet).
 
@@ -280,31 +280,37 @@ signature-checking verifier is not used yet.
 How the open seller protects itself:
 
 - **Quotes are open.** `list_suitable_hardware` and `propose_deployment` move no money. The seller
-  answers `list_suitable_hardware` from a 20 second cache, limits proposals (120 an hour in all,
-  10 an hour for each customer address) and refuses new proposals when 2,000 are stored. It deletes
-  proposals older than 24 hours that never became a deal.
+  answers `list_suitable_hardware` from a 20 second cache (one io.net call at a time), limits
+  proposals for each client IP address (taken from the `X-Real-IP` header that Caddy sets), for each
+  customer address and in all, and refuses new proposals when 2,000 are stored. It deletes proposals
+  that never became a deal after 1 hour.
 - **A call about a task needs the customer's signature.** `deploy_with_escrow` and
   `get_deployment_status` need `request_signature` and `request_timestamp` from the buyer guardrail
   tool `warrant_sign_request`. The signature (EIP-191) binds the chain, the escrow, the task and the
-  action. The seller accepts it only from the customer address of that task, and only for 5
-  minutes. A stranger cannot read the worker token or deploy a task that is not theirs. The seller
-  has no "latest session" fallback: `get_deployment_status` needs a `task_id`.
+  action. The seller accepts it only from the customer address of that task, and only for 60
+  seconds. A `deploy` signature works once. A stranger cannot read the worker token or deploy a
+  task that is not theirs. The seller has no "latest session" fallback: `get_deployment_status`
+  needs a `task_id`.
 - **The guardrail signs only for orders it funded.** `warrant_sign_request` refuses a `task_id`
   that this guardrail did not offer, so a prompt injection cannot make it sign for another task.
-- **Money stays safe.** The seller starts a container only after the buyer's USDC is in escrow with
-  a matching policy hash, so the seller's io.net spend is backed by the buyer.
+- **One deal at a time.** The seller starts a container only after the buyer's USDC is in escrow
+  with a matching policy hash, the order covers the whole lease plus a margin, and no other deal
+  runs. A second `deploy_with_escrow` for the same task returns the existing session. The seller's
+  io.net spend is therefore backed by the buyer and cannot run in parallel.
 
 > [!CAUTION]
 > Limits that remain:
 >
 > - The single deal slot. A buyer who funds an order and never settles blocks other buyers until
 >   the order expires.
-> - The proxy in front of the seller must limit requests for each IP address. The in-process limits
->   above are global, so one client can use them up.
+> - The proxy in front of the seller must set `X-Real-IP` to the client address (the Caddy snippet
+>   of the deploy role does). Without it, every caller shares one limit.
+> - Several client addresses together can still use up the global proposal limit. Stock Caddy has
+>   no rate limit.
 > - The seller spends its own io.net credits on provisioning. The 1 USD cap per deal is the only
 >   spending limit.
 > - To run a seller for local tests without signatures, set `WARRANT_REQUIRE_REQUEST_SIGNATURE=0`.
->   Never set it on a public seller.
+>   The seller refuses to start with it on chain 5042.
 
 ### Mainnet addresses
 
@@ -494,7 +500,7 @@ read on the VM. Ignore them or delete them.
     },
     "seller-transcription-service": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://seller.mnemonik.xyz/mcp"]
+      "args": ["-y", "mcp-remote@0.15.1", "https://seller.mnemonik.xyz/mcp"]
     }
   }
 }
