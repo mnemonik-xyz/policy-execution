@@ -1,9 +1,0 @@
-{
-  "protocol": "warrant.solver.v1",
-  "type": "quote",
-  "instanceHash": "0x48ed79b023d0ca12bcfea54afb9146e4262cb43c18df89fc77579f740118a6e0",
-  "amount": 2000000,
-  "computedCost": 59290000,
-  "seller": "0xb8202bebb6d8a0a822a56c0062632325c3923eeb",
-  "checkerVersion": 1
-}
