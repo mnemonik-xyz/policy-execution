@@ -12,7 +12,7 @@ proposes and that a contract enforces. Five cases exist or are planned:
 - solver
 - **rent**: pay for rented computation, piece by piece. This is the first new target case.
   The proposed spec is [lease-evidence.md](product/lease-evidence.md).
-- swap: a DeFi token swap. It comes last.
+- swap: a DeFi token swap. It comes last. Its crates live in [warrant-swap](https://github.com/mnemonik-xyz/warrant-swap).
 
 Each case has a policy DSL. Each DSL contains a **delivery check**: the proof that
 another party satisfied the policy. The escrow or vault verifies the delivery check on chain.
@@ -23,9 +23,9 @@ The four cases share ideas but not code.
 
 | Part | Task | Invoice | Solver | Swap (DeFi) |
 |---|---|---|---|---|
-| Entry point | `authorize()` | `authorize_invoice()` | `authorize_solver()` | `swap-core` pipeline |
+| Entry point | `authorize()` | `authorize_invoice()` | `authorize_solver()` | `swap-core` pipeline (repo `warrant-swap`) |
 | Rule type | `Rule` | `Rule` | `Rule` | `SwapRule` |
-| Evaluator | `verified/` | `verified/` | `verified/` | `swap-verified/` |
+| Evaluator | `verified/` | `verified/` | `verified/` | `swap-verified/` (repo `warrant-swap`) |
 | Guest | `methods/guest` | `methods/invoice-guest` | `methods/solver-guest` | none |
 | Journal | 12 words | 15 words | 13 words | none (a signed JCS warrant) |
 | Contract | `TaskEscrow`, `PolicyExecutionVault` | `InvoiceEscrow` | `SolverBountyEscrow` | none |
