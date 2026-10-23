@@ -2,7 +2,7 @@
 
 Status: **proposed, 2026-10-14. Nothing in this document is implemented.**
 It applies the [compute marketplace proposal](https://github.com/mnemonik-xyz/warrant/pull/13)
-to the seller in [showcases/ionet_arc](../../showcases/ionet_arc/README.md).
+to the seller in [showcases/ionet_arc](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md).
 
 Abbreviations: MCP — Model Context Protocol; API — Application Programming
 Interface; TLS — Transport Layer Security; EIP — Ethereum Improvement Proposal;
@@ -190,7 +190,7 @@ paid quote carries no credential, only the endpoint:
 
 > [!CAUTION]
 > The open MCP route has the risks listed in the
-> [mainnet seller section](../../showcases/ionet_arc/README.md#arc-mainnet-seller-canary).
+> [mainnet seller section](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md#arc-mainnet-seller-canary).
 > A paid quote also proves nothing about who uses the endpoint.
 
 ### 4.7 Implementation choice
@@ -204,7 +204,7 @@ than it removes. Revisit if Circle changes the proof format.
 
 ## 5. The OpenAPI document
 
-- OpenAPI 3.1, served at `/openapi.json` and committed at `showcases/ionet_arc/openapi/quote.json`.
+- OpenAPI 3.1, served at `/openapi.json` and committed at `showcases/ionet_arc/openapi/quote.json` in the `warrant-showcases` repository.
 - One path, `POST /x402/quote`, with the request schema of section 4.2.
 - Response 402 documents the `PAYMENT-REQUIRED` header. Response 200 documents the quote schema and the `PAYMENT-RESPONSE` header.
 - The description states that the quote fee buys a quote, and that the lease settles through `TaskEscrow`.

@@ -1,5 +1,7 @@
 # Plan: Arc mainnet canary + io.net showcase
 
+> Note (2026-10-23): the `showcases/` folder, with `showcases/ionet_arc` and `scripts/ionet-showcase.py`, moved to the `mnemonik-xyz/warrant-showcases` repository. Paths under `showcases/` in this document refer to that repository.
+
 ## Context
 PR #12 and PR #14 (both merged 2026-10-09) polished the io.net adapter and reworked the worker image. Goal: a mainnet canary. `SolverBountyEscrow` on Arc mainnet (chain 5042, RPC verified live), one small real-proof settlement, then a separate capped io.net GPU transcription run. Decisions: mainnet canary, full local rehearsal first, prefunded io.net credits, new canary script for mainnet txs.
 
@@ -11,7 +13,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 - Escrow, deploy script, solver guest/checker; CI settled a real Groth16 proof on private Anvil (`solver-bounty/ci-result.json`).
 - Worker image `ghcr.io/mnemonik-xyz/transcription:pilot`: public, linux/amd64, CUDA, about 1.9 GB compressed. The separate `mnemonik-xyz/transcription` repository builds and pushes it. The tag is mutable, so read the digest at deploy time and deploy by digest. A CPU-only `:pilot-arm64` image exists for local runs on Apple Silicon. The image holds no Warrant logic.
 - Worker API after PR #14: `POST /job` returns a `job_id` (the audio SHA-256). Poll `GET /job/<job_id>`. `GET /jobs` lists all jobs. `GET /job` works only with zero or one job. Several uploads are accepted and run one at a time. `?language=` is supported. The worker writes JSON logs with GPU statistics and never logs the token, audio or transcript text.
-- io.net deploy/destroy driver (`scripts/ionet-showcase.py`) with offline tests.
+- io.net deploy/destroy driver (`scripts/ionet-showcase.py`, now in the `warrant-showcases` repository) with offline tests.
 
 ## Gaps and work items
 1. **Mainnet driver `scripts/solver-canary.py`** (done; on `main` since PR #18, tests in `scripts/test_solver_canary.py`). Subcommands: `deploy`, `offer`, `accept`, `prove`, `settle`, `evidence`. Reuses the actor logic from `scripts/solver-demo.py`. Requirements: RPC URL and Foundry keystore path from args/env (never a raw key in args or sops), hard `--max-amount` cap, `--dry-run` that only simulates with `cast call`/`eth_call`, refuse chain ID other than 5042 unless `--allow-chain`, refuse `RISC0_DEV_MODE`, exclusive-create evidence files (as `ionet-showcase.py` does), no automatic retry of a broadcast tx.
@@ -38,7 +40,7 @@ Not implemented (state in the showcase): CCTP bridging, automatic provider payme
 13. **Metered payment family** (added 2026-10-14): production-readiness track L1 in the [delivery plan](delivery-plan.md). A new guest and a deployment of `InvoiceEscrow` pinned to the meter image ID, no contract change. Specification: [lease-evidence.md](lease-evidence.md). Not a canary gate. Listed here because its mainnet deployment follows the same deploy, probe and evidence steps as items 3, 4 and 10.
 
 ## Execution order
-1. Local rehearsal on Anvil: `cargo test -p warrant-policy --locked`; `forge test`; `python3 -m unittest showcases.ionet_arc.test_pilot -v`; `scripts/solver-demo.py` with real Groth16 on an x86 Docker host (negatives: wrong image, changed journal, result substitution, replay, buyer cancellation).
+1. Local rehearsal on Anvil: `cargo test -p warrant-policy --locked`; `forge test`; `python3 -m unittest showcases.ionet_arc.test_pilot -v` (in a `warrant-showcases` clone); `scripts/solver-demo.py` with real Groth16 on an x86 Docker host (negatives: wrong image, changed journal, result substitution, replay, buyer cancellation).
 2. Build `solver-canary.py`; run it end to end against local Anvil, in `--dry-run` and live-local modes.
 3. Worker on CPU with real public audio (`:pilot-arm64` on Apple Silicon, or `WARRANT_DEVICE=cpu`).
 4. Items 2, 3, 7, 9, 10 above, and the pre-deployment phase of item 4. Then a checkpoint, before any broadcast: the deployer, buyer, seller and relayer signers exist and sign through the chosen keystore or hardware wallet (item 6), and hold the bounty and gas balances (item 5). Check the balances with read-only calls and record them.

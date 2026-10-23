@@ -1,6 +1,0 @@
-mcp==2.3.0
-httpx2[socks]==2.13.1
-jsonschema==4.26.0
-eth-abi==6.0.0
-eth-account==0.14.0
-pyyaml==6.0.3

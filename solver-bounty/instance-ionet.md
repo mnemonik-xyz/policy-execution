@@ -10,7 +10,7 @@ The instance hash below goes stale on any change to the JSON.
 ## Estimate
 
 The estimate is a real `caas_get_price_estimate` result.
-The user took it on the laptop with their own io.net key:
+The user took it on the laptop with their own io.net key. The driver is in the `mnemonik-xyz/warrant-showcases` repository, so run the command from a clone of it:
 
 ```sh
 .venv/bin/python scripts/ionet-showcase.py read caas_get_price_estimate \

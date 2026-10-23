@@ -1,5 +1,7 @@
 # Canary kickoff: dev tasks and the session prompt
 
+> Note (2026-10-23): the `showcases/` folder, with `showcases/ionet_arc` and `scripts/ionet-showcase.py`, moved to the `mnemonik-xyz/warrant-showcases` repository. Paths under `showcases/` in this document refer to that repository.
+
 Status: prepared 2026-10-14 against `main` at that date. This document lists the
 development work that remains before the first mainnet broadcast of the
 [canary plan](mainnet-canary-plan.md), and the prompt that starts a session on it.

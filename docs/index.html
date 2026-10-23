@@ -53,7 +53,7 @@
 
   <div class="actions">
     <a class="btn" href="https://github.com/mnemonik-xyz/policy-execution/issues/new?template=seller-mcp-access.yml">Request access</a>
-    <a class="btn secondary" href="https://github.com/mnemonik-xyz/policy-execution/blob/main/showcases/ionet_arc/README.md">Read the README</a>
+    <a class="btn secondary" href="https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md">Read the README</a>
   </div>
 
   <div class="note" role="note">
@@ -95,7 +95,7 @@
   <ol>
     <li><a href="https://github.com/mnemonik-xyz/policy-execution/issues/new?template=seller-mcp-access.yml">Request access</a> and wait for the credential. Never post it publicly.</li>
     <li>Make the header value in your own terminal:<br><code>printf 'Basic %s' "$(printf '%s:%s' "&lt;user&gt;" "&lt;password&gt;" | base64 | tr -d '\n')"</code></li>
-    <li>Add the server <code>https://seller.mnemonik.xyz/mcp</code> to Claude Desktop or Cursor through <code>mcp-remote</code>, with the header <code>Authorization:${SELLER_AUTH}</code>. The <a href="https://github.com/mnemonik-xyz/policy-execution/blob/main/showcases/ionet_arc/README.md#desktop-configuration-for-mainnet">README</a> has the exact configuration.</li>
+    <li>Add the server <code>https://seller.mnemonik.xyz/mcp</code> to Claude Desktop or Cursor through <code>mcp-remote</code>, with the header <code>Authorization:${SELLER_AUTH}</code>. The <a href="https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md#desktop-configuration-for-mainnet">README</a> has the exact configuration.</li>
     <li>Ask your agent for a quote with a maximum of 1.00 USD and give it your Arc wallet address. A quote moves no money. A one-hour RTX 4090 costs about 0.30 USD.</li>
   </ol>
 
