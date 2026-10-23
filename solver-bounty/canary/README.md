@@ -84,7 +84,7 @@ Open questions:
 - An own service or an external prover market.
 
 The Circle listing is part of the same next step: see
-[circle-listing.md](../../docs/product/circle-listing.md) and item 12 of the
+[circle-listing.md](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/docs/circle-listing.md) and item 12 of the
 [canary plan](../../docs/product/mainnet-canary-plan.md).
 
 ## Rules
