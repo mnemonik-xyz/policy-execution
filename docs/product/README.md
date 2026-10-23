@@ -6,7 +6,7 @@ Status: proposed product and interface, 2026-10-04. This specification does not 
 
 Warrant is a common website for configuring policies, authorizing agents and settling every payment path already developed in the project. Customers can fund committed task agreements or purchase orders, operate an explicitly revocable policy vault, submit evidence and inspect the resulting receipts. Each path retains its own trust assumptions and lifecycle.
 
-The site includes both contractor policy templates, verified compute schedules, invoice policies and all three invoice settlement modes, the revocable Rust policy vault, and the fixed-circuit Circom payment prototype. See the exhaustive [policy catalog](policy-catalog.md). Presets and a typed advanced editor expose the existing rule language. A separately specified [DeFi swap flow](defi-swaps.md) extends the product; it is not an existing implementation.
+The site includes both contractor policy templates, verified compute schedules, invoice policies and all three invoice settlement modes, the revocable Rust policy vault, and the fixed-circuit Circom payment prototype. See the exhaustive [policy catalog](policy-catalog.md). Presets and a typed advanced editor expose the existing rule language. A separately specified [DeFi swap flow](https://github.com/mnemonik-xyz/warrant-swap/blob/main/docs/defi-swaps.md) extends the product; it is not an existing implementation.
 
 **Verified compute planning with optional managed execution on io.net** remains the first real-world showcase within this broader product. Its first workload is transcription of public audio. The planning fee buys a schedule that passes the committed checker. Running the GPU workload is a separate service; a paid schedule does not establish transcript correctness or completed execution.
 
@@ -66,7 +66,7 @@ An invalid schedule never becomes payable merely because a transcript was produc
 ## Specification map
 
 - [Complete policy catalog and settlement routing](policy-catalog.md)
-- [DeFi swap flow and execution requirements](defi-swaps.md)
+- [DeFi swap flow and execution requirements](https://github.com/mnemonik-xyz/warrant-swap/blob/main/docs/defi-swaps.md)
 - [Frontend and interaction design](frontend.md)
 - [Backend, API and agents](architecture-api.md)
 - [Escrow, proof and trust boundary](settlement.md)
