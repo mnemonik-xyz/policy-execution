@@ -59,6 +59,9 @@ jobs:
           - { name: linux-x86_64, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  musl: true }
           - { name: linux-arm64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
           - { name: macos-arm64,  runner: macos-14,         target: aarch64-apple-darwin }
+          # Built on the Apple Silicon runner with the Intel target. The architecture check below
+          # proves the result is x86_64, because this runner does not run it natively.
+          - { name: macos-x86_64, runner: macos-14,         target: x86_64-apple-darwin, arch: x86_64 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Install the Rust target
@@ -72,6 +75,19 @@ jobs:
           --bin warrant-policy --bin warrant-evidence --target ${{ matrix.target }}
         env:
           RISC0_SKIP_BUILD: '1'
+      - name: Check the architecture of the binaries
+        if: matrix.arch
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          for b in warrant-policy warrant-evidence; do
+            got=$(lipo -archs "target/${TARGET}/release/${b}")
+            echo "${b}: ${got}"
+            test "${got}" = "${ARCH}"
+          done
       - name: Package
         shell: bash
         env:
