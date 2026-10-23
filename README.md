@@ -4,7 +4,7 @@ The [solver bounty showcase](solver-bounty/README.md) adds reviewer-free accepta
 for compute schedules. It checks the committed workload, publishes the result,
 and pays the seller through a separate solver guest and escrow.
 
-The [io.net / Arc pilot](showcases/ionet_arc/README.md) starts the real-workload
+The [io.net / Arc pilot](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md) starts the real-workload
 integration: bounded GPU provisioning, a transcription worker, and Arc/CCTP
 funding design. Live execution and cross-chain payments remain validation gates.
 
