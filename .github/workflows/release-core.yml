@@ -1,0 +1,229 @@
+name: Release core
+
+# Push a tag such as core-v0.1.0 to build the Warrant helper binaries, the host binary and the
+# compiled contracts, and to publish them as a GitHub release with checksums.
+# A manual run builds and uploads workflow artifacts only. It never publishes.
+#
+# Consumers (for example the warrant-showcases repository) pin one release in their own lock file.
+# They download the assets and verify the SHA-256 sums in SHA256SUMS before they use them.
+on:
+  push:
+    tags: ['core-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for a test build, for example 0.0.0.dev1
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RISC0_BUILD_LOCKED: "1"
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            v="${GITHUB_REF_NAME#core-v}"
+          else
+            v="${INPUT_VERSION}"
+          fi
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-]?[a-z0-9]+)*$ ]]; then
+            echo "Invalid version format: $v" >&2
+            exit 1
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+
+  tools:
+    # warrant-policy and warrant-evidence. They do not use the prover, so the guest build is skipped.
+    name: tools (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  musl: true }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
+          - { name: macos-arm64,  runner: macos-14,         target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build the helper binaries
+        run: >
+          cargo build --release --locked -p warrant-host
+          --bin warrant-policy --bin warrant-evidence --target ${{ matrix.target }}
+        env:
+          RISC0_SKIP_BUILD: '1'
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage/bin
+          for b in warrant-policy warrant-evidence; do
+            install -m 0755 "target/${TARGET}/release/${b}" "stage/bin/${b}"
+          done
+          tar -C stage -czf "dist/warrant-tools-${VERSION}-${TARGET}.tar.gz" bin
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: tools-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  host-and-contracts:
+    # The host binary embeds the guest programs. Build them in Docker, so that the image IDs do not
+    # depend on the machine. The release notes and core-manifest.json carry the three image IDs.
+    name: host binary and contracts
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install RISC Zero
+        run: |
+          curl -fsSL https://risczero.com/install -o /tmp/rzup-install.sh
+          bash /tmp/rzup-install.sh
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          "$HOME/.risc0/bin/rzup" install rust 1.88.0
+          "$HOME/.risc0/bin/rzup" install r0vm 3.0.5
+      - name: Install Foundry and the contract dependencies
+        run: |
+          export FOUNDRY_DIR="$HOME/.foundry"
+          curl -fsSL https://foundry.paradigm.xyz -o /tmp/foundry-install.sh
+          bash /tmp/foundry-install.sh
+          "$HOME/.foundry/bin/foundryup" --install v1.8.4
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          npm ci --prefix contracts --ignore-scripts
+          docker info
+      - name: Build the host binary and read the image IDs
+        id: host
+        shell: bash
+        env:
+          RISC0_USE_DOCKER: '1'
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p warrant-host
+          for kind in image-id invoice-image-id solver-image-id; do
+            id=$(target/release/warrant-host "$kind")
+            if ! [[ "$id" =~ ^(0x)?[0-9a-fA-F]{64}$ ]]; then
+              echo "Unexpected output from warrant-host $kind: $id" >&2
+              exit 1
+            fi
+            echo "${kind//-/_}=$id" >> "$GITHUB_OUTPUT"
+          done
+      - name: Build the contracts
+        run: forge build --root contracts
+      - name: Package the host binary and the contract artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
+          IMAGE_ID: ${{ steps.host.outputs.image_id }}
+          INVOICE_IMAGE_ID: ${{ steps.host.outputs.invoice_image_id }}
+          SOLVER_IMAGE_ID: ${{ steps.host.outputs.solver_image_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist stage-host/bin stage-contracts
+          install -m 0755 target/release/warrant-host stage-host/bin/warrant-host
+          tar -C stage-host -czf "dist/warrant-host-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" bin
+
+          # Each artifact holds the ABI, the creation code and the deployed code of one contract.
+          # Test contracts are included on purpose: local demos deploy them. They are not for a
+          # public network. The JournalVerifier test double checks no proof.
+          out=contracts/out
+          contracts=(
+            "TaskEscrow.sol/TaskEscrow"
+            "ReceiptClaimVerifier.sol/ReceiptClaimVerifier"
+            "PolicyExecutionVault.t.sol/TestToken"
+            "PolicyExecutionVault.t.sol/JournalVerifier"
+          )
+          hashes='{}'
+          for c in "${contracts[@]}"; do
+            name=${c##*/}
+            src="${out}/${c%%/*}/${name}.json"
+            test -f "$src" || { echo "Missing build output: $src" >&2; exit 1; }
+            jq '{abi: .abi, bytecode: .bytecode.object, deployedBytecode: .deployedBytecode.object}' "$src" \
+              > "stage-contracts/${name}.json"
+            h=$(cast keccak "$(jq -r .deployedBytecode "stage-contracts/${name}.json")")
+            hashes=$(jq --arg n "$name" --arg h "$h" '. + {($n): $h}' <<<"$hashes")
+          done
+          tar -C stage-contracts -czf "dist/warrant-contracts-${VERSION}.tar.gz" .
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg commit "$GITHUB_SHA" \
+            --arg image "$IMAGE_ID" \
+            --arg invoice "$INVOICE_IMAGE_ID" \
+            --arg solver "$SOLVER_IMAGE_ID" \
+            --argjson hashes "$hashes" \
+            '{
+               version: $version,
+               commit: $commit,
+               image_ids: {task: $image, invoice: $invoice, solver: $solver},
+               toolchain: {rust: "1.88.0", r0vm: "3.0.5", foundry: "v1.8.4", solc: "0.8.28"},
+               deployed_code_hashes: $hashes
+             }' > dist/core-manifest.json
+          cat dist/core-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: host-and-contracts
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    # Only a tag publishes. A manual run stops after the upload steps above.
+    name: publish release
+    if: github.ref_type == 'tag'
+    needs: [version, tools, host-and-contracts]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Write checksums and release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          cd assets
+          ls -l
+          sha256sum -- * > SHA256SUMS
+          {
+            echo "Warrant core ${VERSION}, built from ${GITHUB_SHA}."
+            echo
+            echo "Guest image IDs (Docker build):"
+            jq -r '.image_ids | to_entries[] | "- \(.key): \(.value)"' core-manifest.json
+            echo
+            echo "Verify every download against SHA256SUMS before use."
+            echo "The contracts archive holds test contracts. Do not deploy the JournalVerifier test"
+            echo "double to a public network: it checks no proof."
+          } > ../notes.md
+          cat ../notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" assets/* --title "$TAG" --notes-file notes.md --verify-tag
