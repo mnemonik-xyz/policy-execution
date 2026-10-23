@@ -1,16 +1,18 @@
 # Framework design: one proving path for every case
 
-Status: proposal. No code changes yet. Written 2026-10-23.
+Status: proposal. No code changes yet. Written 2026-10-23. Decisions 1 to 3 approved by the owner; 4 deferred to step 9; 5 and 6 open.
 
 ## Goal
 
 Any case must be built on one framework. A case is one kind of payment that an agent
-proposes and that a contract enforces. Four cases exist or are planned:
+proposes and that a contract enforces. Five cases exist or are planned:
 
 - task
 - invoice
 - solver
-- swap
+- **rent**: pay for rented computation, piece by piece. This is the first new target case.
+  The proposed spec is [lease-evidence.md](product/lease-evidence.md).
+- swap: a DeFi token swap. It comes last.
 
 Each case has a policy DSL. Each DSL contains a **delivery check**: the proof that
 another party satisfied the policy. The escrow or vault verifies the delivery check on chain.
@@ -19,7 +21,7 @@ another party satisfied the policy. The escrow or vault verifies the delivery ch
 
 The four cases share ideas but not code.
 
-| Part | Task | Invoice | Solver | Swap |
+| Part | Task | Invoice | Solver | Swap (DeFi) |
 |---|---|---|---|---|
 | Entry point | `authorize()` | `authorize_invoice()` | `authorize_solver()` | `swap-core` pipeline |
 | Rule type | `Rule` | `Rule` | `Rule` | `SwapRule` |
@@ -28,6 +30,11 @@ The four cases share ideas but not code.
 | Journal | 12 words | 15 words | 13 words | none (a signed JCS warrant) |
 | Contract | `TaskEscrow`, `PolicyExecutionVault` | `InvoiceEscrow` | `SolverBountyEscrow` | none |
 | Delivery check | Signed acceptance | Signed vendor attestation, signed purchase order, parsed document | Checker run on a schedule | Counterparty lock seen on chain |
+
+The rent case is not in this table. It is a proposal that has no code. It reuses the invoice
+journal and `InvoiceEscrow`. Its only delivery evidence is a note that the buyer signs. A note
+authorizes a payment. It does not prove that the service ran. The spec says so: "Nobody can
+check that." The framework closes this gap (see "Rent computation").
 
 Problems:
 
@@ -97,6 +104,7 @@ A delivery check has a **kind**. The kind fixes which evidence the guest must au
 | `signed_attestation` | A signed statement plus facts that the guest derives from a document | invoice |
 | `computed_result` | A deterministic checker runs on the delivered result | solver |
 | `chain_observation` | Chain state at a stated finality, from a quorum of providers | swap |
+| `signed_usage` | A usage record that a meter key signs. The owner approves the key. | rent |
 
 A kind can have parameters: the key, the checker version, the instance hash, the chain and
 the contract pin. The `delivery` section holds them. Its hash is `deliverySpecHash`.
@@ -195,9 +203,47 @@ warrant-host image-id <case>
 
 `solver-cli` and the case-specific commands are removed.
 
+## Rent computation
+
+This is the first new target case. A buyer pays per piece for rented computation. A piece can be a
+GPU job, an hour of a virtual server, or a gigabyte. The existing spec fixes the payment side:
+a signed note per piece, settled in batches through `InvoiceEscrow`. It has no delivery proof.
+
+The framework adds one. The `delivery` section of a rent policy holds:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `signed_usage` |
+| `meter_key` | The key of the meter that signs usage records. The owner approves it. |
+| `unit` | What the meter counts, for example GPU-seconds |
+| `price_per_unit` | The price of one unit, in token units |
+| `tolerance` | How far the billed amount can exceed the metered amount. Zero by default. |
+
+A batch must carry one usage record per note, or one for the whole batch. The guest checks:
+
+1. The signature of each record under `meter_key`.
+2. The lease identifier, the window and the units in each record.
+3. The billed amount of each note is at most `units * price_per_unit` plus the tolerance.
+4. The total of the notes in the batch equals the request amount.
+
+A missing record gives `Ask`. A bad signature or a billed amount above the metered amount gives `Deny`.
+The note still binds the recipient and the amount. The usage record binds what was delivered.
+
+What this proves, and what it does not:
+
+- It proves that a key the owner approved signed a record of delivery. It proves that the buyer was
+  not billed for more than that record shows.
+- It does not prove that the meter was honest. The meter key becomes a trust assumption.
+  If the compute provider signs the record, the buyer trusts the provider. If an independent
+  metering service signs it, the buyer trusts that service.
+- Nobody signs such records for the compute providers in the pilot today. Who runs the meter is an open question.
+
+A batch job whose output can be checked by a deterministic checker can use `computed_result`
+instead. That is the solver case. The two kinds can be combined: the rule tree can require both.
+
 ## Swap
 
-Swap needs the most work, because it has no guest and no contract.
+Swap (DeFi) is the last case. It needs the most work, because it has no guest and no contract.
 
 | Gap | Proposal |
 |---|---|
@@ -235,7 +281,8 @@ Each step is its own pull request. Each step keeps all tests green.
 | 5 | Generic evaluator and the Verus proof | High |
 | 6 | One DSL shape, JSON Schemas and templates | Low |
 | 7 | One `warrant-host` command set. Remove `solver-cli` | Low |
-| 8 | Swap guest and swap escrow | High |
+| 8 | Rent case: `core` module, `signed_usage` delivery check, batch proving | Medium |
+| 9 | Swap guest and swap escrow | High |
 
 Steps 1 to 7 change no behavior of the existing cases except the journal layout in step 2.
 
@@ -244,5 +291,12 @@ Steps 1 to 7 change no behavior of the existing cases except the journal layout 
 1. Approve one journal header with `schemaId` and the two delivery words (section 2).
 2. Approve one image per case from one guest crate (section 6).
 3. Approve the generic evaluator with a fallback to a closed atom enum (section 7).
-4. Decide the swap escrow chain and what it escrows (swap section).
-5. Decide whether the buyer-signed path is removed first (step 0) or after step 3.
+4. Decide the swap escrow chain and what it escrows (swap section). Not needed before step 9.
+5. **Reopened.** The rent spec settles notes with `settleSigned` (`meter-signature-v1`) and
+   `warrant-host meter-sign`. Removing the buyer-signed path removes that fast path. Without it, every
+   rent batch needs a proof. One proof took 445 s to make in one measured run. Decide one of these:
+   - Remove the signed path, and accept proofs only for rent. Batches are then larger and rarer.
+   - Keep a signed fast path in `WarrantEscrow` for all cases. The signer must run the same
+     delivery check natively and sign the journal. It then stays inside the framework.
+   - Remove it from the three old cases and keep it for rent only.
+6. Decide who runs the meter for rent computation, and which key signs usage records.
