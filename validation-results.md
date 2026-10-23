@@ -9,10 +9,10 @@ session, without the RISC Zero toolchain.
 | Check | Result |
 |---|---|
 | `cargo test -p warrant-policy --locked` | 76 passed: 39 invoice (11 new), 17 policy, 17 solver, 3 unit |
-| `cargo test -p warrant-ids --locked` | 4 passed; test vectors regenerated |
+| `cargo test -p warrant-ids --locked` | Removed. The code moved to warrant-bean-count-ledger; the vectors moved to `core/tests/identifier_vectors.rs`. Last commit with the old code: 15da112 |
 | `forge test` | 74 passed, using regenerated `invoice-journal.json` and `invoice-signature.json` |
-| `connectors/ledger` pytest | 14 passed |
-| `scripts/invoice-demo.py --signed-only --ledger` on Anvil | Signed and buyer-approved USD settlements, then the ledger; `bean-check` passed |
+| `connectors/ledger` pytest | Removed. Moved to warrant-bean-count-ledger |
+| `scripts/invoice-demo.py --signed-only` on Anvil | Signed and buyer-approved USD settlements. The `--ledger` option was removed |
 
 New tests cover: an EUR invoice at the signed rate (E11, now `Allow`), an AMD
 invoice rounded down, the unchanged USD amount, a USD order with another rate, a

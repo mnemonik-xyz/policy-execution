@@ -10,10 +10,7 @@ import argparse, json, os, pathlib, platform, shutil, socket, subprocess, sys, t
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--deploy-only", action="store_true", help="Exercise deployment, funding and acceptance without proving")
 parser.add_argument("--signed-only", action="store_true", help="Stop after the signed settlement; skip proving")
-parser.add_argument("--ledger", action="store_true", help="With --signed-only: book the settlements with connectors/ledger and check the beancount output")
 options = parser.parse_args()
-if options.ledger and not options.signed_only:
-    parser.error("--ledger requires --signed-only")
 # Hosts without the zkVM toolchain build the host with RISC0_SKIP_BUILD=1 and get a
 # zero image ID, which the deployment refuses. The signed and approved paths never
 # verify a proof, so they may run against a stand-in image ID; proving may not.
@@ -46,32 +43,6 @@ def deploy(name, *args):
 def number(text):
     return int(text.split()[0])
 
-def ledger_demo(out, escrow):
-    """Books the two settlements with the ledger connector and checks the result."""
-    run('cargo','build','-p','warrant-ids','--release','--locked')
-    for name, request in (('invoice-1001.xml', out/'request.json'), ('invoice-1003.xml', out/'ask/request.json')):
-        (out/name).write_bytes(bytes(json.loads(request.read_text())['document']))
-    host_tool, db_path, books_path = ROOT/'target/release/warrant-ids', out/'ledger.sqlite', out/'books.beancount'
-    (out/'ledger.toml').write_text(
-        f'[chain]\nrpc_url = "{URL}"\nchain_id = 31337\nescrow = "{escrow}"\ncustomer = "{CUSTOMER}"\n'
-        f'from_block = 0\nconfirmations = 0\n'
-        f'[tools]\nwarrant_ids = "{host_tool}"\n[store]\npath = "{db_path}"\n'
-        f'[beancount]\npath = "{books_path}"\n[vendors]\n"{VENDOR.lower()}" = "Vendor"\n')
-    ledger=lambda *a: run(sys.executable,'-m','warrant_ledger','--config',str(out/'ledger.toml'),*a,cwd=ROOT/'connectors/ledger')
-    ledger('intake',str(out/'invoice-1001.xml'),str(out/'invoice-1003.xml'))
-    ledger('sync')
-    ledger('export-beancount')
-    kinds=sorted(i['kind'] for i in json.loads(ledger('report','--json')))
-    assert kinds==['buyer approval: the checker did not run on chain'], kinds
-    books=(out/'books.beancount').read_text()
-    assert books.count('Expenses:Warrant:Vendor  ')==2 and 'match: "matched"' in books, books
-    if shutil.which('bean-check'):
-        ENV['PYTHONPATH']=str(ROOT/'connectors/ledger')  # the plugin lives in the connector package
-        run('bean-check',str(out/'books.beancount'))
-        checked='bean-check passed'
-    else:
-        checked='bean-check not installed; skipped'
-    print(f'Ledger: both settlements booked against their invoices; {checked}. File: {books_path}',flush=True)
 
 out = ROOT/'artifacts'/f'invoice-{time.time_ns()}'
 out.mkdir(parents=True)
@@ -180,8 +151,6 @@ try:
     except (RuntimeError,AssertionError): pass
     else: raise AssertionError('Approval replay unexpectedly accepted')
     print('Undecided invoice settled by buyer approval; replay rejected; smuggled inputs and unnamed signers refused.',flush=True)
-    if options.ledger:
-        ledger_demo(out, escrow)
     if options.signed_only:
         (out/'result.json').write_text(json.dumps(dict(chainId=31337,token=token,escrow=escrow,signer=SIGNER,orderId=order,
             amount=amount,signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],

@@ -17,6 +17,8 @@ interface InvoiceVm {
     function parseJsonUint(string calldata, string calldata) external pure returns (uint256);
     function parseJsonAddress(string calldata, string calldata) external pure returns (address);
     function assume(bool) external pure;
+    function chainId(uint256) external;
+    function etch(address, bytes calldata) external;
     function sign(uint256, bytes32) external pure returns (uint8, bytes32, bytes32);
     function addr(uint256) external pure returns (address);
 }
@@ -116,6 +118,22 @@ contract InvoiceEscrowTest {
     function signWith(uint256 key, bytes memory j) internal view returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, escrow.signerDigest(j));
         return abi.encodePacked(r, s, v);
+    }
+
+    /// Golden order id. It moved here from the removed `ids` crate, which was the only other
+    /// check of this layout. A change breaks every off-chain reader of orders. Change the value
+    /// only together with a new encoding version, never to silence a failure. The escrow code
+    /// is copied to a fixed address because `orderIdFor` hashes `address(this)`.
+    function testOrderIdMatchesTheGoldenVector() public {
+        address at = address(0x1111111111111111111111111111111111111111);
+        vm.etch(at, address(escrow).code);
+        vm.chainId(5042002);
+        bytes32 got = InvoiceEscrow(at).orderIdFor(
+            address(0x2222222222222222222222222222222222222222),
+            0x3333333333333333333333333333333333333333333333333333333333333333,
+            0x647b78c11a5e9b06e7088f5da15e149b7130a938d26b8c62d7256da8625788da
+        );
+        require(got == 0xdc4749f59dc65fccadc58a5b4473d74d7ec1598b5f8246f36117997a70112b8b);
     }
 
     function testReservesFullOrderAndRequiresVendorAcceptance() public {
