@@ -1,9 +1,0 @@
-# Buyer policy template for TaskEscrow on Arc Testnet.
-# Concrete policy timestamps (valid_after/valid_until) are stamped per request.
-version: 1
-rule:
-  all:
-  - accepted
-  - amount_at_most: 2000000  # 2.00 USDC
-  - vendor_category_in:
-    - 42

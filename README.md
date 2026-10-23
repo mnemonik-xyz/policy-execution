@@ -4,7 +4,7 @@ The [solver bounty showcase](solver-bounty/README.md) adds reviewer-free accepta
 for compute schedules. It checks the committed workload, publishes the result,
 and pays the seller through a separate solver guest and escrow.
 
-The [io.net / Arc pilot](showcases/ionet_arc/README.md) starts the real-workload
+The [io.net / Arc pilot](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/showcases/ionet_arc/README.md) starts the real-workload
 integration: bounded GPU provisioning, a transcription worker, and Arc/CCTP
 funding design. Live execution and cross-chain payments remain validation gates.
 
@@ -77,18 +77,12 @@ rebuild it with `RISC0_USE_DOCKER=1`, prove into a new receipt directory, and de
 a new `InvoiceEscrow`. The image ID and real receipts for this revision are not
 recorded yet.
 
-## Ledger connector (2026-10-08, in progress)
+## Ledger connector (moved)
 
-Phase 0 and phase 1 of [the ledger integration](../ledger-integration/spec.md)
-([implementation plan](../ledger-integration/implementation.md)):
-
-- [`ids`](ids/): the `warrant-ids` binary. It prints the document hash, the
-  obligation ID, the PO hash and `orderId` with the library functions. It has no
-  zkVM dependency, and the guests do not link it, so the image IDs are unchanged.
-- [`connectors/ledger`](connectors/ledger/README.md): reads `InvoiceEscrow` logs,
-  matches each `Paid` event to the invoice that the agent submitted, and writes a
-  beancount ledger with a `bean-check` plugin. It holds no Warrant key.
-  `python3 scripts/invoice-demo.py --signed-only --ledger` runs it end to end.
+The ledger connector and the `warrant-ids` helper moved to
+[warrant-bean-count-ledger](https://github.com/mnemonik-xyz/warrant-bean-count-ledger).
+That repository pins a core release. The identifier golden vectors now live in
+`core/tests/identifier_vectors.rs`. The last commit that held the old code is `15da112`.
 
 ## Invoice authentication and compatibility (2026-09-30)
 

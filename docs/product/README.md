@@ -72,8 +72,9 @@ An invalid schedule never becomes payable merely because a transcript was produc
 - [Escrow, proof and trust boundary](settlement.md)
 - [io.net execution and cross-chain funding](execution-funding.md)
 - [Delivery plan, operations and release gates](delivery-plan.md)
-- [Arc mainnet canary plan](mainnet-canary-plan.md)
-- [Circle marketplace listing of the io.net seller](circle-listing.md)
+- [Arc mainnet canary plan](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/docs/mainnet-canary-plan.md)
+- [Canary kickoff: dev tasks and session prompt](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/docs/canary-kickoff.md)
+- [Circle marketplace listing of the io.net seller](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/docs/circle-listing.md)
 - [Metered payment policy family](lease-evidence.md)
 
 ## Evidence baseline

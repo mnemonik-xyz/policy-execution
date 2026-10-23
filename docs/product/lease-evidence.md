@@ -91,7 +91,7 @@ identifier. The service stores the note for settlement.
 
 The metering rule is therefore not prose. The unit of metering is whichever paths
 challenge, and for how much. The OpenAPI document records the 402 response on each
-metered path, as the [listing specification](circle-listing.md) already does for the
+metered path, as the [listing specification](https://github.com/mnemonik-xyz/warrant-showcases/blob/main/docs/circle-listing.md) already does for the
 quote path.
 
 Whether Circle's review accepts a resource whose metered paths use this scheme is not
@@ -318,7 +318,7 @@ batch size or threshold is chosen.
 | Requirement | Value |
 |---|---|
 | Hardware | One GPU per container, one replica, duration billing. The showcase uses an RTX 4090 class at about 0.35 USD per hour on io.net. |
-| Image | `ghcr.io/mnemonik-xyz/warrant-transcription:pilot`, about 1.9 GiB compressed, CUDA 12.3 base, `libcublas-12-3` and `libcudnn9-cuda-12` only, `faster-whisper-small` pinned by revision. Deploy by digest, not by tag. |
+| Image | `ghcr.io/mnemonik-xyz/transcription:pilot`, about 1.9 GiB compressed, CUDA 12.3 base, `libcublas-12-3` and `libcudnn9-cuda-12` only, `faster-whisper-small` pinned by revision. Deploy by digest, not by tag. |
 | Network | One traffic port, 8080, reachable by the seller service. The buyer reaches it through the seller's metered path, not directly. |
 | Keys | None of Warrant. The worker never sees a note. |
 | Provider | An io.net account, API key, credits, and the hardware and location identifiers discovered through the provider's API, never invented. |

@@ -66,7 +66,7 @@ The [evidence archive](https://github.com/mnemonik-xyz/policy-execution/actions/
 contains both receipts, deployment data, the EVM journal, and the settlement receipt.
 Its SHA-256 is `0834d6fa710d7d0cb1afe1bc9a549e1b52124c4dbc56db1cbee85246faec873e`.
 The downloaded archive matched that digest.
-The [saved result](ci-result.json) preserves the run's summary.
+The [saved result](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/ci-result.json) preserves the run's summary.
 
 This was a local test chain with a synthetic workload and test funds.
 It was not a public deployment or a customer transaction.

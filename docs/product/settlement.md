@@ -65,4 +65,35 @@ Before offering real deals, verify the RPC chain, token behavior/decimals, deplo
 - CHAIN-5: Independent review covers the solver checker, projection, escrow, proving build and signing boundary. Mainnet rollout requires recorded resolution of findings.
 - CHAIN-6: Each enabled task, invoice and revocable-vault deployment has its own verified manifest and settlement evidence; the Circom deployment uses its own reviewed key/setup. CAT coverage prevents presenting a solver-only deployment as complete site support.
 
+## Recorded exception for the Arc mainnet canary
+
+Recorded 2026-10-14. Decision of the core team on 2026-10-09, in the
+[canary plan](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/docs/mainnet-canary-plan.md).
+
+- CHAIN-1 is not satisfied. No real proof has settled on Arc testnet. The canary settles
+  one capped order on Arc mainnet without a prior testnet settlement.
+- CHAIN-5 is not satisfied. No independent review is planned before the canary. A
+  self-review in [`solver-bounty/canary/self-review.md`](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/canary/self-review.md) replaces it for the canary only.
+- The exception applies to the canary only: one order, at most 10 USDC, on the solver path.
+  It does not apply to a production launch. CHAIN-1 and CHAIN-5 remain open gates for P5.
+- Extension of 2026-10-15: the exception also covers the `TaskEscrow` seller service on
+  chain 5042. Its scope is the task set: `ReceiptClaimVerifier` and `TaskEscrow` pinned to the
+  Warrant guest image ID. `ReceiptClaimVerifier` verifies a 101-byte cryptographic receipt seal
+  (`SELECTOR || claimDigest || signature`) signed by the authorized prover over the RISC Zero
+  `ReceiptClaim` digest, chain ID, and verifier address, without a Groth16 SNARK proof. Seller
+  policy limits each deal to at most 1.00 USD and 1 hour, and allows one deal at a time.
+  These limits are seller policy, not contract rules.
+- Trust facts of the seller service: `ReceiptClaimVerifier` requires the authorized prover's
+  secp256k1 signature over the exact `(chainId, verifier, imageId, journalDigest)` receipt claim,
+  so unauthorized third parties cannot forge a seal. Because the seller controls the prover key
+  for the canary, the buyer trusts the seller not to sign a receipt claim without buyer
+  acceptance. The extension does not apply to a production launch either.
+- CHAIN-6 for the task set: the deployment record `task-escrow.json` holds the Foundry
+  broadcast and the `cast` checks, and the deployment PR publishes it. No settlement
+  evidence exists before the first buyer deal, so CHAIN-6 stays open for the task set.
+- Evidence in place of CHAIN-1 has three parts. The first is the real Groth16 settlement on
+  private Anvil in CI ([`solver-bounty/ci-result.json`](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/ci-result.json)). The second is the read-only mainnet
+  probe of the canary plan item 4. The third is the local rehearsal record
+  `solver-bounty/canary/local/<UTC timestamp>/rehearsal.md` with its `rehearsal.json`, in [warrant-canary-deployment](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/canary).
+
 Sources: [Arc network configuration](https://docs.arc.io/arc/references/connect-to-arc), [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses), [Arc EVM differences](https://docs.arc.io/integrate/evm-differences).

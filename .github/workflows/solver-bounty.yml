@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned Rust and prover
         run: |
           rustup toolchain install 1.98.1 --profile minimal
@@ -47,8 +47,6 @@ jobs:
           forge test --root contracts
       - name: Guest execution agrees with native checks
         run: cargo test --release --locked -p warrant-host --test solver_execution
-      - name: Canary script guard tests
-        run: python3 scripts/test_solver_canary.py
 
   solver-proof:
     if: >-
@@ -58,7 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install pinned Rust and prover
         run: |
           rustup toolchain install 1.98.1 --profile minimal
@@ -87,7 +85,7 @@ jobs:
           WARRANT_SOLVER_RECEIPT_DIR="$receipt_dir" cargo test --release --locked -p warrant-host --test solver_receipt -- --ignored
       - name: Preserve proof and settlement evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: solver-bounty-evidence
           path: artifacts/solver-*/
