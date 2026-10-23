@@ -81,6 +81,7 @@ Arc notes, checked 2026-09-23:
   broadcasting from the repository root:
 
   ```sh
+  # check-arc.py moved to warrant-canary-deployment (scripts/check-arc.py)
   python3 scripts/check-arc.py contracts/test/fixtures/risc0-3.0.5.json
   ```
 

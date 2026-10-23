@@ -216,7 +216,7 @@ evaluation; the contract does not interpret them.
   fixture equal to the current encoding.
 - Host unit tests pin `orderIdFor`'s layout, the signer address derivation and
   the `order()` decoding the service relies on.
-- The Arc probe (`scripts/check-arc.py`) constructs `InvoiceEscrow` in a
+- The Arc probe (`scripts/check-arc.py`, now in [warrant-canary-deployment](https://github.com/mnemonik-xyz/warrant-canary-deployment)) constructs `InvoiceEscrow` in a
   read-only Arc Testnet simulation.
 - `scripts/invoice-demo.py` runs the whole flow on a local chain: one invoice
   settled by signature (the service reading the order from the chain), an

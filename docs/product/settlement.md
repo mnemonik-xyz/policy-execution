@@ -68,12 +68,12 @@ Before offering real deals, verify the RPC chain, token behavior/decimals, deplo
 ## Recorded exception for the Arc mainnet canary
 
 Recorded 2026-10-14. Decision of the core team on 2026-10-09, in the
-[canary plan](mainnet-canary-plan.md).
+[canary plan](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/docs/mainnet-canary-plan.md).
 
 - CHAIN-1 is not satisfied. No real proof has settled on Arc testnet. The canary settles
   one capped order on Arc mainnet without a prior testnet settlement.
 - CHAIN-5 is not satisfied. No independent review is planned before the canary. A
-  self-review in `solver-bounty/canary/self-review.md` replaces it for the canary only.
+  self-review in [`solver-bounty/canary/self-review.md`](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/canary/self-review.md) replaces it for the canary only.
 - The exception applies to the canary only: one order, at most 10 USDC, on the solver path.
   It does not apply to a production launch. CHAIN-1 and CHAIN-5 remain open gates for P5.
 - Extension of 2026-10-15: the exception also covers the `TaskEscrow` seller service on
@@ -92,8 +92,8 @@ Recorded 2026-10-14. Decision of the core team on 2026-10-09, in the
   broadcast and the `cast` checks, and the deployment PR publishes it. No settlement
   evidence exists before the first buyer deal, so CHAIN-6 stays open for the task set.
 - Evidence in place of CHAIN-1 has three parts. The first is the real Groth16 settlement on
-  private Anvil in CI (`solver-bounty/ci-result.json`). The second is the read-only mainnet
+  private Anvil in CI ([`solver-bounty/ci-result.json`](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/ci-result.json)). The second is the read-only mainnet
   probe of the canary plan item 4. The third is the local rehearsal record
-  `solver-bounty/canary/local/<UTC timestamp>/rehearsal.md` with its `rehearsal.json`.
+  `solver-bounty/canary/local/<UTC timestamp>/rehearsal.md` with its `rehearsal.json`, in [warrant-canary-deployment](https://github.com/mnemonik-xyz/warrant-canary-deployment/blob/main/solver-bounty/canary).
 
 Sources: [Arc network configuration](https://docs.arc.io/arc/references/connect-to-arc), [Arc contract addresses](https://docs.arc.io/arc/references/contract-addresses), [Arc EVM differences](https://docs.arc.io/integrate/evm-differences).
