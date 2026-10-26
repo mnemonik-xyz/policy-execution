@@ -85,7 +85,7 @@ jobs:
           WARRANT_SOLVER_RECEIPT_DIR="$receipt_dir" cargo test --release --locked -p warrant-host --test solver_receipt -- --ignored
       - name: Preserve proof and settlement evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: solver-bounty-evidence
           path: artifacts/solver-*/

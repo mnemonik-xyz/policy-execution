@@ -100,7 +100,7 @@ jobs:
             install -m 0755 "target/${TARGET}/release/${b}" "stage/bin/${b}"
           done
           tar -C stage -czf "dist/warrant-tools-${VERSION}-${TARGET}.tar.gz" bin
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: tools-${{ matrix.name }}
           path: dist/*.tar.gz
@@ -199,7 +199,7 @@ jobs:
                deployed_code_hashes: $hashes
              }' > dist/core-manifest.json
           cat dist/core-manifest.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: host-and-contracts
           path: dist/*
