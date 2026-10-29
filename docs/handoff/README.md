@@ -33,7 +33,7 @@ These files turn it into work packages.
 | 3 | Generic evaluator, one Verus proof. Fallback: one closed atom enum | Approved |
 | 4 | Chain and escrowed asset for the DeFi swap | Deferred to step 9 |
 | 5 | Fate of the buyer-signed settlement path | **Open.** See below |
-| 6 | Who runs the meter and signs usage records for rent | **Open** |
+| 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md` |
 
 Decision 5. The owner said earlier: remove the buyer-signed path (`settleSigned`, `invoice-sign`).
 Pull request #25 merged on 2026-10-23. It makes the metered-payment design proof-only, with no signer key.

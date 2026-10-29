@@ -7,6 +7,10 @@ an entry in the [policy catalog](policy-catalog.md). The compute marketplace in
 [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13) is its first consumer,
 not its owner.
 
+Revision 2026-10-29: the delivery proof. A metered policy must name a meter. The
+meter signs a usage record per piece. The guest checks the records before the rule
+tree. PoCC (`mnemonik-xyz/pocc`) is the first meter. Section 5a describes it.
+
 Revision 2026-10-14, evening: settlement is by proof for every batch. No signer key
 exists in the design. The family deploys on the proof-only escrow and factory of
 [policy-execution#19](https://github.com/mnemonik-xyz/policy-execution/pull/19),
@@ -417,8 +421,8 @@ Batches are disjoint by construction, because a note index belongs to exactly on
 batch. Each batch is one obligation, so each note pays once with no contract change.
 The factory's registry keeps that true across escrows of later meter images. Batch
 size one is allowed. The module does not know the spent ceiling or whether an earlier
-batch was paid. The contract checks both. It does not know whether the service ran.
-Nobody can check that.
+batch was paid. The contract checks both. The module does not know whether the
+service ran. The delivery proof of section 5a does: the meter key attests it.
 
 The rest of the delta:
 
@@ -430,6 +434,112 @@ The rest of the delta:
 | Template | `templates/meter-v1.json` with ceiling, per-note cap and batch size as parameters. |
 | Deployment | `DeployInvoice.s.sol` with `proofOnly` and the meter image ID: one factory, one escrow from it. A later meter image gets a new escrow from the same factory. |
 | Tests | The positive path, every gate, removed-check mutations. |
+
+## 5a. The delivery proof
+
+A note proves that the buyer agreed to pay for a piece. It does not prove that the
+seller delivered the piece. The delivery proof closes that gap. It follows the
+framework design (`docs/framework.md`, "Rent computation").
+
+### 5a.1 The delivery section of the policy
+
+Every metered policy must have one `delivery` section. The validator rejects a policy
+without one. The section fixes who may attest delivery and what the attestation must
+satisfy. Its hash is `deliverySpecHash`. The escrow stores that hash at `offer`.
+
+```json
+"delivery": {
+  "kind": "signed_usage",
+  "meter_key": "<SEC1 compressed secp256k1 key>",
+  "unit": 1,
+  "price_per_unit": 1100,
+  "tolerance": 0,
+  "min_uptime_bp": 9500,
+  "min_assurance": 0,
+  "meter_spec": "<32-byte hash>"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `signed_usage`. Other kinds exist for other cases. |
+| `meter_key` | The key that signs usage records. The owner approves it. It never comes from the agent or a model. |
+| `unit` | What the meter counts. `1` is instance-second, `2` is gpu-second. The table is in `core`. |
+| `price_per_unit` | Token base units per unit. |
+| `tolerance` | Token base units that a note can exceed `units * price_per_unit`. Zero by default. |
+| `min_uptime_bp` | The least share of a window that the record must credit, in basis points. |
+| `min_assurance` | The least assurance level of the record. `0` is no hardware attestation, `1` is AMD SEV-SNP. |
+| `meter_spec` | The hash of the meter's own parameter document. The meter checks its parameters against it. Warrant stores the hash only. |
+
+`min_uptime_bp` and `min_assurance` are gates of the delivery check, not rule atoms.
+The evaluator and the `Rule` enum do not change.
+
+### 5a.2 The usage record
+
+A usage record is a typed struct. The meter key signs it over
+`tagged_bytes(b"warrant/usage/v1", record)`. The tag differs from the note tag, so a
+record cannot pass as a note.
+
+```rust
+pub struct UsageRecord {
+    pub scope: Scope,            // chain, escrow, token; equal to the policy's
+    pub lease_id: Hash,
+    pub first_index: u32,        // first note index that the record covers
+    pub last_index: u32,         // last note index; equal to first_index for one piece
+    pub window_start: u64,       // unix seconds
+    pub window_end: u64,
+    pub units: u64,              // metered units in the window
+    pub assurance: u8,           // 0 or 1, as in min_assurance
+    pub meter_spec: Hash,        // the meter_spec the meter checked against
+    pub deliverable_hash: Hash,  // hash of the evidence the record was computed from
+}
+```
+
+`deliveryHash` in the journal is `hash_tagged(b"warrant/usage-batch/v1", records)`,
+with the records in index order.
+
+### 5a.3 Gates
+
+`authorize_meter` runs these gates after the nine checks of section 5 and before the
+rule tree. Each gate has a test and a removed-check experiment (ME-1).
+
+| # | Gate | Result if it fails |
+|---|---|---|
+| D1 | A record exists for every note index in the batch, with no gap and no overlap | `Ask` for a missing record, `Deny` for an overlap |
+| D2 | Each record signature verifies under `meter_key` | `Deny` |
+| D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
+| D4 | Each record window is inside the policy validity | `Deny` |
+| D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance` | `Deny` |
+| D6 | `units_k * 10000 / (window_end - window_start) >= min_uptime_bp` | `Deny` |
+| D7 | `assurance >= min_assurance` | `Deny` |
+
+### 5a.4 The first meter: PoCC
+
+PoCC proves that a rented virtual machine ran for the time that the seller bills.
+An agent in the machine signs a heartbeat on every 60-second slot of the drand beacon.
+A notary anchors one Merkle root per slot on the escrow chain. The PoCC verifier reads
+the receipt, the beacon and the anchors, and credits only the seconds between two
+anchored heartbeats. The verifier is public code over public inputs. Anyone who runs
+it on the same receipt gets the same result.
+
+In the first implementation the buyer runs the verifier, and `meter_key` is the
+buyer's guardrail key. This answers decision 6 of the handoff. The buyer cannot gain
+from a false record: an over-credit pays the seller from the buyer's funds, and an
+under-credit stops the service after one piece and can be shown wrong by anyone who
+re-runs the verifier. A later step runs the verifier inside the guest as a
+`computed_result` check. Then no meter key exists.
+
+`meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
+the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor
+contract and the attestation level. The PoCC verifier recomputes the hash and refuses to
+sign a record when it differs from the policy.
+
+The piece for PoCC is one clock hour. The seller challenges the buyer for note k after
+hour k. The buyer's guardrail runs the verifier, signs the usage record for hour k, and
+signs note k for at most `units_k * price_per_unit`. The seller settles batches of
+hours as section 4 describes.
+
+The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
 ## 6. Seller service requirements
 
@@ -460,6 +570,8 @@ The rest of the delta:
 | RISC Zero soundness, the verifier, the BN254 precompiles on Arc | Existing assumptions, unchanged. |
 | Block time for windows and `settleBy` | Existing assumption. The worker keeps a margin. |
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
+| The meter key signs honest usage records | A false record cannot move funds outside the ceiling. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier. The guest-run verifier removes the key. |
+| The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. |
 
 ## 9. Attack surface
 
@@ -484,6 +596,10 @@ The rest of the delta:
 | Anyone | Replay a settlement, relay to another recipient | Consumed obligation, recipient fixed, any relayer pays only the recipient. |
 | Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. |
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
+| Seller | Bill a piece that was not delivered | No usage record, or a record below the note amount: `Ask` or `Deny`. The piece is not paid. |
+| Buyer | Sign a record with fewer units than delivered | The seller loses at most one piece and stops. Anyone can re-run the verifier and show the under-credit. |
+| Seller | Present a record signed by another key | D2 denies. |
+| Seller | Reuse a record for another lease or batch | D1 and D3 deny. |
 
 What this does not secure: quality of service, the hardware model, response time. The
 buyer's remedy is to stop. That is the same limit every metered cloud has.
@@ -498,6 +614,13 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - ME-6: A metered path returns the 402 challenge of section 3 unpaid, serves against a valid note, and refuses a reused index.
 - ME-7: The settlement worker proves and settles a full batch and a partial last batch, retries after a prover failure without losing a batch, and stops accepting notes at its margin before `settleBy`, in a test with a mocked prover and a mocked verifier.
 - ME-8: Proving time, CPU seconds, peak memory and cost for one full batch are measured on the x86 prover before the batch size is chosen. The batch size is set so that proving cost per batch stays well below the batch value.
+- DL-1: A batch without a usage record gives `Ask`, and no journal exists.
+- DL-2: A batch that bills more than `units * price_per_unit + tolerance` gives `Deny`.
+- DL-3: A usage record signed by a key other than `meter_key` gives `Deny`.
+- DL-4: The escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
+- DL-5: The trust table names the meter key and says what happens if it fails.
+- DL-6: A record below `min_uptime_bp` or `min_assurance` gives `Deny`.
+- DL-7: A PoCC receipt from `test/live/2026-10-28` in `mnemonik-xyz/pocc` turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort
 

@@ -81,7 +81,19 @@ The escrow checks that `deliverySpecHash` equals the value that the buyer fixed 
 It proves that the key the owner approved signed a record of delivery, and that the buyer was not billed for more than the record shows.
 It does not prove that the meter was honest. The meter key is a new trust assumption. State it in the trust table of the specification.
 
-### Decision 6 (open): who runs the meter
+### Decision 6 (proposed answer, 2026-10-29): PoCC, run by the buyer
+
+PoCC (`mnemonik-xyz/pocc`) is the meter. Its verifier credits seconds from heartbeats
+that an agent in the rented machine signs and a notary anchors on the escrow chain.
+The verifier is public code over public inputs. In the first implementation the buyer
+runs it, and `meter_key` is the buyer's guardrail key. A later step runs the verifier
+inside the guest, and the key disappears. Specification: `docs/product/lease-evidence.md`,
+section 5a, and `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
+
+The delivery section gains `min_uptime_bp`, `min_assurance` and `meter_spec`. The usage
+record gains `assurance` and `meter_spec`. Both are in section 5a.
+
+### Decision 6 (the options that were on the table)
 
 | Option | Trust | Cost |
 |---|---|---|
@@ -90,7 +102,8 @@ It does not prove that the meter was honest. The meter key is a new trust assump
 | The seller signs, the buyer countersigns | Two parties agree | Needs the buyer online, as the old signed path did |
 | `computed_result` instead (solver style) | The checker, not a party | Only for work with a checkable output |
 
-Ask the owner. Do not choose alone. Do not write the guest for a key you cannot name.
+The owner chose the buyer-run PoCC verifier on 2026-10-29. The key is named: the
+buyer's guardrail key.
 
 ## Work packages
 
@@ -159,10 +172,12 @@ New:
 - DL-3: a usage record signed by a key other than `meter_key` gives `Deny`.
 - DL-4: the escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: the written trust table names the meter key and says what happens if it fails.
+- DL-6: a record below `min_uptime_bp` or `min_assurance` gives `Deny`.
+- DL-7: a PoCC receipt from `test/live/2026-10-28` in `mnemonik-xyz/pocc` turns into a usage record that `warrant-host check rent` accepts.
 
 ## Risks
 
-- **No honest meter exists yet.** The delivery proof is only as good as the meter key. Decision 6 decides whether this case is real or a promise.
+- **The meter key is the buyer's.** A buyer can under-credit. The seller's loss is one piece, and the under-credit is visible to anyone who re-runs the PoCC verifier. The guest-run verifier removes the key.
 - **Dependency on unmerged work.** #19 (the proof-only escrow and the factory) is closed and not merged. The merged specification depends on it.
 - **Proving cost.** One measured proof took about 445 s for the succinct proof and about 80 s for the wrap on a Mac with four workers.
   ME-8 must measure the x86 cost before the batch size is set.
