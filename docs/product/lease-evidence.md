@@ -510,8 +510,14 @@ rule tree. Each gate has a test and a removed-check experiment (ME-1).
 | D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
 | D4 | Each record window is inside the policy validity | `Deny` |
 | D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance` | `Deny` |
-| D6 | `units_k * 10000 / (window_end - window_start) >= min_uptime_bp` | `Deny` |
-| D7 | `assurance >= min_assurance` | `Deny` |
+| D6 | If `units_k * 10000 / (window_end - window_start) < min_uptime_bp`, then `amount_k == 0` | `Deny` |
+| D7 | If `assurance < min_assurance`, then `amount_k == 0` | `Deny` |
+
+A piece below the floors is not skipped. The guardrail signs its usage record and a
+note for amount 0. The index is consumed, the indices stay consecutive (section 2), and
+the batch settles with that piece unpaid. D1 and `authorize_meter` keep their no-gap
+rule. A buyer that signs nothing for piece k is the non-cooperation case: the seller
+stops serving (SS-9) and settles the notes that exist as a partial batch.
 
 ### 5a.4 The first meter: PoCC
 
@@ -536,8 +542,9 @@ sign a record when it differs from the policy.
 
 The piece for PoCC is one clock hour. The seller challenges the buyer for note k after
 hour k. The buyer's guardrail runs the verifier, signs the usage record for hour k, and
-signs note k for at most `units_k * price_per_unit`. The seller settles batches of
-hours as section 4 describes.
+signs note k for at most `units_k * price_per_unit`, or for 0 when the record is below
+the floors. The seller settles batches of hours as section 4 describes. The challenge
+comes after the hour, never before (SS-9): nobody can prove an hour before it ran.
 
 The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
@@ -551,6 +558,7 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 - SS-6: The OpenAPI document records the 402 response, the scheme and the price on every metered path.
 - SS-7: Notes are payment authorizations. The service stores them for settlement and does not log them elsewhere.
 - SS-8: The service may challenge before serving or after. Before puts one note of exposure on the buyer. After puts it on the seller. The listing states which.
+- SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: the service serves piece k+1 against note k. If note k has not arrived by the end of piece k+1, the service stops. The seller's exposure is one piece.
 
 ## 7. Buyer guardrail requirement
 
@@ -577,7 +585,8 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
 | Attacker | Attempt | Outcome |
 |---|---|---|
-| Buyer | Withhold a note | No service for that piece. Nothing else. |
+| Buyer | Withhold a note | No service for that piece. For `signed_usage`, the seller serves one more piece and stops (SS-9). Nothing else. |
+| Buyer | Sign a zero note for a delivered piece above the floors | D5 to D7 bound the amount from above only. The seller loses that piece and stops (SS-9). Anyone can re-run the verifier and show the record. |
 | Buyer | Reuse an index | SS-2 refuses the request. |
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
@@ -619,7 +628,8 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-3: A usage record signed by a key other than `meter_key` gives `Deny`.
 - DL-4: The escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: The trust table names the meter key and says what happens if it fails.
-- DL-6: A record below `min_uptime_bp` or `min_assurance` gives `Deny`.
+- DL-6: A record below `min_uptime_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
+- DL-8: A batch with a zero note for a piece below the floors settles the other pieces.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort

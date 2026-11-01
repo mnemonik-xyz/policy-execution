@@ -172,7 +172,8 @@ New:
 - DL-3: a usage record signed by a key other than `meter_key` gives `Deny`.
 - DL-4: the escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: the written trust table names the meter key and says what happens if it fails.
-- DL-6: a record below `min_uptime_bp` or `min_assurance` gives `Deny`.
+- DL-6: a record below `min_uptime_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
+- DL-8: a batch with a zero note for a piece below the floors settles the other pieces.
 - DL-7: a PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## Risks
