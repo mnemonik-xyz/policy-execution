@@ -471,7 +471,7 @@ satisfy. Its hash is `deliverySpecHash`. The escrow stores that hash at `offer`.
   "unit": 1,
   "price_per_unit": 1100,
   "tolerance": 0,
-  "min_uptime_bp": 9500,
+  "min_coverage_bp": 9500,
   "min_assurance": 0,
   "meter_spec": "<32-byte hash>",
   "service_start": 1794819600,
@@ -488,14 +488,14 @@ satisfy. Its hash is `deliverySpecHash`. The escrow stores that hash at `offer`.
 | `unit` | What the meter counts. `1` is instance-second, `2` is gpu-second. The table is in `core`. |
 | `price_per_unit` | Token base units per unit. |
 | `tolerance` | Token base units that a note can exceed `units * price_per_unit`. Zero by default. |
-| `min_uptime_bp` | The least share of a window that the record must credit, in basis points. |
+| `min_coverage_bp` | The least creditable interval coverage of a record, in basis points: `units * 10000 / creditable`. Not wall-clock uptime (5a.2). |
 | `min_assurance` | The least assurance level of the record. `0` is no hardware attestation, `1` is AMD SEV-SNP. |
 | `meter_spec` | The hash of the meter's own parameter document. The meter checks its parameters against it. Warrant stores the hash only. |
 | `service_start`, `service_end` | The service period, unix seconds. `service_start` is the origin of the piece index and must be on a piece boundary of the meter's schedule (a clock hour for PoCC). `validity.after <= service_start` and `validity.until >= service_end + the settlement grace` (5a.5). The meter checks that its own request names the same period. |
 | `piece_s` | The piece length in seconds; 3,600 for PoCC. `service_end - service_start` is a multiple of it. |
 | `challenge_timeout_s` | How long after piece k ends the seller waits for note k before it stops (5a.5). |
 
-`min_uptime_bp` and `min_assurance` are gates of the delivery check, not rule atoms.
+`min_coverage_bp` and `min_assurance` are gates of the delivery check, not rule atoms.
 The evaluator and the `Rule` enum do not change.
 
 ### 5a.2 The usage record
@@ -543,10 +543,16 @@ start, ends at or before the service end, and ends inside the window, where an
 interval ending exactly on the hour belongs to the hour before. Both endpoints are
 constrained, so the interval that begins before the service start is never counted.
 With quicknet's grid (slots at :24 past each minute) the first hour of a service has
-59 such intervals, 3,540 s; a middle hour has 60; the last hour has 59. The uptime
-floor is a share of `creditable`: "100 %" means every scheduled interval was credited,
-not 3,600 s of wall-clock time. This is a commercial definition, not an arithmetic
-detail, and the listing states it.
+59 such intervals, 3,540 s; a middle hour has 60; the last hour has 59. The denominator
+is fixed before the piece runs, from the schedule alone, so an outage can never shrink
+it.
+
+The floor is **creditable interval coverage**, not uptime: `min_coverage_bp` is the
+least share of `creditable` that the record must credit, and "100 %" means every
+scheduled interval was credited, not 3,600 s of wall-clock availability. Two
+heartbeats bound an interval; they do not observe the machine inside it. Payment is
+for credited seconds only. This is a commercial definition, not an arithmetic detail,
+and the listing states it in these words.
 
 The note for index k binds to the record by `deliverable_hash`: the service puts the
 record's hash in the challenge, and the note carries it (section 2). A note for a
@@ -567,7 +573,7 @@ rule tree. Each gate has a test and a removed-check experiment (ME-1).
 | D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
 | D4 | Each record window is the window of its index (above), inside the policy validity, and `window_end - window_start == piece_s` | `Deny` |
 | D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance`, and `note.deliverable_hash == hash(record_k)` | `Deny` |
-| D6 | If `units_k * 10000 < min_uptime_bp * creditable_k`, then `amount_k == 0` | `Deny` |
+| D6 | If `units_k * 10000 < min_coverage_bp * creditable_k`, then `amount_k == 0` | `Deny` |
 | D7 | If `assurance_k < min_assurance`, then `amount_k == 0` | `Deny` |
 | D8 | `0 < creditable_k <= window_end - window_start`, `units_k <= creditable_k`, `assurance_k` is 0 or 1 | `Deny` |
 | D9 | Every product and sum above is checked; an overflow is a failure, never a wrap | `Deny` |
@@ -610,10 +616,14 @@ under-credits stops its own service after one piece, and anyone can re-run the
 verifier on the public evidence and show the under-credit; a buyer that over-credits
 pays the seller from its own funds; a party holding the buyer's key can sign records
 and notes that agree with each other and pay the fixed recipient, up to the ceiling,
-for service that did not happen. The key cannot move funds anywhere else. A later step
-runs the verifier inside the guest as a `computed_result` check over authenticated
-evidence (beacon signatures, anchor history, provider metadata). Then no meter key
-exists and the records are proved, not attested.
+for service that did not happen. The key cannot move funds anywhere else. This is
+acceptable for an explicitly limited pilot and for nothing more: if the requirement is
+that a compromised agent or signer cannot pay without delivery evidence, v1 does not
+meet it. The step that meets it runs the verifier inside the guest as a
+`computed_result` check over authenticated evidence (beacon signatures, anchor
+history, provider metadata; X-1). Then no meter key exists and the records are proved,
+not attested. X-1 still inherits Stage 0's physical-machine assumption (the table
+above).
 
 `meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
 the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor
@@ -626,14 +636,16 @@ signs note k for at most `units_k * price_per_unit`, or for 0 when the record is
 the floors. The seller settles batches of hours as section 4 describes. The challenge
 comes after the hour, never before (SS-9): nobody can prove an hour before it ran.
 
-**Commercial boundary.** The first supported arrangement is a reseller: the seller
-rents the machine from a cloud under its own account and resells it under a Warrant
-lease. The seller holds the cloud credentials, pays the cloud's invoice whether or not
-Warrant pays, absorbs rejected and unpaid pieces, terminates the machine when the lease
-ends or stops, and pays for storage and network after compute stops. A cloud that
-accepts Warrant leases directly is the same protocol with the seller and the cloud
-being one party. The one-piece exposure of SS-9 is the seller's exposure to the buyer;
-the seller's exposure to the cloud is its own.
+**Commercial boundary.** The pilot runs with a clearly identified reseller: a named
+seller that rents the machine from a cloud under its own account and resells it under
+a Warrant lease. The reseller holds the cloud credentials under an explicit spending
+limit it sets with the cloud, pays the cloud's invoice whether or not Warrant pays,
+absorbs rejected and unpaid pieces, is responsible for terminating the machine and its
+volumes when the lease ends or stops, and pays for storage and network after compute
+stops. The cloud takes no part in Warrant and is never described as accepting Warrant
+payments; that description is reserved for a cloud that actually participates, which
+none does today. The exposure `E` of 5a.5 is the reseller's exposure to the buyer; its
+exposure to the cloud is its own and bounded by its spending limit.
 
 The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
@@ -744,7 +756,7 @@ time it is one piece plus the proving and settlement margin.
 | Block time for windows and `settleBy` | Existing assumption. The worker keeps a margin. |
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
 | The meter key signs honest usage records (v1 trusts this attestation; the guest checks the signature and the gates, not the metering) | A false record cannot move funds outside the ceiling or to another recipient. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier, after the fact. The guest-run verifier (`computed_result` over authenticated evidence) removes the key. |
-| The buyer's guardrail key is not compromised (in v1 it is the meter, acceptance and registry key at once) | One stolen key signs records and notes that agree with each other and pays the fixed recipient for service that did not happen, up to the ceiling and before `settleBy`. Keep orders small; separate the keys when the exposure justifies it (pocc decision 25 reversal). |
+| The buyer's guardrail key is not compromised (in v1 it is the meter, acceptance and registry key at once) | One stolen key signs records and notes that agree with each other and pays the fixed recipient for service that did not happen, up to the ceiling and before `settleBy`. This trust is accepted for an explicitly limited pilot only: small ceilings, named parties, short leases. A requirement that a compromised signer cannot pay without delivery evidence is not met by v1; only the guest-verified evidence of X-1 meets it. Splitting the keys is not a substitute: two keys held by the same compromised process protect nothing. |
 | The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. |
 
 ## 9. Attack surface
@@ -795,10 +807,10 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-3: A usage record signed by a key other than `meter_key` gives `Deny`.
 - DL-4: The escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: The trust table names the meter key and says what happens if it fails.
-- DL-6: A record below `min_uptime_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
+- DL-6: A record below `min_coverage_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
 - DL-8: A batch with a zero note for a piece below the floors settles the other pieces.
 - DL-9: A record whose window is not its index's window, or longer than one piece, or with `units > creditable`, or with a range of indices, gives `Deny`; a product that would overflow gives `Deny`.
-- DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_uptime_bp` of 10000.
+- DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_coverage_bp` of 10000.
 - DL-11: The state machine of 5a.5 is exercised in a simulation with these expected outcomes. No response to the first challenge: the machine is stopped `challenge_timeout_s` after piece 0 ends, no note exists, the seller's loss is `E`. A lease whose ceiling covers one piece: piece 1 never starts (SS-10, `open` already holds piece 0). A late response after a batch closed: refused "batch closed", the index is consumed, nothing settles for it. A note that would expire inside an unfinished batch: never signed (BG-6) and refused if presented (SS-11). A missing middle piece below the floors: zero note, batch settles the rest. A buyer that disappears after the last piece: the final timeout passes, the held notes settle, the last piece is unpaid. A duplicate challenge: the same note. A proof failure near `valid_until`: retried within the margin, else the batch is lost and recorded.
 - DL-12: A boundary-hour record (3,540 credited of 3,540 creditable under quicknet's grid) serialized by `pocc-verify` and checked by `warrant-host check rent` gives the same decision in both implementations; the shared vector is `test/vectors/` in `mnemonik-xyz/pocc`.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.

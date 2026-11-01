@@ -90,7 +90,7 @@ runs it, and `meter_key` is the buyer's guardrail key. A later step runs the ver
 inside the guest, and the key disappears. Specification: `docs/product/lease-evidence.md`,
 section 5a, and `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
-The delivery section gains `min_uptime_bp`, `min_assurance` and `meter_spec`. The usage
+The delivery section gains `min_coverage_bp`, `min_assurance` and `meter_spec`. The usage
 record gains `assurance` and `meter_spec`. Both are in section 5a.
 
 ### Decision 6 (the options that were on the table)
@@ -172,9 +172,9 @@ New:
 - DL-3: a usage record signed by a key other than `meter_key` gives `Deny`.
 - DL-4: the escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: the written trust table names the meter key and says what happens if it fails.
-- DL-6: a record below `min_uptime_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
+- DL-6: a record below `min_coverage_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
 - DL-8: a batch with a zero note for a piece below the floors settles the other pieces.
-- DL-9 to DL-11 as in `lease-evidence.md` section 5a: record arithmetic, boundary-hour uptime, and the state-machine scenarios.
+- DL-9 to DL-11 as in `lease-evidence.md` section 5a: record arithmetic, boundary-hour coverage, and the state-machine scenarios.
 - PE-0: one versioned interface document for the rent case precedes PE-2, PE-3 and PE-6 (`lease-evidence.md` section 5, "Interface status").
 - DL-7: a PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
