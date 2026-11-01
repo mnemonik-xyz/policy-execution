@@ -356,6 +356,19 @@ batch size or threshold is chosen.
 
 ## 5. The module
 
+**Interface status (2 Nov).** This document, the revision of 29 Oct (section 5a) and
+the framework document name different settlement interfaces: the fifteen-word invoice
+journal on `ProofInvoiceEscrow` with no contract change (below); that journal plus two
+delivery words (5a); and the framework's common header with `schemaId` on the escrow
+of framework step 3, with `check rent` and `prove rent` in place of the `meter-*`
+commands. They differ in the proof statement, the image identity, the Solidity
+decoding and the replay domain. Before any of PE-2, PE-3 and PE-6 starts, one
+versioned interface document (PE-0) fixes the policy types, the signing encodings,
+the journal words, the contract ABI, the image and schema binding and the replay
+domain for the rent case, and marks the superseded text here. Until PE-0 exists, this
+section describes the invoice-journal variant as the baseline and 5a the delivery
+words; neither is approved for implementation on its own.
+
 The module `core/src/meter.rs` follows the solver path: mandatory gates first, the rule
 tree last. It reuses `Acceptance` as the note, `VendorCredential` as the seller
 credential, the existing `verify`, and the fifteen-word journal layout of the invoice
@@ -489,11 +502,29 @@ pub struct UsageRecord {
     pub window_start: u64,       // unix seconds
     pub window_end: u64,
     pub units: u64,              // metered units in the window
+    pub creditable: u64,         // the most units the window can earn under the meter's schedule
     pub assurance: u8,           // 0 or 1, as in min_assurance
     pub meter_spec: Hash,        // the meter_spec the meter checked against
     pub deliverable_hash: Hash,  // hash of the evidence the record was computed from
 }
 ```
+
+In v1 one record covers one piece: `first_index == last_index`, and the record's index
+is the note's index. The window of index k is `[validity.after + k * piece_s,
+validity.after + (k + 1) * piece_s)`, with `piece_s` the policy's piece length (3,600
+for PoCC). Records that cover several indices are an extension with its own gates; the
+guest refuses them in v1.
+
+`creditable` is the most units the window can earn under the meter's own schedule, as
+the meter computes it from its parameters and the window alone, never from the
+evidence. For PoCC it is 60 s per heartbeat slot whose interval ends inside the window
+and inside the lease period; a boundary hour of the lease earns less than 3,600 s
+because the beacon slots do not fall on the hour. The uptime floor is a share of
+`creditable`, so a perfect boundary hour meets a 100 % floor.
+
+The note for index k binds to the record by `deliverable_hash`: the service puts the
+record's hash in the challenge, and the note carries it (section 2). A note for a
+record the buyer never signed does not exist.
 
 `deliveryHash` in the journal is `hash_tagged(b"warrant/usage-batch/v1", records)`,
 with the records in index order.
@@ -505,35 +536,58 @@ rule tree. Each gate has a test and a removed-check experiment (ME-1).
 
 | # | Gate | Result if it fails |
 |---|---|---|
-| D1 | A record exists for every note index in the batch, with no gap and no overlap | `Ask` for a missing record, `Deny` for an overlap |
+| D1 | One record for every note index in the batch, `first_index == last_index == k`, no gap, no overlap | `Ask` for a missing record, `Deny` for an overlap or a range |
 | D2 | Each record signature verifies under `meter_key` | `Deny` |
 | D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
-| D4 | Each record window is inside the policy validity | `Deny` |
-| D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance` | `Deny` |
-| D6 | If `units_k * 10000 / (window_end - window_start) < min_uptime_bp`, then `amount_k == 0` | `Deny` |
-| D7 | If `assurance < min_assurance`, then `amount_k == 0` | `Deny` |
+| D4 | Each record window is the window of its index (above), inside the policy validity, and `window_end - window_start == piece_s` | `Deny` |
+| D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance`, and `note.deliverable_hash == hash(record_k)` | `Deny` |
+| D6 | If `units_k * 10000 < min_uptime_bp * creditable_k`, then `amount_k == 0` | `Deny` |
+| D7 | If `assurance_k < min_assurance`, then `amount_k == 0` | `Deny` |
+| D8 | `0 < creditable_k <= window_end - window_start`, `units_k <= creditable_k`, `assurance_k` is 0 or 1 | `Deny` |
+| D9 | Every product and sum above is checked; an overflow is a failure, never a wrap | `Deny` |
 
-A piece below the floors is not skipped. The guardrail signs its usage record and a
-note for amount 0. The index is consumed, the indices stay consecutive (section 2), and
+The gates bound each note's amount from above. They never raise it, and they never
+check that the buyer credited what the evidence shows; that is the trust assumption of
+section 8 on the meter key. A piece below the floors is not skipped. The guardrail
+signs its usage record and a note for amount 0. The index is consumed, the indices stay consecutive (section 2), and
 the batch settles with that piece unpaid. D1 and `authorize_meter` keep their no-gap
 rule. A buyer that signs nothing for piece k is the non-cooperation case: the seller
 stops serving (SS-9) and settles the notes that exist as a partial batch.
 
 ### 5a.4 The first meter: PoCC
 
-PoCC proves that a rented virtual machine ran for the time that the seller bills.
-An agent in the machine signs a heartbeat on every 60-second slot of the drand beacon.
-A notary anchors one Merkle root per slot on the escrow chain. The PoCC verifier reads
-the receipt, the beacon and the anchors, and credits only the seconds between two
-anchored heartbeats. The verifier is public code over public inputs. Anyone who runs
-it on the same receipt gets the same result.
+PoCC proves sampled liveness: an agent key born inside a rented virtual machine signed
+a heartbeat on every 60-second slot of the drand beacon, and a notary anchored each one
+in time. It credits the 60 s between two consecutive anchored heartbeats. It does not
+observe the machine between heartbeats, and in Stage 0 (no hardware attestation) it
+assumes the provider does not read the agent key out of the machine and run the signer
+elsewhere. Of the five properties a buyer may mean by "delivered compute", Stage 0
+establishes the first only:
+
+| Property | Stage 0 | Stage 1 (SEV-SNP) | Later |
+|---|---|---|---|
+| Instance availability, sampled every 60 s | Yes, under the Stage 0 assumption | Yes | — |
+| Hardware identity and launched image | No (Nova's own record only) | Yes: the launch measurement | — |
+| Resource allocation (vCPUs, memory, GPU) | No | Partly: the attested image reads the hardware | Stage 1 counters and GPU evidence |
+| Performance | No | No | Throughput checks (`tau_max`) |
+| Job correctness | No | No | Job commitments, sampling, re-execution |
+
+The verifier is public code over public inputs. Anyone who runs it on the same
+receipt gets the same result.
 
 In the first implementation the buyer runs the verifier, and `meter_key` is the
-buyer's guardrail key. This answers decision 6 of the handoff. The buyer cannot gain
-from a false record: an over-credit pays the seller from the buyer's funds, and an
-under-credit stops the service after one piece and can be shown wrong by anyone who
-re-runs the verifier. A later step runs the verifier inside the guest as a
-`computed_result` check. Then no meter key exists.
+buyer's guardrail key. This answers decision 6 of the handoff. What the guest then
+proves is that this key signed the records and that the gates hold; it does not run
+PoCC, read the receipt or check that the records follow from the evidence. v1 trusts
+the guardrail's attestation of delivery. The limits of that trust: a buyer that
+under-credits stops its own service after one piece, and anyone can re-run the
+verifier on the public evidence and show the under-credit; a buyer that over-credits
+pays the seller from its own funds; a party holding the buyer's key can sign records
+and notes that agree with each other and pay the fixed recipient, up to the ceiling,
+for service that did not happen. The key cannot move funds anywhere else. A later step
+runs the verifier inside the guest as a `computed_result` check over authenticated
+evidence (beacon signatures, anchor history, provider metadata). Then no meter key
+exists and the records are proved, not attested.
 
 `meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
 the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor
@@ -546,7 +600,69 @@ signs note k for at most `units_k * price_per_unit`, or for 0 when the record is
 the floors. The seller settles batches of hours as section 4 describes. The challenge
 comes after the hour, never before (SS-9): nobody can prove an hour before it ran.
 
+**Commercial boundary.** The first supported arrangement is a reseller: the seller
+rents the machine from a cloud under its own account and resells it under a Warrant
+lease. The seller holds the cloud credentials, pays the cloud's invoice whether or not
+Warrant pays, absorbs rejected and unpaid pieces, terminates the machine when the lease
+ends or stops, and pays for storage and network after compute stops. A cloud that
+accepts Warrant leases directly is the same protocol with the seller and the cloud
+being one party. The one-piece exposure of SS-9 is the seller's exposure to the buyer;
+the seller's exposure to the cloud is its own.
+
 The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
+
+### 5a.5 The rent state machine
+
+One lease, one machine, pieces of `piece_s` seconds indexed from 0 at
+`validity.after`. The seller's service and the buyer's guardrail each keep this state
+durably before they act on it.
+
+| State | Entered when | Seller does | Buyer does | Leaves when |
+|---|---|---|---|---|
+| Offered | Buyer funds the order | Reads the policy (SS-5), accepts or not | Waits | Seller accepts, or the offer expires |
+| Provisioning | Seller accepts | Creates the machine with the binding `h0`; this cost is the seller's no-show residue | Waits | The agent's boot proof is anchored |
+| Serving k | Piece k starts | Keeps the machine running | Nothing | Piece k ends |
+| Challenging k | Piece k ended | Assembles the evidence for piece k and sends the challenge for note k: index, window, the record it expects, the evidence | Fetches and stores the evidence (BG-5), runs the verifier, signs record k and note k, returns both | Seller stores record k and note k (SS-2, SS-7) and acknowledges, or the deadline passes |
+| Serving k+1 | Challenge k sent | Keeps the machine running through piece k+1 while challenge k is open | — | Piece k+1 ends |
+| Stopped | Note k not acknowledged by the end of piece k+1, or the buyer or seller ends the lease, or the period ends | Sends the final challenge for the last served piece, terminates the machine, settles | Answers the final challenge, or not | The last batch settles or `settleBy` passes |
+| Settling | A batch is complete, or the lease stopped with notes outstanding | Proves and settles the batch (SS-4) | Nothing | `consume` succeeds |
+
+Rules that hold across states:
+
+- The challenge for index k is idempotent. A repeated challenge for k returns the
+  same record and note; the guardrail persists its answer before it replies (BG-2), so
+  a lost reply never produces a second, different note for k.
+- The seller serves piece k+1 against note k (SS-9). At most one piece is served
+  without a durable note.
+- The first piece is served before any note exists. That piece plus provisioning is
+  the seller's exposure to a buyer that never answers.
+- The last served piece always needs the buyer after delivery. A buyer that
+  disappears then owes nothing on chain; the seller settles the notes it holds as a
+  partial batch and records the loss. The listing may price this in.
+- The seller settles a batch when it is full, when the lease stops, and in any case
+  before the notes' `valid_until` and the order's `settleBy`, with its proving margin
+  (SS-4). A partial batch is a prefix of its index range.
+- A piece below the floors gets a zero note and stays in sequence (5a.3). A piece the
+  buyer disputes is future work; it cannot be a hole in a batch either, so the dispute
+  design must give it its own obligation.
+
+### 5a.6 Limits and exposure
+
+Three limits bound the money, and they are not the same:
+
+- The per-note cap (`max_note`) bounds one piece. The guardrail refuses a note above
+  it (BG-1).
+- The rule tree evaluates the batch: its `amount` fact is the sum of the batch's
+  notes. A rule bound on `amount` must be at least `batch_size * max_note`, or it must
+  be absent; D5 and the cap already bound the amount per piece.
+- The ceiling bounds the lease: `ceiling >= pieces * max_note` for a lease that may
+  run its whole period at full price, or the lease stops when the ceiling is reached.
+
+A signed note is a claim on the escrow, not a reservation. Settled batches, notes
+accepted but not yet settled, and the piece being served all draw on the same ceiling.
+SS-10 keeps the seller inside it. The seller's exposure in money is one piece at the
+cap plus provisioning and shutdown cost plus the cloud's own invoice for the lease; in
+time it is one piece plus the proving and settlement margin.
 
 ## 6. Seller service requirements
 
@@ -559,6 +675,7 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 - SS-7: Notes are payment authorizations. The service stores them for settlement and does not log them elsewhere.
 - SS-8: The service may challenge before serving or after. Before puts one note of exposure on the buyer. After puts it on the seller. The listing states which.
 - SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: the service serves piece k+1 against note k. If note k has not arrived by the end of piece k+1, the service stops. The seller's exposure is one piece.
+- SS-10: Before it serves a piece, the service checks that the amount settled plus the amount of notes held but not settled plus `max_note` is at most the order's ceiling, and that one more batch can still be proved and settled before `settleBy`. Otherwise it stops.
 
 ## 7. Buyer guardrail requirement
 
@@ -566,6 +683,7 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
 - BG-3: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
 - BG-4: The guardrail funds an order only with `signer == address(0)`, no allowance and no threshold, on an escrow created by the factory for an image the buyer approved.
+- BG-5: For `signed_usage` the guardrail stores the evidence for piece k (for PoCC: the entries and inclusion proofs of that hour, and the verdict) before it signs record k and note k, and keeps it until `settleBy` plus the dispute window of a later design. A chain anchor holds roots only; nothing withheld by the seller's notary can be rebuilt from it.
 
 ## 8. Trust assumptions
 
@@ -578,7 +696,8 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 | RISC Zero soundness, the verifier, the BN254 precompiles on Arc | Existing assumptions, unchanged. |
 | Block time for windows and `settleBy` | Existing assumption. The worker keeps a margin. |
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
-| The meter key signs honest usage records | A false record cannot move funds outside the ceiling. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier. The guest-run verifier removes the key. |
+| The meter key signs honest usage records (v1 trusts this attestation; the guest checks the signature and the gates, not the metering) | A false record cannot move funds outside the ceiling or to another recipient. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier, after the fact. The guest-run verifier (`computed_result` over authenticated evidence) removes the key. |
+| The buyer's guardrail key is not compromised (in v1 it is the meter, acceptance and registry key at once) | One stolen key signs records and notes that agree with each other and pays the fixed recipient for service that did not happen, up to the ceiling and before `settleBy`. Keep orders small; separate the keys when the exposure justifies it (pocc decision 25 reversal). |
 | The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. |
 
 ## 9. Attack surface
@@ -591,7 +710,7 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
 | Buyer | Stop near `settleBy` so the seller cannot settle | SS-4: the service stops first, by its margin. |
-| Buyer | Withhold any cooperation after funding | None is needed. Settlement is a proof over notes the buyer already signed. |
+| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. |
 | Buyer | Cancel after `accept` | Impossible before `settleBy`. |
 | Buyer | Never answer the first challenge | The seller loses provisioning cost. The no-show residue. |
 | Seller | Forge a note | Impossible. |
@@ -601,7 +720,8 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 | Seller | Settle notes of another lease, chain or customer | Lease, scope and customer are in the signed note and the journal. |
 | Seller | Overcharge | The amount is the sum of notes the buyer signed, each at most the cap. |
 | Seller | Take a note and not serve | The buyer loses one piece and stops. SS-8 states who carries that piece. |
-| Seller | Settle before any service | No note exists before the buyer asks. |
+| Seller | Settle before any service | No note exists before the buyer asks. For `signed_usage`, no note exists before the piece ran and its record was signed. |
+| Anyone | Obtain the buyer's guardrail key | Records and notes that agree with each other, paid to the fixed recipient within the ceiling. Section 8. |
 | Anyone | Replay a settlement, relay to another recipient | Consumed obligation, recipient fixed, any relayer pays only the recipient. |
 | Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. |
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
@@ -630,6 +750,9 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-5: The trust table names the meter key and says what happens if it fails.
 - DL-6: A record below `min_uptime_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
 - DL-8: A batch with a zero note for a piece below the floors settles the other pieces.
+- DL-9: A record whose window is not its index's window, or longer than one piece, or with `units > creditable`, or with a range of indices, gives `Deny`; a product that would overflow gives `Deny`.
+- DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_uptime_bp` of 10000.
+- DL-11: The state machine of 5a.5 is exercised in a simulation: a missing middle piece, a rejected uptime, an exhausted ceiling, a buyer that disappears after the last piece, a duplicate challenge, a proof failure near `valid_until`, and unavailable evidence each end in the state the table names.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort
