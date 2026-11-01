@@ -620,7 +620,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-4: The escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: The trust table names the meter key and says what happens if it fails.
 - DL-6: A record below `min_uptime_bp` or `min_assurance` gives `Deny`.
-- DL-7: A PoCC receipt from `test/live/2026-10-28` in `mnemonik-xyz/pocc` turns into a usage record that `warrant-host check rent` accepts.
+- DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort
 

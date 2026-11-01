@@ -173,7 +173,7 @@ New:
 - DL-4: the escrow rejects a receipt whose `deliverySpecHash` differs from the order's.
 - DL-5: the written trust table names the meter key and says what happens if it fails.
 - DL-6: a record below `min_uptime_bp` or `min_assurance` gives `Deny`.
-- DL-7: a PoCC receipt from `test/live/2026-10-28` in `mnemonik-xyz/pocc` turns into a usage record that `warrant-host check rent` accepts.
+- DL-7: a PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## Risks
 
