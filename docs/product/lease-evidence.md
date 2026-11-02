@@ -39,8 +39,12 @@ optional weaker tier on the plain escrow with a signer. It is not the design.
 
 Why proof for every batch is affordable: the proof is never on the service path. The
 service answers against a note in milliseconds. The settlement worker proves a batch
-in the background, once per hour or once per day. The cost is prover time per batch,
-measured by ME-8, and it sets the batch size.
+in the background, once per day. The cost is prover time per batch, and the prover is
+a GPU: the rent work is 674,352 zkVM cycles per hour of service (pocc
+`docs/measurements.md`), linear in the hours, which on a CPU prover is about 195 s of
+proving per hour of service and on a GPU prover about 1 to 7 s. ME-8 and DL-13 measure
+both before the batch size and the settlement margin are set; the pilot plans for the
+GPU.
 
 ## 2. The note
 
@@ -112,8 +116,10 @@ Serving never waits for settlement. A worker inside the seller server settles la
 5. If the prover fails, the worker keeps the batch and retries on the next tick. It never discards a batch.
 6. A partial last batch is proved and settled the same way before `settleBy`. The worker stops accepting new notes for a lease when the time left is below its proving and settlement margin.
 
-The worker needs a queue, a timer, a prover and one settlement call. The prover is the
-seller's own x86 Docker host from the canary plan, or a rented proving service. The
+The worker needs a queue, a timer, a prover and one settlement call. The prover is a
+GPU host with RISC Zero's CUDA prover, the seller's own or rented by the hour, or a
+rented proving service; the x86 Docker host of the canary plan is for development and
+for the Groth16 wrap, which runs in Docker on x86. The
 receipt is checked on chain, so the prover needs no trust. The seller runs it because
 the seller wants to be paid. The seller depends on nobody else for settlement: not on
 the buyer, not on a signer, not on a third party.
@@ -195,7 +201,7 @@ flowchart TB
         SV["Seller service<br/>HTTP + MCP, public HTTPS host<br/>402 middleware, native note check<br/>holds: payout key"]
         NQ[("Note store<br/>signed notes, batches, settlement state")]
         WK["Settlement worker<br/>background process beside the service<br/>timer, prove, settle, retry"]
-        PR["Prover<br/>x86 Docker host, seller's or rented<br/>runs: warrant-host meter-prove, wrap<br/>required, one proof per batch"]
+        PR["Prover<br/>GPU host (CUDA), seller's or rented<br/>runs: warrant-host prove rent, wrap<br/>required, one proof per batch"]
         SV --> NQ --> WK --> PR
     end
 
@@ -244,7 +250,7 @@ flowchart TB
 | Seller service | A public HTTPS host of the seller | Seller | Payout key | Serving against notes, SS-1 to SS-8 |
 | Note store | The seller's host | Seller | Signed notes, settlement state | Liveness of settlement only |
 | Settlement worker | A background process on the seller's host | Seller | Access to the note store and the payout key | Settling every batch in time |
-| Prover | The seller's x86 Docker host, or a rented proving service | Seller, or a vendor | Batch inputs | Nothing. The receipt is checked on chain. Required for every batch. |
+| Prover | A GPU host with the CUDA prover (the seller's, or rented by the hour), or a rented proving service; the x86 Docker host for the Groth16 wrap | Seller, or a vendor | Batch inputs | Nothing. The receipt is checked on chain. Required for every batch. |
 | Worker container | The cloud provider | Provider, rented by the seller | No Warrant key | Nothing. Service quality is outside the protocol. |
 | `ProofInvoiceEscrow` | Arc | Nobody. No owner, no upgrade, no signer, no approval. | Reserved USDC per order | Recipient, ceiling, deadline, proof only, one payment per batch |
 | `ProofInvoiceFactory` | Arc | Nobody. No admin. | The replay history of every escrow it created | One payment per batch across image migrations |
@@ -266,8 +272,8 @@ seller depends on nobody for settlement except its own worker and its own prover
 ## 4c. Hardware and other requirements per component
 
 Figures marked "measured" come from `validation-results.md` or the showcase. Figures
-marked "unmeasured" are gates, not estimates. ME-8 measures the prover before any
-batch size or threshold is chosen.
+marked "unmeasured" are gates, not estimates. ME-8 and DL-13 measure the prover, on
+a GPU and on a CPU, before any batch size, margin or threshold is chosen.
 
 ### Buyer agent
 
@@ -315,11 +321,11 @@ batch size or threshold is chosen.
 
 | Requirement | Value |
 |---|---|
-| Hardware | x86_64 Linux with Docker. The Groth16 wrap runs only in Docker on x86. CPU count and memory: unmeasured for the meter guest. The measured sample for the invoice guest ran on 14 reported CPUs with four Rayon workers and segment exponent 18, used 2,097,152 cycles in eight segments, and took 445.65 s to prove and 79.73 s to wrap. Peak memory was not recorded. |
-| Software | Ubuntu, Docker, Rust via `rustup`, `rzup install rust 1.88.0`, `rzup install r0vm 3.0.5`, Foundry. `scripts/prover-vm.sh` installs all of it on a fresh machine. |
+| Hardware | A GPU host: x86_64 Linux with Docker and an NVIDIA GPU of the 22 GB class or more (RTX 4090, RTX 5090, L4, H100) running RISC Zero's CUDA prover. The Groth16 wrap runs only in Docker on x86 and is the fixed cost per batch (79.73 s measured). CPU-only proving is for development: the invoice guest (1,571,975 cycles) took 445.65 s on a 14-CPU Mac with four Rayon workers and segment exponent 18, about 3.5 kHz, and the rent work is 674,352 cycles per hour of service, so a daily batch on that CPU is about 77 minutes. GPU figures for this guest: unmeasured (PE-8, DL-13); published RISC Zero 3.x rates are 100 kHz to 1 MHz, 16 s to 3 min for a daily batch. Peak memory: unmeasured. |
+| Software | Ubuntu, Docker, NVIDIA driver and CUDA toolkit, Rust via `rustup`, `rzup install rust 1.88.0`, `rzup install r0vm 3.0.5` built with the `cuda` feature, Foundry. `scripts/prover-vm.sh` installs the CPU set on a fresh machine; the CUDA step is added with PE-8. |
 | Settings | `RAYON_NUM_THREADS` and `WARRANT_SEGMENT_PO2` between 16 and 20 to keep proving out of swap. `RISC0_DEV_MODE` is rejected. |
 | Alternative | A rented proving service. The receipt is verified on chain, so the prover needs no trust. It needs the batch input, which contains the notes and the credential, not the job payloads. |
-| Gate | ME-8: one full batch proved and wrapped on this host, with wall time, CPU seconds and peak memory recorded, before the batch size and the threshold are set. |
+| Gate | ME-8 and DL-13: batches of 1, 6, 24 and 168 hours proved and wrapped on the GPU host and on a CPU host, with wall time, GPU and CPU seconds, peak memory and the host's hourly price recorded, before the batch size, `settlement_margin_s` and the threshold are set. |
 
 ### Worker container
 
@@ -816,7 +822,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - ME-5: `meter-image-id` is recorded from a `RISC0_USE_DOCKER=1` build before any deployment.
 - ME-6: A metered path returns the 402 challenge of section 3 unpaid, serves against a valid note, and refuses a reused index.
 - ME-7: The settlement worker proves and settles a full batch and a partial last batch, retries after a prover failure without losing a batch, and stops accepting notes at its margin before `settleBy`, in a test with a mocked prover and a mocked verifier.
-- ME-8: Proving time, CPU seconds, peak memory and cost for one full batch are measured on the x86 prover before the batch size is chosen. The batch size is set so that proving cost per batch stays well below the batch value.
+- ME-8: Proving time, GPU and CPU seconds, peak memory and cost for one full batch are measured on the GPU prover and on the x86 CPU prover before the batch size is chosen. The batch size is set so that proving cost per batch stays well below the batch value.
 - DL-1: A batch without a usage record gives `Ask`, and no journal exists.
 - DL-2: A batch that bills more than `units * price_per_unit + tolerance` gives `Deny`.
 - DL-3: A usage record signed by a key other than `meter_key` gives `Deny`.

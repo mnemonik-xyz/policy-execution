@@ -109,7 +109,10 @@ would refuse that, and a value outside the typed struct would be outside the
 commitment. The margin is a commitment the seller makes at `accept` (SS-5): after the
 latest allowed note arrival, queueing, zkVM proving, the Groth16 wrap, transaction
 inclusion and the chain's finality must all fit inside it. The 1,800 s of the examples
-is a placeholder until the rent proof is benchmarked (the cost document, section 6).
+assumes a GPU prover (the pilot's prover, pocc decision 43: a daily batch in 16 s to 3
+minutes plus the 80 s wrap) and is a placeholder until PE-8 and DL-13 measure it; on
+the one CPU prover measured so far a daily batch takes about 77 minutes and would need
+a margin of about 2.5 hours.
 
 ### 2.2 Hashes
 

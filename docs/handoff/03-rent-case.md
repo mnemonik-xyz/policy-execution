@@ -150,7 +150,7 @@ Add a file; do not move existing ones.
 - The guardrail challenge handler belongs to `warrant-buyer`.
 - The settlement worker proves each batch in the background and retries on prover failure.
   It stops accepting notes at a margin before `settleBy`.
-- Run the prover on an x86 Docker host (`scripts/prover-vm.sh`) or a rented service. Decide with the owner.
+- Run the prover on a GPU host with the CUDA prover (owner's decision of 2 Nov, pocc decision 43); the x86 Docker host (`scripts/prover-vm.sh`) does the Groth16 wrap and development proofs. A rented proving service is the alternative.
 
 ## Acceptance criteria
 
@@ -163,7 +163,7 @@ From #25, kept:
 - ME-5: the meter image ID is recorded from a `RISC0_USE_DOCKER=1` build before any deployment.
 - ME-6: a metered path returns the 402 challenge, serves against a valid note and refuses a reused index.
 - ME-7: the settlement worker proves a full and a partial batch, retries after a prover failure and stops at its margin. Mock the prover and the verifier.
-- ME-8: proving time, CPU seconds, peak memory and cost for one full batch are measured on the x86 prover before the batch size is chosen.
+- ME-8: proving time, GPU and CPU seconds, peak memory and cost for one full batch are measured on the GPU prover and on the x86 prover before the batch size is chosen.
 
 New:
 
@@ -182,7 +182,6 @@ New:
 
 - **The meter key is the buyer's.** A buyer can under-credit. The seller's loss is one piece, and the under-credit is visible to anyone who re-runs the PoCC verifier. The guest-run verifier removes the key.
 - **Dependency on unmerged work.** #19 (the proof-only escrow and the factory) is closed and not merged. The merged specification depends on it.
-- **Proving cost.** One measured proof took about 445 s for the succinct proof and about 80 s for the wrap on a Mac with four workers.
-  ME-8 must measure the x86 cost before the batch size is set.
+- **Proving cost.** The rent work is 674,352 zkVM cycles per hour of service, linear in the hours (pocc `docs/measurements.md`). On the one CPU prover measured (the invoice guest, 445 s for 1.57 M cycles) a daily batch is about 77 minutes and about $1.30 at $1 per prover-hour, which prices VMs below about $10 a day out. The pilot therefore plans for a GPU prover, where published RISC Zero rates put a daily batch at 16 s to 3 minutes and cents; PE-8 and DL-13 measure it before the batch size and `settlement_margin_s` are set. The 80 s Groth16 wrap is then the fixed cost per batch, which favours daily batches.
 - **Single point.** A stolen note key spends the ceiling on service to the fixed recipient. The loss is bounded by the ceiling and the deadline. Keep orders small.
 - **The metered checker is tested, not proved.** Like the invoice and solver checkers, it is outside the Verus claim.
