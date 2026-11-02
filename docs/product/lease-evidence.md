@@ -360,18 +360,17 @@ batch size or threshold is chosen.
 
 ## 5. The module
 
-**Interface status (2 Nov).** This document, the revision of 29 Oct (section 5a) and
-the framework document name different settlement interfaces: the fifteen-word invoice
-journal on `ProofInvoiceEscrow` with no contract change (below); that journal plus two
-delivery words (5a); and the framework's common header with `schemaId` on the escrow
-of framework step 3, with `check rent` and `prove rent` in place of the `meter-*`
-commands. They differ in the proof statement, the image identity, the Solidity
-decoding and the replay domain. Before any of PE-2, PE-3 and PE-6 starts, one
-versioned interface document (PE-0) fixes the policy types, the signing encodings,
-the journal words, the contract ABI, the image and schema binding and the replay
-domain for the rent case, and marks the superseded text here. Until PE-0 exists, this
-section describes the invoice-journal variant as the baseline and 5a the delivery
-words; neither is approved for implementation on its own.
+**Interface status (2 Nov, decided).** Three settlement interfaces were described for
+the rent case: (A) the fifteen-word invoice journal on `ProofInvoiceEscrow` with no
+contract change (the baseline below); (B) that journal plus two delivery words on
+`ProofInvoiceEscrow` with one added check (section 5a as first written); (C) the
+framework's common header with `schemaId` on `WarrantEscrow` (`docs/framework.md`,
+steps 2 and 3). The owner chose **C** (pocc decision 40). A is superseded. B is not
+for production and is not implemented. The rent interface on C is
+[`docs/handoff/04-rent-interface-v1.md`](../handoff/04-rent-interface-v1.md) (PE-0);
+where this document and PE-0 differ, PE-0 governs. The baseline below is kept as the
+record of A and of the parts PE-0 reuses (the note, the credential, `note_id`,
+`obligation_id`, the nine checks).
 
 The module `core/src/meter.rs` follows the solver path: mandatory gates first, the rule
 tree last. It reuses `Acceptance` as the note, `VendorCredential` as the seller
@@ -543,7 +542,10 @@ start, ends at or before the service end, and ends inside the window, where an
 interval ending exactly on the hour belongs to the hour before. Both endpoints are
 constrained, so the interval that begins before the service start is never counted.
 With quicknet's grid (slots at :24 past each minute) the first hour of a service has
-59 such intervals, 3,540 s; a middle hour has 60; the last hour has 59. The denominator
+59 such intervals, 3,540 s; every later hour, the last one included, has 60: the
+interval that starts at :59:24 of the previous hour ends inside this one, and the
+interval that would start at :59:24 of the last hour ends after `service_end` and is
+excluded. A service of n hours can earn `3600 n - 60` seconds. The denominator
 is fixed before the piece runs, from the schedule alone, so an outage can never shrink
 it.
 
@@ -652,25 +654,29 @@ The full specification is `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 ### 5a.5 The rent state machine
 
 One lease, one machine, pieces of `piece_s` seconds indexed from 0 at
-`validity.after`. The seller's service and the buyer's guardrail each keep this state
+`service_start`. The seller's service and the buyer's guardrail each keep this state
 durably before they act on it.
 
 | State | Entered when | Seller does | Buyer does | Leaves when |
 |---|---|---|---|---|
 | Offered | Buyer funds the order | Reads the policy (SS-5), accepts or not | Waits | Seller accepts, or the offer expires |
 | Provisioning | Seller accepts | Creates the machine with the binding `h0`; this cost is the seller's no-show residue | Waits | The agent's boot proof is anchored, before `service_start` |
-| Serving k | Piece k starts (`service_start + k * piece_s`), and the continuation gate held: note k-1 is durable (or k = 0), and SS-10 holds | Keeps the machine running; reserves `max_note` for piece k | Nothing | Piece k ends |
-| Challenging k | Piece k ended | Sends the challenge for note k: index, window, the record it expects, the evidence. Keeps the machine running | Fetches and stores the evidence (BG-5), runs the verifier, signs record k and note k, returns both | Seller stores record k and note k (SS-2, SS-7) and acknowledges: the reservation for k moves to "held". Or `challenge_timeout_s` passes with no acknowledged note |
-| Stopping | `challenge_timeout_s` passed with note k missing; or SS-10 fails for piece k+1; or the buyer or seller ends the lease; or `service_end` is reached | Terminates the machine within its shutdown latency; sends the final challenge for the last served piece; waits `challenge_timeout_s` for it | Answers the final challenge, or not | The timeout passes or the final note is acknowledged |
+| Serving k | Piece k starts (`service_start + k * piece_s`) with note k-1 durable (or k = 0) and SS-10 holding for k | Keeps the machine running; the reservation for k is already `open` (made in Provisional k, or at Provisioning for k = 0) | Nothing | Piece k ends |
+| Challenging k, Provisional k+1 | Piece k ended | Reserves `max_note` for piece k+1 as `open` (SS-10 must hold for it; otherwise Stopping), keeps the machine running, and sends the challenge for note k: index, window, the record it expects, the evidence. Piece k+1 is provisional: it runs, but the seller has not yet decided to bill it | Fetches and stores the evidence (BG-5), runs the verifier, signs record k and note k, returns both | Seller stores record k and note k (SS-2, SS-7) and acknowledges: the reservation for k moves to `held`, and Provisional k+1 becomes Serving k+1, billable from its start. Or `challenge_timeout_s` passes with no acknowledged note: Stopping, and the provisional part of piece k+1 is the seller's loss |
+| Stopping | `challenge_timeout_s` passed with note k missing; or SS-10 fails for the next piece; or the buyer or seller ends the lease; or `service_end` is reached | Terminates the machine within its shutdown latency; sends the final challenge for the last served piece; waits `challenge_timeout_s` for it | Answers the final challenge, or not | The timeout passes or the final note is acknowledged |
 | Closing batch b | Batch b is full; or the lease is Stopping and the final timeout passed | Marks batch b closed durably: no note for an index of b is accepted after this mark | — | The mark is durable |
 | Settling b | Batch b is closed | Proves and settles the notes held for b (SS-4) | Nothing | `consume` succeeds, or `settleBy` passes |
 
-The continuation gate is the point of the design. Piece k+1 starts only when note k is
-durable on the seller's side. Since piece k+1 starts when piece k ends, and note k can
-only exist after piece k ends, the gate is met during a grace period: the seller keeps
-the machine running for at most `challenge_timeout_s` after piece k ends while it waits
-for note k. If note k arrives in time, piece k+1 was served against it from its start.
-If not, the seller stops. The seller's exposure to the buyer is therefore
+The continuation gate is the point of the design, and it is a gate on *billing*, not
+on running the machine. Note k can only exist after piece k ends, and piece k+1 starts
+at that moment, so piece k+1 begins in a provisional state: the machine runs, its
+funding is reserved before it starts, and the seller has not yet committed to bill it.
+The gate decides within `challenge_timeout_s`: if note k is acknowledged in time,
+piece k+1 becomes a served piece and is billable from its start, through the ordinary
+challenge for note k+1 later; if not, the seller stops, and whatever of piece k+1 ran
+is never challenged for and never paid. Nothing is served "against" a note that did not
+exist yet; a piece is billed only when the gate for it had already passed. The
+seller's exposure to the buyer is therefore
 
 ```latex
 E = \text{max\_note} + \text{price}(\text{challenge\_timeout\_s} + \text{shutdown latency}) + \text{provisioning cost}
@@ -699,9 +705,15 @@ Rules that hold across states:
 - A piece below the floors gets a zero note and stays in sequence (5a.3). A piece the
   buyer disputes is future work; it cannot be a hole in a batch either, so the dispute
   design must give it its own obligation.
-- Settlement validity is longer than the service period: `validity.until` and
-  `settleBy` are at least `service_end + challenge_timeout_s + proving and settlement
-  margin`, the settlement grace.
+- One deadline formula, used everywhere. The settlement grace is
+  `G = challenge_timeout_s + M`, where `M` is the seller's proving and settlement
+  margin, a listing parameter. For batch b, `last(b)` is the last *scheduled* piece of
+  the service inside b: `min((b + 1) * batch_size - 1, pieces - 1)`, with `pieces =
+  (service_end - service_start) / piece_s`. Then
+  `deadline(b) = service_start + (last(b) + 1) * piece_s + G`. The policy and the
+  order satisfy `validity.until >= deadline(last batch)` and
+  `settleBy >= deadline(last batch)`; the seller refuses a policy or an order that
+  does not (SS-5). BG-6 and SS-10 use `deadline(b)` and nothing else.
 
 ### 5a.6 Limits and exposure
 
@@ -731,8 +743,8 @@ time it is one piece plus the proving and settlement margin.
 - SS-6: The OpenAPI document records the 402 response, the scheme and the price on every metered path.
 - SS-7: Notes are payment authorizations. The service stores them for settlement and does not log them elsewhere.
 - SS-8: The service may challenge before serving or after. Before puts one note of exposure on the buyer. After puts it on the seller. The listing states which.
-- SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: the service serves piece k+1 against note k. If note k has not arrived by the end of piece k+1, the service stops. The seller's exposure is one piece.
-- SS-10: The seller keeps one durable reservation ledger per lease with three categories: `settled` (paid by `consume`), `held` (notes acknowledged, not settled), and `open` (pieces served or being served whose note has not been acknowledged, reserved at `max_note` each). A reservation enters `open` when a piece starts, moves to `held` when its note is acknowledged (at the note's amount), and to `settled` when its batch settles; each moves exactly once. Before piece k starts, `settled + held + open + max_note <= ceiling`, and `now + piece_s + challenge_timeout_s + proving and settlement margin <= min(valid_until of the batch's notes, settleBy)`. Otherwise the lease stops.
+- SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: piece k+1 runs provisionally and becomes billable when note k is acknowledged within `challenge_timeout_s` of the end of piece k (5a.5). If note k has not arrived by then, the service stops and the provisional part of piece k+1 is unpaid. The seller's exposure is `E` of 5a.5.
+- SS-10: The seller keeps one durable reservation ledger per lease with three categories: `settled` (paid by `consume`), `held` (notes acknowledged, not settled), and `open` (pieces served, provisional or being served whose note has not been acknowledged, reserved at `max_note` each). A reservation enters `open` before its piece starts (for piece k+1, when piece k ends and piece k+1 becomes provisional; for piece 0, at Provisioning), moves to `held` when its note is acknowledged (at the note's amount; a timed-out piece leaves `open` as a recorded loss), and to `settled` when its batch settles; each moves exactly once. Before a reservation enters `open` for piece k, `settled + held + open + max_note <= ceiling`, and `service_start + (k + 1) * piece_s + G <= min(deadline(batch of k), settleBy)` with `G` of 5a.5. Otherwise the lease stops.
 - SS-11: A batch closes once (5a.5). The service refuses a note for an index of a closed batch, and a note whose `valid_until` is earlier than BG-6 requires.
 
 ## 7. Buyer guardrail requirement
@@ -741,7 +753,7 @@ time it is one piece plus the proving and settlement margin.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
 - BG-3: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
 - BG-4: The guardrail funds an order only with `signer == address(0)`, no allowance and no threshold, on an escrow created by the factory for an image the buyer approved.
-- BG-6: The guardrail sets each note's `valid_until` to at least the end of the last piece of the note's batch plus `challenge_timeout_s` plus the settlement grace, and at most `settleBy`, so that no note of an unfinished batch expires before the batch can complete and settle.
+- BG-6: The guardrail sets each note's `valid_until` to `deadline(b)` of the note's batch (5a.5), which is at most `settleBy` by SS-5, so that no note of an unfinished batch expires before the batch can complete and settle.
 - BG-5: For `signed_usage` the guardrail stores the evidence for piece k (for PoCC: the entries and inclusion proofs of that hour, and the verdict) before it signs record k and note k, and keeps it until `settleBy` plus the dispute window of a later design. A chain anchor holds roots only; nothing withheld by the seller's notary can be rebuilt from it.
 
 ## 8. Trust assumptions
@@ -812,7 +824,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-9: A record whose window is not its index's window, or longer than one piece, or with `units > creditable`, or with a range of indices, gives `Deny`; a product that would overflow gives `Deny`.
 - DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_coverage_bp` of 10000.
 - DL-11: The state machine of 5a.5 is exercised in a simulation with these expected outcomes. No response to the first challenge: the machine is stopped `challenge_timeout_s` after piece 0 ends, no note exists, the seller's loss is `E`. A lease whose ceiling covers one piece: piece 1 never starts (SS-10, `open` already holds piece 0). A late response after a batch closed: refused "batch closed", the index is consumed, nothing settles for it. A note that would expire inside an unfinished batch: never signed (BG-6) and refused if presented (SS-11). A missing middle piece below the floors: zero note, batch settles the rest. A buyer that disappears after the last piece: the final timeout passes, the held notes settle, the last piece is unpaid. A duplicate challenge: the same note. A proof failure near `valid_until`: retried within the margin, else the batch is lost and recorded.
-- DL-12: A boundary-hour record (3,540 credited of 3,540 creditable under quicknet's grid) serialized by `pocc-verify` and checked by `warrant-host check rent` gives the same decision in both implementations; the shared vector is `test/vectors/` in `mnemonik-xyz/pocc`.
+- DL-12: A first-hour record (3,540 of 3,540 creditable), a last-hour record (3,600 of 3,600), a zero-unit record for an uncredited middle hour, and a record after `service_end`, serialized by `pocc-verify` and checked by `warrant-host check rent`, give the same decisions in both implementations; the shared vectors are `test/vectors/usage-gates.json` in `mnemonik-xyz/pocc`, and Warrant publishes the bincode serialization and hash of one record so PoCC can check its JSON maps to it.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort

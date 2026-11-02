@@ -20,6 +20,7 @@ The DeFi swap comes last.
 | `01-cleanup.md` | The cleanup that is not finished |
 | `02-framework-steps.md` | Steps 1 to 9 of the framework, with acceptance criteria |
 | `03-rent-case.md` | The rent case and its delivery proof |
+| `04-rent-interface-v1.md` | PE-0: the rent settlement interface on the framework (journal v2, `WarrantEscrow`, encodings, replay). Proposal for review |
 
 The design is in [`../framework.md`](../framework.md). It is the source of truth.
 These files turn it into work packages.
@@ -34,6 +35,7 @@ These files turn it into work packages.
 | 4 | Chain and escrowed asset for the DeFi swap | Deferred to step 9 |
 | 5 | Fate of the buyer-signed settlement path | **Open.** See below |
 | 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md` |
+| 7 | Settlement interface for rent: the framework header on `WarrantEscrow` (C); the invoice journal variants A and B are superseded | Chosen by the owner, 2 Nov. The concrete interface, `04-rent-interface-v1.md`, awaits review |
 
 Decision 5. The owner said earlier: remove the buyer-signed path (`settleSigned`, `invoice-sign`).
 Pull request #25 merged on 2026-10-23. It makes the metered-payment design proof-only, with no signer key.
