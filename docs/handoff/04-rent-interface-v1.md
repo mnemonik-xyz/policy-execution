@@ -119,8 +119,13 @@ a margin of about 2.5 hours.
 
 ### 2.2 Hashes
 
-- `policy_hash = hash_tagged("warrant/policy/rent/v1", bincode(RentPolicy))`.
-- `deliverySpecHash = hash_tagged("warrant/delivery/v1", bincode(SignedUsage))`.
+- `policy_hash = hash_tagged("warrant/policy/rent/v1", &policy)`, where `policy: RentPolicy`.
+- `deliverySpecHash = hash_tagged("warrant/delivery/v1", &delivery)`, where `delivery: SignedUsage`.
+- `tagged_bytes(tag, value)` and `hash_tagged(tag, value)` are the existing helpers in
+  `core/src/lib.rs`. They bincode-serialize the typed `value` once and frame it as
+  `u64_le(len(tag)) || tag || u64_le(len(encoded)) || encoded`. Every expression in this
+  document passes the typed value. Do not pass bytes that are already bincode-encoded:
+  that encodes them a second time, adds a length prefix and changes the digest.
 - `lease_id` is the meter's: for PoCC, `H("PoCC/poc/lease", tenant_pubkey, request_id, period.start, period.end)`.
   Warrant treats it as opaque 32 bytes.
 
@@ -129,9 +134,9 @@ a margin of about 2.5 hours.
 | Object | Struct | Signing message | Signer |
 |---|---|---|---|
 | Seller credential | `VendorCredential` (unchanged) | existing | `registry_key` |
-| Note k | `Acceptance` (unchanged): `scope`, `task_id = note_id(lease_id, k)`, `deliverable_hash = record_hash(k)`, `recipient`, `amount`, `accepted = true`, `valid_after`, `valid_until` | `tagged_bytes("warrant/acceptance/v1", bincode(note))` | `acceptance_key` |
-| Usage record k | `UsageRecord` (below) | `tagged_bytes("warrant/usage/v1", bincode(record))` | `meter_key` |
-| Batch record | `Vec<UsageRecord>` of the batch, index order, the same records | `tagged_bytes("warrant/usage-batch-signed/v1", bincode(records))` | `meter_key`, once per batch |
+| Note k | `Acceptance` (unchanged): `scope`, `task_id = note_id(lease_id, k)`, `deliverable_hash = record_hash(k)`, `recipient`, `amount`, `accepted = true`, `valid_after`, `valid_until` | `tagged_bytes("warrant/acceptance/v1", &note)`, the existing `acceptance_message` | `acceptance_key` |
+| Usage record k | `UsageRecord` (below) | `tagged_bytes("warrant/usage/v1", &record)` | `meter_key` |
+| Batch record | `Vec<UsageRecord>` of the batch, index order, the same records | `tagged_bytes("warrant/usage-batch-signed/v1", &records)`, `records: Vec<UsageRecord>` | `meter_key`, once per batch |
 
 ```rust
 pub struct UsageRecord {
@@ -149,7 +154,7 @@ pub struct UsageRecord {
 }
 ```
 
-- `record_hash(k) = sha256(tagged_bytes("warrant/usage/v1", bincode(record_k)))`. A
+- `record_hash(k) = hash_tagged("warrant/usage/v1", &record_k)`. A
   note binds to one record through it (D5), whether or not record k carries its own
   signature.
 - The batch record is the same `UsageRecord` values, signed once. The guest accepts a

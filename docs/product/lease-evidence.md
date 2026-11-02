@@ -594,7 +594,7 @@ rule tree. Each gate has a test and a removed-check experiment (ME-1).
 | D1 | One record for every note index in the batch, `first_index == last_index == k`, no gap, no overlap | `Ask` for a missing record, `Deny` for an overlap or a range |
 | D2 | The meter's signature verifies under `meter_key`: one signature over `tagged_bytes("warrant/usage-batch-signed/v1", records)` when the batch carries it, else one per record over `tagged_bytes("warrant/usage/v1", record)` | `Deny` |
 | D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
-| D4 | Each record window is the window of its index (above), inside the policy validity, and `window_end - window_start == piece_s` | `Deny` |
+| D4 | Each record window is the window of its index (above), `window_end - window_start == piece_s`, inside the policy validity, and `window_end <= service_end` (equivalently `k < pieces`): the validity runs on through the settlement grace, so it does not bound the index by itself | `Deny` |
 | D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance`, and `note.deliverable_hash == hash(record_k)` | `Deny` |
 | D6 | If `units_k * 10000 < min_coverage_bp * creditable_k`, then `amount_k == 0` | `Deny` |
 | D7 | If `assurance_k < min_assurance`, then `amount_k == 0` | `Deny` |
