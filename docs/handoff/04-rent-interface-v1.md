@@ -62,6 +62,7 @@ pub struct RentPolicy {
     pub ceiling: u64,                // token base units, whole lease
     pub max_note: u64,               // token base units, one piece
     pub batch_size: u32,             // 1 to MAX_BATCH
+    pub settlement_margin_s: u64,    // M of 5a.5: the seller's proving and settlement margin
     pub delivery: SignedUsage,
     pub rule: Rule,                  // atoms of the rent case
 }
@@ -92,16 +93,23 @@ Validation (the policy validator refuses otherwise):
   `1 <= batch_size <= MAX_BATCH`; `min_coverage_bp <= 10000`; `min_assurance <= 1`;
   `piece_s > 0`; `service_end > service_start`; `(service_end - service_start) % piece_s == 0`;
   `service_start % piece_s == 0`.
-- `validity.after <= service_start`; `validity.until >= deadline(last batch)` with
-  `deadline` of 5a.5 and the seller's margin `M` given as a policy parameter
-  `settlement_margin_s` in the rule section's constants (see 2.1).
+- `settlement_margin_s > 0`; `validity.after <= service_start`;
+  `validity.until >= deadline(last batch)` with `deadline` of 5a.5 computed from
+  `service_start`, `service_end`, `piece_s`, `batch_size`, `challenge_timeout_s` and
+  `settlement_margin_s`, all of them typed fields of this policy.
 - `rule` valid for the rent atom set; the invoice flag off.
 
-### 2.1 Constants the rule section carries
+### 2.1 The settlement margin is a typed field
 
 `settlement_margin_s` (the seller's proving and settlement margin, `M` in 5a.5) is a
-constant of the policy, not of the listing, so that `deadline(b)` is computable by both
-sides from the policy alone. It sits beside the rule as `"constants": {"settlement_margin_s": 1800}`.
+top-level field of `RentPolicy`, so it is validated, hashed into `policy_hash` and
+present in every fixture; `deadline(b)` is then computable by both sides from the
+policy alone. It is not a "constants" object beside the rule: `deny_unknown_fields`
+would refuse that, and a value outside the typed struct would be outside the
+commitment. The margin is a commitment the seller makes at `accept` (SS-5): after the
+latest allowed note arrival, queueing, zkVM proving, the Groth16 wrap, transaction
+inclusion and the chain's finality must all fit inside it. The 1,800 s of the examples
+is a placeholder until the rent proof is benchmarked (the cost document, section 6).
 
 ### 2.2 Hashes
 
@@ -136,22 +144,29 @@ pub struct UsageRecord {
 
 - `record_hash(k) = sha256(tagged_bytes("warrant/usage/v1", bincode(record_k)))`: the
   same bytes the meter key signs. A note binds to one record through it (D5).
-- Signatures are 65-byte recoverable secp256k1 over `sha256(message)`, as today.
+- Signatures are 64-byte secp256k1 `r || s` (low-s) over `sha256(message)`, verified
+  under the named public key with no recovery, as `core::verify` does today
+  (`Signature::from_slice`). The 65-byte `r || s || v` form exists only for
+  `settleSigned`, which the rent case does not have.
 - `note_id(lease_id, k) = hash_tagged("warrant/note/v1", (lease_id, k))` and
   `obligation_id(lease_id, b) = hash_tagged("warrant/obligation/v1", (lease_id, b))`,
   as in `lease-evidence.md` section 5.
 - Windows: `valid_until` of note k equals `deadline(batch(k))` (BG-6).
 
-Warrant publishes, as a fixture, one record in JSON, its bincode bytes, its signing
-message and its hash, so that the meter (which writes JSON and never bincode,
-decision 18) can check that its JSON maps to the same bytes (DL-12).
+Warrant publishes byte-for-byte fixtures before any independent implementation
+starts: one `RentPolicy` with its bincode bytes and `policy_hash`; its `SignedUsage`
+with `deliverySpecHash`; one record in JSON, its bincode bytes, its signing message,
+its 64-byte signature and its hash; one note the same way; one `RentInput` and the
+journal it yields. The meter (which writes JSON and never bincode, decision 18) checks
+that its JSON maps to the same bytes (DL-12). Until these fixtures exist, PE-0 is not
+frozen.
 
 ## 4. Guest input and decision
 
 ```rust
 pub struct RentInput {
     pub policy: RentPolicy,
-    pub request: Authorization,                  // task_id = obligation_id(lease_id, batch)
+    pub request: Request,                        // core::Request: scope, task_id, deliverable_hash, recipient, amount
     pub batch: u32,
     pub vendor: VendorCredential,
     pub vendor_signature: Vec<u8>,
@@ -159,6 +174,11 @@ pub struct RentInput {
     pub records: Vec<(UsageRecord, Vec<u8>)>,    // same order, one per note
 }
 ```
+
+`request` is the existing `core::Request` (`scope`, `task_id = obligation_id(lease_id,
+batch)`, `deliverable_hash` = the hash of the ordered note identifiers, `recipient`,
+`amount` = the sum of the notes). It is the seller's claim; `decide` checks it against
+the notes. `Authorization` is the guest's result type and never an input.
 
 `decide` runs, in order: the nine checks of `lease-evidence.md` section 5 (policy,
 request, credential, notes, amount, `deliverable_hash` of the request, validity
@@ -171,13 +191,13 @@ with the fixture of section 3.
 
 ## 5. Journal v2 for rent
 
-Fifteen header words, then four extension words:
+Fifteen header words, then five extension words:
 
 ```text
 header:    schemaId, policyHash, chainId, vault, token, recipient, amount,
            obligationId, deliverableHash, policyVersion, validAfter, validUntil,
            evidenceHash, deliverySpecHash, deliveryHash
-extension: leaseId, batch, ceiling, customer
+extension: leaseId, batch, batchSize, ceiling, customer
 ```
 
 | Word | Value |
@@ -194,7 +214,7 @@ extension: leaseId, batch, ceiling, customer
 | `evidenceHash` | over the checker version, the credential, the notes and the records |
 | `deliverySpecHash` | 2.2 |
 | `deliveryHash` | `hash_tagged("warrant/usage-batch/v1", records in index order)` |
-| `leaseId`, `batch`, `ceiling`, `customer` | the rent extension |
+| `leaseId`, `batch`, `batchSize`, `ceiling`, `customer` | the rent extension; `batchSize` is the partition the registry pins (section 8) |
 
 Each word is 32 bytes, ABI-encoded as the escrow decodes it (`uint256`/`bytes32`/`address`
 per word, as the existing journals). A fixture mutates every word and expects the
@@ -221,15 +241,29 @@ function settle(bytes calldata seal, bytes calldata journal) external; // proof 
 function close(bytes32 orderId) external;                              // after settleBy: remainder to customer
 ```
 
-`settle` checks, in order: journal length for schema v2; `verifier.verify(seal, imageId,
-sha256(journal))` against the pinned rent image; `schemaId` equals the pinned one;
-`policyHash`, `policyVersion`, `chainId`, `vault`, `token` equal the order's;
-`recipient` equals the order's; `deliverySpecHash` equals the stored one;
-`deliveryHash != 0`; `customer` equals the order's funder; `block.timestamp` inside
-`[validAfter, validUntil]` and before `settleBy`; `spent + amount <= maxTotal`;
-`consumed[customer][obligationId]` false in the factory registry; then marks it
-consumed, adds to `spent`, pays `recipient`. No `settleSigned` and no `settleApproved`
-exist for rent: proof only (framework decision 5, first option, for rent).
+`settle` checks, in order:
+
+1. Journal length for schema v2; `schemaId` equals the pinned one.
+2. `verifier.verify(seal, imageId, sha256(journal))` against the pinned rent image.
+3. The order: `orderId = orderIdFor(customer, policyHash, leaseId)` from the journal's
+   own words; the order exists and is in state `Accepted` (not `Missing`, `Offered` or
+   `Closed`).
+4. Terms: `policyHash`, `policyVersion`, `chainId == block.chainid`, `vault ==
+   address(this)`, `token`, `recipient`, `customer` equal the order's;
+   `ceiling == order.maxTotal`; `leaseId == order.obligationScope`.
+5. Delivery: `deliverySpecHash` equals the stored one; `deliveryHash != 0`.
+6. Time: `block.timestamp` inside `[validAfter, validUntil]` and before `settleBy`.
+7. Money: `spent + amount <= maxTotal`, checked arithmetic.
+8. Replay: the factory registry's `partition[customer][leaseId]` is unset or equals the
+   journal's `batchSize` (set it when unset); `consumed[customer][obligationId]` is
+   false.
+9. Effects: mark the obligation consumed, add `amount` to `spent`, pay `recipient`.
+
+No `settleSigned` and no `settleApproved` exist for rent: proof only (framework
+decision 5, first option, for rent). The Solidity tests settle before `accept`, after
+`close`, with a journal for another order's terms, with a mismatched ceiling, with a
+second `batchSize` for the same lease, and twice with the same obligation; each
+reverts.
 
 Events: `Offered(orderId, customer, recipient, maxTotal, deliverySpecHash)`,
 `Accepted(orderId)`, `Settled(orderId, obligationId, amount)`, `Closed(orderId, refund)`.
@@ -252,13 +286,24 @@ the escrow never reads it. The guest never reads it in v1 either (decision 35).
 
 | Thing | Consumed once by | Where |
 |---|---|---|
-| A batch of a lease | `obligationId = obligation_id(lease_id, batch)` | Factory registry, per customer |
+| The batch partition of a lease | `partition[customer][leaseId]` = the first settled journal's `batchSize`; every later settlement for that customer and lease, under any policy or escrow of the factory, must carry the same `batchSize` | Factory registry |
+| A batch of a lease | `obligationId = obligation_id(lease_id, batch)`, meaningful only under the pinned partition | Factory registry, per customer |
 | A note | Its index, inside its batch; a batch closes once (5a.5, SS-11) | Seller's ledger; the guest refuses a gap or a duplicate index |
 | A record | Bound to its note by `deliverable_hash` | Guest, D5 |
 | An order | `orderId = orderIdFor(customer, policyHash, lease_id)` | Escrow |
 
 A later meter image, a later escrow, or a relayer cannot pay a consumed obligation
 again. A different `lease_id` is a different order.
+
+Why the partition is pinned: `obligation_id(lease_id, batch)` names a set of note
+indices only together with `batch_size`. Two funded policies for the same lease with
+different batch sizes would make overlapping obligations (batch 1 of size 2 and batch 3
+of size 1 both contain note 3) that the registry would consume separately, so one note
+could pay twice. Pinning `batchSize` per customer and lease at the first settlement
+makes the partition immutable across policies, escrows and images, with one registry
+write; the alternative, consuming every `note_id` separately, costs one storage write
+per note per settlement. A buyer that wants a different batch size for the same
+machine starts a new lease (a new `lease_id`: a new request id or period).
 
 ## 9. Migration consequences
 
@@ -268,8 +313,8 @@ again. A different `lease_id` is a different order.
 - `lease-evidence.md` section 5 (interface A) and the first text of 5a (interface B)
   are superseded; they are not deleted, so the history of the choice stays readable.
 - `pocc` changes nothing in its artifacts; its adapter already writes the record of
-  section 3 as JSON. It gains the `constants.settlement_margin_s` check and
-  `deadline(b)` in the next step.
+  section 3 as JSON and checks the typed `settlement_margin_s` and the validity
+  bound.
 - `warrant` compute-rent spec cites this document for settlement.
 
 ## 10. Order of work
