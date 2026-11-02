@@ -108,8 +108,10 @@ present in every fixture; `deadline(b)` is then computable by both sides from th
 policy alone. It is not a "constants" object beside the rule: `deny_unknown_fields`
 would refuse that, and a value outside the typed struct would be outside the
 commitment. The margin is a commitment the seller makes at `accept` (SS-5): after the
-latest allowed note arrival, queueing, zkVM proving, the Groth16 wrap, transaction
-inclusion and the chain's finality must all fit inside it. The 1,800 s of the examples
+batch-signature wait (5a.5, `G = 2 * challenge_timeout_s + M`), queueing, the
+succinct proof in the slower per-record form (the fallback when the batch signature
+is withheld), the Groth16 wrap, verification, transaction inclusion and the chain's
+finality must all fit inside `M`. The 1,800 s of the examples
 assumes a GPU prover (the pilot's prover, pocc decision 43: a daily batch in 16 s to 3
 minutes plus the 80 s wrap) and is a placeholder until PE-8 and DL-13 measure it; on
 the one CPU prover measured so far a daily batch takes about 77 minutes and would need

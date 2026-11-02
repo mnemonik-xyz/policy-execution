@@ -568,9 +568,13 @@ record the buyer never signed does not exist.
 
 **One meter signature per batch (decision 44).** The meter signs each hour's record
 when it answers that hour's challenge, so the seller holds evidence hour by hour.
-When a batch closes, the guardrail signs the batch's records once more as one list,
-`tagged_bytes("warrant/usage-batch-signed/v1", records)`, and the seller proves the
-batch with that one signature and no per-record ones. Measured on the rent work: a
+When a batch closes, the seller builds the batch from the hourly records it persisted
+at each acknowledgement (SS-7), byte for byte, never from records regenerated from
+the receipt; a regenerated record that differs from the persisted one is a defect to
+investigate, not a record to sign. The guardrail does the same on its side (BG-5) and
+signs the batch's persisted records once more as one list,
+`tagged_bytes("warrant/usage-batch-signed/v1", records)`; the seller proves the batch
+with that one signature and no per-record ones. Measured on the rent work: a
 daily batch is 9.0 million cycles with the batch signature and 16.2 million without
 (pocc `docs/measurements.md`). The batch signature is a re-signing of records the
 guardrail already signed, with no new judgement, so a guardrail that refuses it is
@@ -726,10 +730,14 @@ Rules that hold across states:
   the buyer disputes is future work; it cannot be a hole in a batch either, so the
   dispute design must give it its own obligation.
 - One deadline formula, used everywhere. The settlement grace is
-  `G = challenge_timeout_s + M`, where `M` is the seller's proving and settlement
-  margin, a listing parameter. For batch b, `last(b)` is the last *scheduled* piece of
-  the service inside b: `min((b + 1) * batch_size - 1, pieces - 1)`, with `pieces =
-  (service_end - service_start) / piece_s`. Then
+  `G = 2 * challenge_timeout_s + M`: one timeout for the last note of the batch, one
+  for the batch signature (BG-7), and `M`, the seller's proving and settlement margin,
+  a typed policy field (PE-0 2.1). `M` is budgeted for the slower path, the fallback
+  proof with per-record signatures (about 1.8 times the cycles of the batch-signed
+  proof), plus the wrap, inclusion and finality; the batch signature only shortens
+  it. For batch b, `last(b)` is the last *scheduled* piece of the service inside b:
+  `min((b + 1) * batch_size - 1, pieces - 1)`, with `pieces = (service_end -
+  service_start) / piece_s`. Then
   `deadline(b) = service_start + (last(b) + 1) * piece_s + G`. The policy and the
   order satisfy `validity.until >= deadline(last batch)` and
   `settleBy >= deadline(last batch)`; the seller refuses a policy or an order that
@@ -773,7 +781,7 @@ time it is one piece plus the proving and settlement margin.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
 - BG-3: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
 - BG-4: The guardrail funds an order only with `signer == address(0)`, no allowance and no threshold, on an escrow created by the factory for an image the buyer approved.
-- BG-7: When the seller presents a closed batch whose records the guardrail signed, the guardrail signs the batch record (the same records as one list) within `challenge_timeout_s`. It signs nothing it did not sign hour by hour, and it refuses a batch that differs from its own records.
+- BG-7: When the seller presents a closed batch whose records the guardrail signed, the guardrail compares them byte for byte with the hourly records it persisted (BG-5) and signs the batch record (the same records as one list) within `challenge_timeout_s`. It signs nothing it did not sign hour by hour, and it refuses a batch that differs from its own records.
 - BG-6: The guardrail sets each note's `valid_until` to `deadline(b)` of the note's batch (5a.5), which is at most `settleBy` by SS-5, so that no note of an unfinished batch expires before the batch can complete and settle.
 - BG-5: For `signed_usage` the guardrail stores the evidence for piece k (for PoCC: the entries and inclusion proofs of that hour, and the verdict) before it signs record k and note k, and keeps it until `settleBy` plus the dispute window of a later design. A chain anchor holds roots only; nothing withheld by the seller's notary can be rebuilt from it.
 
@@ -845,7 +853,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-9: A record whose window is not its index's window, or longer than one piece, or with `units > creditable`, or with a range of indices, gives `Deny`; a product that would overflow gives `Deny`.
 - DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_coverage_bp` of 10000.
 - DL-11: The state machine of 5a.5 is exercised in a simulation with these expected outcomes. No response to the first challenge: the machine is stopped `challenge_timeout_s` after piece 0 ends, no note exists, the seller's loss is `E`. A lease whose ceiling covers one piece: piece 1 never starts (SS-10, `open` already holds piece 0). A late response after a batch closed: refused "batch closed", the index is consumed, nothing settles for it. A note that would expire inside an unfinished batch: never signed (BG-6) and refused if presented (SS-11). A missing middle piece below the floors: zero note, batch settles the rest. A buyer that disappears after the last piece: the final timeout passes, the held notes settle, the last piece is unpaid. A duplicate challenge: the same note. A proof failure near `valid_until`: retried within the margin, else the batch is lost and recorded. Underpayment: the seller's challenge carries the amount its own verifier expects for the piece; a note below it (a zero note for a delivered piece) is kept and the lease stops after that piece, while a zero note for an outage the seller's verifier also saw continues the lease.
-- DL-13: The settlement margin is measured, not assumed: on the rent guest of PE-0, for batches of 1, 6, 24 and 168 hours, on a CPU prover host and on a GPU prover (RISC Zero CUDA), the time from the latest allowed note arrival through queueing, proving, the Groth16 wrap, transaction inclusion and the chain's finality is recorded with its cost and peak memory, and `settlement_margin_s` in the template is set from it with headroom. A simulation's "prover ok" flag does not meet this criterion. The rent work is 674,352 zkVM cycles per hour of service (pocc `docs/measurements.md`), so on the one CPU prover measured so far a 24-hour batch proves in about 80 minutes; the GPU result decides the batch size and whether VMs below about $10 a day can be sold.
+- DL-13: The settlement margin is measured, not assumed: on the rent guest of PE-0, for batches of 1, 6, 24 and 168 hours, in both signature forms (one batch signature, and the per-record fallback that `M` is budgeted for), on a CPU prover host and on a GPU prover (RISC Zero CUDA), the time from the latest allowed note arrival through queueing, a *succinct* proof, the Groth16 wrap, verification of the wrapped receipt against the pinned image, transaction inclusion and the chain's finality is recorded with its cost and peak memory, and `settlement_margin_s` in the template is set from it with headroom. A composite receipt is not the measured object. The same is measured under concurrent load: N batches proved at once on one prover, for the throughput (batches per prover-hour) and the latency each batch sees. A simulation's "prover ok" flag does not meet this criterion. The rent work is 674,352 zkVM cycles per hour of service (pocc `docs/measurements.md`), so on the one CPU prover measured so far a 24-hour batch proves in about 80 minutes; the GPU result decides the batch size and whether VMs below about $10 a day can be sold.
 - DL-14: A batch proved with one meter signature over its records and the same batch proved with per-record signatures settle identically; a batch signature over records that differ from the notes' bound records gives `Deny`.
 - DL-12: A first-hour record (3,540 of 3,540 creditable), a last-hour record (3,600 of 3,600), a zero-unit record for an uncredited middle hour, and a record after `service_end`, serialized by `pocc-verify` and checked by `warrant-host check rent`, give the same decisions in both implementations; the shared vectors are `test/vectors/usage-gates.json` in `mnemonik-xyz/pocc`, and Warrant publishes the bincode serialization and hash of one record so PoCC can check its JSON maps to it.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
