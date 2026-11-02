@@ -35,7 +35,8 @@ The owner chose C on 2 Nov (pocc decision 40).
 | Policy version | `1` | `policy.version` |
 | Journal schema | `warrant/journal/rent/v2` | `schemaId = sha256(utf8("warrant/journal/rent/v2"))`. The escrow deployment pins it |
 | Delivery kind | `signed_usage` | The only kind the rent case accepts in v1 |
-| Record tag | `warrant/usage/v1` | The signing tag of a usage record |
+| Record tag | `warrant/usage/v1` | The signing tag of a usage record; also the hash a note binds to |
+| Batch record tag | `warrant/usage-batch-signed/v1` | The signing tag of one meter signature over a batch's records (decision 44) |
 | Batch tag | `warrant/usage-batch/v1` | The tag of `deliveryHash` |
 | Note tag | `warrant/acceptance/v1` | Unchanged: a note is an `Acceptance` |
 | Delivery spec tag | `warrant/delivery/v1` | The tag of `deliverySpecHash` |
@@ -128,6 +129,7 @@ a margin of about 2.5 hours.
 | Seller credential | `VendorCredential` (unchanged) | existing | `registry_key` |
 | Note k | `Acceptance` (unchanged): `scope`, `task_id = note_id(lease_id, k)`, `deliverable_hash = record_hash(k)`, `recipient`, `amount`, `accepted = true`, `valid_after`, `valid_until` | `tagged_bytes("warrant/acceptance/v1", bincode(note))` | `acceptance_key` |
 | Usage record k | `UsageRecord` (below) | `tagged_bytes("warrant/usage/v1", bincode(record))` | `meter_key` |
+| Batch record | `Vec<UsageRecord>` of the batch, index order, the same records | `tagged_bytes("warrant/usage-batch-signed/v1", bincode(records))` | `meter_key`, once per batch |
 
 ```rust
 pub struct UsageRecord {
@@ -145,8 +147,14 @@ pub struct UsageRecord {
 }
 ```
 
-- `record_hash(k) = sha256(tagged_bytes("warrant/usage/v1", bincode(record_k)))`: the
-  same bytes the meter key signs. A note binds to one record through it (D5).
+- `record_hash(k) = sha256(tagged_bytes("warrant/usage/v1", bincode(record_k)))`. A
+  note binds to one record through it (D5), whether or not record k carries its own
+  signature.
+- The batch record is the same `UsageRecord` values, signed once. The guest accepts a
+  batch in either form: one meter signature over the batch (the normal case, 44 %
+  fewer cycles for a daily batch), or one meter signature per record (the fallback
+  when the guardrail signed the hours but not the batch). The records' content, the
+  note binding and gates D1 and D3 to D9 are identical in both; only D2 differs.
 - Signatures are 64-byte secp256k1 `r || s` (low-s) over `sha256(message)`, verified
   under the named public key with no recovery, as `core::verify` does today
   (`Signature::from_slice`). The 65-byte `r || s || v` form exists only for
@@ -174,7 +182,8 @@ pub struct RentInput {
     pub vendor: VendorCredential,
     pub vendor_signature: Vec<u8>,
     pub notes: Vec<(Acceptance, Vec<u8>)>,       // index order, a prefix of the batch
-    pub records: Vec<(UsageRecord, Vec<u8>)>,    // same order, one per note
+    pub records: Vec<(UsageRecord, Vec<u8>)>,    // same order, one per note; signatures empty when batch_signature is set
+    pub batch_signature: Option<Vec<u8>>,        // one meter signature over the records (decision 44)
 }
 ```
 

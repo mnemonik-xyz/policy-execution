@@ -566,6 +566,17 @@ The note for index k binds to the record by `deliverable_hash`: the service puts
 record's hash in the challenge, and the note carries it (section 2). A note for a
 record the buyer never signed does not exist.
 
+**One meter signature per batch (decision 44).** The meter signs each hour's record
+when it answers that hour's challenge, so the seller holds evidence hour by hour.
+When a batch closes, the guardrail signs the batch's records once more as one list,
+`tagged_bytes("warrant/usage-batch-signed/v1", records)`, and the seller proves the
+batch with that one signature and no per-record ones. Measured on the rent work: a
+daily batch is 9.0 million cycles with the batch signature and 16.2 million without
+(pocc `docs/measurements.md`). The batch signature is a re-signing of records the
+guardrail already signed, with no new judgement, so a guardrail that refuses it is
+not cooperating (BG-7); the seller then proves the batch with the per-record
+signatures it holds, and nothing is lost but the saving.
+
 `deliveryHash` in the journal is `hash_tagged(b"warrant/usage-batch/v1", records)`,
 with the records in index order.
 
@@ -577,7 +588,7 @@ rule tree. Each gate has a test and a removed-check experiment (ME-1).
 | # | Gate | Result if it fails |
 |---|---|---|
 | D1 | One record for every note index in the batch, `first_index == last_index == k`, no gap, no overlap | `Ask` for a missing record, `Deny` for an overlap or a range |
-| D2 | Each record signature verifies under `meter_key` | `Deny` |
+| D2 | The meter's signature verifies under `meter_key`: one signature over `tagged_bytes("warrant/usage-batch-signed/v1", records)` when the batch carries it, else one per record over `tagged_bytes("warrant/usage/v1", record)` | `Deny` |
 | D3 | Each record has the policy's `scope`, `lease_id` and `meter_spec` | `Deny` |
 | D4 | Each record window is the window of its index (above), inside the policy validity, and `window_end - window_start == piece_s` | `Deny` |
 | D5 | For each note k: `amount_k <= units_k * price_per_unit + tolerance`, and `note.deliverable_hash == hash(record_k)` | `Deny` |
@@ -670,7 +681,7 @@ durably before they act on it.
 | Serving k | Piece k starts (`service_start + k * piece_s`) with note k-1 durable (or k = 0) and SS-10 holding for k | Keeps the machine running; the reservation for k is already `open` (made in Provisional k, or at Provisioning for k = 0) | Nothing | Piece k ends |
 | Challenging k, Provisional k+1 | Piece k ended | Reserves `max_note` for piece k+1 as `open` (SS-10 must hold for it; otherwise Stopping), keeps the machine running, and sends the challenge for note k: index, window, the record it expects (from its own run of the verifier) and so the amount it expects, the evidence. Piece k+1 is provisional: it runs, but the seller has not yet decided to bill it | Fetches and stores the evidence (BG-5), runs the verifier, signs record k and note k, returns both | Seller stores record k and note k (SS-2, SS-7) and acknowledges: the reservation for k moves to `held`, and Provisional k+1 becomes Serving k+1, billable from its start. Or `challenge_timeout_s` passes with no acknowledged note: Stopping, and the provisional part of piece k+1 is the seller's loss |
 | Stopping | `challenge_timeout_s` passed with note k missing; or SS-10 fails for the next piece; or the buyer or seller ends the lease; or `service_end` is reached | Terminates the machine within its shutdown latency; sends the final challenge for the last served piece; waits `challenge_timeout_s` for it | Answers the final challenge, or not | The timeout passes or the final note is acknowledged |
-| Closing batch b | Batch b is full; or the lease is Stopping and the final timeout passed | Marks batch b closed durably: no note for an index of b is accepted after this mark | — | The mark is durable |
+| Closing batch b | Batch b is full; or the lease is Stopping and the final timeout passed | Marks batch b closed durably: no note for an index of b is accepted after this mark; asks the guardrail for the batch signature over b's records (BG-7) | Signs the batch record, or not | The mark is durable; the batch signature arrives or `challenge_timeout_s` passes, after which the per-record signatures are used |
 | Settling b | Batch b is closed | Proves and settles the notes held for b (SS-4) | Nothing | `consume` succeeds, or `settleBy` passes |
 
 The continuation gate is the point of the design, and it is a gate on *billing*, not
@@ -762,6 +773,7 @@ time it is one piece plus the proving and settlement margin.
 - BG-2: The guardrail assigns consecutive indices per lease and never signs two notes with the same index.
 - BG-3: The agent never holds the note key. It asks the guardrail, which enforces BG-1.
 - BG-4: The guardrail funds an order only with `signer == address(0)`, no allowance and no threshold, on an escrow created by the factory for an image the buyer approved.
+- BG-7: When the seller presents a closed batch whose records the guardrail signed, the guardrail signs the batch record (the same records as one list) within `challenge_timeout_s`. It signs nothing it did not sign hour by hour, and it refuses a batch that differs from its own records.
 - BG-6: The guardrail sets each note's `valid_until` to `deadline(b)` of the note's batch (5a.5), which is at most `settleBy` by SS-5, so that no note of an unfinished batch expires before the batch can complete and settle.
 - BG-5: For `signed_usage` the guardrail stores the evidence for piece k (for PoCC: the entries and inclusion proofs of that hour, and the verdict) before it signs record k and note k, and keeps it until `settleBy` plus the dispute window of a later design. A chain anchor holds roots only; nothing withheld by the seller's notary can be rebuilt from it.
 
@@ -834,6 +846,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-10: A perfect boundary hour of a PoCC lease (3,540 credited of 3,540 creditable seconds) passes a `min_coverage_bp` of 10000.
 - DL-11: The state machine of 5a.5 is exercised in a simulation with these expected outcomes. No response to the first challenge: the machine is stopped `challenge_timeout_s` after piece 0 ends, no note exists, the seller's loss is `E`. A lease whose ceiling covers one piece: piece 1 never starts (SS-10, `open` already holds piece 0). A late response after a batch closed: refused "batch closed", the index is consumed, nothing settles for it. A note that would expire inside an unfinished batch: never signed (BG-6) and refused if presented (SS-11). A missing middle piece below the floors: zero note, batch settles the rest. A buyer that disappears after the last piece: the final timeout passes, the held notes settle, the last piece is unpaid. A duplicate challenge: the same note. A proof failure near `valid_until`: retried within the margin, else the batch is lost and recorded. Underpayment: the seller's challenge carries the amount its own verifier expects for the piece; a note below it (a zero note for a delivered piece) is kept and the lease stops after that piece, while a zero note for an outage the seller's verifier also saw continues the lease.
 - DL-13: The settlement margin is measured, not assumed: on the rent guest of PE-0, for batches of 1, 6, 24 and 168 hours, on a CPU prover host and on a GPU prover (RISC Zero CUDA), the time from the latest allowed note arrival through queueing, proving, the Groth16 wrap, transaction inclusion and the chain's finality is recorded with its cost and peak memory, and `settlement_margin_s` in the template is set from it with headroom. A simulation's "prover ok" flag does not meet this criterion. The rent work is 674,352 zkVM cycles per hour of service (pocc `docs/measurements.md`), so on the one CPU prover measured so far a 24-hour batch proves in about 80 minutes; the GPU result decides the batch size and whether VMs below about $10 a day can be sold.
+- DL-14: A batch proved with one meter signature over its records and the same batch proved with per-record signatures settle identically; a batch signature over records that differ from the notes' bound records gives `Deny`.
 - DL-12: A first-hour record (3,540 of 3,540 creditable), a last-hour record (3,600 of 3,600), a zero-unit record for an uncredited middle hour, and a record after `service_end`, serialized by `pocc-verify` and checked by `warrant-host check rent`, give the same decisions in both implementations; the shared vectors are `test/vectors/usage-gates.json` in `mnemonik-xyz/pocc`, and Warrant publishes the bincode serialization and hash of one record so PoCC can check its JSON maps to it.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 

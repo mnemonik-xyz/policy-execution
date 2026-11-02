@@ -174,6 +174,7 @@ New:
 - DL-5: the written trust table names the meter key and says what happens if it fails.
 - DL-6: a record below `min_coverage_bp` or `min_assurance` with a note amount above 0 gives `Deny`; with a zero note the batch settles.
 - DL-8: a batch with a zero note for a piece below the floors settles the other pieces.
+- DL-14: one meter signature per batch and per-record signatures settle identically (`lease-evidence.md` 5a.2, decision 44).
 - DL-9 to DL-11 as in `lease-evidence.md` section 5a: record arithmetic, boundary-hour coverage, and the state-machine scenarios.
 - PE-0: `04-rent-interface-v1.md` is the rent settlement interface on the framework (C); it precedes PE-2, PE-3 and PE-6, and the rent case settles through `WarrantEscrow` with journal v2, never through `ProofInvoiceEscrow`.
 - DL-7: a PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
