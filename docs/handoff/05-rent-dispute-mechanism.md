@@ -21,7 +21,7 @@ The requested flow is sound under four conditions:
 
 1. Funding authorizes the fallback delivery policy before service starts.
 2. A proof can establish that policy without the missing buyer acknowledgement.
-3. The contract enforces the response period, payment limits and one shared replay check.
+3. Acknowledgement settlement requires provider consent; both paths enforce timing, limits and one shared replay check.
 4. Refunds remain unavailable until the provider's proof settlement deadline passes.
 
 Silence is not evidence of delivery. Timeout only enables the proof path.
@@ -51,7 +51,9 @@ For payment per completed hour, use `batch_size = 1`.
 Payment of the full escrow on VM handover is a different, fixed-delivery product.
 That product needs a handover predicate and an explicit transfer-of-control test before this specification can cover it.
 
-**Assumption B: an agreed independent meter supplies fallback evidence.** The buyer selects its key before funding.
+**Assumption B: a meter agreed by both parties supplies fallback evidence.** The buyer records the proposed meter key before funding.
+Before calling `accept`, the provider must approve that meter, its delivery predicate, evidence access and retention commitments.
+The provider's acceptance binds the funded policy and meter configuration. Otherwise it must refuse the order.
 Neither the buyer nor the provider can replace that key after acceptance.
 A different key held by the same buyer is not an independent meter.
 The provider must be able to obtain the signed evidence without a new buyer action.
@@ -73,7 +75,7 @@ Source inspection and local verification: 3 Nov 2026.
 | Component | Existing evidence | Reuse and remaining work |
 |---|---|---|
 | `contracts/src/InvoiceEscrow.sol` | `settle`, `settleSigned`, `_authorize`, `_pay`, `close` | Reuse the common authorization/payment structure. Its invoice schema, price threshold and signer allowance are not this rent protocol. |
-| Same contract | Both paths use `consumed[customer][obligation]` and `spent` | Preserve cross-path exclusion. Its map is contract-local; the framework's shared factory registry remains necessary across deployments. |
+| Same contract | Both paths use `consumed[customer][obligation]` and `spent` | Preserve cross-path exclusion, with provider consent for acknowledgement. Its map is contract-local; cross-deployment replay still needs the factory registry. |
 | `host/src/signer.rs` | Buyer service checks policy and live order before signing | Reuse the pattern, not the invoice decoder or its field offsets. |
 | `core/src/evidence.rs` | `signer_digest`, `sign_journal`, recoverable signatures | Reuse cryptographic primitives. Rent needs a separate domain and fixtures. |
 | `methods/*-guest`, receipt verification infrastructure | Existing task, invoice and solver proof paths | Reuse build/prove/wrap/verify machinery. There is no `core/src/rent.rs` or implemented `WarrantEscrow` at the inspected base. |
@@ -87,6 +89,11 @@ Checks run against these bases:
 - `go test ./pkg/lease ./pkg/adapter/warrant`: both packages passed.
 - The contract tests use a test journal verifier. They do not establish a real rent proof or a deployed fallback.
 
+Review correction, 3 Nov: shared replay protection does not protect a provider against an underpaid settlement submitted by the buyer.
+The draft previously allowed that attack. Section 6 now requires provider consent before acknowledgement can consume an obligation or establish a cutoff.
+A separate reproduction against `InvoiceEscrow.settleApproved` paid one unit, blocked a 1,000-unit authorization, then refunded the remainder.
+That reproduction used the test verifier. The legacy invoice flaw remains separate work; do not copy its customer-only approval semantics.
+
 ## 4. Flow
 
 ```mermaid
@@ -94,18 +101,20 @@ flowchart TD
     A[Buyer funds pinned terms] --> B[Provider accepts and delivers service]
     B --> C[Persist independently available delivery evidence]
     C --> D[Request buyer acknowledgement for the batch]
-    D --> E{Valid acknowledgement available?}
-    E -->|Yes| F[Relay acknowledgement]
+    D --> E{Provider accepts exact acknowledgement?}
+    E -->|Yes| F[Provider account submits acknowledgement]
     E -->|No, response period expires| G[Generate and verify delivery proof]
     F --> H[Shared bounds and consumed-obligation check]
     G --> H
     H --> I[Mark paid and transfer to fixed provider]
 ```
 
-The caller can be the provider or a relayer. The recipient always comes from the funded order.
+Only the funded recipient account can call acknowledgement settlement in this version.
+Anyone can relay a valid proof settlement. The recipient always comes from the funded order.
 Signing alone does not move funds. A valid settlement transaction must be included on chain.
 Acknowledgement remains usable after the response period, until settlement expires.
-The first successful settlement wins. The other path must revert without another transfer.
+The first fully authorized settlement wins. The other path must revert without another transfer.
+An unaccepted buyer signature cannot reserve, consume, close or otherwise modify an obligation.
 
 The provider can prepare witness data early. The default worker starts costly proving after the response period.
 The contract cannot observe when proving started. It enforces when proof settlement becomes valid.
@@ -140,6 +149,9 @@ The guest recomputes this hash from its policy and order witness; the contract c
 Order-only `acceptBy` and `settleBy` come from that witness and must satisfy policy constraints.
 Every multiplication, addition, index conversion and subtraction must be checked.
 Reject invalid schedules, overflowing deadlines and policy amounts above the existing supported bounds.
+Require `piece_s > 0`, `service_end > service_start`, and `(service_end - service_start) % piece_s == 0` before division.
+Require `service_start % piece_s == 0` and a positive batch size within the supported maximum.
+The piece count and every index must fit their declared types without truncation.
 
 For scheduled batch `b`, define:
 
@@ -173,7 +185,7 @@ No CPU/GPU estimate or existing 1,800-second placeholder is a measured value for
 
 ## 6. Claim, acknowledgement and shared checks
 
-Keep PE-0's fifteen header words. The proposed extension, in order, is:
+Keep PE-0's fifteen header words. Replace its five-word extension with these eight words, in order:
 
 ```text
 leaseId, batch, batchSize, ceiling, customer,
@@ -222,17 +234,45 @@ function settleAcknowledged(bytes calldata journal, bytes calldata buyerSignatur
 function settleProven(bytes calldata seal, bytes calldata journal) external;
 ```
 
+### 6.1 Provider consent is a contract check
+
+For `settleAcknowledged`, require `msg.sender == order.recipient` from the stored, validated order.
+Reject the customer, a third-party relayer, and any other caller unless that caller is also the funded recipient.
+Do not use `tx.origin`, a caller-supplied provider address or untrusted forwarded-sender data.
+The requirement is identical for positive, reduced and zero amounts, and for full or partial batches.
+
+The provider's transaction accepts the exact journal in its calldata.
+That consent includes the amount, service prefix, evidence commitments, final cutoff and one-time closure of the whole batch.
+A copied buyer signature or copied calldata gives another account no right to submit acknowledgement settlement.
+The provider must check these values against its expected claim before sending the transaction.
+The worker check prevents accidental acceptance; the contract caller check prevents hostile buyer submissions.
+
+A provider contract wallet must invoke the escrow through its own authorized execution path.
+An operator EOA which is not the recipient cannot call the entry point directly.
+Do not configure a permissionless forwarding contract as the provider account.
+
+A buyer signature is a payment offer until the provider submits it.
+Invalid or rejected offers do not restart the response period, change the cutoff, consume a batch or disable proof settlement.
+The proof path does not require a provider caller or countersignature: its pinned guest establishes the exact entitlement.
+
+Relayed acknowledgement settlement is deferred. Adding it requires a separately reviewed provider countersignature over the same exact claim.
+That future design must use a distinct provider-consent signing type and bind the order, journal hash, domain and expiry.
+It must not make the current caller check optional based on an empty signature.
+
+### 6.2 Shared authorization and payment
+
 Both paths must call the same authorization and payment routines:
 
 1. Check schema, journal length, canonical word encoding and order existence.
 2. Require state Accepted and exact customer, policy, scope, recipient, lease, ceiling and terms hash.
 3. Check schedule, batch partition, contiguous prefix, per-batch cap and time limits.
 4. Require `amount <= pieceCount * maxPerPiece` and `spent + amount <= ceiling`.
-5. Authenticate through the selected path. Proofs use the pinned image and exact journal hash.
+5. Authenticate the path: customer signature plus provider caller for acknowledgement; pinned image and exact journal hash for proof.
 6. Atomically consume the same factory-registry obligation, update spend, then transfer the exact amount.
 
 Use checks-effects-interactions and reentrancy protection for every settlement and refund entry point.
 Reverts must roll back consumption and spend. A zero-amount outage batch closes without an ERC-20 transfer.
+A zero-amount acknowledgement still needs provider consent. A zero-amount proof must establish the policy-derived zero entitlement.
 Keep the batch partition pinned across all deployments and policy versions for a customer and lease.
 Retain the shared factory registry when changing images or settlement modes.
 The shared terminal-cutoff state is a new registry requirement alongside partition and consumption.
@@ -240,14 +280,18 @@ Deploy this mode for fresh funded leases. Do not reinterpret existing orders or 
 
 A partial-prefix settlement closes the whole batch. There is no later top-up for its suffix.
 It is allowed only as a final batch of a stopped lease.
+The acknowledgement path obtains both parties' agreement to that final prefix through the buyer signature and provider transaction.
+It does not independently prove physical shutdown. The provider must stop service before accepting a terminal cutoff.
+The proof path instead requires the guest-authenticated final stop and billing-eligibility statement.
 Record that terminal cutoff in shared lease state; both paths refuse later pieces beyond it.
 Previously completed earlier batches remain payable until their own deadlines.
 Concurrent settlement must enforce one consistent cutoff. A new lease needs a new lease identifier.
 The registry must also track the highest settled index. A new cutoff cannot invalidate already settled later pieces.
 
-**Fast-path trust:** the buyer signature directly authorizes the bounded payment.
+**Fast-path trust:** the buyer signature authorizes payment, and the provider transaction accepts its amount and closure terms.
 The contract does not execute the rule tree or independently check physical delivery on that path.
-A compromised buyer account can pay the fixed provider within these bounds.
+A compromised buyer account can offer payment within these bounds; the provider must accept before it settles.
+An explicitly accepted reduced amount is final. The provider cannot later prove a top-up for the consumed obligation.
 This is different from the previous proof-only guarantee and must be explicit in the funded terms.
 
 ## 7. Dispute evidence and guest changes
@@ -323,7 +367,14 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 
 | Test | Required result |
 |---|---|
-| Valid buyer acknowledgement, no proof | Pays once; emits acknowledgement authenticator |
+| Valid buyer acknowledgement submitted by the provider, no proof | Pays once; emits acknowledgement authenticator |
+| Buyer submits zero or one-unit acknowledgement while full delivery is owed | Revert Unauthorized; consumed, spent and cutoff unchanged; later full proof still pays |
+| Buyer submits a one-piece final prefix while later delivered batches remain unpaid | Revert Unauthorized; no terminal cutoff; all valid proof claims remain available |
+| Third party copies a valid buyer signature and transaction calldata | Acknowledgement submission reverts; no provider consent is inferred |
+| Provider submits an invalid buyer signature or changes the signed amount/prefix | Revert without state changes |
+| Provider explicitly accepts a zero or reduced amount | Close once under both parties' authority; no later top-up |
+| Provider contract wallet executes through its authorized path | Accepted; unrelated operator direct calls and buyer forwarding fail |
+| Any caller submits a valid proof after timeout | Pays the fixed recipient, subject to all common checks |
 | No buyer signature after funding, first piece delivered | Independent meter evidence can settle after timeout |
 | Buyer-only evidence withheld | Explicitly no payment; not advertised as a working independent fallback |
 | Valid proof just before / exactly at `proof_after` | Revert / eligible |
@@ -341,11 +392,13 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Forged meter record or forged billing eligibility | Deny |
 | Proof queue failure, retry, buyer acknowledgement during proof | No duplicate reservation or payment |
 | Transfer failure, reentrant token, zero payout | Atomic rollback / rejection / closure without transfer |
-| Underpayment acknowledgement compared with proof amount | First authorized settlement closes the batch; no hidden remainder claim |
+| Rejected underpayment offers are repeated through the deadline | No clock reset or state changes; proof path remains usable |
+| Non-divisible service period, zero piece size or overflowing index | Policy/order rejected before service starts |
 
-The buyer UI must warn before authorizing a reduced final payment which closes the batch.
+Both UIs must display any reduced final payment and forfeited suffix before consent.
 The provider worker must reject an acknowledgement below its expected amount and use fallback instead.
-A deliberately signed reduced acknowledgement can still be relayed by another holder; do not issue it as a negotiation message.
+Only an explicit provider decision can accept a concession. The worker must never submit such an acknowledgement automatically.
+The caller check is the security boundary; a buyer's possession of its signature is not provider consent.
 
 Require new Rust/Solidity/Go fixtures for terms, journal, acknowledgement and independent meter evidence.
 Run real receipt verification and a funded testnet end-to-end run for both paths.
