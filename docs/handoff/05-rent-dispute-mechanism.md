@@ -9,6 +9,7 @@ Normal settlement uses the buyer's acknowledgement. The dispute path uses a deli
 "Fallback" in the technical sections means this proof-based dispute path.
 Buyer silence makes that path available; it is not evidence of delivery or an admission of fault.
 Resolution follows the funded policy and verified evidence. This version adds no human arbitrator or appeal process.
+It is not the referee dispute of the pocc integration specification, section 8 (pocc decision 20), which stays deferred.
 
 Base inspected: policy-execution `e4b8ac8` (includes PR #76).
 Companion: pocc `docs/handoff/dispute-mechanism.md`, based on PR #1 at `110d813`.

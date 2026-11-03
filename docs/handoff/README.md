@@ -35,7 +35,7 @@ These files turn it into work packages.
 | 3 | Generic evaluator, one Verus proof. Fallback: one closed atom enum | Approved |
 | 4 | Chain and escrowed asset for the DeFi swap | Deferred to step 9 |
 | 5 | Fate of the buyer-signed settlement path | **Open.** See below |
-| 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md` |
+| 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md`. The buyer controls the PoCC agent, so the seller watches it every slot (pocc decision 47, lease evidence SS-12, SS-13); the dispute mode proposes an agreed meter (`05-rent-dispute-mechanism.md`) |
 | 7 | Settlement interface for rent: the framework header on `WarrantEscrow` (C); the invoice journal variants A and B are superseded | Chosen by the owner, 2 Nov. The concrete interface, `04-rent-interface-v1.md`, awaits review |
 
 Decision 5 update, 3 Nov 2026. The owner now requests a buyer acknowledgement path for rent,

@@ -7,6 +7,15 @@ an entry in the [policy catalog](policy-catalog.md). The compute marketplace in
 [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13) is its first consumer,
 not its owner.
 
+Revision 2026-11-03: two amendments. First, pocc decision 47, taken: the buyer controls
+the PoCC agent, so the seller watches it every slot and stores every anchored entry
+(SS-12, SS-13). This applies to every PoCC lease. Second, proposed and not adopted: the
+rent dispute mechanism (`docs/handoff/05-rent-dispute-mechanism.md`) adds a mode where a
+buyer acknowledgement that the provider accepts, or a proof that the provider submits
+after a response period, settles a batch. In that mode a silent buyer does not leave
+completed service with anchored evidence unpaid. Statements below about a silent buyer,
+non-cooperation and the proof-only escrow describe the buyer-note mode.
+
 Revision 2026-10-29: the delivery proof. A metered policy must name a meter. The
 meter signs a usage record per piece. The guest checks the records before the rule
 tree. PoCC (`mnemonik-xyz/pocc`) is the first meter. Section 5a describes it.
@@ -847,7 +856,7 @@ time it is one piece plus the proving and settlement margin.
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
 | Buyer | Stop near `settleBy` so the seller cannot settle | SS-4: the service stops first, by its margin. |
-| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. |
+| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. In the proposed dispute mode, completed service with anchored evidence stays payable by a provider-submitted proof after the response period (handoff 05). |
 | Buyer | Cancel after `accept` | Impossible before `settleBy`. |
 | Buyer | Never answer the first challenge | The seller loses provisioning cost. The no-show residue. |
 | Seller | Forge a note | Impossible. |
@@ -860,7 +869,7 @@ time it is one piece plus the proving and settlement margin.
 | Seller | Settle before any service | No note exists before the buyer asks. For `signed_usage`, no note exists before the piece ran and its record was signed. |
 | Anyone | Obtain the buyer's guardrail key | Records and notes that agree with each other, paid to the fixed recipient within the ceiling. Section 8. |
 | Anyone | Replay a settlement, relay to another recipient | Consumed obligation, recipient fixed, any relayer pays only the recipient. |
-| Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. |
+| Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. The proposed dispute mode adds `settleAcknowledged`, which requires the provider as caller and the buyer's signature (handoff 05, 6.1). |
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
 | Seller | Bill a piece that was not delivered | No usage record, or a record below the note amount: `Ask` or `Deny`. The piece is not paid. |
 | Buyer | Sign a record with fewer units than delivered | The seller loses at most one piece and stops. Anyone can re-run the verifier and show the under-credit. |
