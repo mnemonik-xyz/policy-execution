@@ -8,21 +8,23 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {PolicyExecutionVault, IZkvmVerifier} from "./PolicyExecutionVault.sol";
 
 /// @notice Purchase-order escrow settled by invoice authorizations: proven, signed
-/// or approved by the buyer.
+/// or approved by the buyer and accepted by the vendor.
 /// @dev Same trust model as TaskEscrow: no administrator, one immutable verifier,
 /// interpreter and standard ERC-20 per deployment. One funded order backs many
-/// invoices; each customer pays an obligation ID at most once, and cumulative
-/// payments never exceed the order's ceiling. Every path pays the order's
-/// accepted vendor and nobody else.
+/// invoices; each customer pays an obligation ID to a vendor address at most once,
+/// and cumulative payments never exceed the order's ceiling. Every path pays the
+/// order's accepted vendor and nobody else.
 ///
 /// Three authenticators:
 /// - `settle`: a RISC Zero receipt for the pinned invoice interpreter image, any amount;
 /// - `settleSigned`: a signature from the signer the buyer named for this order,
 ///   which runs that interpreter natively; only below the order's proof threshold
 ///   and within its signer allowance. The buyer can revoke it per order.
-/// - `settleApproved`: the buyer settles an invoice the interpreter could not decide
-///   on their own authority, within the same ceiling and replay protection.
-///   The contract does not require a prior Ask result.
+/// - `approveInvoice` then `settleApproved`: the buyer approves an invoice the
+///   interpreter could not decide, on their own authority, and the vendor accepts
+///   that exact approval. Both must agree; neither one alone consumes an obligation.
+///   The same ceiling and replay protection apply. The contract does not require a
+///   prior Ask result.
 contract InvoiceEscrow is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -84,8 +86,13 @@ contract InvoiceEscrow is ReentrancyGuard {
     bytes32 public immutable imageId;
     uint256 public totalReserved;
     mapping(bytes32 => Order) internal orders;
-    /// @notice Each customer consumes an obligation across their orders and authenticators.
-    mapping(address => mapping(bytes32 => bool)) public consumed;
+    /// @notice customer => vendor => obligation: paid, across the customer's orders to
+    /// that vendor address and every authenticator. An order to another address cannot
+    /// consume this vendor's obligation.
+    mapping(address => mapping(address => mapping(bytes32 => bool))) public consumed;
+    /// @notice The customer's open approval per order and obligation:
+    /// `keccak256(abi.encode(amount, documentHash))`, or zero for none.
+    mapping(bytes32 => mapping(bytes32 => bytes32)) public approvals;
 
     error InvalidTerms();
     error InvalidState();
@@ -107,6 +114,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         bytes32 deliverableHash,
         bytes32 evidenceHash
     );
+    event InvoiceApproved(bytes32 indexed orderId, bytes32 indexed obligationId, uint64 amount, bytes32 documentHash);
     event SignerRevoked(bytes32 indexed orderId);
     event Closed(bytes32 indexed orderId, uint64 refunded);
 
@@ -234,22 +242,41 @@ contract InvoiceEscrow is ReentrancyGuard {
         _pay(orderId, o, a.taskId, a.amount, Authenticator.Signature, a.deliverableHash, a.evidenceHash);
     }
 
-    /// @notice The customer pays an invoice the interpreter left undecided (Ask) on
-    /// their own authority. The same bounds apply: the order's vendor, its ceiling
-    /// and its deadline, and the obligation pays once across this customer's orders
-    /// and every path. No Ask result is required on chain.
+    /// @notice The customer approves payment of an invoice the interpreter left
+    /// undecided (Ask), on their own authority. This pays nothing and consumes
+    /// nothing: the vendor must accept the approval with `settleApproved`. Until the
+    /// vendor does, a proof or a signature can still pay the obligation in full. A new
+    /// approval for the same order and obligation replaces the previous one.
     /// @param obligationId `evidence::obligation_id` of the invoice: seller tax ID and number.
     /// @param documentHash sha256 of the invoice bytes, for the record.
+    function approveInvoice(bytes32 orderId, bytes32 obligationId, uint64 amount, bytes32 documentHash) external {
+        Order storage o = orders[orderId];
+        if (o.state != State.Accepted || block.timestamp > o.settleBy) revert InvalidState();
+        if (msg.sender != o.customer) revert Unauthorized();
+        if (amount == 0 || obligationId == bytes32(0) || documentHash == bytes32(0)) revert InvalidAuthorization();
+        if (consumed[o.customer][o.recipient][obligationId]) revert AlreadyPaid();
+        approvals[orderId][obligationId] = keccak256(abi.encode(amount, documentHash));
+        emit InvoiceApproved(orderId, obligationId, amount, documentHash);
+    }
+
+    /// @notice The order's vendor accepts the customer's approval exactly as approved,
+    /// for example a reduced amount, and is paid. This consumes the obligation across
+    /// this customer's orders to this vendor and every path. The same bounds apply:
+    /// the order's vendor, its ceiling and its deadline. No Ask result is required on chain.
     function settleApproved(bytes32 orderId, bytes32 obligationId, uint64 amount, bytes32 documentHash)
         external
         nonReentrant
     {
         Order storage o = orders[orderId];
         if (o.state != State.Accepted || block.timestamp > o.settleBy) revert InvalidState();
-        if (msg.sender != o.customer) revert Unauthorized();
-        if (amount == 0 || obligationId == bytes32(0) || documentHash == bytes32(0)) revert InvalidAuthorization();
-        if (consumed[o.customer][obligationId]) revert AlreadyPaid();
+        if (msg.sender != o.recipient) revert Unauthorized();
+        if (consumed[o.customer][o.recipient][obligationId]) revert AlreadyPaid();
+        if (
+            amount == 0 || obligationId == bytes32(0) || documentHash == bytes32(0)
+                || approvals[orderId][obligationId] != keccak256(abi.encode(amount, documentHash))
+        ) revert InvalidAuthorization();
         if (amount > o.maxTotal - o.spent) revert OrderExceeded();
+        delete approvals[orderId][obligationId];
         _pay(orderId, o, obligationId, amount, Authenticator.BuyerApproval, documentHash, bytes32(0));
     }
 
@@ -276,7 +303,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         ) {
             revert InvalidAuthorization();
         }
-        if (consumed[o.customer][a.taskId]) revert AlreadyPaid();
+        if (consumed[o.customer][o.recipient][a.taskId]) revert AlreadyPaid();
         if (a.amount > o.maxTotal - o.spent) revert OrderExceeded();
     }
 
@@ -289,7 +316,7 @@ contract InvoiceEscrow is ReentrancyGuard {
         bytes32 deliverableHash,
         bytes32 evidenceHash
     ) internal {
-        consumed[o.customer][taskId] = true;
+        consumed[o.customer][o.recipient][taskId] = true;
         o.spent += amount;
         totalReserved -= amount;
         token.safeTransfer(o.recipient, amount);

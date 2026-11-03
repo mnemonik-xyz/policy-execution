@@ -78,7 +78,7 @@ contract RealInvoiceSettlementTest {
         require(token.balanceOf(a.recipient) == a.amount);
         require(escrow.remaining(orderId) == ceiling - a.amount);
         require(escrow.totalReserved() == ceiling - a.amount);
-        require(escrow.consumed(customer, a.taskId));
+        require(escrow.consumed(customer, a.recipient, a.taskId));
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
         escrow.settle(seal, journal);
     }
