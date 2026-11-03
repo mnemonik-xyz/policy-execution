@@ -1,5 +1,8 @@
 # Rent interface v1 (PE-0)
 
+Proposed amendment, 3 Nov 2026: [rent dispute mechanism](05-rent-dispute-mechanism.md).
+It defines a new rent mode and its evidence requirements. This file retains the earlier proof-only interface.
+
 Status: proposal for the owner's review, 2 Nov 2026. Supersedes the settlement
 interfaces A and B of `docs/product/lease-evidence.md` section 5. Built on the
 framework (`docs/framework.md`): one journal header with `schemaId`, one escrow base

@@ -21,6 +21,7 @@ The DeFi swap comes last.
 | `02-framework-steps.md` | Steps 1 to 9 of the framework, with acceptance criteria |
 | `03-rent-case.md` | The rent case and its delivery proof |
 | `04-rent-interface-v1.md` | PE-0: the rent settlement interface on the framework (journal v2, `WarrantEscrow`, encodings, replay). Proposal for review |
+| `05-rent-dispute-mechanism.md` | Rent dispute mechanism: buyer acknowledgement, then proof after timeout. Correctness review, code reuse, proposed interface and acceptance tests |
 
 The design is in [`../framework.md`](../framework.md). It is the source of truth.
 These files turn it into work packages.
@@ -37,9 +38,11 @@ These files turn it into work packages.
 | 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md` |
 | 7 | Settlement interface for rent: the framework header on `WarrantEscrow` (C); the invoice journal variants A and B are superseded | Chosen by the owner, 2 Nov. The concrete interface, `04-rent-interface-v1.md`, awaits review |
 
-Decision 5. The owner said earlier: remove the buyer-signed path (`settleSigned`, `invoice-sign`).
-Pull request #25 merged on 2026-10-23. It makes the metered-payment design proof-only, with no signer key.
-That agrees with the removal. Confirm once with the owner before step 0, then remove the path.
+Decision 5 update, 3 Nov 2026. The owner now requests a buyer acknowledgement path for rent,
+with proof settlement after a response timeout. See [the change specification](05-rent-dispute-mechanism.md).
+This request authorizes specification work on that mode. It does not change existing funded orders or other cases.
+The settlement unit and independent evidence authority remain explicit draft assumptions.
+The earlier proof-only design remains documented in PE-0; do not remove reusable signing components before reviewing this change.
 
 ## Repositories
 
