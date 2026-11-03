@@ -94,8 +94,9 @@ Each record binds the hash of the receipt that it was computed from, so the sell
 verifier run detects a false record at once. Settlement still trusts the signature.
 The agent runs in the buyer's machine, so the buyer can stop it. That stops evidence for
 later slots, not for anchored ones. The seller watches the agent every slot and stops the
-machine after `liveness_miss_slots` slots without an anchored heartbeat (lease evidence
-SS-12, SS-13; pocc decision 47).
+machine after `liveness_miss_slots` slots without an anchored heartbeat, when the current
+piece can no longer reach its coverage floor, and after any zero-payable piece (lease
+evidence SS-12 to SS-14; pocc decisions 47 and 48).
 
 The delivery section gains `min_coverage_bp`, `min_assurance` and `meter_spec`. The usage
 record gains `assurance` and `meter_spec`. Both are in section 5a.
