@@ -669,9 +669,10 @@ stores the anchored entries each slot (SS-13). Therefore a buyer that disables t
 stops the evidence for later slots only. The seller's liveness watch (SS-12) then stops
 the machine after `liveness_miss_slots` slots without an anchored heartbeat. Time
 without anchored heartbeats is never paid. The listing states this rule and the value
-of `liveness_miss_slots`. Evidence that the buyer cannot reach (a proof of the cloud's
-own instance state, an attested agent at a privilege level that the buyer's system
-cannot change) is future work (pocc decision 47).
+of `liveness_miss_slots`. Evidence that the buyer cannot stop is kept as research for a
+later improvement: a sidecar that the buyer cannot stop, and an observer. Either must
+also be one that the seller cannot forge (pocc decision 47 and
+`docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
 
 `meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
 the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor

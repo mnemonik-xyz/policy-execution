@@ -70,7 +70,7 @@ The PoCC agent runs inside the buyer's machine. The buyer can stop it, block it,
 The buyer cannot remove anchored evidence: the notary keeps the first entry for each agent and sequence number, and the provider stores every anchored entry (lease evidence SS-13).
 Therefore a hostile buyer can stop future evidence only. The provider's liveness watch (SS-12) then stops the machine after `liveness_miss_slots` slots.
 The fallback pays only for time with anchored heartbeats. Time after the agent stopped is never paid.
-The listing must state this rule. Evidence that the buyer cannot reach is future work (pocc decision 47).
+The listing must state this rule. A sidecar that the buyer cannot stop, and an observer, are research for a later improvement (pocc decision 47 and `docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
 
 PoCC Stage 0 also retains its physical-machine and sampled-liveness limitations.
 It does not establish allocated GPU resources, performance, or successful access by the customer.
