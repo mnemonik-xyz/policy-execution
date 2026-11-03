@@ -7,6 +7,15 @@ an entry in the [policy catalog](policy-catalog.md). The compute marketplace in
 [warrant#13](https://github.com/mnemonik-xyz/warrant/pull/13) is its first consumer,
 not its owner.
 
+Revision 2026-11-03: two amendments. First, pocc decision 47, taken: the buyer controls
+the PoCC agent, so the seller watches it every slot and stores every anchored entry
+(SS-12, SS-13). This applies to every PoCC lease. Second, proposed and not adopted: the
+rent dispute mechanism (`docs/handoff/05-rent-dispute-mechanism.md`) adds a mode where a
+buyer acknowledgement that the provider accepts, or a proof that the provider submits
+after a response period, settles a batch. In that mode a silent buyer does not leave
+completed service with anchored evidence unpaid. Statements below about a silent buyer,
+non-cooperation and the proof-only escrow describe the buyer-note mode.
+
 Revision 2026-10-29: the delivery proof. A metered policy must name a meter. The
 meter signs a usage record per piece. The guest checks the records before the rule
 tree. PoCC (`mnemonik-xyz/pocc`) is the first meter. Section 5a describes it.
@@ -648,6 +657,38 @@ history, provider metadata; X-1). Then no meter key exists and the records are p
 not attested. X-1 still inherits Stage 0's physical-machine assumption (the table
 above).
 
+**Detection of a false record, without enforcement.** Settlement trusts the meter's
+signature, but the record is not opaque. Each usage record binds the hash of the PoCC
+receipt that it was computed from (`deliverable_hash`), and the verifier is
+deterministic: the same receipt always gives the same record. The seller runs the same
+verifier for each piece and sends the record it expects with the challenge (5a.5).
+Therefore the seller detects a false or conflicting record at once, and anyone can
+refute it later from the kept receipt. Detection is not enforcement. The escrow pays on
+the signature, and this version has no referee and no clawback (pocc decision 20).
+While the development anchor is in use, a refutation also rests on the notary's anchor
+key; the Arc anchor removes that dependency. Enforcement in the guest is X-1, which
+needs BLS verification of the drand rounds, the chain anchor and a witness design.
+
+**The buyer controls the agent.** The PoCC agent runs inside the buyer's machine. The
+buyer can stop it, block its network, or read its key from memory and sign with it.
+Nothing in Stage 0 prevents this, and Stage 1 as specified does not prevent it either.
+The buyer cannot remove evidence that is already anchored: the notary keeps the first
+entry for each agent and sequence number and refuses a different one, and the seller
+stores the anchored entries each slot (SS-13). The extracted key can still damage a
+receipt. The notary checks only an entry's signature and sequence, so it accepts a
+correctly signed but malformed heartbeat, and a receipt that includes that entry is
+`INVALID` and gives zero usage records. The receipt over the earlier entries still
+verifies. Therefore the seller checks each entry's contents before it counts as
+liveness, keeps the last valid receipt prefix, and builds records from that prefix only
+(SS-12, SS-13). A buyer that disables or damages the agent stops the evidence for later
+slots only. The liveness watch then stops the machine. Time without valid anchored
+heartbeats is never paid, and heartbeats inside a provisional piece do not make it
+billable: only the continuation gate does (5a.5). The listing states this rule and the value
+of `liveness_miss_slots`. Evidence that the buyer cannot stop is kept as research for a
+later improvement: a sidecar that the buyer cannot stop, and an observer. Either must
+also be one that the seller cannot forge (pocc decision 47 and
+`docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
+
 `meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
 the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor
 contract and the attestation level. The PoCC verifier recomputes the hash and refuses to
@@ -682,9 +723,9 @@ durably before they act on it.
 |---|---|---|---|---|
 | Offered | Buyer funds the order | Reads the policy (SS-5), accepts or not | Waits | Seller accepts, or the offer expires |
 | Provisioning | Seller accepts | Creates the machine with the binding `h0`; this cost is the seller's no-show residue | Waits | The agent's boot proof is anchored, before `service_start` |
-| Serving k | Piece k starts (`service_start + k * piece_s`) with note k-1 durable (or k = 0) and SS-10 holding for k | Keeps the machine running; the reservation for k is already `open` (made in Provisional k, or at Provisioning for k = 0) | Nothing | Piece k ends |
+| Serving k | Piece k starts (`service_start + k * piece_s`) with note k-1 durable (or k = 0) and SS-10 holding for k | Keeps the machine running; the reservation for k is already `open` (made in Provisional k, or at Provisioning for k = 0); watches the agent every slot and stores the anchored entries (SS-12, SS-13) | Nothing | Piece k ends, or SS-12 stops the lease |
 | Challenging k, Provisional k+1 | Piece k ended | Reserves `max_note` for piece k+1 as `open` (SS-10 must hold for it; otherwise Stopping), keeps the machine running, and sends the challenge for note k: index, window, the record it expects (from its own run of the verifier) and so the amount it expects, the evidence. Piece k+1 is provisional: it runs, but the seller has not yet decided to bill it | Fetches and stores the evidence (BG-5), runs the verifier, signs record k and note k, returns both | Seller stores record k and note k (SS-2, SS-7) and acknowledges: the reservation for k moves to `held`, and Provisional k+1 becomes Serving k+1, billable from its start. Or `challenge_timeout_s` passes with no acknowledged note: Stopping, and the provisional part of piece k+1 is the seller's loss |
-| Stopping | `challenge_timeout_s` passed with note k missing; or SS-10 fails for the next piece; or the buyer or seller ends the lease; or `service_end` is reached | Terminates the machine within its shutdown latency; sends the final challenge for the last served piece; waits `challenge_timeout_s` for it | Answers the final challenge, or not | The timeout passes or the final note is acknowledged |
+| Stopping | `challenge_timeout_s` passed with note k missing; or SS-10 fails for the next piece; or SS-12 found `liveness_miss_slots` consecutive slots without an anchored heartbeat, or a final heartbeat before `service_end`; or the buyer or seller ends the lease; or `service_end` is reached | Terminates the machine within its shutdown latency; sends the final challenge for the last served piece; waits `challenge_timeout_s` for it | Answers the final challenge, or not | The timeout passes or the final note is acknowledged |
 | Closing batch b | Batch b is full; or the lease is Stopping and the final timeout passed | Marks batch b closed durably: no note for an index of b is accepted after this mark; asks the guardrail for the batch signature over b's records (BG-7) | Signs the batch record, or not | The mark is durable; the batch signature arrives or `challenge_timeout_s` passes, after which the per-record signatures are used |
 | Settling b | Batch b is closed | Proves and settles the notes held for b (SS-4) | Nothing | `consume` succeeds, or `settleBy` passes |
 
@@ -714,6 +755,17 @@ Rules that hold across states:
   a lost reply never produces a second, different note for k.
 - The first piece is served before any note exists. That piece plus provisioning is
   the seller's exposure to a buyer that never answers.
+- The agent can stop inside a piece. SS-12 stops the machine within
+  `liveness_miss_slots * slot_s` plus the shutdown latency, where `slot_s` is the 60 s
+  PoCC slot of `meter_spec`. The seller sets
+  `liveness_miss_slots * slot_s <= challenge_timeout_s`, so `E` remains the single
+  bound: the loss is at most the current piece, the time to detection and the
+  shutdown. Valid anchored slots before the stop stay credited, but only inside pieces
+  that passed the continuation gate; the provisional part of the next piece stays unpaid
+  even when it has valid heartbeats. Open for the owner: whether the last eligible piece
+  of a lease that SS-12 stopped is paid pro rata over the time served,
+  or keeps the coverage floor of D6 over the whole piece. Until the owner decides, D6
+  applies unchanged, and that piece can be a zero note.
 - The last served piece always needs the buyer after delivery. A buyer that
   disappears then owes nothing on chain; the seller settles the notes it holds and
   records the loss. The listing may price this in.
@@ -774,6 +826,8 @@ time it is one piece plus the proving and settlement margin.
 - SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: piece k+1 runs provisionally and becomes billable when note k is acknowledged within `challenge_timeout_s` of the end of piece k (5a.5). If note k has not arrived by then, the service stops and the provisional part of piece k+1 is unpaid. The seller's exposure is `E` of 5a.5.
 - SS-10: The seller keeps one durable reservation ledger per lease with three categories: `settled` (paid by `consume`), `held` (notes acknowledged, not settled), and `open` (pieces served, provisional or being served whose note has not been acknowledged, reserved at `max_note` each). A reservation enters `open` before its piece starts (for piece k+1, when piece k ends and piece k+1 becomes provisional; for piece 0, at Provisioning), moves to `held` when its note is acknowledged (at the note's amount; a timed-out piece leaves `open` as a recorded loss), and to `settled` when its batch settles; each moves exactly once. Before a reservation enters `open` for piece k, `settled + held + open + max_note <= ceiling`, and `service_start + (k + 1) * piece_s + G <= min(deadline(batch of k), settleBy)` with `G` of 5a.5. Otherwise the lease stops.
 - SS-11: A batch closes once (5a.5). The service refuses a note for an index of a closed batch, and a note whose `valid_until` is earlier than BG-6 requires.
+- SS-12: For a PoCC lease the service watches the agent every slot. After each slot it reads the notary's entries for the lease's agent and checks each new entry with the verifier against the stored valid prefix (sequence, slot schedule, beacon value, chain link, signature, no entry after a final heartbeat: every check that gives the verifier an error code). An entry that passes but is anchored outside the bracket is late: it is valid, earns no credit and does not count as liveness, and it is not a failed entry. Only a passing entry anchored inside the bracket counts as liveness. When `liveness_miss_slots` consecutive slots have no valid anchored heartbeat, or a heartbeat marked final arrives before `service_end`, or an entry fails the check, the lease goes to Stopping and the machine is terminated within its shutdown latency. A valid heartbeat signed with an extracted key counts as a heartbeat; a final heartbeat counts as a stop; a failed entry counts as a stop. Liveness measures delivery inside pieces; it never makes a provisional piece billable. The listing states `liveness_miss_slots` (default 5) and that disabling, blocking or changing the agent ends the lease. The seller keeps `liveness_miss_slots * slot_s <= challenge_timeout_s`. When the cause is the seller's own notary, the seller can repair it instead of stopping; the unanchored slots stay unpaid.
+- SS-13: For a PoCC lease the service stores every anchored entry of the lease and its inclusion proof within one slot of the anchor, and keeps them until `settleBy` plus the dispute window of a later design. It keeps the last valid receipt prefix: the longest run of entries from the boot proof that verifies with no error code. Usage records, the expected record of each challenge and every settlement use that prefix only, never a receipt that includes a failed entry; the failed entry itself is kept as evidence. It uses a notary that it can read and that keeps the first entry for each agent and sequence number. The fork check of the verifier uses that notary's log.
 
 ## 7. Buyer guardrail requirement
 
@@ -798,7 +852,7 @@ time it is one piece plus the proving and settlement margin.
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
 | The meter key signs honest usage records (v1 trusts this attestation; the guest checks the signature and the gates, not the metering) | A false record cannot move funds outside the ceiling or to another recipient. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier, after the fact. The guest-run verifier (`computed_result` over authenticated evidence) removes the key. |
 | The buyer's guardrail key is not compromised (in v1 it is the meter, acceptance and registry key at once) | One stolen key signs records and notes that agree with each other and pays the fixed recipient for service that did not happen, up to the ceiling and before `settleBy`. This trust is accepted for an explicitly limited pilot only: small ceilings, named parties, short leases. A requirement that a compromised signer cannot pay without delivery evidence is not met by v1; only the guest-verified evidence of X-1 meets it. Splitting the keys is not a substitute: two keys held by the same compromised process protect nothing. |
-| The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. |
+| The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. The buyer controls the machine and can always stop the agent or read its key: that stops evidence for later slots, never for anchored ones, and SS-12 stops the machine. |
 
 ## 9. Attack surface
 
@@ -810,7 +864,7 @@ time it is one piece plus the proving and settlement margin.
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
 | Buyer | Stop near `settleBy` so the seller cannot settle | SS-4: the service stops first, by its margin. |
-| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. |
+| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. In the proposed dispute mode, completed service with anchored evidence stays payable by a provider-submitted proof after the response period (handoff 05). |
 | Buyer | Cancel after `accept` | Impossible before `settleBy`. |
 | Buyer | Never answer the first challenge | The seller loses provisioning cost. The no-show residue. |
 | Seller | Forge a note | Impossible. |
@@ -823,10 +877,14 @@ time it is one piece plus the proving and settlement margin.
 | Seller | Settle before any service | No note exists before the buyer asks. For `signed_usage`, no note exists before the piece ran and its record was signed. |
 | Anyone | Obtain the buyer's guardrail key | Records and notes that agree with each other, paid to the fixed recipient within the ceiling. Section 8. |
 | Anyone | Replay a settlement, relay to another recipient | Consumed obligation, recipient fixed, any relayer pays only the recipient. |
-| Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. |
+| Anyone | Settle with a signature or a buyer approval | `settleSigned` and `settleApproved` revert on the proof-only escrow, and `_pay` refuses any authenticator but a proof. The proposed dispute mode adds `settleAcknowledged`, which requires the provider as caller and the buyer's signature (handoff 05, 6.1). |
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
 | Seller | Bill a piece that was not delivered | No usage record, or a record below the note amount: `Ask` or `Deny`. The piece is not paid. |
 | Buyer | Sign a record with fewer units than delivered | The seller loses at most one piece and stops. Anyone can re-run the verifier and show the under-credit. |
+| Buyer | Stop the agent, block its network, or change it | Later slots have no anchored heartbeat and earn nothing. SS-12 stops the machine after `liveness_miss_slots` slots. Anchored slots stay credited. The loss stays within `E`. |
+| Buyer | Read the agent key and sign a different entry for an anchored sequence number | The notary keeps the first entry and refuses the new one (SS-13). Anchored slots do not change. |
+| Buyer | Sign an early final heartbeat with the extracted key | Credit ends at that heartbeat. SS-12 stops the machine. Earlier valid anchored slots stay credited. |
+| Buyer | Sign a malformed heartbeat with the extracted key (wrong round, wrong beacon value, broken chain link, entry after a final heartbeat) | The notary accepts it, and a receipt that includes it is `INVALID`. The seller's content check stops the lease at once (SS-12), and records come from the last valid prefix (SS-13), so completed pieces keep their records. |
 | Seller | Present a record signed by another key | D2 denies. |
 | Seller | Reuse a record for another lease or batch | D1 and D3 deny. |
 
@@ -856,6 +914,7 @@ buyer's remedy is to stop. That is the same limit every metered cloud has.
 - DL-13: The settlement margin is measured, not assumed: on the rent guest of PE-0, for batches of 1, 6, 24 and 168 hours, in both signature forms (one batch signature, and the per-record fallback that `M` is budgeted for), on a CPU prover host and on a GPU prover (RISC Zero CUDA), the time from the latest allowed note arrival through queueing, a *succinct* proof, the Groth16 wrap, verification of the wrapped receipt against the pinned image, transaction inclusion and the chain's finality is recorded with its cost and peak memory, and `settlement_margin_s` in the template is set from it with headroom. A composite receipt is not the measured object. The same is measured under concurrent load: N batches proved at once on one prover, for the throughput (batches per prover-hour) and the latency each batch sees. A simulation's "prover ok" flag does not meet this criterion. The rent work is 674,352 zkVM cycles per hour of service (pocc `docs/measurements.md`), so on the one CPU prover measured so far a 24-hour batch proves in about 80 minutes; the GPU result decides the batch size and whether VMs below about $10 a day can be sold.
 - DL-14: A batch proved with one meter signature over its records and the same batch proved with per-record signatures settle identically; a batch signature over records that differ from the notes' bound records gives `Deny`.
 - DL-12: A first-hour record (3,540 of 3,540 creditable), a last-hour record (3,600 of 3,600), a zero-unit record for an uncredited middle hour, and a record after `service_end`, serialized by `pocc-verify` and checked by `warrant-host check rent`, give the same decisions in both implementations; the shared vectors are `test/vectors/usage-gates.json` in `mnemonik-xyz/pocc`, and Warrant publishes the bincode serialization and hash of one record so PoCC can check its JSON maps to it.
+- DL-15: The liveness watch of SS-12 and the custody rule of SS-13 are exercised in a simulation with these expected outcomes. The agent stops in the middle of a piece: Stopping within `liveness_miss_slots` slots plus the shutdown latency, earlier anchored slots credited, later slots not. The agent's network is blocked: the same. A final heartbeat before `service_end`: Stopping, credit ends at that heartbeat. A different entry for an anchored sequence number: refused by the notary, the verdict for the anchored slots unchanged. The seller's notary is down for fewer than `liveness_miss_slots` slots: no stop, the unanchored slots earn nothing. A correctly signed but malformed heartbeat after a valid prefix: Stopping at once, the full receipt `INVALID`, the prefix receipt verifies and gives the same records for completed pieces. A provisional next piece with valid heartbeats whose continuation is never authorized, followed by shutdown: that piece is not billable. The loss in each case is at most `E`.
 - DL-7: A PoCC receipt from a live run against an escrow order (`test/live/` in `mnemonik-xyz/pocc`) turns into a usage record that `warrant-host check rent` accepts.
 
 ## 11. Effort

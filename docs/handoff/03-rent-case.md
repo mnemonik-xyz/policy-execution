@@ -90,6 +90,13 @@ runs it, and `meter_key` is the buyer's guardrail key. A later step runs the ver
 inside the guest, and the key disappears. Specification: `docs/product/lease-evidence.md`,
 section 5a, and `docs/warrant-integration.md` in `mnemonik-xyz/pocc`.
 
+Each record binds the hash of the receipt that it was computed from, so the seller's own
+verifier run detects a false record at once. Settlement still trusts the signature.
+The agent runs in the buyer's machine, so the buyer can stop it. That stops evidence for
+later slots, not for anchored ones. The seller watches the agent every slot and stops the
+machine after `liveness_miss_slots` slots without an anchored heartbeat (lease evidence
+SS-12, SS-13; pocc decision 47).
+
 The delivery section gains `min_coverage_bp`, `min_assurance` and `meter_spec`. The usage
 record gains `assurance` and `meter_spec`. Both are in section 5a.
 
