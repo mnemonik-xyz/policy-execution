@@ -210,7 +210,7 @@ firstIndex, pieceCount, settlementTermsHash
 This is a 23-word journal. Golden fixtures must fix every word's ABI type and range before implementation is frozen.
 `firstIndex` must equal `first(batch)`.
 `pieceCount` is positive and cannot exceed that batch's scheduled piece count.
-The claim covers that exact contiguous prefix, including zero-priced outage pieces.
+The claim covers that exact contiguous prefix, including a zero-priced outage piece. Such a piece ends the lease (SS-14), so it is the last piece of the claim.
 `deliveryHash` binds the ordered records and the closure/billing eligibility evidence.
 No arbitrary caller-selected obligation identifier is accepted.
 Derive `obligationId` from the existing `(leaseId, batch)` identifier rule.
@@ -353,7 +353,7 @@ Recovery after a crash must retain these commitments. A replacement key or resta
 
 Finalize a usage record only after its piece ends and the policy's evidence-completion/finality rule is satisfied.
 Finalize a batch only after its scheduled end, or after a unique terminal stop statement establishes an earlier final prefix.
-Include every scheduled piece of a normal batch, including zero-unit outages. Refuse interim or incomplete eligibility snapshots.
+Include every scheduled piece of a normal batch. A zero-payable piece ends the lease (SS-14), so it is always the last eligible piece of its batch. Refuse interim or incomplete eligibility snapshots.
 For an early final batch, include every eligible completed piece through the terminal cutoff; never an arbitrary shorter prefix.
 The final batch statement must bind the terminal statement's hash when it closes a lease early.
 The meter must not finalize billable pieces beyond a terminal cutoff.
@@ -476,7 +476,7 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Interim eligibility statement or interim usage record used in a proof | Guest rejects regardless of signature validity |
 | Short non-final batch without terminal statement, or prefix shorter than its terminal cutoff | Guest rejects |
 | Terminal statement revised, duplicated inconsistently or paired with a mismatched final batch | Meter refuses revision; guest rejects supplied contradictions; worker stops on observed conflict |
-| Full scheduled batch with zero-unit outage records | Includes every index; final claim can settle by provider submission |
+| Batch whose last eligible piece is a zero-unit outage record | Includes every index through that piece; the lease stops after it (SS-14); final claim can settle by provider submission |
 | Buyer stops the agent or blocks its network in the middle of a batch | Provider stops within `liveness_miss_slots` slots plus shutdown latency; anchored earlier pieces remain payable by proof; later time unpaid |
 | Buyer reads the agent key and signs a different entry for an anchored sequence number | Notary refuses it; anchored evidence and the proof claim do not change |
 | Buyer signs an early final heartbeat with the extracted key | Credit ends there; provider stops; terminal stop statement records the cutoff |
