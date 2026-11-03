@@ -21,7 +21,7 @@ The requested flow is sound under four conditions:
 
 1. Funding authorizes the fallback delivery policy before service starts.
 2. A proof can establish that policy without the missing buyer acknowledgement.
-3. Acknowledgement settlement requires provider consent; both paths enforce timing, limits and one shared replay check.
+3. Both settlement paths require provider consent and enforce timing, limits and one shared replay check.
 4. Refunds remain unavailable until the provider's proof settlement deadline passes.
 
 Silence is not evidence of delivery. Timeout only enables the proof path.
@@ -103,14 +103,14 @@ flowchart TD
     C --> D[Request buyer acknowledgement for the batch]
     D --> E{Provider accepts exact acknowledgement?}
     E -->|Yes| F[Provider account submits acknowledgement]
-    E -->|No, response period expires| G[Generate and verify delivery proof]
+    E -->|No, response period expires| G[Provider verifies final evidence and submits proof]
     F --> H[Shared bounds and consumed-obligation check]
     G --> H
     H --> I[Mark paid and transfer to fixed provider]
 ```
 
-Only the funded recipient account can call acknowledgement settlement in this version.
-Anyone can relay a valid proof settlement. The recipient always comes from the funded order.
+Only the funded recipient account can call either settlement entry point in this version.
+The recipient always comes from the funded order. A third party can supply a proof but cannot submit settlement directly.
 Signing alone does not move funds. A valid settlement transaction must be included on chain.
 Acknowledgement remains usable after the response period, until settlement expires.
 The first fully authorized settlement wins. The other path must revert without another transfer.
@@ -236,16 +236,16 @@ function settleProven(bytes calldata seal, bytes calldata journal) external;
 
 ### 6.1 Provider consent is a contract check
 
-For `settleAcknowledged`, require `msg.sender == order.recipient` from the stored, validated order.
+For both `settleAcknowledged` and `settleProven`, require `msg.sender == order.recipient` from the stored, validated order.
 Reject the customer, a third-party relayer, and any other caller unless that caller is also the funded recipient.
 Do not use `tx.origin`, a caller-supplied provider address or untrusted forwarded-sender data.
 The requirement is identical for positive, reduced and zero amounts, and for full or partial batches.
 
-The provider's transaction accepts the exact journal in its calldata.
+The provider's transaction accepts the exact journal in its calldata on either path.
 That consent includes the amount, service prefix, evidence commitments, final cutoff and one-time closure of the whole batch.
 A copied buyer signature or copied calldata gives another account no right to submit acknowledgement settlement.
 The provider must check these values against its expected claim before sending the transaction.
-The worker check prevents accidental acceptance; the contract caller check prevents hostile buyer submissions.
+The worker check prevents accidental acceptance; the contract caller check prevents hostile buyer submissions, including valid lower-value proofs.
 
 A provider contract wallet must invoke the escrow through its own authorized execution path.
 An operator EOA which is not the recipient cannot call the entry point directly.
@@ -253,11 +253,16 @@ Do not configure a permissionless forwarding contract as the provider account.
 
 A buyer signature is a payment offer until the provider submits it.
 Invalid or rejected offers do not restart the response period, change the cutoff, consume a batch or disable proof settlement.
-The proof path does not require a provider caller or countersignature: its pinned guest establishes the exact entitlement.
+The proof path requires provider submission plus verification against the pinned guest.
+The provider caller cannot replace evidence verification, and a valid proof cannot replace provider consent to close the claim.
+Possession of the witness, proof or journal does not grant settlement authority.
+This prevents another party from racing a different valid claim against the provider's preferred claim.
 
-Relayed acknowledgement settlement is deferred. Adding it requires a separately reviewed provider countersignature over the same exact claim.
+Direct third-party settlement is deferred on both paths. Adding it requires a separately reviewed provider countersignature over the exact claim and settlement path.
 That future design must use a distinct provider-consent signing type and bind the order, journal hash, domain and expiry.
 It must not make the current caller check optional based on an empty signature.
+Provider account unavailability can delay either path until expiry. Operate that account with its own authorized recovery or execution arrangements.
+Do not add an emergency permissionless settlement bypass: it would restore the proof race.
 
 ### 6.2 Shared authorization and payment
 
@@ -267,7 +272,7 @@ Both paths must call the same authorization and payment routines:
 2. Require state Accepted and exact customer, policy, scope, recipient, lease, ceiling and terms hash.
 3. Check schedule, batch partition, contiguous prefix, per-batch cap and time limits.
 4. Require `amount <= pieceCount * maxPerPiece` and `spent + amount <= ceiling`.
-5. Authenticate the path: customer signature plus provider caller for acknowledgement; pinned image and exact journal hash for proof.
+5. Require the provider caller on both paths. Also verify the customer signature for acknowledgement, or the pinned image and exact journal hash for proof.
 6. Atomically consume the same factory-registry obligation, update spend, then transfer the exact amount.
 
 Use checks-effects-interactions and reentrancy protection for every settlement and refund entry point.
@@ -313,10 +318,50 @@ It cannot accept an unauthenticated provider assertion that a provisional piece 
 For a trust-free alternative, those events need authenticated witnesses checked inside the guest.
 This protocol witness is a new integration requirement, not an existing PoCC record field.
 
+### 7.1 Final evidence and non-revision
+
+An interim measurement is not a payable record. An eligibility snapshot is not a final batch statement.
+Use distinct signed types and tags for interim observations, final usage records, final batch statements and terminal stop statements.
+The finality marker and all identifiers must be inside the signed message, not a host-supplied flag.
+Freeze these types, tags and canonical encodings in the shared fixtures before implementing the meter.
+
+Within the accepted policy scope, the meter must enforce these durable uniqueness keys:
+
+- `(lease_id, index)`: at most one final usage-record content, including units and evidence hash.
+- `(lease_id, batch)`: at most one final batch-statement content, including the eligible prefix and ordered final-record hashes.
+- `lease_id`: at most one terminal stop-statement content, including the final billable cutoff.
+
+Persist each final content commitment atomically before signing or returning it. Retries return that same content.
+Multiple signature encodings or zkVM proof representations are not different entitlements; uniqueness applies to the committed content.
+The meter cannot replace final records with lower or higher unit counts, or issue a later revision of a final stop boundary.
+Recovery after a crash must retain these commitments. A replacement key or restarted service cannot reset them for an accepted lease.
+
+Finalize a usage record only after its piece ends and the policy's evidence-completion/finality rule is satisfied.
+Finalize a batch only after its scheduled end, or after a unique terminal stop statement establishes an earlier final prefix.
+Include every scheduled piece of a normal batch, including zero-unit outages. Refuse interim or incomplete eligibility snapshots.
+For an early final batch, include every eligible completed piece through the terminal cutoff; never an arbitrary shorter prefix.
+The final batch statement must bind the terminal statement's hash when it closes a lease early.
+The meter must not finalize billable pieces beyond a terminal cutoff.
+
+The guest requires the full scheduled batch unless the authenticated terminal statement fixes its final eligible prefix.
+It checks exact record coverage, the finality type, and all cross-bindings. It must reject contradictory statements presented together.
+It must reject a short prefix presented as an ordinary non-final batch, even when every included signature is valid.
+The worker compares the final statement with its persisted records and expected claim before requesting either settlement.
+If it observes conflicting final statements, it must retain them and stop automatic settlement and continued service.
+It must not resolve a conflict by choosing the first, cheapest, highest-value or newest signed statement.
+
+These rules constrain an honest meter and detect conflicts which are supplied or observed.
+A guest cannot prove that a trusted meter never signed an undisclosed conflicting statement elsewhere.
+Therefore finality rules do not replace the provider caller check, nor do they remove the trusted-meter assumption.
+Correcting a finalized metering error requires explicit recovery work; this version has no automatic revision or arbitration path.
+Keep the reservation Held until an authorized outcome or the existing expiry/loss rules apply.
+
+### 7.2 Guest decision
+
 The guest must:
 
 - Validate the policy and its hash, order terms, credential, scope, period and pinned evidence authority.
-- Authenticate each record and the closure/billing statement; reject a buyer-only meter configuration for this fallback profile.
+- Authenticate final records and final batch/terminal statements under section 7.1; reject a buyer-only meter configuration for this fallback profile.
 - Enforce lease-wide indices, exact windows within `service_end`, meter specification and canonical record hashes.
 - Recompute creditable limits from the agreed schedule or check the approved meter's schedule-bound attestation.
 - Require `units <= creditable`, valid assurance, checked arithmetic and all mandatory delivery gates.
@@ -374,7 +419,11 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Provider submits an invalid buyer signature or changes the signed amount/prefix | Revert without state changes |
 | Provider explicitly accepts a zero or reduced amount | Close once under both parties' authority; no later top-up |
 | Provider contract wallet executes through its authorized path | Accepted; unrelated operator direct calls and buyer forwarding fail |
-| Any caller submits a valid proof after timeout | Pays the fixed recipient, subject to all common checks |
+| Provider submits a valid proof after timeout | Pays the fixed recipient, subject to all common checks |
+| Buyer or third party submits any valid proof, including a lower-value claim | Revert Unauthorized; consumption, spend and cutoff unchanged |
+| Non-recipient submits a valid proof with an earlier final prefix | Revert Unauthorized; later unpaid claims remain available |
+| Another account copies the provider's proof and calldata | Revert Unauthorized; copied evidence is not provider consent |
+| Provider caller supplies an invalid proof | Revert; caller authority cannot replace proof verification |
 | No buyer signature after funding, first piece delivered | Independent meter evidence can settle after timeout |
 | Buyer-only evidence withheld | Explicitly no payment; not advertised as a working independent fallback |
 | Valid proof just before / exactly at `proof_after` | Revert / eligible |
@@ -394,11 +443,17 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Transfer failure, reentrant token, zero payout | Atomic rollback / rejection / closure without transfer |
 | Rejected underpayment offers are repeated through the deadline | No clock reset or state changes; proof path remains usable |
 | Non-divisible service period, zero piece size or overflowing index | Policy/order rejected before service starts |
+| Meter retries a finalized record after restart | Same committed content; attempts to change units or evidence hash refused |
+| Meter attempts two final batch statements with different prefixes | Durable finalization refuses the second; worker stops on observed conflicting signatures |
+| Interim eligibility statement or interim usage record used in a proof | Guest rejects regardless of signature validity |
+| Short non-final batch without terminal statement, or prefix shorter than its terminal cutoff | Guest rejects |
+| Terminal statement revised, duplicated inconsistently or paired with a mismatched final batch | Meter refuses revision; guest rejects supplied contradictions; worker stops on observed conflict |
+| Full scheduled batch with zero-unit outage records | Includes every index; final claim can settle by provider submission |
 
 Both UIs must display any reduced final payment and forfeited suffix before consent.
 The provider worker must reject an acknowledgement below its expected amount and use fallback instead.
 Only an explicit provider decision can accept a concession. The worker must never submit such an acknowledgement automatically.
-The caller check is the security boundary; a buyer's possession of its signature is not provider consent.
+The caller check is the security boundary on both paths; possession of a signature or proof is not provider consent.
 
 Require new Rust/Solidity/Go fixtures for terms, journal, acknowledgement and independent meter evidence.
 Run real receipt verification and a funded testnet end-to-end run for both paths.
