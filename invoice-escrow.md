@@ -16,28 +16,32 @@ of three ways, all to the order's accepted vendor:
   only below the order's `proofThreshold` and within its `signerAllowance`. The
   buyer can `revokeSigner(orderId)` at any time; that only tightens, since proofs
   and approvals still settle.
-- **Buyer approval** (`settleApproved`): when the interpreter cannot decide (Ask),
-  the buyer pays the invoice on their own authority. Same vendor, same ceiling,
-  same deadline, same replay protection; the payment is marked as approved, not
-  proven, in the `Paid` event.
+- **Buyer approval** (`approveInvoice`, then `settleApproved`): when the
+  interpreter cannot decide (Ask), the buyer approves an amount on their own
+  authority. The vendor then accepts that exact approval to get the payment. Both
+  parties must agree. Same vendor, same ceiling, same deadline, same replay
+  protection. The `Paid` event marks the payment as approved, not proven.
 
 ## Lifecycle
 
 1. The buyer funds an order with `offer(Terms)`: policy hash and version, order
    number, vendor, ceiling, and the signer terms for this order: `signer`
-   address, `signerAllowance` (how much may settle on signatures alone) and
+   address, `signerAllowance` (how much can settle on signatures alone) and
    `proofThreshold` (amounts at or above it need a proof or approval). A zero
    signer means proofs and approvals only; a signer needs a nonzero allowance
    and threshold, and cannot be the vendor. The full ceiling is transferred and
    reserved.
 2. The vendor calls `accept(orderId)`. From then on the buyer cannot cancel
-   before `settleBy`, so the vendor can deliver against committed funds.
+   before `settleBy`, so the vendor can deliver against committed funds. The
+   buyer alone also cannot use an approval to block the vendor's invoice. See
+   [Vendor protection](#vendor-protection) for what this covers and its limits.
 3. For each invoice, one of: the signing service runs `warrant-host invoice-sign`
    and anyone relays `settleSigned(journal, signature)`; a prover runs the invoice
    guest and anyone relays `settle(seal, journal)`; or, for an invoice the checker
-   left undecided, the buyer calls `settleApproved(orderId, obligationId, amount,
-   documentHash)`. The first two take the same 15-word journal and the same
-   checks; only the authenticator differs.
+   left undecided, the buyer calls `approveInvoice(orderId, obligationId, amount,
+   documentHash)` and the vendor calls `settleApproved` with the same four values.
+   The first two take the same 15-word journal and the same checks; only the
+   authenticator differs.
 4. After `settleBy`, anyone can `close(orderId)`; the unpaid remainder returns to
    the buyer. An unaccepted order can be closed by the buyer at any time, or by
    anyone after `acceptBy`.
@@ -45,8 +49,10 @@ of three ways, all to the order's accepted vendor:
 `orderId = keccak256(abi.encode(chainId, escrow, customer, policyHash, poId))`.
 `offer` binds `customer` to `msg.sender`; settlement reads it from the authenticated
 journal. Another buyer cannot squat this namespace by copying public terms.
-`consumed[customer][obligationId]` prevents replay across one buyer's orders and
-all three settlement paths without allowing another buyer to block payment.
+`consumed[customer][recipient][obligationId]` prevents replay across one buyer's
+orders to one vendor address and all three settlement paths. Another buyer cannot
+block the payment. The same buyer cannot block it through an order to another
+address (changed 2026-11-03; before, the key was `consumed[customer][obligationId]`).
 
 This is a breaking revision (2026-09-30): `InvoicePolicy.customer` and `InvoicePolicy.invoice_key` are required,
 the policy commitment domain is `warrant/invoice-policy/v2`, and the journal
@@ -163,18 +169,71 @@ sequenceDiagram
     Service-->>Agent: ask record: UnlabeledLines([1]), obligationId, documentHash, payable
     Agent->>Buyer: escalate with the invoice and the ask record
     Buyer->>Buyer: reads the invoice, decides
-    Buyer->>Chain: settleApproved(orderId, obligationId, payable, documentHash)
-    Chain->>Chain: accepted order, before settleBy, msg.sender is the buyer, within ceiling, obligation unused
+    Buyer->>Chain: approveInvoice(orderId, obligationId, payable, documentHash)
+    Chain->>Chain: accepted order, before settleBy, msg.sender is the buyer, obligation unused
+    Note over Chain: InvoiceApproved — records the approval, pays nothing, consumes nothing
+    Vendor->>Chain: settleApproved(orderId, obligationId, payable, documentHash)
+    Chain->>Chain: msg.sender is the vendor, values equal the approval, within ceiling, obligation unused
     Chain-->>Vendor: USDC
     Note over Chain: Paid(..., BuyerApproval, ...) — a later proof or signature for the same obligation reverts
 ```
 
 Approval is bounded like every other path: it pays only the order's vendor, only
 within the remaining ceiling, only before the deadline, and consumes the
-obligation ID across all paths and orders of the same customer.
+obligation ID across all paths and all orders of the same customer to that vendor.
 The contract does not require evidence of a previous `Ask`; approval is an
-explicit buyer override, including for invoices the checker would deny. It is not bounded by the signer allowance or the
-threshold, because it is the buyer's own explicit decision with their own key.
+explicit buyer override, including for invoices the checker would deny. It is not
+bounded by the signer allowance or the threshold, because the buyer and the vendor
+both agree to it with their own keys.
+
+The approval is a record on the chain, not a signature. It is valid only for its
+order and only for the order's vendor. A new approval for the same order and
+obligation replaces the previous one. The vendor can wait: until the vendor calls
+`settleApproved`, a proof or a signature can still pay the obligation in full.
+
+## Vendor protection
+
+The invoice escrow protects the vendor against a buyer who does not cooperate after
+`accept`. The buyer cannot cancel the order before `settleBy`, and anyone can relay
+a proof with `settle`. The buyer alone cannot consume the vendor's obligation ID.
+
+Before 2026-11-03, the buyer alone could call `settleApproved`. A payment of one
+unit consumed the obligation ID. The vendor's valid proof for the same invoice then
+reverted with `AlreadyPaid`, and after `settleBy` the buyer got the remainder back
+with `close`. This was reproduced on 2026-11-03 with the test verifier: a one-unit
+approval blocked a 1,000-unit proof. A buyer could also open a second order to an
+address that they control and consume the obligation ID there, because the
+`consumed` key had no recipient.
+
+Now (verified 2026-11-03 with Foundry tests, test verifier only):
+
+- `approveInvoice` records the buyer's approval only. It pays nothing and consumes
+  nothing (`testCustomerCannotPreemptProofWithOneUnitApproval`).
+- Only the order's vendor can call `settleApproved`, and only with the amount and
+  document hash that the buyer approved. Another party, another order or other
+  values revert (`testCopiedApprovalByThirdPartyReverts`).
+- The vendor can accept a reduced amount. This closes the obligation one time, on
+  every path (`testVendorAcceptedReducedAmountClosesOnce`).
+- An order to another recipient cannot consume this vendor's obligation ID
+  (`testSideOrderToOwnAddressCannotConsumeVendorObligation`).
+
+What this does not protect:
+
+- **The signer path.** On an order with a signer, the vendor trusts that signer.
+  The buyer runs the signing service. That signer can sign a small journal for the
+  vendor's obligation ID and consume it, below `proofThreshold` and within
+  `signerAllowance` (`testOrderSignerCanStillConsumeWithinItsAllowance`). A vendor
+  who does not trust the signer must accept only a proofs-only order (zero signer).
+- **Access to a proof.** The buyer writes the policy and names its authorities,
+  for example `invoice_key`. If the buyer controls an authority that the vendor
+  needs, or the policy does not allow the vendor's invoices, the vendor cannot get a
+  proof. The vendor must review the policy and its authorities before `accept`.
+- **Orders that the vendor accepted.** The buyer can open another order to the same
+  vendor address with a policy and a signer that the buyer controls. If the vendor
+  accepts that order, it shares the vendor's obligation IDs. The vendor must accept
+  an order only if it accepts the order's policy and signer.
+- **Time.** The vendor must settle before `settleBy`. After it, `close` returns the
+  unpaid remainder to the buyer.
 
 ## What settlement enforces
 
@@ -185,13 +244,14 @@ threshold, because it is the buyer's own explicit decision with their own key.
 | `policyVersion`, chain, escrow address, token match | Domain binding |
 | `recipient` equals the order's vendor | The invoice cannot redirect payment |
 | `poMaxTotal` equals the funded ceiling | The proven order is the funded order |
-| `amount ≤ maxTotal − spent` (live state) | The checker's `po_spent` input may be stale; the contract's is not |
-| Obligation ID not yet consumed, across the **same customer's** orders and paths | An invoice pays once, even under another order or by another route |
+| `amount ≤ maxTotal − spent` (live state) | The checker's `po_spent` input can be stale; the contract's is not |
+| Obligation ID not yet consumed, across the **same customer's** orders to the **same vendor address** and all paths | An invoice pays once, even under another order or by another route; an order to another address cannot block it |
 | Nonzero amount, obligation, deliverable and evidence hashes; journal validity window | Well-formed authorization |
 | Proof verifies for the pinned invoice image ID (`settle`) | The fixed interpreter produced this journal |
 | Signature recovers to the order's `signer` over `signerDigest(journal)` (`settleSigned`) | The buyer's own service produced this journal |
 | `amount < proofThreshold`, `amount ≤ signerAllowance − signerSpent`, signer not revoked (`settleSigned`) | Bounds the damage of a stolen signer key to this order's terms |
-| `msg.sender` is the order's customer, amount, obligation and document hash nonzero (`settleApproved`) | Only the buyer approves, and the record is complete |
+| `msg.sender` is the order's customer, amount, obligation and document hash nonzero (`approveInvoice`) | Only the buyer approves, and the record is complete |
+| `msg.sender` is the order's vendor, and amount and document hash equal the buyer's approval for this order and obligation (`settleApproved`) | The buyer alone cannot consume an obligation; a copy of the approval pays nobody else |
 
 `signerDigest(journal) = sha256("warrant/invoice-signer/v1" ‖ chainId ‖ escrow ‖
 sha256(journal))`, computed identically by `evidence::signer_digest` in Rust, so
@@ -204,11 +264,13 @@ evaluation; the contract does not interpret them.
 
 ## Evidence
 
-- 29 invoice Solidity tests (2026-09-30), including customer-isolation and legacy-journal regressions, including fuzz cases showing cumulative payments never
-  exceed the ceiling and signed payments never exceed the allowance; a signer
-  named on one order signs nothing for another; buyer approval respects the
-  ceiling, the deadline and the shared obligation registry; inconsistent signer
-  terms are refused at `offer`.
+- 35 invoice Solidity tests (verified 2026-11-03, Foundry v1.8.4), including
+  customer-isolation and legacy-journal regressions, including fuzz cases showing
+  cumulative payments never exceed the ceiling and signed payments never exceed the
+  allowance; a signer named on one order signs nothing for another; buyer approval
+  needs the vendor's acceptance and respects the ceiling, the deadline and the
+  shared obligation registry; inconsistent signer terms are refused at `offer`.
+  The [vendor protection](#vendor-protection) regressions are listed in that section.
 - `testRustSignatureRecoversToSigner` recovers the signer from a signature the
   Rust helper produced (`contracts/test/fixtures/invoice-signature.json`).
 - `testRustJournalDecodesFieldForField` decodes a journal produced by the Rust
@@ -220,8 +282,9 @@ evaluation; the contract does not interpret them.
   read-only Arc Testnet simulation.
 - `scripts/invoice-demo.py` runs the whole flow on a local chain: one invoice
   settled by signature (the service reading the order from the chain), an
-  undecided one by buyer approval, and a third by real proof (`--signed-only`
-  skips proving). It also shows the service refusing a request that smuggles
+  undecided one by buyer approval and vendor acceptance, and a third by real proof
+  (`--signed-only` skips proving). The approval step changed on 2026-11-03 and is
+  not yet run end to end (unverified). It also shows the service refusing a request that smuggles
   `po_spent` and a key the order does not name.
 
 ## Limits
@@ -232,11 +295,16 @@ evaluation; the contract does not interpret them.
   false invoice; source honesty and business-level deduplication remain trusted.
 - **Signer compromise and availability.** A compromised settlement signer can
   submit arbitrary obligation IDs within an order it can authorize. Consuming
-  an ID also blocks it on the same customer's other orders. Allowances bound
-  token payments, not that availability impact. Other customers stay isolated.
-- **Scope of replay protection.** Consumption is per funding address, not global
-  across a company's wallets, deployments or chains. Buyer approval must supply
-  the correct obligation ID; the contract cannot derive it from a document hash.
+  an ID also blocks it on the same customer's other orders to the same vendor.
+  Allowances bound token payments, not that availability impact. Other customers
+  and other vendor addresses stay isolated. The buyer runs the signer, so the
+  vendor trusts the buyer on this path. See [Vendor protection](#vendor-protection).
+- **Scope of replay protection.** Consumption is per funding address and per vendor
+  address, not global across a company's wallets, deployments or chains. If a
+  vendor registry credentials two addresses for one seller tax ID, and the buyer
+  funds an order to each address, the same invoice can pay one time to each
+  address. Registry honesty covers this case. Buyer approval must supply the
+  correct obligation ID; the contract cannot derive it from a document hash.
 - **Image IDs.** Local guest builds differ across machines. Build with
   `RISC0_USE_DOCKER=1` (see the README) for a reproducible image ID, and deploy
   with that.

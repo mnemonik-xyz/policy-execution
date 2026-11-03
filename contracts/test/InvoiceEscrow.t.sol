@@ -128,11 +128,12 @@ contract InvoiceEscrowTest {
         address at = address(0x1111111111111111111111111111111111111111);
         vm.etch(at, address(escrow).code);
         vm.chainId(5042002);
-        bytes32 got = InvoiceEscrow(at).orderIdFor(
-            address(0x2222222222222222222222222222222222222222),
-            0x3333333333333333333333333333333333333333333333333333333333333333,
-            0x647b78c11a5e9b06e7088f5da15e149b7130a938d26b8c62d7256da8625788da
-        );
+        bytes32 got = InvoiceEscrow(at)
+            .orderIdFor(
+                address(0x2222222222222222222222222222222222222222),
+                0x3333333333333333333333333333333333333333333333333333333333333333,
+                0x647b78c11a5e9b06e7088f5da15e149b7130a938d26b8c62d7256da8625788da
+            );
         require(got == 0xdc4749f59dc65fccadc58a5b4473d74d7ec1598b5f8246f36117997a70112b8b);
     }
 
@@ -477,33 +478,42 @@ contract InvoiceEscrowTest {
         require(token.balanceOf(VENDOR) == 300);
     }
 
-    /// The buyer settles an undecided invoice on their own authority, within the same bounds.
+    /// The buyer approves an undecided invoice on their own authority and the vendor
+    /// accepts it, within the same bounds.
     function testBuyerApprovalWithinBounds() public {
         bytes32 obligation = keccak256("INV-ASK-1");
         bytes32 document = keccak256("ask document");
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
-        escrow.settleApproved(id, obligation, 700, document);
+        escrow.approveInvoice(id, obligation, 700, document);
         accept();
-        vm.prank(RELAYER);
-        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
-        escrow.settleApproved(id, obligation, 700, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.approveInvoice(id, obligation, 0, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.approveInvoice(id, bytes32(0), 700, document);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.approveInvoice(id, obligation, 700, bytes32(0));
+        // Without an approval, the vendor gets nothing.
         vm.prank(VENDOR);
-        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
         escrow.settleApproved(id, obligation, 700, document);
-        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
-        escrow.settleApproved(id, obligation, 0, document);
-        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
-        escrow.settleApproved(id, bytes32(0), 700, document);
-        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
-        escrow.settleApproved(id, obligation, 700, bytes32(0));
+        // An approval above the remaining ceiling records but cannot pay.
+        escrow.approveInvoice(id, obligation, 3001, document);
+        vm.prank(VENDOR);
         vm.expectRevert(InvoiceEscrow.OrderExceeded.selector);
         escrow.settleApproved(id, obligation, 3001, document);
+        // A new approval replaces the previous one.
+        escrow.approveInvoice(id, obligation, 700, document);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, obligation, 3001, document);
+        vm.prank(VENDOR);
         escrow.settleApproved(id, obligation, 700, document);
         require(token.balanceOf(VENDOR) == 700 && spent() == 700 && signerSpent() == 0);
         require(escrow.remaining(id) == 2300 && escrow.totalReserved() == 2300);
+        require(escrow.approvals(id, obligation) == bytes32(0));
         // Once approved, neither a proof nor a signature nor a second approval pays it again.
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
-        escrow.settleApproved(id, obligation, 1, document);
+        escrow.approveInvoice(id, obligation, 1, document);
         bytes memory proven = invoice(obligation, 700);
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
         escrow.settle(hex"abcd", proven);
@@ -513,13 +523,138 @@ contract InvoiceEscrowTest {
         // And an invoice paid by proof cannot be approved again.
         escrow.settle(hex"abcd", invoice(keccak256("INV-2"), 100));
         vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
-        escrow.settleApproved(id, keccak256("INV-2"), 100, document);
+        escrow.approveInvoice(id, keccak256("INV-2"), 100, document);
         // Approval ignores the signer allowance and threshold but not the deadline.
+        escrow.approveInvoice(id, keccak256("INV-ASK-2"), 2000, document);
+        vm.prank(VENDOR);
         escrow.settleApproved(id, keccak256("INV-ASK-2"), 2000, document);
         require(spent() == 2800 && signerSpent() == 0);
+        escrow.approveInvoice(id, keccak256("INV-ASK-3"), 1, document);
         vm.warp(5001);
         vm.expectRevert(InvoiceEscrow.InvalidState.selector);
+        escrow.approveInvoice(id, keccak256("INV-ASK-4"), 1, document);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.InvalidState.selector);
         escrow.settleApproved(id, keccak256("INV-ASK-3"), 1, document);
+    }
+
+    /// Regression (2026-11-03): the customer alone cannot consume an obligation. A one-unit
+    /// customer approval for the vendor's invoice does not block the vendor's proof.
+    function testCustomerCannotPreemptProofWithOneUnitApproval() public {
+        accept();
+        bytes32 obligation = keccak256("INV-1000");
+        bytes32 document = keccak256("vendor invoice");
+        bytes memory proven = invoice(obligation, 1000);
+        escrow.approveInvoice(id, obligation, 1, document);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleApproved(id, obligation, 1, document);
+        require(!escrow.consumed(address(this), VENDOR, obligation) && spent() == 0);
+        vm.prank(RELAYER);
+        escrow.settle(hex"abcd", proven);
+        require(token.balanceOf(VENDOR) == 1000 && spent() == 1000);
+        // The stale approval cannot pay the same obligation a second time.
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleApproved(id, obligation, 1, document);
+        vm.warp(5001);
+        escrow.close(id);
+        require(token.balanceOf(VENDOR) == 1000 && escrow.totalReserved() == 0);
+    }
+
+    /// Only the order's vendor can use a customer approval. A copy of it pays nobody.
+    function testCopiedApprovalByThirdPartyReverts() public {
+        accept();
+        bytes32 obligation = keccak256("INV-ASK-COPY");
+        bytes32 document = keccak256("ask document");
+        vm.prank(RELAYER);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.approveInvoice(id, obligation, 700, document);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.approveInvoice(id, obligation, 700, document);
+        escrow.approveInvoice(id, obligation, 700, document);
+        vm.prank(RELAYER);
+        vm.expectRevert(InvoiceEscrow.Unauthorized.selector);
+        escrow.settleApproved(id, obligation, 700, document);
+        // Another buyer with an order to the same vendor cannot use this approval either.
+        address otherBuyer = address(0xB0B);
+        token.mint(otherBuyer, 3000);
+        vm.prank(otherBuyer);
+        token.approve(address(escrow), 3000);
+        vm.prank(otherBuyer);
+        bytes32 otherOrder = escrow.offer(terms(POLICY, PO, VENDOR, 3000));
+        vm.prank(VENDOR);
+        escrow.accept(otherOrder);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(otherOrder, obligation, 700, document);
+        // The vendor cannot change the approved amount or document.
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, obligation, 701, document);
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.InvalidAuthorization.selector);
+        escrow.settleApproved(id, obligation, 700, keccak256("other document"));
+        require(
+            spent() == 0 && escrow.order(otherOrder).spent == 0 && !escrow.consumed(address(this), VENDOR, obligation)
+        );
+    }
+
+    /// The vendor can accept a reduced amount. The obligation then closes, once, on every path.
+    function testVendorAcceptedReducedAmountClosesOnce() public {
+        accept();
+        bytes32 obligation = keccak256("INV-REDUCED");
+        bytes32 document = keccak256("disputed invoice");
+        bytes memory proven = invoice(obligation, 1000);
+        escrow.approveInvoice(id, obligation, 600, document);
+        vm.prank(VENDOR);
+        escrow.settleApproved(id, obligation, 600, document);
+        require(token.balanceOf(VENDOR) == 600 && spent() == 600 && escrow.consumed(address(this), VENDOR, obligation));
+        vm.prank(VENDOR);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleApproved(id, obligation, 600, document);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.approveInvoice(id, obligation, 400, document);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settle(hex"abcd", proven);
+        (bytes memory j, bytes memory sig) = signed(obligation, 400);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settleSigned(j, sig);
+        require(token.balanceOf(VENDOR) == 600 && spent() == 600);
+    }
+
+    /// Regression (2026-11-03): the customer cannot consume the vendor's obligation through
+    /// a side order to another address that the customer controls.
+    function testSideOrderToOwnAddressCannotConsumeVendorObligation() public {
+        accept();
+        bytes32 obligation = keccak256("INV-1000");
+        bytes32 document = keccak256("vendor invoice");
+        bytes memory proven = invoice(obligation, 1000);
+        address own = address(0xC0FFEE);
+        bytes32 side = escrow.offer(terms(keccak256("side policy"), keccak256("side PO"), own, 1));
+        vm.prank(own);
+        escrow.accept(side);
+        escrow.approveInvoice(side, obligation, 1, document);
+        vm.prank(own);
+        escrow.settleApproved(side, obligation, 1, document);
+        require(escrow.consumed(address(this), own, obligation));
+        require(!escrow.consumed(address(this), VENDOR, obligation));
+        escrow.settle(hex"abcd", proven);
+        require(token.balanceOf(VENDOR) == 1000 && spent() == 1000);
+    }
+
+    /// Known limit, kept on purpose: on an order with a signer, the vendor trusts that signer.
+    /// A buyer-run signer can consume the vendor's obligation with a small signed journal.
+    /// A vendor who does not trust the signer accepts only proofs-only orders.
+    function testOrderSignerCanStillConsumeWithinItsAllowance() public {
+        accept();
+        bytes32 obligation = keccak256("INV-1000");
+        bytes memory proven = invoice(obligation, 1000);
+        (bytes memory j, bytes memory sig) = signed(obligation, 1);
+        escrow.settleSigned(j, sig);
+        vm.expectRevert(InvoiceEscrow.AlreadyPaid.selector);
+        escrow.settle(hex"abcd", proven);
+        require(token.balanceOf(VENDOR) == 1 && signerSpent() == 1);
     }
 
     /// Signature-authorized payments never exceed the allowance; proofs still respect the ceiling.
@@ -607,12 +742,12 @@ contract InvoiceEscrowTest {
         escrow.settleSigned(redirected, sig);
 
         escrow.settleSigned(journal, sig);
-        require(escrow.consumed(address(this), obligation));
-        require(!escrow.consumed(otherBuyer, obligation));
+        require(escrow.consumed(address(this), VENDOR, obligation));
+        require(!escrow.consumed(otherBuyer, VENDOR, obligation));
         require(escrow.order(otherOrder).spent == 0);
         // An independently authenticated journal can pay the other customer's order.
         escrow.settleSigned(redirected, signWith(SIGNER_KEY, redirected));
-        require(escrow.consumed(otherBuyer, obligation));
+        require(escrow.consumed(otherBuyer, VENDOR, obligation));
         require(escrow.order(otherOrder).spent == 100);
     }
 
@@ -639,6 +774,8 @@ contract InvoiceEscrowTest {
         bytes32 attackOrder = escrow.offer(terms(keccak256("attacker policy"), keccak256("attacker PO"), attacker, 1));
         vm.prank(attacker);
         escrow.accept(attackOrder);
+        vm.prank(attacker);
+        escrow.approveInvoice(attackOrder, obligation, 1, keccak256("anything"));
         vm.prank(attacker);
         escrow.settleApproved(attackOrder, obligation, 1, keccak256("anything"));
         require(token.balanceOf(attacker) == 1, "attacker gets own funding back");
