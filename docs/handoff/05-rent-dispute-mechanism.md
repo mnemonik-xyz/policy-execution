@@ -58,8 +58,20 @@ Neither the buyer nor the provider can replace that key after acceptance.
 A different key held by the same buyer is not an independent meter.
 The provider must be able to obtain the signed evidence without a new buyer action.
 
-This is a trusted-meter pilot. A dishonest meter can attest false delivery.
-The proof checks the attestation and the policy; it does not remove trust in the meter.
+Settlement trusts the meter's signature. A dishonest meter can attest false delivery, and the proof checks the attestation and the policy, not the metering.
+The meter's output is not opaque, however. Each usage record binds the hash of the PoCC receipt that it was computed from.
+The PoCC verifier is deterministic, and the provider runs it for each piece. Therefore the provider detects a false or conflicting record at once.
+Anyone can refute such a record later by running the verifier on the kept receipt.
+Detection is not enforcement: the escrow pays on the signature, and this version has no referee or clawback.
+While the development anchor is in use, a refutation also rests on the notary's anchor key.
+Enforcement in the guest is X-1 (below). See [lease evidence 5a.4](../product/lease-evidence.md#5a4-the-first-meter-pocc).
+
+The PoCC agent runs inside the buyer's machine. The buyer can stop it, block it, or read its key.
+The buyer cannot remove anchored evidence: the notary keeps the first entry for each agent and sequence number, and the provider stores every anchored entry (lease evidence SS-13).
+Therefore a hostile buyer can stop future evidence only. The provider's liveness watch (SS-12) then stops the machine after `liveness_miss_slots` slots.
+The fallback pays only for time with anchored heartbeats. Time after the agent stopped is never paid.
+The listing must state this rule. Evidence that the buyer cannot reach is future work (pocc decision 47).
+
 PoCC Stage 0 also retains its physical-machine and sampled-liveness limitations.
 It does not establish allocated GPU resources, performance, or successful access by the customer.
 The listing must identify the exact delivery predicate and those limits.
@@ -349,6 +361,12 @@ It must reject a short prefix presented as an ordinary non-final batch, even whe
 The worker compares the final statement with its persisted records and expected claim before requesting either settlement.
 If it observes conflicting final statements, it must retain them and stop automatic settlement and continued service.
 It must not resolve a conflict by choosing the first, cheapest, highest-value or newest signed statement.
+It must run the PoCC verifier on the receipt that each conflicting statement binds.
+A statement that does not follow from its receipt is the meter's fault. Record that result with both statements for the parties and for a later dispute design.
+This identifies the fault. It does not authorize a payment or replace the missing final statement.
+
+When the liveness watch (lease evidence SS-12) stops the lease, the terminal stop statement must record that stop.
+Its cutoff is the last piece that has anchored heartbeats; a later piece is not eligible.
 
 These rules constrain an honest meter and detect conflicts which are supplied or observed.
 A guest cannot prove that a trusted meter never signed an undisclosed conflicting statement elsewhere.
@@ -388,6 +406,9 @@ Provisioning, hourly metering, the continuation timeout and resource shutdown re
 Hourly continuation messages are distinct from the batch settlement acknowledgement.
 If the buyer stops responding, stop the machine under the existing exposure policy.
 The new fallback can recover eligible completed service; it does not authorize unlimited continued provisioning.
+The provider also watches the agent every slot (lease evidence SS-12) and stores every anchored entry (SS-13).
+After `liveness_miss_slots` slots without an anchored heartbeat, or an early final heartbeat, stop the machine.
+Keep `liveness_miss_slots × 60 s ≤ challenge_timeout_s`, so that the existing exposure bound `E` still applies.
 
 Missing settlement acknowledgement changes payment status, not the amount of collateral available.
 Use reservation categories with explicit meanings:
@@ -449,6 +470,10 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Short non-final batch without terminal statement, or prefix shorter than its terminal cutoff | Guest rejects |
 | Terminal statement revised, duplicated inconsistently or paired with a mismatched final batch | Meter refuses revision; guest rejects supplied contradictions; worker stops on observed conflict |
 | Full scheduled batch with zero-unit outage records | Includes every index; final claim can settle by provider submission |
+| Buyer stops the agent or blocks its network in the middle of a batch | Provider stops within `liveness_miss_slots` slots plus shutdown latency; anchored earlier pieces remain payable by proof; later time unpaid |
+| Buyer reads the agent key and signs a different entry for an anchored sequence number | Notary refuses it; anchored evidence and the proof claim do not change |
+| Buyer signs an early final heartbeat with the extracted key | Credit ends there; provider stops; terminal stop statement records the cutoff |
+| Meter signs a record that does not follow from its bound receipt | Provider's verifier run detects the mismatch; worker stops automatic settlement and keeps both results |
 
 Both UIs must display any reduced final payment and forfeited suffix before consent.
 The provider worker must reject an acknowledgement below its expected amount and use fallback instead.
@@ -483,7 +508,7 @@ Implementation packages:
 1. Confirm settlement unit and independent evidence profile; freeze terms, witness and signing fixtures.
 2. Implement the rent decision and journal on the framework; retain existing case semantics.
 3. Add both escrow entry points, shared checks, shared replay/cutoff state and boundary tests.
-4. Adapt the buyer signer and provider worker; extend lease accounting and independent meter custody.
+4. Adapt the buyer signer and provider worker; extend lease accounting and independent meter custody; add the per-slot liveness watch and evidence custody (SS-12, SS-13).
 5. Benchmark fallback proof and both settlement paths; set measured deadlines and batch sizes.
 6. Execute both paths on testnet, including races, cancellation, expiry and complete buyer silence.
 

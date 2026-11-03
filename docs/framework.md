@@ -235,7 +235,10 @@ What this proves, and what it does not:
   not billed for more than that record shows.
 - It does not prove that the meter was honest. The meter key becomes a trust assumption.
   If the compute provider signs the record, the buyer trusts the provider. If an independent
-  metering service signs it, the buyer trusts that service.
+  metering service signs it, the buyer trusts that service. When the record binds
+  re-executable evidence, as a PoCC record binds its receipt, a false record can be detected
+  by running the verifier again. Detection does not stop the payment; settlement still
+  trusts the key.
 - Nobody signs such records for the compute providers in the pilot today. Who runs the meter is an open question.
 
 A batch job whose output can be checked by a deterministic checker can use `computed_result`
