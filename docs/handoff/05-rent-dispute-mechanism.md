@@ -70,7 +70,9 @@ Enforcement in the guest is X-1 (below). See [lease evidence 5a.4](../product/le
 The PoCC agent runs inside the buyer's machine. The buyer can stop it, block it, or read its key.
 The buyer cannot remove anchored evidence: the notary keeps the first entry for each agent and sequence number, and the provider stores every anchored entry (lease evidence SS-13).
 Therefore a hostile buyer can stop future evidence only. The provider's liveness watch (SS-12) then stops the machine after `liveness_miss_slots` slots.
-The fallback pays only for time with anchored heartbeats. Time after the agent stopped is never paid.
+With the extracted key, the buyer can also submit a signed but malformed heartbeat. The notary accepts it, and a receipt that includes it is `INVALID`.
+The provider therefore checks each entry's contents, keeps the last valid receipt prefix, builds records from that prefix only, and stops on a failed entry (SS-12, SS-13).
+The fallback pays only for billing-eligible pieces, and inside them only for time with valid anchored heartbeats. Time after the agent stopped is never paid.
 The listing must state this rule. A sidecar that the buyer cannot stop, and an observer, are research for a later improvement (pocc decision 47 and `docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
 
 PoCC Stage 0 also retains its physical-machine and sampled-liveness limitations.
@@ -367,7 +369,8 @@ A statement that does not follow from its receipt is the meter's fault. Record t
 This identifies the fault. It does not authorize a payment or replace the missing final statement.
 
 When the liveness watch (lease evidence SS-12) stops the lease, the terminal stop statement must record that stop.
-Its cutoff is the last piece that has anchored heartbeats; a later piece is not eligible.
+Its cutoff comes from authenticated billing eligibility: the last piece that passed the continuation gate.
+Heartbeats measure delivery inside eligible pieces only. A provisional next piece with valid heartbeats is not eligible and never moves the cutoff.
 
 These rules constrain an honest meter and detect conflicts which are supplied or observed.
 A guest cannot prove that a trusted meter never signed an undisclosed conflicting statement elsewhere.
@@ -474,6 +477,8 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Buyer stops the agent or blocks its network in the middle of a batch | Provider stops within `liveness_miss_slots` slots plus shutdown latency; anchored earlier pieces remain payable by proof; later time unpaid |
 | Buyer reads the agent key and signs a different entry for an anchored sequence number | Notary refuses it; anchored evidence and the proof claim do not change |
 | Buyer signs an early final heartbeat with the extracted key | Credit ends there; provider stops; terminal stop statement records the cutoff |
+| Buyer signs a malformed heartbeat after a valid prefix (wrong round, beacon value or chain link, or an entry after a final heartbeat) | Provider stops at once; the full receipt is `INVALID`; the last valid prefix verifies and gives the same records for completed pieces |
+| Next piece runs provisionally with valid heartbeats, continuation never authorized, then shutdown | Cutoff is the last eligible piece; the provisional piece is not paid |
 | Meter signs a record that does not follow from its bound receipt | Provider's verifier run detects the mismatch; worker stops automatic settlement and keeps both results |
 
 Both UIs must display any reduced final payment and forfeited suffix before consent.
