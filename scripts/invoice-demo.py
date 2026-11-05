@@ -139,18 +139,24 @@ try:
         str(out/'request.json'),str(out/'other-out.json'),expect=1)
     assert not (out/'other-out.json').exists()
     # An undecided invoice: a line nobody can label. The service signs nothing and
-    # records why; the buyer settles it on their own authority, within the same bounds.
+    # records why; the buyer approves it on their own authority and the vendor accepts
+    # that approval, within the same bounds. Neither party alone consumes the invoice.
     run('cargo','run','--quiet','--locked','-p','warrant-policy','--example','invoice_fixture','--',
         str(out/'ask'),'31337',escrow,token,VENDOR,CUSTOMER,str(base),'INV-1003','ask')
     sign(out/'ask/request.json',out/'ask.json',expect=3)
     ask=json.loads((out/'ask.json').read_text())
     assert ask['ask']==['UnlabeledLines([1])'] and 'signature' not in ask
-    approved=send(CUSTOMER,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',ask['orderId'],ask['obligationId'],ask['payable'],ask['documentHash'])
+    approval=(ask['orderId'],ask['obligationId'],ask['payable'],ask['documentHash'])
+    send(CUSTOMER,escrow,'approveInvoice(bytes32,bytes32,uint64,bytes32)',*approval)
+    try: send(CUSTOMER,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',*approval)
+    except (RuntimeError,AssertionError): pass
+    else: raise AssertionError('Customer settled an approval without the vendor')
+    approved=send(VENDOR,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',*approval)
     assert number(call(token,'balanceOf(address)(uint256)',VENDOR))==amount+ask['payable']
-    try: send(CUSTOMER,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',ask['orderId'],ask['obligationId'],ask['payable'],ask['documentHash'])
+    try: send(VENDOR,escrow,'settleApproved(bytes32,bytes32,uint64,bytes32)',*approval)
     except (RuntimeError,AssertionError): pass
     else: raise AssertionError('Approval replay unexpectedly accepted')
-    print('Undecided invoice settled by buyer approval; replay rejected; smuggled inputs and unnamed signers refused.',flush=True)
+    print('Undecided invoice settled by buyer approval and vendor acceptance; replay rejected; smuggled inputs and unnamed signers refused.',flush=True)
     if options.signed_only:
         (out/'result.json').write_text(json.dumps(dict(chainId=31337,token=token,escrow=escrow,signer=SIGNER,orderId=order,
             amount=amount,signedTransaction=settled_signed['transactionHash'],signedGasUsed=settled_signed['gasUsed'],

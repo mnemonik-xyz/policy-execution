@@ -312,9 +312,9 @@ Plan: owner-run signer for the live payment path in the hackathon window; RISC
 Zero on Arc as the trustless mode once one Groth16 receipt verifies on testnet.
 Implemented in [`InvoiceEscrow`](invoice-escrow.md): `settleSigned` by the signer
 the buyer names per order, below that order's `proofThreshold` and within its
-`signerAllowance`; `settle` with a receipt for any amount; `settleApproved` by the
-buyer for invoices the checker leaves undecided; and a buyer-only `revokeSigner`
-that only tightens. The signing service holds the policy and reads the order's
+`signerAllowance`; `settle` with a receipt for any amount; `approveInvoice` by the
+buyer and `settleApproved` by the vendor for invoices the checker leaves
+undecided; and a buyer-only `revokeSigner` that only tightens. The signing service holds the policy and reads the order's
 spend from the escrow; the agent hands it only the document, claims and signed
 credentials.
 
