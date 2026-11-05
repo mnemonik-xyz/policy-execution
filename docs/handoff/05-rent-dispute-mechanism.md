@@ -413,6 +413,9 @@ The new fallback can recover eligible completed service; it does not authorize u
 The provider also watches the agent every slot (lease evidence SS-12) and stores every anchored entry (SS-13).
 After `liveness_miss_slots` slots without an anchored heartbeat, or an early final heartbeat, stop the machine.
 Keep `liveness_miss_slots × 60 s ≤ challenge_timeout_s`, so that the existing exposure bound `E` still applies.
+Also stop as soon as the current piece cannot reach its coverage floor, counting every irrecoverably missed interval after its anchoring deadline (SS-12).
+Never continue after a zero-payable piece, even when the buyer acknowledges zero correctly (SS-14). The zero piece stays in its batch and the earlier pieces settle.
+A buyer can repeat the pattern across new leases; the listing needs admission controls or an agreed provisioning or minimum charge.
 
 Missing settlement acknowledgement changes payment status, not the amount of collateral available.
 Use reservation categories with explicit meanings:
@@ -479,6 +482,8 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Buyer signs an early final heartbeat with the extracted key | Credit ends there; provider stops; terminal stop statement records the cutoff |
 | Buyer signs a malformed heartbeat after a valid prefix (wrong round, beacon value or chain link, or an entry after a final heartbeat) | Provider stops at once; the full receipt is `INVALID`; the last valid prefix verifies and gives the same records for completed pieces |
 | Next piece runs provisionally with valid heartbeats, continuation never authorized, then shutdown | Cutoff is the last eligible piece; the provisional piece is not paid |
+| Buyer drops fewer than `liveness_miss_slots` slots at a time so that each hour misses the floor | Lease stops in the first hour once the floor is out of reach; at most one zero-payable piece per lease |
+| Correct zero acknowledgement for an honest outage | Zero piece stays in the batch; earlier pieces settle; the lease stops |
 | Meter signs a record that does not follow from its bound receipt | Provider's verifier run detects the mismatch; worker stops automatic settlement and keeps both results |
 
 Both UIs must display any reduced final payment and forfeited suffix before consent.
