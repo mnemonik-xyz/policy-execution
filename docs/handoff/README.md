@@ -21,7 +21,7 @@ The DeFi swap comes last.
 | `02-framework-steps.md` | Steps 1 to 9 of the framework, with acceptance criteria |
 | `03-rent-case.md` | The rent case and its delivery proof |
 | `04-rent-interface-v1.md` | PE-0: the rent settlement interface on the framework (journal v2, `WarrantEscrow`, encodings, replay). Proposal for review |
-| `05-rent-dispute-mechanism.md` | Rent dispute mechanism: buyer acknowledgement, then proof after timeout. Correctness review, code reuse, proposed interface and acceptance tests |
+| `05-rent-dispute-mechanism.md` | Rent dispute mechanism, ruled 6 Nov (pocc decision 49): buyer acknowledgement pays; proof after timeout only with the enclave agent (`min_assurance = 1`); without it a silent buyer stops the lease. Correctness review, code reuse, interface and acceptance tests |
 
 The design is in [`../framework.md`](../framework.md). It is the source of truth.
 These files turn it into work packages.
@@ -35,13 +35,13 @@ These files turn it into work packages.
 | 3 | Generic evaluator, one Verus proof. Fallback: one closed atom enum | Approved |
 | 4 | Chain and escrowed asset for the DeFi swap | Deferred to step 9 |
 | 5 | Fate of the buyer-signed settlement path | **Open.** See below |
-| 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md`. The buyer controls the PoCC agent, so the seller watches it every slot (pocc decision 47, lease evidence SS-12, SS-13); the dispute mode proposes an agreed meter (`05-rent-dispute-mechanism.md`) |
+| 6 | Who runs the meter and signs usage records for rent | Proposed: PoCC, run by the buyer. See `03-rent-case.md`. The buyer controls the PoCC agent, so the seller watches it every slot (pocc decision 47, lease evidence SS-12, SS-13); at `min_assurance = 1` the meter is the enclave agent, whose key neither party can read (`05-rent-dispute-mechanism.md` 2a, pocc decision 49) |
 | 7 | Settlement interface for rent: the framework header on `WarrantEscrow` (C); the invoice journal variants A and B are superseded | Chosen by the owner, 2 Nov. The concrete interface, `04-rent-interface-v1.md`, awaits review |
 
 Decision 5 update, 3 Nov 2026. The owner now requests a buyer acknowledgement path for rent,
 with proof settlement after a response timeout. See [the change specification](05-rent-dispute-mechanism.md).
-This request authorizes specification work on that mode. It does not change existing funded orders or other cases.
-The settlement unit and independent evidence authority remain explicit draft assumptions.
+Ruled on 6 Nov 2026 (pocc decision 49): the acknowledgement pays in every lease; the proof path exists only with the enclave agent (`min_assurance = 1`); without it a silent buyer stops the lease. It does not change existing funded orders or other cases.
+The settlement unit is the service batch; the evidence authority of the proof path is the enclave agent.
 The earlier proof-only design remains documented in PE-0; do not remove reusable signing components before reviewing this change.
 
 ## Repositories

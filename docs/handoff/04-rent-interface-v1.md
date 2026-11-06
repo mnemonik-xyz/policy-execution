@@ -1,7 +1,8 @@
 # Rent interface v1 (PE-0)
 
-Proposed amendment, 3 Nov 2026: [rent dispute mechanism](05-rent-dispute-mechanism.md).
-It defines a new rent mode and its evidence requirements. This file retains the earlier proof-only interface.
+Amendment, 3 Nov 2026, ruled on 6 Nov (pocc decision 49): [rent dispute mechanism](05-rent-dispute-mechanism.md).
+The buyer's acknowledgement pays a batch in every lease; the proof path of this file is the dispute path, and it exists only for a lease at `min_assurance = 1`, where `meter_key` is the enclave agent's key.
+This file retains the proof-only interface; `min_assurance` (section 3) now also selects whether the lease has that path.
 
 Status: proposal for the owner's review, 2 Nov 2026. Supersedes the settlement
 interfaces A and B of `docs/product/lease-evidence.md` section 5. Built on the
@@ -78,7 +79,7 @@ pub struct SignedUsage {
     pub price_per_unit: u64,         // token base units per unit
     pub tolerance: u64,              // token base units a note may exceed units x price
     pub min_coverage_bp: u16,        // creditable interval coverage floor, 0..=10000
-    pub min_assurance: u8,           // 0 or 1
+    pub min_assurance: u8,           // 0: buyer's guardrail is the meter, no dispute path; 1: enclave agent is the meter, dispute path (pocc decision 49)
     pub meter_spec: Hash,            // the meter's parameter document hash
     pub service_start: u64,          // origin of the piece index; on a piece boundary
     pub service_end: u64,            // service_end - service_start is a multiple of piece_s

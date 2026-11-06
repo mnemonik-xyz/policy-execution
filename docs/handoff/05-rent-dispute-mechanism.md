@@ -1,8 +1,13 @@
 # Rent dispute mechanism
 
-Status: draft specification, 3 Nov 2026. No implementation of this mode exists.
-The owner requested the two payment paths. This document proposes their exact scope.
-The settlement unit and independent evidence authority remain assumptions for review.
+Status: specification, 3 Nov 2026, amended 6 Nov 2026 by the owner's ruling (pocc decision 49). No implementation of this mode exists.
+The owner requested the two payment paths. This document states their exact scope.
+
+**The ruling of 6 Nov.** The happy path is optimistic: an honest buyer signs the hourly note and the batch acknowledgement, and the acknowledgement pays.
+The dispute path, which the provider engages after the response period without the buyer's signature, exists only for a lease whose policy requires the enclave agent (`min_assurance = 1`); its evidence is the enclave's records.
+A lease without the enclave (`min_assurance = 0`) has no dispute path: a missing signature stops the lease after its timeout, and what the buyer signed settles.
+The third-party meter, the sidecar and observer research, and X-1 are not pursued. Section 2a states the rule; the other sections are amended to it.
+The settlement unit stays the service batch.
 
 The owner named this flow the **dispute mechanism**.
 Normal settlement uses the buyer's acknowledgement. The dispute path uses a delivery proof after the response period.
@@ -21,7 +26,7 @@ PE-0 remains the specification of the previous proof-only rent mode.
 The requested flow is sound under four conditions:
 
 1. Funding authorizes the fallback delivery policy before service starts.
-2. A proof can establish that policy without the missing buyer acknowledgement.
+2. A proof can establish that policy without the missing buyer acknowledgement. Only the enclave agent's records can (section 2a); a lease without it has no proof path.
 3. Both settlement paths require provider consent and enforce timing, limits and one shared replay check.
 4. Refunds remain unavailable until the provider's proof settlement deadline passes.
 
@@ -38,7 +43,7 @@ There are two distinct products:
 | Product | What happens when the buyer is silent? |
 |---|---|
 | Add a final release signature but retain all existing hourly evidence | Proof works if the provider already holds the required notes and meter signatures. It cannot recover a missing last note. |
-| Pay for delivered service despite refusal to sign its receipt | Requires an independent delivery witness and a new rent decision that does not require that receipt. This is the proposed mode below. |
+| Pay for delivered service despite refusal to sign its receipt | Requires a delivery witness the buyer cannot stop or forge (the enclave agent) and a new rent decision that does not require that receipt. This is the mode below, at `min_assurance = 1` only. |
 
 ## 2. Scope and assumptions
 
@@ -52,36 +57,51 @@ For payment per completed hour, use `batch_size = 1`.
 Payment of the full escrow on VM handover is a different, fixed-delivery product.
 That product needs a handover predicate and an explicit transfer-of-control test before this specification can cover it.
 
-**Assumption B: a meter agreed by both parties supplies fallback evidence.** The buyer records the proposed meter key before funding.
-Before calling `accept`, the provider must approve that meter, its delivery predicate, evidence access and retention commitments.
-The provider's acceptance binds the funded policy and meter configuration. Otherwise it must refuse the order.
-Neither the buyer nor the provider can replace that key after acceptance.
-A different key held by the same buyer is not an independent meter.
-The provider must be able to obtain the signed evidence without a new buyer action.
+**Rule B (replaces the 3 Nov assumption of a meter agreed by both parties): the enclave agent supplies the fallback evidence.** See section 2a.
+The buyer records the enclave's key and attestation before funding; the policy pins the measurement in `meter_spec`.
+Before calling `accept`, the provider verifies the attestation against that measurement and must refuse the order if it fails.
+Neither party can replace that key after acceptance, and the provider obtains the signed evidence from the enclave without a new buyer action.
 
-Settlement trusts the meter's signature. A dishonest meter can attest false delivery, and the proof checks the attestation and the policy, not the metering.
-The meter's output is not opaque, however. Each usage record binds the hash of the PoCC receipt that it was computed from.
+Settlement trusts the enclave's signature; the proof checks the attestation and the policy, not the metering. The attestation is why that trust holds against both parties.
+The enclave's output is not opaque, however. Each usage record binds the hash of the PoCC receipt that it was computed from.
 The PoCC verifier is deterministic, and the provider runs it for each piece. Therefore the provider detects a false or conflicting record at once.
 Anyone can refute such a record later by running the verifier on the kept receipt.
 Detection is not enforcement: the escrow pays on the signature, and this version has no referee or clawback.
 While the development anchor is in use, a refutation also rests on the notary's anchor key.
 Enforcement in the guest is X-1 (below). See [lease evidence 5a.4](../product/lease-evidence.md#5a4-the-first-meter-pocc).
 
-The PoCC agent runs inside the buyer's machine. The buyer can stop it, block it, or read its key.
+At `min_assurance = 0` the PoCC agent runs inside the buyer's machine, and the buyer can stop it, block it, or read its key; such a lease has no fallback. At `min_assurance = 1` the buyer can still stop the machine, but cannot read the key.
 The buyer cannot remove anchored evidence: the notary keeps the first entry for each agent and sequence number, and the provider stores every anchored entry (lease evidence SS-13).
 Therefore a hostile buyer can stop future evidence only. The provider's liveness watch (SS-12) then stops the machine after `liveness_miss_slots` slots.
 With the extracted key, the buyer can also submit a signed but malformed heartbeat. The notary accepts it, and a receipt that includes it is `INVALID`.
 The provider therefore checks each entry's contents, keeps the last valid receipt prefix, builds records from that prefix only, and stops on a failed entry (SS-12, SS-13).
 The fallback pays only for billing-eligible pieces, and inside them only for time with valid anchored heartbeats. Time after the agent stopped is never paid.
-The listing must state this rule. A sidecar that the buyer cannot stop, and an observer, are research for a later improvement (pocc decision 47 and `docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
+The listing must state this rule. The sidecar and observer research of 3 Nov is closed by pocc decision 49: its first candidate is the enclave agent; the rest is not pursued.
 
 PoCC Stage 0 also retains its physical-machine and sampled-liveness limitations.
 It does not establish allocated GPU resources, performance, or successful access by the customer.
 The listing must identify the exact delivery predicate and those limits.
 
-An alternative is X-1: run the delivery verifier inside the guest over authenticated witnesses.
-That alternative needs authenticated beacon, anchor and provider evidence. It is not implemented by this proposal.
-Neither independent metering nor X-1 is treated as an already approved business choice.
+X-1 (the delivery verifier inside the guest over authenticated witnesses) is on no path (pocc decision 49). It is not implemented, and it is not a prerequisite of either path.
+
+## 2a. Mode selection: `min_assurance` (pocc decision 49)
+
+The policy's existing `min_assurance` field selects the settlement paths of a lease. No new field is needed.
+
+| `min_assurance` | Agent | Meter key | Buyer silent after the response period |
+|---|---|---|---|
+| `0` | Stage 0: in the buyer's machine; the buyer can stop it or read its key (pocc decision 47) | The buyer's guardrail key (pocc decisions 25, 35) | **No dispute path.** The continuation gate and the liveness watch stop the lease (lease evidence SS-9, SS-12). The batch settles what the buyer signed; the loss stays within `E`. |
+| `1` | Stage 1: the **enclave agent**, the agent and verifier in a privileged, attested component inside the confidential machine, whose key neither the buyer's system nor the provider's host can read (lease evidence 5a.4) | The enclave's key; the attestation report binds it to the measurement that `meter_spec` pins | **Dispute path.** After `ack_timeout_s` the provider submits the proof over the enclave's records; it pays the eligible prefix up to the last record the enclave signed. |
+
+The happy path is the same in both rows: the buyer signs the hourly note (continuation) and the batch acknowledgement, and the acknowledgement pays the batch under the provider's consent and the shared bounds of section 6.
+
+The enclave agent runs the verifier over its own anchored heartbeats and signs each hour's final usage record once it holds the anchoring proofs of the hour's last slot.
+It records the buyer's signed notes that the provider forwards to it, verified against the buyer's key in the policy, so billing eligibility (the continuation gate) is inside its statement; the provider cannot tell it that a provisional piece became billable.
+The provider keeps the machine running until the enclave has signed the last record (`shutdown_latency_s`); a record the enclave never signed is not payable.
+A record signed by a key without a valid attestation for the pinned measurement fails D7.
+The guest verifies the enclave's signature as it verifies the meter signature today; decisions 44 and 46 keep their form.
+Stage 1 is not implemented; until it is, every lease runs at `min_assurance = 0` and has no dispute path.
+One open point goes to the Stage 1 prototype: whether the buyer's system can starve the privileged component without stopping the machine. If it can, the effect is a stop, never a false credit.
 
 ## 3. Existing code and what can be reused
 
@@ -114,7 +134,7 @@ That reproduction used the test verifier. The legacy invoice flaw remains separa
 ```mermaid
 flowchart TD
     A[Buyer funds pinned terms] --> B[Provider accepts and delivers service]
-    B --> C[Persist independently available delivery evidence]
+    B --> C[Persist the enclave agent's delivery evidence]
     C --> D[Request buyer acknowledgement for the batch]
     D --> E{Provider accepts exact acknowledgement?}
     E -->|Yes| F[Provider account submits acknowledgement]
@@ -239,7 +259,7 @@ Never label this only a login, receipt download, or harmless confirmation of VM 
 EOA signatures use a standard checked recovery implementation: reject malformed length, high-s and zero recovery.
 Smart-account customers use ERC-1271 and must return the specified magic value through a static call.
 The signature is checked at settlement time. Smart-account signature validity can change.
-Neither signer unavailability nor invalidation disables the independent proof path.
+Neither signer unavailability nor invalidation disables the proof path of a lease at `min_assurance = 1`.
 EIP-712 domain separation does not replace the consumed-obligation check.
 
 Proposed entry points:
@@ -321,14 +341,14 @@ The provider does not need a new acceptance signature for a piece after its deli
 Do not create a dummy `Acceptance`, set `accepted = true`, or skip that check in the old guest.
 Create a versioned rent input and explicit delivery-based authorization semantics.
 
-The fallback input contains the typed policy, order terms, seller credential, records and independent meter evidence.
+The fallback input contains the typed policy, order terms, seller credential, the enclave agent's records and its attestation.
 It also contains authenticated billing eligibility and any final stop boundary.
 The meter must bind scope, policy, lease, batch, record hashes, eligible prefix and stop boundary in its signed statement.
 The statement must bind the meter specification and the service period.
-Freeze this statement's exact type, tag and encodings with shared fixtures before building an independent signer.
+Freeze this statement's exact type, tag and encodings with shared fixtures before building the enclave agent's signer.
 
 Billing eligibility is necessary because a running provisional piece is not automatically billable under the existing continuation gate.
-The independent meter must observe and durably record continuation acknowledgements and stopping events as they occur.
+The enclave agent must record the forwarded continuation acknowledgements and the stopping events as they occur.
 It cannot accept an unauthenticated provider assertion that a provisional piece became billable.
 For a trust-free alternative, those events need authenticated witnesses checked inside the guest.
 This protocol witness is a new integration requirement, not an existing PoCC record field.
@@ -395,12 +415,12 @@ The guest must:
 - Commit the new journal, including the terms hash and the exact closed prefix.
 
 The proof cannot establish more than its evidence model permits.
-Provider-controlled telemetry without an approved independent authority is insufficient for this pilot profile.
-Distinct key bytes do not prove independent ownership. Independence is a disclosed operational assumption checked when both parties accept the listing.
+Provider-controlled telemetry is insufficient; so is any key the buyer can read. Only the attested enclave key qualifies (section 2a).
+Distinct key bytes do not prove independence; the attestation report bound to the pinned measurement does.
 The seller credential and meter evidence must remain available without the buyer after service delivery.
 Withheld or invalid evidence results in no proof payment. Expiry is not an alternative authorization.
 
-For the first implementation, verify independent meter signatures inside the guest.
+For the first implementation, verify the enclave's signatures inside the guest.
 Decision 46's Solidity verification is an optional later optimization with a separate schema and integration test.
 Do not reuse its existing record-plus-buyer-note facts layout for a fallback which has no buyer notes.
 
@@ -452,7 +472,7 @@ Preserve checked sums, the ceiling invariant and the existing Lost/Unresolved ov
 | Non-recipient submits a valid proof with an earlier final prefix | Revert Unauthorized; later unpaid claims remain available |
 | Another account copies the provider's proof and calldata | Revert Unauthorized; copied evidence is not provider consent |
 | Provider caller supplies an invalid proof | Revert; caller authority cannot replace proof verification |
-| No buyer signature after funding, first piece delivered | Independent meter evidence can settle after timeout |
+| No buyer signature after funding, first piece delivered | At `min_assurance = 1` the enclave's records settle after timeout; at `0` the lease stops and nothing is proved |
 | Buyer-only evidence withheld | Explicitly no payment; not advertised as a working independent fallback |
 | Valid proof just before / exactly at `proof_after` | Revert / eligible |
 | Both paths at `deadline`; refund at `settleBy` | Settlement allowed subject to other checks; refund refused |
@@ -491,7 +511,7 @@ The provider worker must reject an acknowledgement below its expected amount and
 Only an explicit provider decision can accept a concession. The worker must never submit such an acknowledgement automatically.
 The caller check is the security boundary on both paths; possession of a signature or proof is not provider consent.
 
-Require new Rust/Solidity/Go fixtures for terms, journal, acknowledgement and independent meter evidence.
+Require new Rust/Solidity/Go fixtures for terms, journal, acknowledgement, the enclave's records and its attestation.
 Run real receipt verification and a funded testnet end-to-end run for both paths.
 Repeat the no-buyer-response case after deleting access to all buyer signing services.
 Run existing lease adversarial tests plus the new transition/race scenarios.
@@ -516,10 +536,10 @@ The GPU decision remains a capacity/latency decision until this fallback is benc
 
 Implementation packages:
 
-1. Confirm settlement unit and independent evidence profile; freeze terms, witness and signing fixtures.
+1. Freeze terms, witness and signing fixtures, with the enclave's attestation in the witness (the settlement unit and evidence authority are decided: service batches, the enclave agent).
 2. Implement the rent decision and journal on the framework; retain existing case semantics.
 3. Add both escrow entry points, shared checks, shared replay/cutoff state and boundary tests.
-4. Adapt the buyer signer and provider worker; extend lease accounting and independent meter custody; add the per-slot liveness watch and evidence custody (SS-12, SS-13).
+4. Adapt the buyer signer and provider worker; extend lease accounting; build the enclave agent (pocc PC-10) on Stage 1 hosts; add the per-slot liveness watch and evidence custody (SS-12, SS-13).
 5. Benchmark fallback proof and both settlement paths; set measured deadlines and batch sizes.
 6. Execute both paths on testnet, including races, cancellation, expiry and complete buyer silence.
 

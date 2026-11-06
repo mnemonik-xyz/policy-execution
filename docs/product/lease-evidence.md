@@ -11,13 +11,16 @@ Revision 2026-11-03: two amendments. First, pocc decision 47, taken: the buyer c
 the PoCC agent, so the seller watches it every slot and stores every anchored entry
 (SS-12, SS-13). This applies to every PoCC lease. Pocc decision 48, taken the same day:
 the seller also stops when the current piece can no longer reach its coverage floor
-(SS-12), and never continues after a zero-payable piece (SS-14). Second, proposed and not
-adopted: the
-rent dispute mechanism (`docs/handoff/05-rent-dispute-mechanism.md`) adds a mode where a
-buyer acknowledgement that the provider accepts, or a proof that the provider submits
-after a response period, settles a batch. In that mode a silent buyer does not leave
-completed service with anchored evidence unpaid. Statements below about a silent buyer,
-non-cooperation and the proof-only escrow describe the buyer-note mode.
+(SS-12), and never continues after a zero-payable piece (SS-14). Second, the rent
+dispute mechanism (`docs/handoff/05-rent-dispute-mechanism.md`), ruled on by the owner on
+6 Nov 2026 (pocc decision 49): a buyer acknowledgement that the provider accepts settles a
+batch without a proof, in every lease. A proof that the provider submits after a response
+period, the dispute path, exists only for a lease at `min_assurance = 1`, where the meter
+key is the **enclave agent**'s (5a.4): an attested component inside the machine whose key
+neither the buyer's system nor the seller's host can read. At `min_assurance = 0` there is
+no dispute path: a silent buyer stops the lease (SS-9, SS-12) and the seller settles what
+the buyer signed. Statements below about a silent buyer, non-cooperation and the
+proof-only escrow describe that lease, which is every lease until Stage 1 exists.
 
 Revision 2026-10-29: the delivery proof. A metered policy must name a meter. The
 meter signs a usage record per piece. The guest checks the records before the rule
@@ -631,9 +634,10 @@ assumes the provider does not read the agent key out of the machine and run the 
 elsewhere. Of the five properties a buyer may mean by "delivered compute", Stage 0
 establishes the first only:
 
-| Property | Stage 0 | Stage 1 (SEV-SNP) | Later |
+| Property | Stage 0 | Stage 1 (the enclave agent, SEV-SNP) | Later |
 |---|---|---|---|
 | Instance availability, sampled every 60 s | Yes, under the Stage 0 assumption | Yes | — |
+| Evidence the buyer cannot stop, forge or read the key of | No: the agent is the buyer's | Yes: the agent key lives in the attested component, outside the buyer's system (pocc decision 49) | — |
 | Hardware identity and launched image | No (Nova's own record only) | Yes: the launch measurement | — |
 | Resource allocation (vCPUs, memory, GPU) | No | Partly: the attested image reads the hardware | Stage 1 counters and GPU evidence |
 | Performance | No | No | Throughput checks (`tau_max`) |
@@ -672,9 +676,10 @@ While the development anchor is in use, a refutation also rests on the notary's 
 key; the Arc anchor removes that dependency. Enforcement in the guest is X-1, which
 needs BLS verification of the drand rounds, the chain anchor and a witness design.
 
-**The buyer controls the agent.** The PoCC agent runs inside the buyer's machine. The
-buyer can stop it, block its network, or read its key from memory and sign with it.
-Nothing in Stage 0 prevents this, and Stage 1 as specified does not prevent it either.
+**The buyer controls the agent (Stage 0).** The PoCC agent runs inside the buyer's
+machine. The buyer can stop it, block its network, or read its key from memory and sign
+with it. Nothing in Stage 0 prevents this, and an attested launch of the buyer's image
+would not either, because the buyer is root inside the attested machine.
 The buyer cannot remove evidence that is already anchored: the notary keeps the first
 entry for each agent and sequence number and refuses a different one, and the seller
 stores the anchored entries each slot (SS-13). The extracted key can still damage a
@@ -687,10 +692,25 @@ liveness, keeps the last valid receipt prefix, and builds records from that pref
 slots only. The liveness watch then stops the machine. Time without valid anchored
 heartbeats is never paid, and heartbeats inside a provisional piece do not make it
 billable: only the continuation gate does (5a.5). The listing states this rule and the value
-of `liveness_miss_slots`. Evidence that the buyer cannot stop is kept as research for a
-later improvement: a sidecar that the buyer cannot stop, and an observer. Either must
-also be one that the seller cannot forge (pocc decision 47 and
-`docs/research-sidecar-observer.md` in `mnemonik-xyz/pocc`).
+of `liveness_miss_slots`.
+
+**The enclave agent (Stage 1, pocc decision 49).** The evidence that the buyer cannot
+stop short of stopping the machine, cannot forge, and whose key it cannot read is the
+agent and the verifier running in a privileged, attested component inside the
+confidential machine (SEV-SNP VMPL0 or an SVSM, or the equivalent partitioning of another
+TEE), with memory the seller's host cannot read. The agent key is generated there and
+never leaves; the attestation report binds it to the measurement that `meter_spec` pins,
+and a record signed by a key without that attestation fails D7. In such a lease
+(`min_assurance = 1`) the enclave's key is `meter_key`: the enclave runs the verifier over
+its own anchored heartbeats, signs each hour's final record once it holds the anchoring
+proofs of the hour's last slot, records the buyer's signed notes that the seller forwards
+to it (so the continuation gate is inside its statement), and emits the terminal stop
+statement. That is what makes the dispute path of handoff 05 possible: after the response
+period the seller proves the eligible prefix from the enclave's records, and the buyer's
+silence costs the seller nothing but the delay. A lease at `min_assurance = 0` has no such
+evidence and therefore no dispute path; the buyer's guardrail is its meter, and silence
+stops the lease (SS-9, SS-12). The third-party meter, the sidecar outside the machine and
+the observer of the earlier research are not pursued; X-1 is on no path.
 
 `meter_spec` for PoCC is the hash of its parameter document: the virtual machine image,
 the flavor, the beacon chain, the slot length, the anchoring bracket, the anchor
@@ -831,7 +851,7 @@ time it is one piece plus the proving and settlement margin.
 - SS-6: The OpenAPI document records the 402 response, the scheme and the price on every metered path.
 - SS-7: Notes are payment authorizations. The service stores them for settlement and does not log them elsewhere.
 - SS-8: The service may challenge before serving or after. Before puts one note of exposure on the buyer. After puts it on the seller. The listing states which.
-- SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. SS-1 and SS-3 apply to the next piece: piece k+1 runs provisionally and becomes billable when note k is acknowledged within `challenge_timeout_s` of the end of piece k (5a.5). If note k has not arrived by then, the service stops and the provisional part of piece k+1 is unpaid. The seller's exposure is `E` of 5a.5.
+- SS-9: For `signed_usage` the service challenges after the piece, with the usage evidence for that piece. A note that does not arrive within `challenge_timeout_s` stops the lease in every mode; at `min_assurance = 0` that is the whole answer to a silent buyer, and at `1` the completed eligible pieces stay payable by the dispute path of handoff 05 (pocc decision 49). SS-1 and SS-3 apply to the next piece: piece k+1 runs provisionally and becomes billable when note k is acknowledged within `challenge_timeout_s` of the end of piece k (5a.5). If note k has not arrived by then, the service stops and the provisional part of piece k+1 is unpaid. The seller's exposure is `E` of 5a.5.
 - SS-10: The seller keeps one durable reservation ledger per lease with three categories: `settled` (paid by `consume`), `held` (notes acknowledged, not settled), and `open` (pieces served, provisional or being served whose note has not been acknowledged, reserved at `max_note` each). A reservation enters `open` before its piece starts (for piece k+1, when piece k ends and piece k+1 becomes provisional; for piece 0, at Provisioning), moves to `held` when its note is acknowledged (at the note's amount; a timed-out piece leaves `open` as a recorded loss), and to `settled` when its batch settles; each moves exactly once. Before a reservation enters `open` for piece k, `settled + held + open + max_note <= ceiling`, and `service_start + (k + 1) * piece_s + G <= min(deadline(batch of k), settleBy)` with `G` of 5a.5. Otherwise the lease stops.
 - SS-11: A batch closes once (5a.5). The service refuses a note for an index of a closed batch, and a note whose `valid_until` is earlier than BG-6 requires.
 - SS-12: For a PoCC lease the service watches the agent every slot. After each slot it reads the notary's entries for the lease's agent and checks each new entry with the verifier against the stored valid prefix (sequence, slot schedule, beacon value, chain link, signature, no entry after a final heartbeat: every check that gives the verifier an error code). An entry that passes but is anchored outside the bracket is late: it is valid, earns no credit and does not count as liveness, and it is not a failed entry. Only a passing entry anchored inside the bracket counts as liveness. When `liveness_miss_slots` consecutive slots have no valid anchored heartbeat, or a heartbeat marked final arrives before `service_end`, or an entry fails the check, or the current piece can no longer reach its coverage floor, the lease goes to Stopping and the machine is terminated within its shutdown latency. The coverage condition: for piece k, an interval is irrecoverably missed when its anchoring deadline (the round time of its later slot plus `bracket_s`) has passed and the verifier, over the valid prefix, did not credit it; `lost_k` is the sum of those seconds, consecutive or scattered. The seller stops when `(creditable_k - lost_k) * 10000 < min_coverage_bp * creditable_k`, the integer form of D6. With `min_coverage_bp = 9500`, a middle hour (`creditable_k = 3600`) needs 3,420 credited seconds and stops at the fourth lost interval (240 s); a boundary hour (`creditable_k = 3540`) needs 3,363 and stops at the third (180 s). The five-consecutive-slot condition stays a separate stop. A valid heartbeat signed with an extracted key counts as a heartbeat; a final heartbeat counts as a stop; a failed entry counts as a stop. Liveness measures delivery inside pieces; it never makes a provisional piece billable. The listing states `liveness_miss_slots` (default 5) and that disabling, blocking or changing the agent ends the lease. The seller keeps `liveness_miss_slots * slot_s <= challenge_timeout_s`. When the cause is the seller's own notary, the seller can repair it instead of stopping; the unanchored slots stay unpaid.
@@ -861,7 +881,7 @@ time it is one piece plus the proving and settlement margin.
 | Nothing about Circle, the cloud provider, the marketplace or the prover | They affect liveness and cost, not who gets paid. |
 | The meter key signs honest usage records (v1 trusts this attestation; the guest checks the signature and the gates, not the metering) | A false record cannot move funds outside the ceiling or to another recipient. An over-credit pays the seller from the buyer's own funds. An under-credit stops the service after one piece. With PoCC the record is a re-executable computation, so a false record is visible to anyone who re-runs the verifier, after the fact. The guest-run verifier (`computed_result` over authenticated evidence) removes the key. |
 | The buyer's guardrail key is not compromised (in v1 it is the meter, acceptance and registry key at once) | One stolen key signs records and notes that agree with each other and pays the fixed recipient for service that did not happen, up to the ceiling and before `settleBy`. This trust is accepted for an explicitly limited pilot only: small ceilings, named parties, short leases. A requirement that a compromised signer cannot pay without delivery evidence is not met by v1; only the guest-verified evidence of X-1 meets it. Splitting the keys is not a substitute: two keys held by the same compromised process protect nothing. |
-| The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it. The policy states the assurance level it accepts. The buyer controls the machine and can always stop the agent or read its key: that stops evidence for later slots, never for anchored ones, and SS-12 stops the machine. |
+| The PoCC evidence (drand, the anchor chain, the agent in the machine) | A broken beacon or chain stops credit for new hours. Old records stay valid. The agent key is inside the machine; without hardware attestation the provider can read it, and the buyer always can. With the enclave agent (`min_assurance = 1`) neither can. The policy states the assurance level it accepts, and with it whether the lease has a dispute path (pocc decision 49). The buyer controls the machine and can always stop the agent or read its key: that stops evidence for later slots, never for anchored ones, and SS-12 stops the machine. |
 
 ## 9. Attack surface
 
@@ -873,7 +893,7 @@ time it is one piece plus the proving and settlement margin.
 | Buyer | Sign a note with a wrong amount, recipient or lease | SS-3 refuses before serving. |
 | Buyer | Sign a note with a window too short to settle | SS-3 refuses before serving. |
 | Buyer | Stop near `settleBy` so the seller cannot settle | SS-4: the service stops first, by its margin. |
-| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. In the proposed dispute mode, completed service with anchored evidence stays payable by a provider-submitted proof after the response period (handoff 05). |
+| Buyer | Withhold any cooperation after funding | For request-paid service none is needed: settlement is a proof over notes the buyer already signed. For `signed_usage` the buyer must answer the challenge for every served piece, the last one after delivery; a buyer that stops answering costs the seller one piece (SS-9), and the seller settles the notes it holds. At `min_assurance = 1`, completed eligible service stays payable by a provider-submitted proof over the enclave agent's records after the response period (handoff 05, pocc decision 49); at `0` there is no such path. |
 | Buyer | Cancel after `accept` | Impossible before `settleBy`. |
 | Buyer | Never answer the first challenge | The seller loses provisioning cost. The no-show residue. |
 | Seller | Forge a note | Impossible. |
@@ -890,7 +910,7 @@ time it is one piece plus the proving and settlement margin.
 | Listing board | Serve a false `payTo` | The quote signature must recover to the listed address. The credential rule decides. |
 | Seller | Bill a piece that was not delivered | No usage record, or a record below the note amount: `Ask` or `Deny`. The piece is not paid. |
 | Buyer | Sign a record with fewer units than delivered | The seller loses at most one piece and stops. Anyone can re-run the verifier and show the under-credit. |
-| Buyer | Stop the agent, block its network, or change it | Later slots have no anchored heartbeat and earn nothing. SS-12 stops the machine after `liveness_miss_slots` slots. Anchored slots stay credited. The loss stays within `E`. |
+| Buyer | Stop the agent, block its network, or change it | Later slots have no anchored heartbeat and earn nothing. SS-12 stops the machine after `liveness_miss_slots` slots. Anchored slots stay credited. The loss stays within `E`. With the enclave agent the buyer can only stop the whole machine; the effect is the same stop. |
 | Buyer | Read the agent key and sign a different entry for an anchored sequence number | The notary keeps the first entry and refuses the new one (SS-13). Anchored slots do not change. |
 | Buyer | Sign an early final heartbeat with the extracted key | Credit ends at that heartbeat. SS-12 stops the machine. Earlier valid anchored slots stay credited. |
 | Buyer | Sign a malformed heartbeat with the extracted key (wrong round, wrong beacon value, broken chain link, entry after a final heartbeat) | The notary accepts it, and a receipt that includes it is `INVALID`. The seller's content check stops the lease at once (SS-12), and records come from the last valid prefix (SS-13), so completed pieces keep their records. |
