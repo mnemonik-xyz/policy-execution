@@ -106,12 +106,16 @@ record gains `assurance` and `meter_spec`. Both are in section 5a.
 | Option | Trust | Cost |
 |---|---|---|
 | The compute provider signs usage | The buyer trusts the provider | The provider must sign records. No provider does today. |
-| An independent metering service signs usage | The buyer trusts that service | A new service to build and run |
+| An independent metering service signs usage | The buyer trusts that service | A new service to build and run. Not pursued (pocc decision 49) |
+| The enclave agent signs usage: the agent and verifier in an attested component inside the machine whose key neither party can read | Both parties trust the attestation | Stage 1 hosts and the enclave agent (pocc PC-10). Chosen on 6 Nov for `min_assurance = 1`; it is what makes the dispute path possible (handoff 05, 2a) |
 | The seller signs, the buyer countersigns | Two parties agree | Needs the buyer online, as the old signed path did |
 | `computed_result` instead (solver style) | The checker, not a party | Only for work with a checkable output |
 
 The owner chose the buyer-run PoCC verifier on 2026-10-29. The key is named: the
-buyer's guardrail key.
+buyer's guardrail key. On 6 Nov 2026 (pocc decision 49) that choice was scoped to
+`min_assurance = 0`, where a silent buyer stops the lease and nothing is proved against
+it; at `min_assurance = 1` the meter key is the enclave agent's, and the provider can
+settle a silent buyer's batch by proof (handoff 05).
 
 ## Work packages
 
